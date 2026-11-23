@@ -30,7 +30,16 @@
 //! never run is marked `Failed { retry_at: None }` and later [`Manager::enqueue`] calls fail at
 //! once ([`Manager::is_alive`]), so nothing waits on a dead queue. [`Manager::shutdown`] sets the
 //! stop flag, which the download, hash and extraction loops check, and joins the worker for at
-//! most `SHUTDOWN_JOIN` before leaving it to finish in the background.
+//! most `SHUTDOWN_JOIN` before leaving it to finish in the background
+//! ([`Manager::shutdown_by`] takes the caller's deadline instead).
+//!
+//! **Cancelling one job** (audit 2026-11, RA resources-4): [`Manager::cancel`] ends a queued,
+//! retrying or running job as `Failed { retry_at: None, error: "cancelled" }` (the running one
+//! stops at its next chunk, hash step or extraction entry; its `.partial` is kept, so a later
+//! attempt resumes). Queuing the key again starts it afresh. A job queued for one waiter
+//! ([`Manager::enqueue_waiting`], the export and training fetches) is cancelled by
+//! [`Waiter::give_up`] only when no other waiter and no plain [`Manager::enqueue`] (a Download
+//! button, the service's provisioning, which keep it wanted until it ends) wants it.
 //!
 //! Every state change is
 //! published in [`Status`] (shared, for `/stats` and `/v1/resources`), through the optional
@@ -68,7 +77,7 @@ use crate::sync::LockExt;
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -593,11 +602,37 @@ struct Shared {
     changed: Condvar,
     subscribers: Mutex<Vec<Sender<Event>>>,
     stop: AtomicBool,
+    /// Set by [`Manager::shutdown`] and by a [`Manager::cancel`] of the running job; the running
+    /// job's download, hash and extraction loops check it (reset when the next job starts).
+    abort: AtomicBool,
+    /// Cancelled keys and the running one (one lock, so a cancel and the worker's pickup of the
+    /// same key cannot miss each other).
+    cancels: Mutex<Cancels>,
+    /// Who wants each key ([`Interest`]).
+    interest: Mutex<HashMap<String, Interest>>,
     /// The worker thread has exited (stopped, or died: see `dead_reason`).
     dead: AtomicBool,
     /// Why the worker died (None after a normal stop).
     dead_reason: Mutex<Option<String>>,
 }
+
+/// See [`Shared::cancels`].
+#[derive(Debug, Default)]
+struct Cancels {
+    keys: HashSet<String>,
+    running: Option<String>,
+}
+
+/// Who wants a key: `pinned` by a plain [`Manager::enqueue`] until the job ends, plus the
+/// [`Waiter`]s of [`Manager::enqueue_waiting`].
+#[derive(Debug, Default, Clone, Copy)]
+struct Interest {
+    pinned: bool,
+    waiters: usize,
+}
+
+/// The error text of a cancelled job.
+pub const CANCELLED: &str = "cancelled";
 
 impl Shared {
     fn set(&self, job: &Job, state: State) {
@@ -609,13 +644,76 @@ impl Shared {
             target: job.target.clone(),
             state,
         };
+        self.publish(status);
+    }
+
+    /// Store `status`, tell the hook and the waiters; a final state ends the key's pin.
+    fn publish(&self, status: Status) {
         if let Some(hook) = &self.opts.on_progress {
             hook(&status);
+        }
+        if status.state.is_final() {
+            let mut interest = self.interest.lock_recover();
+            if let Some(i) = interest.get_mut(&status.key) {
+                i.pinned = false;
+                if i.waiters == 0 {
+                    interest.remove(&status.key);
+                }
+            }
         }
         let mut map = self.statuses.lock_recover();
         map.insert(status.key.clone(), status);
         drop(map);
         self.changed.notify_all();
+    }
+
+    /// The key was cancelled since it was last queued.
+    fn is_cancelled(&self, key: &str) -> bool {
+        self.cancels.lock_recover().keys.contains(key)
+    }
+
+    /// Cancel `key` (see [`Manager::cancel`]).
+    fn cancel(&self, key: &str) -> bool {
+        let mut cancels = self.cancels.lock_recover();
+        let Some(st) = self.statuses.lock_recover().get(key).cloned() else {
+            return false;
+        };
+        if st.state.is_final() {
+            return false;
+        }
+        cancels.keys.insert(key.to_string());
+        if cancels.running.as_deref() == Some(key) {
+            // The worker marks it cancelled when the job returns.
+            self.abort.store(true, Ordering::SeqCst);
+        } else {
+            let attempts = match st.state {
+                State::Failed { attempts, .. } => attempts,
+                _ => 0,
+            };
+            drop(cancels);
+            self.publish(Status {
+                state: State::Failed {
+                    error: CANCELLED.to_string(),
+                    retry_at: None,
+                    attempts,
+                },
+                ..st.clone()
+            });
+            self.emit(Event::Failed {
+                key: st.key,
+                id: st.id,
+                error: CANCELLED.to_string(),
+                retry_at: None,
+            });
+        }
+        tracing::info!("download of {} cancelled", st.id);
+        true
+    }
+
+    /// Start the worker's stop: no new job, the running one abandoned.
+    fn request_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.abort.store(true, Ordering::SeqCst);
     }
 
     fn state(&self, key: &str) -> Option<State> {
@@ -777,6 +875,9 @@ impl Manager {
             changed: Condvar::new(),
             subscribers: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+            cancels: Mutex::new(Cancels::default()),
+            interest: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
             dead_reason: Mutex::new(None),
         });
@@ -794,8 +895,44 @@ impl Manager {
     }
 
     /// Queue `job` unless the same key is already queued, running or installed (and still is:
-    /// an install that lost a file is queued again). Returns the key.
+    /// an install that lost a file is queued again). Returns the key. The key stays wanted until
+    /// the job ends: a [`Waiter::give_up`] does not cancel it meanwhile.
     pub fn enqueue(&self, job: Job) -> String {
+        self.shared
+            .interest
+            .lock_recover()
+            .entry(job.key())
+            .or_default()
+            .pinned = true;
+        self.enqueue_inner(job)
+    }
+
+    /// [`Self::enqueue`] for one waiter that may give up ([`Waiter::give_up`] cancels the job when
+    /// nobody else wants it). Dropping the waiter without giving up leaves the job alone.
+    pub fn enqueue_waiting(&self, job: Job) -> Waiter {
+        let key = job.key();
+        self.shared
+            .interest
+            .lock_recover()
+            .entry(key.clone())
+            .or_default()
+            .waiters += 1;
+        self.enqueue_inner(job);
+        Waiter {
+            shared: Arc::clone(&self.shared),
+            key,
+            released: false,
+        }
+    }
+
+    /// Cancel `key`: a queued or retrying job ends at once, the running one at its next stop
+    /// check, as `Failed { retry_at: None, error: "cancelled" }` (its `.partial` is kept for a
+    /// later attempt). Returns whether there was an unfinished job to cancel.
+    pub fn cancel(&self, key: &str) -> bool {
+        self.shared.cancel(key)
+    }
+
+    fn enqueue_inner(&self, job: Job) -> String {
         let key = job.key();
         let busy = match self.shared.state(&key) {
             Some(
@@ -807,6 +944,8 @@ impl Manager {
             _ => false,
         };
         if !busy {
+            // A fresh request: an earlier cancel of the key no longer applies.
+            self.shared.cancels.lock_recover().keys.remove(&key);
             self.shared.set(&job, State::Queued);
             let sent = self.tx.send(Msg::Job(Box::new(job.clone()))).is_ok();
             // Checked after the status is Queued: a worker dying concurrently either sees
@@ -886,11 +1025,23 @@ impl Manager {
     /// for at most `SHUTDOWN_JOIN`; a worker still busy after that (a hash or an extraction
     /// between two stop checks, a stalled read) is detached and logged.
     pub fn shutdown(&self) {
-        self.shared.stop.store(true, Ordering::SeqCst);
+        self.shutdown_by(Instant::now() + SHUTDOWN_JOIN);
+    }
+
+    /// Ask the worker to stop without waiting (the running download is abandoned at its next
+    /// stop check). [`Self::shutdown_by`] then joins it.
+    pub fn request_stop(&self) {
+        self.shared.request_stop();
         let _ = self.tx.send(Msg::Stop);
+    }
+
+    /// [`Self::shutdown`] joining the worker until `deadline` at most (never past
+    /// `SHUTDOWN_JOIN` from now). Idempotent.
+    pub fn shutdown_by(&self, deadline: Instant) {
+        self.request_stop();
         let handle = self.thread.lock_recover().take();
         if let Some(h) = handle {
-            let until = Instant::now() + SHUTDOWN_JOIN;
+            let until = deadline.min(Instant::now() + SHUTDOWN_JOIN);
             while !h.is_finished() && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -898,9 +1049,8 @@ impl Manager {
                 let _ = h.join();
             } else {
                 tracing::warn!(
-                    "download worker still busy {} s after the stop request; leaving it to \
-                     finish in the background (an unfinished download resumes on the next start)",
-                    SHUTDOWN_JOIN.as_secs()
+                    "download worker still busy after the stop request; leaving it to finish \
+                     in the background (an unfinished download resumes on the next start)"
                 );
             }
         }
@@ -910,6 +1060,61 @@ impl Manager {
 impl Drop for Manager {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// One waiter's interest in a key queued by [`Manager::enqueue_waiting`]. Dropping it only ends
+/// the interest; [`Self::give_up`] also cancels the job when nobody else wants it.
+#[derive(Debug)]
+pub struct Waiter {
+    shared: Arc<Shared>,
+    key: String,
+    released: bool,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared")
+            .field("root", &self.opts.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Waiter {
+    /// The job's key.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Stop waiting and cancel the job ([`Manager::cancel`]) unless another waiter or a plain
+    /// enqueue still wants it. Returns whether it was cancelled.
+    pub fn give_up(mut self) -> bool {
+        let last = self.release();
+        last && self.shared.cancel(&self.key)
+    }
+
+    /// End this interest; true when nobody wants the key any more.
+    fn release(&mut self) -> bool {
+        if self.released {
+            return false;
+        }
+        self.released = true;
+        let mut interest = self.shared.interest.lock_recover();
+        let Some(i) = interest.get_mut(&self.key) else {
+            return true;
+        };
+        i.waiters = i.waiters.saturating_sub(1);
+        let last = i.waiters == 0 && !i.pinned;
+        if i.waiters == 0 && !i.pinned {
+            interest.remove(&self.key);
+        }
+        last
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 

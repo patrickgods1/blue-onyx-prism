@@ -9,16 +9,23 @@
 //! [`QUEUE`] bounds the memory: each queued save holds its decoded frame (12.3 MB for 2688x1520).
 //! The thread keeps the normal priority: a lowered one could starve under CPU inference and
 //! drop every save.
+//!
+//! Stop: [`flush`] (called by `ModelRegistry::shutdown` once its workers are gone, so their last
+//! saves are queued) closes the queue and waits, until a deadline, for the thread to write what
+//! is queued and end; what is still queued then is logged as lost, never silently. The next save
+//! after a flush starts a new thread (the Windows service restarts in process).
 
 use crate::api::Prediction;
 use crate::image::RgbImage;
 use crate::metrics::LogThrottle;
+use crate::sync::LockExt;
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
-use tracing::warn;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use tracing::{debug, error, warn};
 
 /// Saves waiting for the writer. Four 2688x1520 frames are about 50 MB; a camera system that
 /// triggers faster than one thread encodes loses saves instead of growing memory.
@@ -57,6 +64,8 @@ pub(crate) struct Saver {
     dropped: AtomicU64,
     log: LogThrottle,
     clock: Instant,
+    /// Saves queued and not written yet (the writer counts down after each write).
+    queued: Arc<AtomicUsize>,
 }
 
 impl Saver {
@@ -68,38 +77,20 @@ impl Saver {
             dropped: AtomicU64::new(0),
             log: LogThrottle::default(),
             clock: Instant::now(),
+            queued: Arc::default(),
         };
         (saver, rx)
-    }
-
-    /// A saver whose `image-save` thread writes every queued save (None: no thread).
-    fn spawn(capacity: usize) -> Option<Self> {
-        let (saver, rx) = Self::unstarted(capacity);
-        let spawned = std::thread::Builder::new()
-            .name("image-save".into())
-            .spawn(move || {
-                while let Ok(job) = rx.recv() {
-                    write(job);
-                }
-            });
-        match spawned {
-            Ok(_) => Some(saver),
-            Err(e) => {
-                warn!(
-                    "could not start the image-save thread ({e}); save_image_path images are \
-                     not written; restart the service"
-                );
-                None
-            }
-        }
     }
 
     /// Queue `job` (never blocks).
     pub(super) fn submit(&self, job: SaveJob) -> Submitted {
         let model = job.model.clone();
+        // Counted before the send: the writer may write it (and count down) at once.
+        self.queued.fetch_add(1, Ordering::AcqRel);
         match self.tx.try_send(job) {
             Ok(()) => Submitted::Queued,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 let now = u64::try_from(self.clock.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let held_back = self.log.allow(now);
@@ -127,20 +118,113 @@ impl Saver {
     }
 }
 
-/// The process-wide saver, started on first use (None: its thread could not start).
-fn global() -> Option<&'static Saver> {
-    static SAVER: OnceLock<Option<Saver>> = OnceLock::new();
-    SAVER.get_or_init(|| Saver::spawn(QUEUE)).as_ref()
+/// A [`Saver`] with its `image-save` thread.
+#[derive(Debug)]
+struct Writer {
+    saver: Saver,
+    thread: JoinHandle<()>,
 }
 
-/// Queue `job` on `to`, else on the process-wide saver.
+/// How [`flush`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flushed {
+    /// Every queued save was written and the thread ended (or none was running).
+    Drained,
+    /// The deadline passed first: this many saves were still queued or being written (lost
+    /// when the process exits; the thread is left to finish on its own).
+    Left(usize),
+}
+
+/// How often [`Writer::finish`] looks at the thread.
+const FLUSH_POLL: Duration = Duration::from_millis(10);
+
+impl Writer {
+    /// A saver whose `image-save` thread writes every queued save (None: no thread).
+    fn start(capacity: usize) -> Option<Self> {
+        let (saver, rx) = Saver::unstarted(capacity);
+        let queued = saver.queued.clone();
+        let spawned = std::thread::Builder::new()
+            .name("image-save".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    write(job);
+                    queued.fetch_sub(1, Ordering::AcqRel);
+                }
+            });
+        match spawned {
+            Ok(thread) => Some(Self { saver, thread }),
+            Err(e) => {
+                warn!(
+                    "could not start the image-save thread ({e}); save_image_path images are \
+                     not written; the system is out of threads or memory; restart the service"
+                );
+                None
+            }
+        }
+    }
+
+    /// Close the queue and wait, until `deadline`, for the thread to write what is queued.
+    fn finish(self, deadline: Instant) -> Flushed {
+        let Self { saver, thread } = self;
+        let queued = saver.queued.clone();
+        // The thread's `recv` ends once the queue is empty and this, the only sender, is gone.
+        drop(saver);
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(FLUSH_POLL);
+        }
+        if !thread.is_finished() {
+            let left = queued.load(Ordering::Acquire);
+            warn!(
+                left,
+                "{left} annotated image(s) for save_image_path were not written before the stop \
+                 deadline (the disk is slow or full); they are lost; check the disk under \
+                 save_image_path"
+            );
+            return Flushed::Left(left);
+        }
+        if thread.join().is_err() {
+            error!("the image-save thread panicked; queued save_image_path images were lost");
+        } else {
+            debug!("image-save thread stopped; every queued image was written");
+        }
+        Flushed::Drained
+    }
+}
+
+/// The process-wide writer.
+#[derive(Debug)]
+enum Global {
+    /// Not started yet, or flushed: the next save starts it.
+    Idle,
+    Running(Writer),
+    /// Its thread could not start (warned once); saves are dropped until the next flush.
+    Failed,
+}
+
+static GLOBAL: Mutex<Global> = Mutex::new(Global::Idle);
+
+/// Queue `job` on `to`, else on the process-wide saver (started on first use).
 pub(super) fn submit(to: Option<&Saver>, job: SaveJob) -> Submitted {
-    match to {
-        Some(s) => s.submit(job),
-        None => match global() {
-            Some(s) => s.submit(job),
-            None => Submitted::Dropped { warned: false },
-        },
+    if let Some(s) = to {
+        return s.submit(job);
+    }
+    let mut g = GLOBAL.lock_recover();
+    if matches!(*g, Global::Idle) {
+        *g = Writer::start(QUEUE).map_or(Global::Failed, Global::Running);
+    }
+    match &*g {
+        Global::Running(w) => w.saver.submit(job),
+        Global::Idle | Global::Failed => Submitted::Dropped { warned: false },
+    }
+}
+
+/// Stop the process-wide saver: write what is queued, until `deadline` (see the module doc).
+/// Saves submitted meanwhile go to a new writer.
+pub(crate) fn flush(deadline: Instant) -> Flushed {
+    let taken = std::mem::replace(&mut *GLOBAL.lock_recover(), Global::Idle);
+    match taken {
+        Global::Running(w) => w.finish(deadline),
+        Global::Idle | Global::Failed => Flushed::Drained,
     }
 }
 
@@ -223,6 +307,106 @@ mod tests {
         // A writer that is gone drops too.
         drop(rx);
         assert!(matches!(saver.submit(job(&dir)), Submitted::Dropped { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn files_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// RA-075: a stop writes what is queued and ends the thread (before, the thread was
+    /// detached and queued saves were lost without a word).
+    #[test]
+    fn finish_writes_the_queue_and_ends_the_thread() {
+        let dir = std::env::temp_dir().join(format!("bo_save_flush_{}", uuid::Uuid::new_v4()));
+        let w = Writer::start(4).unwrap();
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            let j = SaveJob {
+                image_name: name.into(),
+                ..job(&dir)
+            };
+            assert_eq!(w.saver.submit(j), Submitted::Queued);
+        }
+        let queued = w.saver.queued.clone();
+        assert_eq!(
+            w.finish(Instant::now() + Duration::from_secs(30)),
+            Flushed::Drained
+        );
+        assert_eq!(files_in(&dir), ["a_od.jpg", "b_od.jpg", "c_od.jpg"]);
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the deadline the saves still queued are reported (and logged), and the thread is
+    /// left to finish on its own.
+    #[test]
+    fn finish_past_the_deadline_reports_what_is_left() {
+        let dir = std::env::temp_dir().join(format!("bo_save_late_{}", uuid::Uuid::new_v4()));
+        let w = Writer::start(4).unwrap();
+        // Large frames: encoding them takes long enough that none is done at once.
+        let big = || RgbImage {
+            width: 2000,
+            height: 2000,
+            rgb: vec![90; 2000 * 2000 * 3],
+        };
+        for name in ["a.jpg", "b.jpg", "c.jpg"] {
+            let j = SaveJob {
+                image_name: name.into(),
+                img: big(),
+                ..job(&dir)
+            };
+            assert_eq!(w.saver.submit(j), Submitted::Queued);
+        }
+        let queued = w.saver.queued.clone();
+        let Flushed::Left(n) = w.finish(Instant::now()) else {
+            panic!("drained at once");
+        };
+        assert!((1..=3).contains(&n), "{n}");
+        // The thread goes on writing them.
+        let t = Instant::now();
+        while queued.load(Ordering::Acquire) > 0 {
+            assert!(t.elapsed() < Duration::from_secs(60), "never written");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The process-wide saver starts again after a flush (the Windows service restarts in
+    /// process).
+    #[test]
+    fn the_global_saver_starts_again_after_a_flush() {
+        let dir = std::env::temp_dir().join(format!("bo_save_global_{}", uuid::Uuid::new_v4()));
+        let deadline = || Instant::now() + Duration::from_secs(30);
+        // Another test's registry shutdown may flush the global saver at the same time, and
+        // then writes this test's save itself: wait for the file rather than for this flush.
+        let written = |want: &[&str]| {
+            let t = Instant::now();
+            while files_in(&dir) != want {
+                assert!(
+                    t.elapsed() < Duration::from_secs(30),
+                    "{:?}",
+                    files_in(&dir)
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert_eq!(submit(None, job(&dir)), Submitted::Queued);
+        assert_eq!(flush(deadline()), Flushed::Drained);
+        written(&["cam1_od.jpg"]);
+        let again = SaveJob {
+            image_name: "cam2.jpg".into(),
+            ..job(&dir)
+        };
+        assert_eq!(submit(None, again), Submitted::Queued, "a new writer");
+        assert_eq!(flush(deadline()), Flushed::Drained);
+        written(&["cam1_od.jpg", "cam2_od.jpg"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

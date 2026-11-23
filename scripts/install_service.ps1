@@ -23,6 +23,8 @@
       Administrators and SYSTEM full control, the service account Modify, no Users
     - Configures automatic restart on failure and firewall rules for the HTTP and HTTPS ports,
       both limited to the local subnet
+    - Sets the preshutdown timeout to 75 s (blue-onyx-prism-service.exe --set-preshutdown-timeout),
+      so an OS restart gives the service time for its bounded stop
 .PARAMETER InstallDir
     Directory containing blue-onyx-prism-service.exe (default: the parent of this script's folder).
 .PARAMETER Port
@@ -175,6 +177,14 @@ Invoke-Sc description $ServiceName "Blue Iris / CodeProject.AI compatible object
 Invoke-Sc failure $ServiceName reset= 3600 actions= restart/5000/restart/30000/restart/120000
 # ...also when the service stops itself with an error code (a start that gave up on a busy port).
 Invoke-Sc failureflag $ServiceName 1
+# Stop timeout at an OS shutdown: the service accepts PRESHUTDOWN, and the SCM then waits for it
+# up to this timeout (Windows' default is 10 s). The service binary sets it to 75 s
+# (runner::SERVICE_MANAGER_STOP), above the service's own 60 s stop bound, through
+# ChangeServiceConfig2 (sc.exe has no such option). A failure only warns: Stop still works.
+& $exe --set-preshutdown-timeout
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "Could not set the preshutdown timeout (exit $LASTEXITCODE); an OS shutdown gives the service 10 s to stop."
+}
 
 # --- Permissions --------------------------------------------------------------------------------
 # Well-known SIDs, so the script works on non-English Windows.

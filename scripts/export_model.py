@@ -1180,6 +1180,58 @@ def self_check(recipe: str) -> int:
     return 0
 
 
+def watch_parent() -> None:
+    """Exit when the process that started this one goes away (the service stopped, crashed or
+    was killed). The service runs this script with a pipe as stdin that it never writes to and
+    sets BOP_PARENT_PIPE=1: end of file on that pipe means the service is gone, at once. A check
+    of the parent process id every 2 s stays as the fallback. On the way out the whole process
+    group is killed when this process leads it (the service starts it as a group leader), so the
+    helpers it started (data loader workers) end too. Run by hand (no BOP_PARENT_PIPE) stdin is
+    never read. Windows: the service's job object ends the tree, and nothing reads stdin there
+    (a thread blocked on a pipe stdin can stall other calls on that handle)."""
+    if os.name == "nt":
+        return
+    import signal
+    import threading
+    import time as _time
+
+    def gone(why: str) -> None:
+        try:
+            log(f"the parent process is gone ({why}); stopping")
+        except Exception:  # noqa: BLE001 - the output pipe may be gone with the parent
+            pass
+        try:
+            if os.getpgrp() == os.getpid():
+                os.killpg(os.getpid(), signal.SIGKILL)
+        finally:
+            os._exit(3)
+
+    if os.environ.get("BOP_PARENT_PIPE") == "1":
+        def pipe() -> None:
+            # os.read on the descriptor, not sys.stdin: a daemon thread blocked inside the
+            # buffered reader would hold its lock at interpreter shutdown.
+            try:
+                while os.read(0, 4096):
+                    pass
+            except OSError:
+                pass
+            gone("its pipe closed")
+
+        threading.Thread(target=pipe, name="parent-pipe", daemon=True).start()
+
+    ppid = os.getppid()
+    if ppid <= 1:
+        return
+
+    def loop() -> None:
+        while True:
+            _time.sleep(2)
+            if os.getppid() != ppid:
+                gone("this process was reparented")
+
+    threading.Thread(target=loop, name="parent-watch", daemon=True).start()
+
+
 # ---------------------------------------------------------------------------------------------
 
 
@@ -1187,6 +1239,7 @@ def main() -> int:
     args = parse_args()
     if args.self_check:
         return self_check(args.recipe)
+    watch_parent()
     args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=True)
     args.work = args.work.resolve()

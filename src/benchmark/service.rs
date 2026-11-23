@@ -17,7 +17,10 @@
 //! runtimes (registries built from handles, in tests) it initializes its own.
 //!
 //! The service lives for the whole process (across registry generations); the runner cancels a
-//! running benchmark when a generation stops.
+//! running benchmark when a generation stops, and at the process's stop calls
+//! [`BenchmarkService::stop_for_exit`]: a run that ends within the stop's time leaves no
+//! breadcrumb; one still busy (a compile cannot be interrupted) keeps it, marked as stopped by the
+//! service ([`breadcrumb::Trail::mark_stopped`]).
 
 use super::grade::{AccuracyMetric, Weights};
 use super::images::{self, ImageSet};
@@ -363,7 +366,7 @@ struct Inner {
     /// Bumped per run, so a finished thread of an old run cannot overwrite a newer one.
     run_id: u64,
     /// The breadcrumb of a run that never ended, until the page shows it.
-    interrupted: Option<breadcrumb::Breadcrumb>,
+    interrupted: Option<breadcrumb::Left>,
 }
 
 /// The process-wide benchmark runner.
@@ -371,6 +374,9 @@ struct Inner {
 pub struct BenchmarkService {
     inner: Mutex<Inner>,
     cancel: AtomicBool,
+    /// The running run's breadcrumb ([`RunHandle::trail`]), for [`Self::stop_for_exit`]; weak, so
+    /// it goes with the run.
+    trail: Mutex<std::sync::Weak<breadcrumb::Trail>>,
 }
 
 fn now() -> String {
@@ -396,6 +402,7 @@ impl BenchmarkService {
                 interrupted: None,
             }),
             cancel: AtomicBool::new(false),
+            trail: Mutex::new(std::sync::Weak::new()),
         })
     }
 
@@ -566,6 +573,37 @@ impl BenchmarkService {
         self.start_job(request, move |h| run(&ctx, &req, h))
     }
 
+    /// The process is stopping: cancel a running benchmark and wait for it until `deadline`.
+    /// True when no run is left. A run still busy then (a compile cannot be interrupted; a device
+    /// may hang) is left behind with a warning, and its breadcrumb records the stop
+    /// ([`breadcrumb::Trail::mark_stopped`]) so the next start says the service stopped while that
+    /// device was busy, never that nothing happened. One that ends in time removes its breadcrumb
+    /// as usual.
+    pub fn stop_for_exit(&self, deadline: Instant) -> bool {
+        if !self.cancel() {
+            return true;
+        }
+        let started = Instant::now();
+        if self.wait_idle(deadline.saturating_duration_since(started)) {
+            tracing::info!("benchmark cancelled by the stop");
+            return true;
+        }
+        let waited = started.elapsed().as_secs();
+        let trail = self.trail.lock_recover().upgrade();
+        match trail.as_deref().and_then(breadcrumb::Trail::mark_stopped) {
+            Some((device, model, busy)) => tracing::warn!(
+                "benchmark thread abandoned on {device} ({model}) after waiting {waited} s for it \
+                 to stop: still compiling or hung ({busy} s on that step); its breadcrumb is kept \
+                 and says so at the next start"
+            ),
+            None => tracing::warn!(
+                "benchmark thread abandoned after waiting {waited} s for it to stop (it was not \
+                 on a device yet)"
+            ),
+        }
+        false
+    }
+
     /// Wait until no run is in progress (tests, shutdown). Returns false on timeout.
     pub fn wait_idle(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -600,6 +638,14 @@ impl RunHandle {
 
     pub fn is_cancelled(&self) -> bool {
         self.svc.cancel.load(Ordering::Relaxed)
+    }
+
+    /// This run's breadcrumb under `data_root`, known to [`BenchmarkService::stop_for_exit`]
+    /// while the run holds it.
+    pub(crate) fn trail(&self, data_root: &std::path::Path) -> Arc<breadcrumb::Trail> {
+        let trail = Arc::new(breadcrumb::Trail::new(data_root));
+        *self.svc.trail.lock_recover() = Arc::downgrade(&trail);
+        trail
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> Option<R> {
@@ -861,7 +907,7 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         },
         cache_dir: ctx.config.cache_dir_path(),
         run_id: super::history::new_run_id(),
-        trail: breadcrumb::Trail::new(&ctx.config.data_root()),
+        trail: h.trail(&ctx.config.data_root()),
         priority: crate::backend::priority::DevicePriority::new(req.low_priority),
         cameras,
     };
@@ -1119,8 +1165,9 @@ struct ServiceRun<'a> {
     cache_dir: Option<PathBuf>,
     /// The run's id (its start time), stamped on every model result.
     run_id: String,
-    /// Goes with the run, on every way out: see [`breadcrumb`].
-    trail: breadcrumb::Trail,
+    /// Goes with the run, on every way out: see [`breadcrumb`]. Shared only (weakly) with
+    /// [`BenchmarkService::stop_for_exit`].
+    trail: Arc<breadcrumb::Trail>,
     /// `benchmark.low_priority`: below normal while a CPU device runs, restored for the other
     /// devices and when the run ends (drop).
     priority: crate::backend::priority::DevicePriority,
@@ -2053,6 +2100,64 @@ mod tests {
         assert!(note.contains("ort:cuda:0"), "{note}");
         assert!(!file.exists());
         assert_eq!(svc.take_interrupted(&dir), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Audit 2026-11 phase 1: a planned stop of a run that ends in time leaves no breadcrumb; one
+    /// still busy keeps it, marked as stopped by the service.
+    #[test]
+    fn a_stop_clears_the_breadcrumb_of_a_run_that_ends_and_marks_one_that_does_not() {
+        let dir = std::env::temp_dir().join(format!("bop-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(breadcrumb::BREADCRUMB_FILE);
+        let svc = BenchmarkService::new();
+        assert!(svc.stop_for_exit(Instant::now()), "nothing running");
+        let mut req = request(&[]);
+        req.low_priority = false;
+
+        // Honours the cancel.
+        let root = dir.clone();
+        svc.start_job(req.clone(), move |h| {
+            let trail = h.trail(&root);
+            trail.note("openvino:gpu.0", "m");
+            while !h.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(trail);
+            Err(crate::benchmark::Cancelled.into())
+        })
+        .unwrap();
+        while !file.exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(svc.stop_for_exit(Instant::now() + Duration::from_secs(10)));
+        assert!(!file.exists(), "a planned stop leaves nothing to report");
+        assert_eq!(svc.status().state, RunState::Cancelled);
+
+        // Stuck in a compile: the stop gives up, and the breadcrumb says why it is there.
+        let release = Arc::new(AtomicBool::new(false));
+        let (root, free) = (dir.clone(), release.clone());
+        svc.start_job(req, move |h| {
+            let trail = h.trail(&root);
+            trail.note("openvino:gpu.0", "rtdetr");
+            while !free.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(trail);
+            Err(crate::benchmark::Cancelled.into())
+        })
+        .unwrap();
+        while !file.exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!svc.stop_for_exit(Instant::now() + Duration::from_millis(50)));
+        let left = svc.trail.lock().unwrap().upgrade().unwrap().recorded_left();
+        assert!(left.stopped_at.is_some(), "{left:?}");
+        assert_eq!(left.crumb.device, "openvino:gpu.0");
+        // The run ends after all with the process alive (an in-process restart): the file goes.
+        release.store(true, Ordering::SeqCst);
+        assert!(svc.wait_idle(Duration::from_secs(10)));
+        assert!(!file.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

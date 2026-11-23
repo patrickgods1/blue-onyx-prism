@@ -676,3 +676,343 @@ fn a_rule_checked_under_the_queues_lock_lets_one_of_many_concurrent_starts_throu
     svc.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A task that panics in its run (a bug in an import, an auto-label, a progress parser).
+struct PanicTask {
+    id: String,
+}
+
+impl Task for PanicTask {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn kind(&self) -> task::TaskKind {
+        task::TaskKind::Import
+    }
+    fn title(&self) -> String {
+        format!("panic {}", self.id)
+    }
+    fn steps(&self) -> usize {
+        1
+    }
+    fn run(
+        &self,
+        _ctx: TaskContext<'_>,
+        _report: &mut dyn FnMut(TaskReport<'_>),
+        _cancel: &AtomicBool,
+    ) -> Result<task::TaskOutcome> {
+        panic!("index 812 out of range");
+    }
+}
+
+/// A panic ends its job, never the queue: the record fails with the panic's message, `current`
+/// is cleared (so the queue is not busy and the next job runs), and the queue's files say so.
+#[test]
+fn a_panicking_task_fails_and_the_queue_goes_on() {
+    let dir = std::env::temp_dir().join(format!("bop-train-panic-{}", uuid::Uuid::new_v4()));
+    let svc = TrainingService::start(
+        Arc::new(HoldRunner::default()),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        Some(dir.join("runs.json")),
+    );
+    let ran = Arc::new(AtomicUsize::new(0));
+    let bad = svc
+        .enqueue_task(Box::new(PanicTask { id: "bad".into() }))
+        .unwrap();
+    let next = svc
+        .enqueue_task(Box::new(QuickTask::new("next", None, &ran)))
+        .unwrap();
+    let r = svc.wait_task(&bad, Duration::from_secs(10)).unwrap();
+    assert_eq!(r.state, RunState::Failed);
+    let e = r.error.unwrap();
+    assert!(
+        e.starts_with("internal error: index 812 out of range."),
+        "{e}"
+    );
+    assert!(e.contains("start the job again"), "{e}");
+    assert!(r.finished.is_some());
+    let r = svc.wait_task(&next, Duration::from_secs(10)).unwrap();
+    assert_eq!(r.state, RunState::Done, "the queue kept running");
+    assert_eq!(ran.load(Ordering::Relaxed), 1);
+    assert!(svc.inner.current.lock_recover().is_none());
+    assert!(!svc.busy());
+    let back = task::load_records(&dir.join(task::TASKS_FILE));
+    let saved = back.iter().find(|t| t.id == bad).unwrap();
+    assert_eq!(saved.state, RunState::Failed);
+    assert!(saved.error.as_deref().unwrap().contains("812"));
+    // And still more jobs run after it.
+    let again = svc
+        .enqueue_task(Box::new(QuickTask::new("again", None, &ran)))
+        .unwrap();
+    assert_eq!(
+        svc.wait_task(&again, Duration::from_secs(10))
+            .unwrap()
+            .state,
+        RunState::Done
+    );
+    svc.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The outer catch: a panic outside the job's own (here in a task's `after` rule) still fails
+/// that record and leaves the queue running.
+#[test]
+fn a_panic_outside_the_job_still_fails_its_record() {
+    struct PanicRule(QuickTask);
+    impl Task for PanicRule {
+        fn id(&self) -> &str {
+            self.0.id()
+        }
+        fn kind(&self) -> task::TaskKind {
+            self.0.kind()
+        }
+        fn title(&self) -> String {
+            self.0.title()
+        }
+        fn steps(&self) -> usize {
+            1
+        }
+        fn after(&self) -> Option<&str> {
+            Some("first")
+        }
+        fn skip_reason(&self, _dep: &TaskRecord) -> Option<String> {
+            panic!("the rule broke");
+        }
+        fn run(
+            &self,
+            ctx: TaskContext<'_>,
+            report: &mut dyn FnMut(TaskReport<'_>),
+            cancel: &AtomicBool,
+        ) -> Result<task::TaskOutcome> {
+            self.0.run(ctx, report, cancel)
+        }
+    }
+    let svc = quick_service();
+    let ran = Arc::new(AtomicUsize::new(0));
+    svc.enqueue_task(Box::new(QuickTask::new("first", None, &ran)))
+        .unwrap();
+    let id = svc
+        .enqueue_task(Box::new(PanicRule(QuickTask::new("second", None, &ran))))
+        .unwrap();
+    let r = svc.wait_task(&id, Duration::from_secs(10)).unwrap();
+    assert_eq!(r.state, RunState::Failed);
+    assert!(r.error.unwrap().contains("the rule broke"));
+    let last = svc
+        .enqueue_task(Box::new(QuickTask::new("third", None, &ran)))
+        .unwrap();
+    assert_eq!(
+        svc.wait_task(&last, Duration::from_secs(10)).unwrap().state,
+        RunState::Done
+    );
+    svc.shutdown();
+}
+
+/// A stopped queue takes no job and records none; a job whose message finds no thread fails
+/// rather than staying queued (which would keep the queue busy until a restart).
+#[test]
+fn a_stopped_queue_refuses_jobs_and_a_lost_thread_leaves_no_queued_record() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let svc = quick_service();
+    svc.shutdown();
+    let e = svc
+        .enqueue_task_unless(Box::new(QuickTask::new("late", None, &ran)), &|_| None)
+        .unwrap_err();
+    assert_eq!(e, NotQueued::Failed(STOPPED.into()));
+    assert!(svc.tasks().is_empty(), "nothing recorded");
+    assert!(!svc.busy());
+    assert_eq!(svc.remove("x").unwrap_err(), STOPPED);
+    assert_eq!(
+        svc.set_store(Path::new("/elsewhere/runs.json"))
+            .unwrap_err(),
+        STOPPED
+    );
+
+    let dir = std::env::temp_dir().join(format!("bop-train-gone-{}", uuid::Uuid::new_v4()));
+    let svc = TrainingService::start(
+        Arc::new(HoldRunner::default()),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        Some(dir.join("runs.json")),
+    );
+    svc.end_thread_only();
+    let e = svc
+        .enqueue_task_unless(Box::new(QuickTask::new("lost", None, &ran)), &|_| None)
+        .unwrap_err();
+    assert_eq!(e, NotQueued::Failed(THREAD_GONE.into()));
+    let r = svc.get_task("lost").unwrap();
+    assert_eq!(r.state, RunState::Failed);
+    assert_eq!(r.error.as_deref(), Some(THREAD_GONE));
+    assert!(!svc.busy());
+    let back = task::load_records(&dir.join(task::TASKS_FILE));
+    assert_eq!(back[0].state, RunState::Failed);
+    assert_eq!(back[0].error.as_deref(), Some(THREAD_GONE));
+    assert_eq!(ran.load(Ordering::Relaxed), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The stop for exit: the running task's helper is stopped and the task, like the queued one,
+/// is written as interrupted (the words a restart gives a crash's busy record), the thread ends,
+/// and the queue never writes its files again.
+#[test]
+fn stop_for_exit_interrupts_the_running_and_queued_jobs() {
+    let dir = std::env::temp_dir().join(format!("bop-train-exit-{}", uuid::Uuid::new_v4()));
+    let runner = Arc::new(HoldRunner::default());
+    let svc = TrainingService::start(
+        runner.clone(),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        Some(dir.join("runs.json")),
+    );
+    let ran = Arc::new(AtomicUsize::new(0));
+    let first = svc
+        .enqueue_task(Box::new(HoldTask {
+            id: "first".into(),
+            keep: true,
+        }))
+        .unwrap();
+    let second = svc
+        .enqueue_task(Box::new(QuickTask::new("second", None, &ran)))
+        .unwrap();
+    until("the helper", || runner.started.load(Ordering::Relaxed) == 1);
+    let t = Instant::now();
+    assert!(svc.stop_for_exit(Instant::now() + Duration::from_secs(10)));
+    assert!(t.elapsed() < Duration::from_secs(5));
+    assert!(svc.thread.lock_recover().is_none(), "the thread was joined");
+    assert!(svc.stopped());
+    assert!(!svc.busy());
+    let file = dir.join(task::TASKS_FILE);
+    let crash_words = {
+        let mut busy = svc.get_task(&first).unwrap();
+        busy.state = RunState::Running;
+        busy.error = None;
+        let tmp = dir.join("crash.json");
+        task::save_records(&tmp, &[busy]);
+        task::load_records(&tmp).remove(0).error
+    };
+    for id in [&first, &second] {
+        let r = svc.get_task(id).unwrap();
+        assert_eq!(r.state, RunState::Failed, "{id}");
+        assert!(r.finished.is_some());
+        assert_eq!(
+            r.error, crash_words,
+            "{id}: the words of an interrupted job"
+        );
+        let saved = task::load_records(&file);
+        let s = saved.iter().find(|s| s.id == *id).unwrap();
+        assert_eq!(s.error, crash_words);
+    }
+    // What it kept, it keeps (a task that stops cleanly on the cancel).
+    let r = svc.get_task(&first).unwrap();
+    assert_eq!(r.summary.as_deref(), Some("kept 3 labelled frames"));
+    assert_eq!(ran.load(Ordering::Relaxed), 0, "the queued job never ran");
+    // No more writes: the next queue of the process owns the files.
+    let before = std::fs::read_to_string(&file).unwrap();
+    svc.inner
+        .update_persist_task(&first, |r| r.detail = "late".into());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
+    assert!(
+        svc.enqueue_task(Box::new(QuickTask::new("late", None, &ran)))
+            .is_err()
+    );
+    // Idempotent.
+    assert!(svc.stop_for_exit(Instant::now()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Past the deadline the thread is left behind (a job that ignores its cancel), its record is
+/// written as interrupted at once, and a later Drop of the queue does not wait for it.
+#[test]
+fn stop_for_exit_gives_up_on_the_thread_at_its_deadline() {
+    struct Stubborn {
+        release: Arc<AtomicBool>,
+    }
+    impl Task for Stubborn {
+        fn id(&self) -> &str {
+            "stubborn"
+        }
+        fn kind(&self) -> task::TaskKind {
+            task::TaskKind::Import
+        }
+        fn title(&self) -> String {
+            "stubborn".into()
+        }
+        fn steps(&self) -> usize {
+            1
+        }
+        fn run(
+            &self,
+            _ctx: TaskContext<'_>,
+            _report: &mut dyn FnMut(TaskReport<'_>),
+            _cancel: &AtomicBool,
+        ) -> Result<task::TaskOutcome> {
+            while !self.release.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            anyhow::bail!("ended late")
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("bop-train-stuck-{}", uuid::Uuid::new_v4()));
+    let release = Arc::new(AtomicBool::new(false));
+    let svc = TrainingService::start(
+        Arc::new(HoldRunner::default()),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+        Some(dir.join("runs.json")),
+    );
+    let id = svc
+        .enqueue_task(Box::new(Stubborn {
+            release: release.clone(),
+        }))
+        .unwrap();
+    until("the start", || state(&svc, &id) == RunState::Running);
+    let t = Instant::now();
+    assert!(!svc.stop_for_exit(Instant::now() + Duration::from_millis(100)));
+    assert!(t.elapsed() < Duration::from_secs(5));
+    let saved = task::load_records(&dir.join(task::TASKS_FILE));
+    assert_eq!(saved[0].state, RunState::Failed);
+    assert!(
+        saved[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("interrupted")
+    );
+    let t = Instant::now();
+    drop(svc);
+    assert!(
+        t.elapsed() < Duration::from_secs(1),
+        "the drop did not join"
+    );
+    release.store(true, Ordering::Relaxed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_closed_queue_refuses_everything() {
+    let svc = TrainingService::closed(
+        Arc::new(HoldRunner::default()),
+        Arc::new(NoFetch),
+        Arc::new(super::super::job::NoHooks),
+    );
+    let ran = Arc::new(AtomicUsize::new(0));
+    assert!(svc.stopped());
+    assert!(svc.store().is_none());
+    assert!(
+        svc.enqueue_task(Box::new(QuickTask::new("a", None, &ran)))
+            .is_err()
+    );
+    assert!(svc.tasks().is_empty() && svc.runs().is_empty());
+    assert!(svc.stop_for_exit(Instant::now()));
+}
+
+#[test]
+fn a_panic_message_is_read_from_either_payload() {
+    let p = std::panic::catch_unwind(|| panic!("plain")).unwrap_err();
+    assert_eq!(panic_text(p.as_ref()), "plain");
+    let n = 3;
+    let p = std::panic::catch_unwind(|| panic!("formatted {n}")).unwrap_err();
+    assert_eq!(panic_text(p.as_ref()), "formatted 3");
+    let p = std::panic::catch_unwind(|| std::panic::panic_any(7u8)).unwrap_err();
+    assert_eq!(panic_text(p.as_ref()), "a panic without a message");
+}

@@ -12,6 +12,11 @@
 //!
 //! The marker lives beside the folder, never in it: a folder holding an open, locked file cannot
 //! be removed on Windows.
+//!
+//! A job that panics is no orderly end: a [`Busy`] dropped while its thread unwinds keeps the
+//! marker (and the folder, even with [`Busy::remove_target_on_drop`]) and only lets the lock go,
+//! like [`Busy::abandon`], so the next sweep finds a crashed job and recovers or removes its folder
+//! (an auto-label's finished proposals are written then, [`crate::storage::sweep`]).
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -97,6 +102,14 @@ impl Busy {
 
 impl Drop for Busy {
     fn drop(&mut self) {
+        // Unwinding out of the job: it did not end in order, so the folder reads as crashed.
+        if std::thread::panicking() {
+            self.remove_target = false;
+            if let Some(f) = self.file.take() {
+                let _ = fs4::FileExt::unlock(&f);
+            }
+            return;
+        }
         if self.remove_target
             && let Err(e) = crate::resources::manager::remove_any(&self.target)
         {
@@ -297,6 +310,35 @@ mod tests {
         };
         claim.finish();
         assert!(!marker_of(&work).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A job that panics keeps its marker (unlocked) and its folder, even a staging one: the
+    /// sweep then sees a crash, never an orderly end that kept the folder on purpose.
+    #[test]
+    fn a_hold_dropped_by_a_panic_reads_as_crashed() {
+        let d = tmp("panic");
+        let work = d.join("job");
+        let staging = d.join(".m.train-staging");
+        let (w, s) = (work.clone(), staging.clone());
+        let r = std::panic::catch_unwind(move || {
+            let _busy = Busy::hold(&w);
+            let _staging = Busy::hold(&s).remove_target_on_drop();
+            std::fs::create_dir_all(w.join("sub")).unwrap();
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(w.join("sub/proposals.jsonl"), b"{}\n").unwrap();
+            panic!("a bug in the job");
+        });
+        assert!(r.is_err());
+        assert!(work.join("sub/proposals.jsonl").is_file(), "the work stays");
+        assert!(staging.is_dir(), "a staging folder stays for the sweep");
+        for t in [&work, &staging] {
+            assert!(marker_of(t).is_file(), "the marker stays");
+            let State::Crashed(claim) = probe(t) else {
+                panic!("a panicked job's folder reads as crashed")
+            };
+            claim.finish();
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

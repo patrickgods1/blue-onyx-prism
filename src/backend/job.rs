@@ -12,6 +12,12 @@
 //! open handles in [`Suspended`]) and [`Suspended::resume`] (or dropping it) continues it: the
 //! Train tab's Pause / Resume. Windows has no documented "suspend a job" call, so the threads
 //! are found with a ToolHelp snapshot.
+//!
+//! No helper escapes the job (audit 2026-11, RA backend-8): the runner starts the child with
+//! `CREATE_SUSPENDED`, [`Job::assign`]s it while its first thread has not run a single
+//! instruction, then [`resume_process`] starts it (std closes the primary thread's handle, so
+//! the thread is found by the same ToolHelp walk). Everything the child starts is then in the
+//! job from its first instruction on.
 
 use anyhow::{Context, Result};
 use std::os::windows::io::AsRawHandle;
@@ -67,7 +73,8 @@ impl Job {
     }
 
     /// Put `child` (and every process it will spawn) into the job. Call right after `spawn`;
-    /// helpers the child starts before this call are not covered.
+    /// helpers the child starts before this call are not covered, so a child that may start
+    /// helpers is spawned with `CREATE_SUSPENDED` and started by [`resume_process`] after this.
     pub fn assign(&self, child: &std::process::Child) -> Result<()> {
         let process = HANDLE(child.as_raw_handle().cast());
         // SAFETY: both handles are valid for the duration of the call: the job is owned by
@@ -139,43 +146,91 @@ impl Job {
                 break;
             }
             let mut new = 0usize;
-            // SAFETY: a thread snapshot of the whole system; the handle is closed below.
-            let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
-                .context("CreateToolhelp32Snapshot(threads)")?;
-            let mut entry = THREADENTRY32 {
-                dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).unwrap_or(28),
-                ..Default::default()
-            };
-            // SAFETY: `snap` is a valid snapshot handle and `entry` a THREADENTRY32 with
-            // `dwSize` set, alive for each call.
-            let mut more = unsafe { Thread32First(snap, &mut entry) }.is_ok();
-            while more {
-                if pids.contains(&entry.th32OwnerProcessID) && seen.insert(entry.th32ThreadID) {
-                    // SAFETY: plain thread open by id; a failure (the thread exited) is skipped.
-                    let opened =
-                        unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) };
-                    if let Ok(h) = opened {
-                        // SAFETY: `h` is a thread handle opened with THREAD_SUSPEND_RESUME.
-                        if unsafe { SuspendThread(h) } == u32::MAX {
-                            // SAFETY: `h` was opened above and is closed once.
-                            let _ = unsafe { CloseHandle(h) };
-                        } else {
-                            held.threads.push(h);
-                            new += 1;
-                        }
+            for_each_thread(&pids, |tid| {
+                if !seen.insert(tid) {
+                    return;
+                }
+                // SAFETY: plain thread open by id; a failure (the thread exited) is skipped.
+                let opened = unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, tid) };
+                if let Ok(h) = opened {
+                    // SAFETY: `h` is a thread handle opened with THREAD_SUSPEND_RESUME.
+                    if unsafe { SuspendThread(h) } == u32::MAX {
+                        // SAFETY: `h` was opened above and is closed once.
+                        let _ = unsafe { CloseHandle(h) };
+                    } else {
+                        held.threads.push(h);
+                        new += 1;
                     }
                 }
-                // SAFETY: as for Thread32First.
-                more = unsafe { Thread32Next(snap, &mut entry) }.is_ok();
-            }
-            // SAFETY: the snapshot handle is closed exactly once.
-            let _ = unsafe { CloseHandle(snap) };
+            })?;
             if new == 0 {
                 break;
             }
         }
         Ok(held)
     }
+}
+
+/// Call `f` with the id of every thread whose owning process is in `pids` (one ToolHelp
+/// snapshot of the system's threads).
+fn for_each_thread(pids: &std::collections::HashSet<u32>, mut f: impl FnMut(u32)) -> Result<()> {
+    // SAFETY: a thread snapshot of the whole system; the handle is closed below.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }
+        .context("CreateToolhelp32Snapshot(threads)")?;
+    let mut entry = THREADENTRY32 {
+        dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).unwrap_or(28),
+        ..Default::default()
+    };
+    // SAFETY: `snap` is a valid snapshot handle and `entry` a THREADENTRY32 with `dwSize` set,
+    // alive for each call.
+    let mut more = unsafe { Thread32First(snap, &mut entry) }.is_ok();
+    while more {
+        if pids.contains(&entry.th32OwnerProcessID) {
+            f(entry.th32ThreadID);
+        }
+        // SAFETY: as for Thread32First.
+        more = unsafe { Thread32Next(snap, &mut entry) }.is_ok();
+    }
+    // SAFETY: the snapshot handle is closed exactly once.
+    let _ = unsafe { CloseHandle(snap) };
+    Ok(())
+}
+
+/// Start a process spawned with `CREATE_SUSPENDED`: resume every thread of `pid` (a new
+/// suspended process has exactly its primary thread). Returns how many threads were resumed;
+/// an error when none was (the caller then kills the child: it would wait forever).
+pub fn resume_process(pid: u32) -> Result<usize> {
+    let pids: std::collections::HashSet<u32> = std::iter::once(pid).collect();
+    let mut resumed = 0usize;
+    let mut failed: Option<String> = None;
+    for_each_thread(&pids, |tid| {
+        // SAFETY: plain thread open by id; the handle is closed below.
+        match unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, tid) } {
+            Ok(h) => {
+                // SAFETY: `h` was opened with THREAD_SUSPEND_RESUME; ResumeThread only lowers
+                // the thread's suspend count.
+                if unsafe { ResumeThread(h) } == u32::MAX {
+                    failed.get_or_insert_with(|| {
+                        format!("ResumeThread({tid}): {}", std::io::Error::last_os_error())
+                    });
+                } else {
+                    resumed += 1;
+                }
+                // SAFETY: `h` is closed exactly once.
+                let _ = unsafe { CloseHandle(h) };
+            }
+            Err(e) => {
+                failed.get_or_insert_with(|| format!("OpenThread({tid}): {e}"));
+            }
+        }
+    })?;
+    if resumed == 0 {
+        anyhow::bail!(
+            "process {pid} was started suspended and could not be resumed ({})",
+            failed.as_deref().unwrap_or("no thread of it was found")
+        );
+    }
+    Ok(resumed)
 }
 
 /// Threads suspended by [`Job::suspend`], held open (so a thread id cannot be reused while it is

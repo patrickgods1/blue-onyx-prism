@@ -12,11 +12,14 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
-/// How long a start / restart waits for `state = running`.
+/// How long a start waits for `state = running`.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a stop waits for the job to be gone: the plist's ExitTimeOut is 30 s and `bootout`
-/// returns before the process has exited.
-const STOP_TIMEOUT: Duration = Duration::from_secs(40);
+/// How long a stop waits for the job to be gone: above the plist's ExitTimeOut
+/// (`runner::SERVICE_MANAGER_STOP`, 75 s), since `bootout` returns before the process has exited.
+const STOP_TIMEOUT: Duration = crate::runner::SERVICE_CTL_STOP_WAIT;
+/// How long a restart (`kickstart -k`: the old process stops first, up to ExitTimeOut) waits for
+/// the new process to run.
+const RESTART_TIMEOUT: Duration = STOP_TIMEOUT.saturating_add(START_TIMEOUT);
 const POLL: Duration = Duration::from_millis(250);
 
 fn target() -> String {
@@ -57,7 +60,7 @@ pub(super) fn control(action: Action) -> Result<ServiceState> {
         Action::Restart => match loaded()? {
             Some((_, pid)) => {
                 launchctl(&["kickstart", "-k", &target()], "restart")?;
-                wait_running(pid)
+                wait_running(pid, RESTART_TIMEOUT)
             }
             None => start(),
         },
@@ -93,7 +96,7 @@ fn start() -> Result<ServiceState> {
             }
         }
     }
-    wait_running(None)
+    wait_running(None, START_TIMEOUT)
 }
 
 fn stop() -> Result<ServiceState> {
@@ -125,10 +128,10 @@ fn stop() -> Result<ServiceState> {
     }
 }
 
-/// Poll until the job runs (with a pid other than `old_pid`, after a restart) or the timeout;
+/// Poll until the job runs (with a pid other than `old_pid`, after a restart) or `timeout`;
 /// returns the last state seen.
-fn wait_running(old_pid: Option<u32>) -> Result<ServiceState> {
-    let deadline = Instant::now() + START_TIMEOUT;
+fn wait_running(old_pid: Option<u32>, timeout: Duration) -> Result<ServiceState> {
+    let deadline = Instant::now() + timeout;
     loop {
         let state = match loaded()? {
             Some((ServiceState::Running, pid)) if old_pid.is_none() || pid != old_pid => {

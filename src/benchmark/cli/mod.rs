@@ -14,6 +14,12 @@
 //! blue-onyx-prism-benchmark --threshold-search --threshold-objective recall_at_fa:5
 //!                                                       # most found, <= 5 false alerts / 100 empty frames
 //! ```
+//!
+//! Ctrl-C (SIGINT; SIGTERM on Unix; Ctrl-Break on Windows) cancels a run cleanly ([`Interrupts`]):
+//! the device in hand stops at its next timed iteration (a compile in progress ends first), the
+//! models a sweep finished are saved as the service saves a cancelled run's, and the run's
+//! breadcrumb goes, so the next start reports no interrupted run. A second Ctrl-C quits at once
+//! (exit 130), leaving the breadcrumb: a run that does not stop may be a device that hung.
 
 use crate::backend::{CoreOptions, OrtOptions, Runtimes, libs, priority, spec};
 use crate::benchmark::grade::AccuracyMetric;
@@ -35,6 +41,7 @@ use crate::sync::LockExt;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod args;
@@ -538,6 +545,9 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     if all_devices && let Some(left) = breadcrumb::left_behind(&data_root) {
         report.warnings.push(left.message());
     }
+    // Declared before the trail, so it is dropped after it: a cancelled run unwinds normally.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _interrupts = Interrupts::cancel(cancel.clone());
     let trail = Trail::new(&data_root);
     if !args.json {
         print_header(
@@ -574,6 +584,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     if sets.iter().any(|s| !s.annotated()) {
         let mut pb = Bench::new(&[], 0, 1, params);
         pb.cache_dir = cache_dir.as_deref();
+        pb.cancel = Some(&cancel);
         pb.progress = Some(&progress);
         pb.priority = priority::PER_DEVICE.then_some(&per_device);
         ctx.pseudo_ground_truth(&pb, &jobs, &mut sets, &mut report);
@@ -590,6 +601,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     let mut bench = Bench::new(&sets, warmup, repeat, params);
     bench.object_filter = &config.object_filter;
     bench.cache_dir = cache_dir.as_deref();
+    bench.cancel = Some(&cancel);
     bench.weights = weights;
     bench.threshold_objective = objective;
     bench.accuracy_metric = metric;
@@ -619,6 +631,20 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     )?;
     for m in &mut swept {
         m.run_id = Some(run_id.clone());
+    }
+
+    if cancel.load(Ordering::SeqCst) {
+        // The finished models are kept, as the service keeps a cancelled run's.
+        let saved = if all_devices && !swept.is_empty() {
+            let results =
+                BenchmarkResults::new(HardwareSummary::current(), versions, swept.clone())
+                    .with_sets(&sets);
+            ctx.save_results(results, &swept, &sets, cameras.as_ref(), &mut report)?;
+            (!args.no_save).then(|| results_path(&config_path))
+        } else {
+            None
+        };
+        bail!("{}", cancelled_message(swept.len(), saved.as_deref()));
     }
 
     if all_devices
@@ -814,6 +840,149 @@ fn several_gpus_refusal(gpus: &[(spec::Device, String)]) -> String {
     )
 }
 
+/// The error of a run Ctrl-C cancelled: `finished` models swept, saved to `saved` (None = nothing
+/// saved: a run of single devices, `--no-save`, or no model finished).
+fn cancelled_message(finished: usize, saved: Option<&Path>) -> String {
+    match saved {
+        Some(p) if finished > 0 => format!(
+            "the benchmark was cancelled; the {finished} model(s) it finished were saved to {}",
+            p.display()
+        ),
+        _ => "the benchmark was cancelled; nothing was saved".to_string(),
+    }
+}
+
+/// Ctrl-C (and SIGTERM on Unix, Ctrl-Break on Windows) of a CLI benchmark: the first sets the
+/// cancel flag, so the run stops at its next check and unwinds normally (its breadcrumb goes, the
+/// priority is restored, the results lock is released); a second one quits at once (exit 130).
+/// Stops listening when dropped. Without it the default handler would end the process mid-run,
+/// leaving a breadcrumb the next start reports as an interrupted run.
+struct Interrupts {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Interrupts {
+    fn cancel(cancel: Arc<AtomicBool>) -> Self {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("ctrl-c".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::warn!("Ctrl-C will not cancel the benchmark cleanly: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    let mut signals = Signals::new();
+                    interrupt_loop(rx, &mut signals, &cancel, || std::process::exit(130)).await;
+                });
+            });
+        match thread {
+            Ok(t) => Self {
+                stop: Some(tx),
+                thread: Some(t),
+            },
+            Err(e) => {
+                tracing::warn!("Ctrl-C will not cancel the benchmark cleanly: {e}");
+                Self {
+                    stop: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Interrupts {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The signals [`Interrupts`] listens to.
+struct Signals {
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    brk: Option<tokio::signal::windows::CtrlBreak>,
+}
+
+impl Signals {
+    fn new() -> Self {
+        Self {
+            #[cfg(unix)]
+            term: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok(),
+            #[cfg(windows)]
+            brk: tokio::signal::windows::ctrl_break().ok(),
+        }
+    }
+}
+
+/// Where [`interrupt_loop`] hears of interrupts.
+trait Interrupt {
+    /// The next interrupt; None when they cannot be listened to.
+    fn next(&mut self) -> impl std::future::Future<Output = Option<()>>;
+}
+
+impl Interrupt for Signals {
+    async fn next(&mut self) -> Option<()> {
+        #[cfg(unix)]
+        let other = async {
+            match self.term.as_mut() {
+                Some(t) => t.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        #[cfg(windows)]
+        let other = async {
+            match self.brk.as_mut() {
+                Some(b) => b.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        #[cfg(not(any(unix, windows)))]
+        let other = std::future::pending::<Option<()>>();
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r.ok(),
+            r = other => r,
+        }
+    }
+}
+
+/// [`Interrupts`]' loop: the first interrupt from `source` sets `cancel` (and says so on
+/// stderr), the second calls `quit`; `done` firing (the run ended) ends it.
+async fn interrupt_loop(
+    mut done: tokio::sync::oneshot::Receiver<()>,
+    source: &mut impl Interrupt,
+    cancel: &AtomicBool,
+    quit: impl FnOnce(),
+) {
+    tokio::select! {
+        _ = &mut done => return,
+        r = source.next() => if r.is_none() { return },
+    }
+    eprintln!(
+        "Ctrl-C: cancelling the benchmark; the device in hand stops at its next step (a compile \
+         in progress ends first). Press Ctrl-C again to quit at once."
+    );
+    cancel.store(true, Ordering::SeqCst);
+    tokio::select! {
+        _ = &mut done => {}
+        r = source.next() => if r.is_some() { quit() },
+    }
+}
+
 /// What the steps of [`run`] share once the runtimes are open.
 struct RunCtx<'a> {
     args: &'a BenchArgs,
@@ -903,6 +1072,9 @@ impl RunCtx<'_> {
     ) -> Result<Vec<ModelResult>> {
         let mut swept: Vec<ModelResult> = Vec::new();
         for (k, Planned { job, entry }) in jobs.iter().enumerate() {
+            if bench.cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+                break;
+            }
             let (own, left_out) = own_sets
                 .get(k)
                 .map_or((None, None), |(s, l)| (s.as_deref(), l.clone()));
@@ -928,7 +1100,13 @@ impl RunCtx<'_> {
                 );
             }
             if all_devices {
-                let mut result = self.sweep_job(bench, progress, job, entry.as_ref(), report)?;
+                let mut result = match self.sweep_job(bench, progress, job, entry.as_ref(), report)
+                {
+                    Ok(r) => r,
+                    // Ctrl-C: the models finished so far are the run's.
+                    Err(e) if crate::benchmark::is_cancelled(&e) => break,
+                    Err(e) => return Err(e),
+                };
                 if let Some(l) = left_out.as_ref().filter(|_| !self.args.json) {
                     println!(
                         "  {}: {} ({} of the set's frames run)",
@@ -1012,6 +1190,7 @@ impl RunCtx<'_> {
     fn run_job(&self, bench: &Bench, job: &Job, report: &mut Report) -> Option<ModelReport> {
         let primary = match bench.run(self.runtimes, job, &job.device) {
             Ok(r) => r,
+            Err(e) if crate::benchmark::is_cancelled(&e) => return None,
             Err(e) => {
                 report.error(self.args.json, format!("{}: {e:#}", job.name));
                 return None;
@@ -2052,6 +2231,86 @@ mod tests {
         drop(trail);
         assert!(!file.exists(), "a run that ends leaves nothing");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Interrupts from a channel (None: it closed), for [`interrupt_loop`].
+    struct Fake(tokio::sync::mpsc::UnboundedReceiver<()>);
+
+    impl Interrupt for Fake {
+        async fn next(&mut self) -> Option<()> {
+            self.0.recv().await
+        }
+    }
+
+    /// Never an interrupt.
+    struct Quiet;
+
+    impl Interrupt for Quiet {
+        async fn next(&mut self) -> Option<()> {
+            std::future::pending().await
+        }
+    }
+
+    /// Audit 2026-11 phase 1: the first interrupt cancels the run, a second quits; a run that
+    /// ends stops the listening.
+    #[tokio::test]
+    async fn the_first_interrupt_cancels_and_the_second_quits() {
+        // Two interrupts.
+        let (sig_tx, sig_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (_done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancel, quit) = (AtomicBool::new(false), AtomicBool::new(false));
+        sig_tx.send(()).unwrap();
+        sig_tx.send(()).unwrap();
+        let mut fake = Fake(sig_rx);
+        interrupt_loop(done_rx, &mut fake, &cancel, || {
+            quit.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert!(cancel.load(Ordering::SeqCst) && quit.load(Ordering::SeqCst));
+
+        // One interrupt, then the run ends: cancelled, never quit.
+        let (sig_tx, sig_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancel, quit) = (AtomicBool::new(false), AtomicBool::new(false));
+        sig_tx.send(()).unwrap();
+        let ended = async {
+            while !cancel.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            done_tx.send(()).unwrap();
+        };
+        let mut fake = Fake(sig_rx);
+        let listen = interrupt_loop(done_rx, &mut fake, &cancel, || {
+            quit.store(true, Ordering::SeqCst);
+        });
+        tokio::join!(listen, ended);
+        assert!(cancel.load(Ordering::SeqCst) && !quit.load(Ordering::SeqCst));
+        drop(sig_tx);
+
+        // No interrupt: the run's end stops it, nothing cancelled.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel = AtomicBool::new(false);
+        done_tx.send(()).unwrap();
+        interrupt_loop(done_rx, &mut Quiet, &cancel, || panic!("quit")).await;
+        assert!(!cancel.load(Ordering::SeqCst));
+        // Signals that cannot be listened to: nothing happens either.
+        let (sig_tx, sig_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        drop(sig_tx);
+        let (_keep, done_rx) = tokio::sync::oneshot::channel::<()>();
+        interrupt_loop(done_rx, &mut Fake(sig_rx), &cancel, || panic!("quit")).await;
+        assert!(!cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_cancelled_run_says_what_was_saved() {
+        let p = Path::new("/cfg/benchmark.json");
+        let m = cancelled_message(2, Some(p));
+        assert!(
+            m.contains("2 model(s)") && m.contains("benchmark.json"),
+            "{m}"
+        );
+        assert!(cancelled_message(0, Some(p)).contains("nothing was saved"));
+        assert!(cancelled_message(3, None).contains("nothing was saved"));
     }
 
     #[test]

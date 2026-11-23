@@ -8,6 +8,12 @@
 //! An export and an import run inside their request and answer when done; while they work they
 //! are side jobs ([`crate::server::side_jobs`]) with their progress, so the Jobs tab lists them,
 //! also after the browser left the page (the work goes on).
+//!
+//! Stopping (audit 2026-11 phase 1): both check the run's stop token (`AppState.shutdown`)
+//! between two frames and answer 503 with what happened (an export keeps nothing of itself, an
+//! import keeps the frames it did). While they work they hold only what they need, never the
+//! `AppState`: a long export must not keep the stop's last drops (the provisioner, the log
+//! guard) from happening.
 
 use super::{
     Answer, AppState, blocking, context, fail, folder_problem, folder_unavailable, hidden,
@@ -284,16 +290,26 @@ pub(in crate::server) async fn export(
                 seen: crate::training::seen_days(&state.config_read()),
             }),
         };
-        let job = state
-            .side_jobs
-            .start(SideKind::DatasetExport, export_title(&req));
+        let (side, shutdown) = (state.side_jobs.clone(), state.shutdown.clone());
+        drop(state);
+        let job = side.start(SideKind::DatasetExport, export_title(&req));
         let progress = |s| job.report(side_jobs::export_report(s));
-        let result = export::run_filtered_with(&dir, &classes, &req, &filter, &progress);
+        let stop = || shutdown.is_cancelled();
+        let result = export::run_filtered_until(&dir, &classes, &req, &filter, &progress, &stop);
         drop(job);
         match result {
             Ok(r) => {
                 tracing::info!(out = %r.out_dir.display(), frames = r.frames, "review export written");
                 success(serde_json::json!({ "report": r }))
+            }
+            Err(e) if export::is_stopped(&e) => {
+                tracing::info!("review export stopped: the service is stopping");
+                fail(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Not exported: the service is stopping, so the export was cancelled and \
+                     nothing of it was kept. Export again once the service is back."
+                        .to_string(),
+                )
             }
             Err(e) => fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not exported: {e:#}")),
         }
@@ -339,10 +355,10 @@ pub(in crate::server) async fn import(
             Err((s, m)) => return fail(s, m),
         };
         let hidden = hidden(&state);
-        let job = state
-            .side_jobs
-            .start(SideKind::XanyImport, format!("From {}", src.display()));
-        let result = xany::import_dir_with(
+        let (side, shutdown) = (state.side_jobs.clone(), state.shutdown.clone());
+        drop(state);
+        let job = side.start(SideKind::XanyImport, format!("From {}", src.display()));
+        let result = xany::import_dir_until(
             &dir,
             &src,
             &classes,
@@ -350,10 +366,21 @@ pub(in crate::server) async fn import(
             b.treat_unchecked_as_reviewed,
             &now(),
             &|done, of| job.report(side_jobs::import_report(done, of)),
+            &|| shutdown.is_cancelled(),
         );
         drop(job);
         match result {
             Ok(r) => success(serde_json::json!({ "report": r })),
+            Err(e) if export::is_stopped(&e) => {
+                tracing::info!("X-AnyLabeling import stopped: the service is stopping ({e:#})");
+                fail(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "Not finished: {e:#}. Import the folder again once the service is back; \
+                         the frames already imported come out the same."
+                    ),
+                )
+            }
             Err(e) => fail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("Not imported: {e:#}"),
@@ -630,4 +657,87 @@ pub(in crate::server) async fn class_catalog(State(state): State<Arc<AppState>>)
         }
     })
     .await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::collect::labels::{BoxState, LabelBox, LabelFile, Source, Status};
+    use crate::server::test_util::{call, test_state_with};
+    use axum::body::Body;
+    use axum::http::{Request, header};
+
+    async fn post(state: &Arc<AppState>, uri: &str, body: String) -> (StatusCode, String) {
+        let req = Request::post(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let (s, _, b) = call(state, req).await;
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        (s, v["message"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Audit 2026-11 phase 1: an export or import asked for while the service stops ends with a
+    /// 503 that says so, and the export leaves nothing behind.
+    #[tokio::test]
+    async fn an_export_or_import_during_a_stop_answers_503_and_leaves_nothing() {
+        let root = std::env::temp_dir().join(format!("bop-files-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (d, r) = (root.join("dataset"), root.clone());
+        let state = test_state_with(move |c| {
+            c.download_dir = Some(r);
+            c.collect.dir = Some(d);
+        });
+        let dir = root.join("dataset");
+        let person = LabelBox {
+            label: "person".into(),
+            bbox: [2.0, 2.0, 30.0, 40.0],
+            source: Source::Human,
+            score: None,
+            state: BoxState::Accepted,
+            origin: None,
+            reason: None,
+            model_label: None,
+            orig_bbox: None,
+            difficult: false,
+            reject_reason: None,
+            auto: Default::default(),
+        };
+        let rel = bulk::test_support::put_frame(&dir, "a", None, vec![]);
+        let frame = labels::Frame::resolve(&dir, &rel).unwrap();
+        let reviewed = LabelFile {
+            status: Status::Reviewed,
+            boxes: vec![person.clone()],
+            ..LabelFile::default()
+        };
+        labels::write(&frame.labels, &reviewed).unwrap();
+        let src = root.join("xany");
+        std::fs::create_dir_all(&src).unwrap();
+        let name = export::flat_name(&crate::collect::layout::parse_rel(&rel).unwrap());
+        let x = xany::to_xany(&name, 64, 48, [&person], true);
+        std::fs::write(
+            src.join(name.replace(".jpg", ".json")),
+            serde_json::to_vec(&x).unwrap(),
+        )
+        .unwrap();
+        let exports = exports_dir(&state);
+
+        state.shutdown.cancel();
+        let (s, m) = post(&state, "/v1/review/export", r#"{"format": "yolo"}"#.into()).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{m}");
+        assert!(m.contains("the service is stopping"), "{m}");
+        let left: Vec<_> = std::fs::read_dir(&exports)
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+
+        let body = serde_json::json!({ "dir": src }).to_string();
+        let (s, m) = post(&state, "/v1/review/import", body).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{m}");
+        assert!(m.contains("after 0 of 1 files"), "{m}");
+        assert!(m.contains("Import the folder again"), "{m}");
+        assert_eq!(frame.labels().unwrap().unwrap(), reviewed, "untouched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

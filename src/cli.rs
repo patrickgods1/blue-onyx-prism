@@ -886,8 +886,9 @@ fn for_service_at_in(path: &Path, exe_dir: &Path) -> Result<Config> {
 
 type FilterHandle = reload::Handle<EnvFilter, Registry>;
 
-/// Lets the log level be changed at runtime; also keeps the file-appender flush guard alive.
-/// Cheap to clone (the HTTP layer keeps one); the file log is flushed when the last clone drops.
+/// Lets the log level be changed at runtime. Cheap to clone (the HTTP layer keeps one). The
+/// file appender's flush guard is not in here but in [`LOG_GUARD`] ([`flush_logs`]): a clone kept
+/// by a task that outlives the run must not decide when the file log's tail is written.
 #[derive(Clone)]
 pub struct LogReloadHandle {
     handle: FilterHandle,
@@ -895,7 +896,6 @@ pub struct LogReloadHandle {
     level: Arc<std::sync::Mutex<LogLevel>>,
     /// The in-memory ring behind the web UI's Logs page.
     buffer: crate::logbuf::LogBuffer,
-    _guard: Option<Arc<tracing_appender::non_blocking::WorkerGuard>>,
     /// Keeps the filter layer of a [`Self::detached`] handle alive (reloads need it).
     _detached: Option<Arc<reload::Layer<EnvFilter, Registry>>>,
 }
@@ -966,10 +966,33 @@ impl LogReloadHandle {
             handle,
             level: Arc::new(std::sync::Mutex::new(level)),
             buffer,
-            _guard: None,
             _detached: Some(Arc::new(layer)),
         }
     }
+}
+
+/// The file log's non-blocking writer guard (audit 2026-11, RA-024): set by
+/// [`init_logging_opts`], taken by [`flush_logs`]. Process-wide, because the paths that end the
+/// process (`std::process::exit` on a second Ctrl-C or the shutdown deadline, the Windows service
+/// giving up on a stop) run no destructors and must still get the last lines into the file.
+static LOG_GUARD: std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>> =
+    std::sync::Mutex::new(None);
+
+/// Write every queued file-log line now and stop the file writer (its guard's drop waits up to
+/// about a second for the writer thread). Call it last: before `std::process::exit` and at the end
+/// of a binary's main. Lines logged after it no longer reach the file (stdout logging and the
+/// Windows event log are synchronous and unaffected). Idempotent; a no-op without a file log.
+pub fn flush_logs() {
+    use crate::sync::LockExt;
+    let guard = LOG_GUARD.lock_recover().take();
+    drop(guard);
+}
+
+/// Keep `guard` for [`flush_logs`] (a second file log replaces the first, flushing it).
+fn keep_log_guard(guard: tracing_appender::non_blocking::WorkerGuard) {
+    use crate::sync::LockExt;
+    let old = LOG_GUARD.lock_recover().replace(guard);
+    drop(old);
 }
 
 fn filter_for(level: LogLevel) -> EnvFilter {
@@ -1274,7 +1297,7 @@ pub fn init_logging_opts(
              this is a bug, please report it"
         )
     };
-    let guard = match appender {
+    match appender {
         Some(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
             let file_layer = match format {
@@ -1291,22 +1314,20 @@ pub fn init_logging_opts(
                     .boxed(),
             };
             registry.with(file_layer).try_init().map_err(init_err)?;
-            Some(guard)
+            keep_log_guard(guard);
         }
         None => {
             registry
                 .with(tracing_subscriber::fmt::layer().with_timer(timer))
                 .try_init()
                 .map_err(init_err)?;
-            None
         }
-    };
+    }
     crate::logbuf::replay_early();
     Ok(LogReloadHandle {
         handle,
         level: Arc::new(std::sync::Mutex::new(level)),
         buffer,
-        _guard: guard.map(Arc::new),
         _detached: None,
     })
 }
@@ -2223,6 +2244,37 @@ mod tests {
             .device_thresholds
             .insert("openvino:cpu".into(), 1.0);
         assert_eq!(blocking_thresholds(&c).len(), 1, "b is disabled");
+    }
+
+    /// RA-024: a line queued on the non-blocking file writer reaches the file once
+    /// `flush_logs` returns, with no `LogReloadHandle` dropped (the forced-exit paths run no
+    /// destructors), and a second call is a no-op.
+    #[test]
+    fn flush_logs_writes_the_queued_tail() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                // Slow, so the line is still queued when `flush_logs` starts.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let (mut writer, guard) = tracing_appender::non_blocking(sink.clone());
+        keep_log_guard(guard);
+        for i in 0..5 {
+            std::io::Write::write_all(&mut writer, format!("line {i}\n").as_bytes()).unwrap();
+        }
+        flush_logs();
+        let text = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(text.ends_with("line 4\n"), "{text:?}");
+        assert!(LOG_GUARD.lock().unwrap().is_none());
+        flush_logs();
     }
 
     #[test]

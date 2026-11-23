@@ -5,6 +5,13 @@
 //! queued request); postprocessing runs on this thread. Decode and preprocessing (forwarded
 //! frames included) run on the prep pool, the annotated-image save on the `image-save` thread
 //! after the reply ([`super::save`]).
+//!
+//! Stop: the worker's token is checked by the load too ([`LoadStopped`]): between candidates,
+//! before asking the serving copy for room, while waiting for the runtimes lock, after the
+//! compile and in slices during the warm-up. A compile in progress cannot be interrupted; its
+//! result is dropped unused. A panic anywhere on the thread is contained
+//! ([`WorkerCtx::run_contained`]): the model becomes `Failed` (the supervisor reloads it) and its
+//! load gate opens, so the models after it still load.
 
 use super::pipeline::{Done, InFlight, Job, Meta, Pipeline, Stage};
 use super::reap::reap;
@@ -100,7 +107,94 @@ pub(crate) const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 /// forever). Camera frames never produce that many all-zero raw outputs in a row.
 pub(crate) const MAX_CONSECUTIVE_DEGENERATE: u32 = 25;
 
+/// Opens the worker's [`LoadGate`] whatever happens to its thread, and turns a panic into a
+/// `Failed` model ([`WorkerCtx::run_contained`]). Without it a panic while loading left the gate
+/// closed, so every later model in config order waited for ever, and a panic while serving left
+/// the model `Ready` with no thread behind its channel.
+struct Contained {
+    name: String,
+    gate: LoadGate,
+    state: StateHandle,
+    stuck: Arc<AtomicBool>,
+}
+
+impl Contained {
+    /// The thread panicked with `message`: `Failed`, and marked stuck so the supervisor reloads
+    /// the model on its backoff (`supervisor::Status::Stuck`); its thread has ended, so the
+    /// registry's joins of a stuck worker return at once.
+    fn crashed(&self, message: &str) {
+        let msg = format!(
+            "worker thread panicked: {message}; this is a bug (the panic and its location are \
+             in the log); the model is reloaded automatically, please report the log"
+        );
+        error!(model = %self.name, "{msg}");
+        self.stuck.store(true, Ordering::Release);
+        self.state.set(ModelState::Failed(msg));
+    }
+}
+
+impl Drop for Contained {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // Only reachable when the panic escaped `catch_unwind` (a panicking payload drop).
+            self.crashed("a panic while unwinding");
+        }
+        self.gate.open();
+    }
+}
+
+/// The text of a panic payload (`panic!` gives a `&str` or a `String`).
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// A load given up because the worker was stopped (its token cancelled: the service stops, or
+/// the model was reloaded, disabled or retired). Checked between candidates, before the retry
+/// that asks for room, while waiting for the runtimes lock, after the compile and during the
+/// warm-up. A compile in progress cannot be interrupted (neither OpenVINO nor ONNX Runtime has
+/// a cancel for it): the stop is seen once it returns, and its result is dropped unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LoadStopped;
+
+impl std::fmt::Display for LoadStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the model stopped loading: the service is stopping, or the model was reloaded, \
+             disabled or removed",
+        )
+    }
+}
+
+impl std::error::Error for LoadStopped {}
+
 impl WorkerCtx {
+    /// [`Self::run`] with its panics contained: the model becomes `Failed` (and is reloaded by
+    /// the supervisor) and its [`LoadGate`] opens, so the models after it still load.
+    ///
+    /// `AssertUnwindSafe` holds because nothing the closure owns is used after a panic: the
+    /// context, the receiver and the engine drop while unwinding (aborting what is in flight,
+    /// dropping the replies, so their clients get an error at once). What other threads see
+    /// afterwards is only the state, the stuck flag and the gate, set here, plus metrics
+    /// (atomics) and locks that every reader takes with poison recovery (`crate::sync`).
+    pub(super) fn run_contained(self, rx: Receiver<WorkItem>, after: Option<LoadGate>) {
+        let guard = Contained {
+            name: self.cfg.name.clone(),
+            gate: self.gate.clone(),
+            state: self.state.clone(),
+            stuck: self.stuck.clone(),
+        };
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            self.run(rx, after);
+        }));
+        if let Err(payload) = ran {
+            guard.crashed(&panic_text(payload.as_ref()));
+        }
+    }
+
     pub(super) fn run(mut self, rx: Receiver<WorkItem>, after: Option<LoadGate>) {
         let name = self.cfg.name.clone();
         if let Some(wait) = self.cfg.wait.take() {
@@ -954,6 +1048,12 @@ impl WorkerCtx {
                 self.state.set(ModelState::Ready);
                 Some(engine)
             }
+            Err(e) if self.shutdown.is_cancelled() => {
+                // A normal stop, not a broken model: no error line.
+                info!(model = %self.cfg.name, "{LoadStopped} ({e:#})");
+                self.state.set(ModelState::Failed(LoadStopped.to_string()));
+                None
+            }
             Err(e) => {
                 let msg = load_failure_message(&e);
                 error!(model = %self.cfg.name, "{msg}");
@@ -963,9 +1063,25 @@ impl WorkerCtx {
         }
     }
 
+    /// `Err(LoadStopped)` once the worker's token is cancelled.
+    fn check_stopped(&self) -> Result<()> {
+        if self.shutdown.is_cancelled() {
+            return Err(LoadStopped.into());
+        }
+        Ok(())
+    }
+
+    /// The runtimes lock, or `Err(LoadStopped)` when the worker is stopped while it waits for
+    /// it (another model may hold it for a whole compile) or before it starts work under it.
+    fn lock_runtimes(&self) -> Result<std::sync::MutexGuard<'_, Runtimes>> {
+        let rt = super::lock_unless_cancelled(&self.runtimes, &self.shutdown).ok_or(LoadStopped)?;
+        self.check_stopped()?;
+        Ok(rt)
+    }
+
     fn load(&self) -> Result<Engine> {
         let name = &self.cfg.name;
-        let candidates = self.candidates();
+        let candidates = self.candidates()?;
         info!(
             model = %name,
             path = %self.cfg.load.path.display(),
@@ -977,14 +1093,19 @@ impl WorkerCtx {
         let first = candidates.first().map(|c| c.device);
         let mut better: Option<Better> = None;
         let loaded = crate::backend::try_candidates(&label, &candidates, |cand| {
+            // A stopped worker tries no further candidate, and never makes the previous
+            // generation give up its serving copy for a load that is not wanted any more.
+            self.check_stopped()?;
             let mut attempt = self.load_on(cand);
             if Some(cand.device) == first
                 && let Err(e) = &attempt
+                && !self.shutdown.is_cancelled()
                 && self.room_made(cand, e)
             {
                 attempt = self.load_on(cand);
             }
             if better.is_none()
+                && !self.shutdown.is_cancelled()
                 && let Err(e) = &attempt
             {
                 better = Better::of(cand, e);
@@ -1041,17 +1162,18 @@ impl WorkerCtx {
         Ok(engine)
     }
 
-    /// The candidates to walk: the one [`WorkerConfig::only`] names, else the plan.
-    fn candidates(&self) -> Vec<Candidate> {
+    /// The candidates to walk: the one [`WorkerConfig::only`] names, else the plan
+    /// (`Err(LoadStopped)` when stopped while waiting for the runtimes lock).
+    fn candidates(&self) -> Result<Vec<Candidate>> {
         if let Some(c) = &self.cfg.only {
-            return vec![c.clone()];
+            return Ok(vec![c.clone()]);
         }
         #[cfg(test)]
         if let Some(c) = &self.cfg.faults.candidates {
-            return c.clone();
+            return Ok(c.clone());
         }
-        let rt = self.runtimes.lock_recover();
-        rt.plan(&self.cfg.device, &self.cfg.load.path)
+        let rt = self.lock_runtimes()?;
+        Ok(rt.plan(&self.cfg.device, &self.cfg.load.path))
     }
 
     /// The first candidate failed with `e`. When that is lack of memory and a copy of this
@@ -1089,18 +1211,26 @@ impl WorkerCtx {
             fault(cand)?;
         }
         let compiled = {
-            let mut rt = self.runtimes.lock_recover();
+            let mut rt = self.lock_runtimes()?;
             let tuning = self.tuning_for(&rt, cand);
             let device = cand.device.to_string();
-            watch_slow_compile(
+            let compiled = watch_slow_compile(
                 &self.cfg.name,
                 &device,
                 &self.state,
                 SlowCompile::DEFAULT,
                 || rt.compile_tuned(cand, &self.cfg.load, &tuning),
             )
-            .0?
+            .0?;
+            #[cfg(test)]
+            if let Some(hook) = &self.cfg.faults.compiled {
+                hook();
+            }
+            compiled
         };
+        // Stopped during the compile (which cannot be interrupted): nothing runs on the
+        // compiled model yet, so it is dropped here, unused, instead of warmed up.
+        self.check_stopped()?;
         let info = compiled.info();
         let provider = info.device.execution_provider();
         let device = info.device.spec.clone();
@@ -1125,7 +1255,7 @@ impl WorkerCtx {
         let warmup_timeout = WARMUP_TIMEOUT;
         #[cfg(test)]
         let warmup_timeout = self.cfg.faults.warmup_timeout.unwrap_or(WARMUP_TIMEOUT);
-        let outs = match warm_up(&mut backend, chw, &extra, warmup_timeout) {
+        let outs = match warm_up(&mut backend, chw, &extra, warmup_timeout, &self.shutdown) {
             Ok(outs) => outs,
             Err(e) => {
                 if e.is::<WarmupTimeout>() {
@@ -1134,6 +1264,10 @@ impl WorkerCtx {
                     // ONNX Runtime waits `ABORT_TIMEOUT`): a reaper does, so this thread goes
                     // on to the next candidate (CPU last) and the model still serves.
                     error!(model = %self.cfg.name, "{e:#}; abandoning the device");
+                    reap(&self.cfg.name, Abandoned(backend));
+                } else if e.is::<LoadStopped>() {
+                    // Stopped with the warm-up in flight: a reaper stops and frees it, so the
+                    // worker thread never waits for the device.
                     reap(&self.cfg.name, Abandoned(backend));
                 }
                 return Err(e);
@@ -1694,27 +1828,38 @@ impl std::error::Error for WarmupTimeout {}
 /// Warm every slot of `backend` up on one frame, within `timeout` in total: slot 0 first and
 /// timed (its outputs are returned, with the inference time in ms), then every other slot at
 /// once (first runs allocate per request / session). Waits on the backend's completion channel
-/// so a hung device yields [`WarmupTimeout`] instead of blocking in `collect`.
+/// so a hung device yields [`WarmupTimeout`] instead of blocking in `collect`, in slices of
+/// [`POLL`] so a cancelled `stop` yields [`LoadStopped`] within one slice. Either way an
+/// inference may still be in flight: the caller hands the backend to a reaper.
 pub(crate) fn warm_up(
     backend: &mut Backend,
     chw: &[f32],
     extra: &[crate::model::ExtraInput],
     timeout: Duration,
+    stop: &CancellationToken,
 ) -> Result<(Vec<crate::model::NamedOutput>, u64)> {
     let started = Instant::now();
     let deadline = started + timeout;
     let device = backend.info().device.spec.clone();
     let wait = |backend: &Backend| -> Result<()> {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match backend.completions().recv_timeout(left) {
-            Ok(_) => Ok(()),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Err(WarmupTimeout {
-                device: device.clone(),
-                waited: started.elapsed(),
+        loop {
+            if stop.is_cancelled() {
+                return Err(LoadStopped.into());
             }
-            .into()),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("the inference runtime stopped during the warm-up")
+            let left = deadline.saturating_duration_since(Instant::now());
+            match backend.completions().recv_timeout(left.min(POLL)) {
+                Ok(_) => return Ok(()),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) if left > POLL => {}
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    return Err(WarmupTimeout {
+                        device: device.clone(),
+                        waited: started.elapsed(),
+                    }
+                    .into());
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("the inference runtime stopped during the warm-up")
+                }
             }
         }
     };
@@ -1852,7 +1997,14 @@ mod tests {
         use crate::backend::fake::Call;
         let (mut backend, script) = fake_backend(3, false);
         let chw = vec![0.0f32; 3 * 64 * 64];
-        let (outs, ms) = warm_up(&mut backend, &chw, &[], Duration::from_secs(5)).unwrap();
+        let (outs, ms) = warm_up(
+            &mut backend,
+            &chw,
+            &[],
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(outs.len(), 1);
         assert!(ms < 1000);
         let calls = script.calls();
@@ -1870,7 +2022,14 @@ mod tests {
         let (mut backend, _script) = fake_backend(2, true);
         let chw = vec![0.0f32; 3 * 64 * 64];
         let t = Instant::now();
-        let err = warm_up(&mut backend, &chw, &[], Duration::from_millis(100)).unwrap_err();
+        let err = warm_up(
+            &mut backend,
+            &chw,
+            &[],
+            Duration::from_millis(100),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
         assert!(t.elapsed() < Duration::from_secs(5));
         assert!(err.is::<WarmupTimeout>(), "{err:#}");
         let text = format!("{err:#}");
@@ -1879,6 +2038,42 @@ mod tests {
         // Still in flight: the caller leaks the backend instead of waiting for it.
         assert!(backend.is_busy(0));
         std::mem::forget(backend);
+    }
+
+    /// A stop during a warm-up that hangs ends it within one [`POLL`] slice, long before its
+    /// timeout, with [`LoadStopped`] (not [`WarmupTimeout`]).
+    #[test]
+    fn warm_up_ends_soon_after_a_stop() {
+        let (mut backend, _script) = fake_backend(1, true);
+        let chw = vec![0.0f32; 3 * 64 * 64];
+        let stop = CancellationToken::new();
+        let canceller = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                stop.cancel();
+            })
+        };
+        let t = Instant::now();
+        let err = warm_up(&mut backend, &chw, &[], Duration::from_secs(60), &stop).unwrap_err();
+        let waited = t.elapsed();
+        canceller.join().unwrap();
+        assert!(err.is::<LoadStopped>(), "{err:#}");
+        assert!(!err.is::<WarmupTimeout>(), "{err:#}");
+        assert!(waited < Duration::from_secs(10), "{waited:?}");
+        assert!(backend.is_busy(0));
+        std::mem::forget(backend);
+    }
+
+    #[test]
+    fn panic_text_reads_str_and_string_payloads() {
+        let s = std::panic::catch_unwind(|| panic!("plain")).unwrap_err();
+        assert_eq!(panic_text(s.as_ref()), "plain");
+        let n = 3;
+        let f = std::panic::catch_unwind(move || panic!("formatted {n}")).unwrap_err();
+        assert_eq!(panic_text(f.as_ref()), "formatted 3");
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(7u8)).unwrap_err();
+        assert_eq!(panic_text(other.as_ref()), "non-string panic payload");
     }
 
     #[test]

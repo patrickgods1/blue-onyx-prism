@@ -27,6 +27,12 @@
 //!   and scheduled tasks without a desktop do not).
 //! - Other Unix: `zenity` (preferred) or `kdialog` when `DISPLAY` or `WAYLAND_DISPLAY` is set.
 //!
+//! The dialog process does not outlive the service (RA server-handlers-4, -5): a kill-on-close
+//! Job Object on Windows, the parent-death signal on Linux, an entry in the data root's child
+//! registry ([`crate::children`]) for the next start's sweep everywhere (macOS has no
+//! parent-death signal); a stopped dialog's whole process group gets SIGKILL after the TERM
+//! grace, and a leftover holding its pipes cannot keep [`BUSY`] set (bounded reader join).
+//!
 //! The start folder, prompt and filters never become script source: they are argv elements
 //! (osascript `on run argv`, zenity/kdialog options) or environment variables (PowerShell).
 //! Output is UTF-8 with the trailing newline trimmed; empty output or a cancel exit code means
@@ -724,15 +730,69 @@ fn process(cmd: &PickCommand) -> Command {
 }
 
 /// Run `cmd` until it exits, `timeout` passes or `abandoned` is set (then its process group is
-/// stopped: SIGTERM first, so sudo relays it and osascript closes its dialog, then a kill), through
-/// the shared [`crate::command::run_within`] (own process group, `CREATE_NO_WINDOW`, output
-/// drained and capped at 64 KiB).
+/// stopped: SIGTERM first, so sudo relays it and osascript closes its dialog, then SIGKILL to the
+/// whole group), through the shared [`crate::command::run_capped_with`] (own process group,
+/// Linux `PR_SET_PDEATHSIG`, `CREATE_NO_WINDOW`, output drained and capped at 64 KiB, the reader
+/// threads joined for a bounded time so a leftover holding a pipe cannot pin [`BUSY`]).
+///
+/// The dialog does not outlive the service (RA server-handlers-4): on Windows it runs in its own
+/// kill-on-close Job Object ([`crate::backend::job`]; when the job cannot be made the dialog
+/// still opens, logged), and with `record_in` (the data root) it is listed in
+/// `<data root>/.children.json` ([`crate::children`]) until it is reaped, so the next start ends
+/// one a crash left open (macOS has no parent-death signal). Linux also gets the death signal.
 pub(super) fn run(
     cmd: &PickCommand,
     timeout: Duration,
     abandoned: &AtomicBool,
+    record_in: Option<&Path>,
 ) -> std::io::Result<RunOutput> {
-    crate::command::run_within(process(cmd), timeout, Some(abandoned))
+    crate::command::run_capped_with(
+        process(cmd),
+        timeout,
+        Some(abandoned),
+        crate::command::DEFAULT_OUTPUT_LIMIT,
+        |child| Ok(DialogGuard::hold(child, record_in)),
+    )
+}
+
+/// What ties a running dialog process to the service; kept until it is reaped.
+struct DialogGuard {
+    /// Its tree, killed when the service dies (Windows).
+    #[cfg(windows)]
+    _job: Option<crate::backend::job::Job>,
+    _record: Option<crate::children::Recorded>,
+}
+
+impl DialogGuard {
+    fn hold(child: &std::process::Child, record_in: Option<&Path>) -> DialogGuard {
+        #[cfg(windows)]
+        let job = match crate::backend::job::Job::new().and_then(|j| j.assign(child).map(|()| j)) {
+            Ok(j) => Some(j),
+            Err(e) => {
+                warn!(
+                    "the file dialog is not in a job object ({e:#}); it stays open if the \
+                     service is stopped by force while it is"
+                );
+                None
+            }
+        };
+        let record = record_in.and_then(|root| {
+            crate::children::Registry::new(root)
+                .record("file-dialog", child.id())
+                .map_err(|e| {
+                    warn!(
+                        "the file dialog is not listed for the startup clean-up: {e:#}; a \
+                         crash while it is open leaves it on the screen"
+                    );
+                })
+                .ok()
+        });
+        DialogGuard {
+            #[cfg(windows)]
+            _job: job,
+            _record: record,
+        }
+    }
 }
 
 /// Holds [`BUSY`] while a dialog is open.
@@ -894,7 +954,8 @@ pub(super) async fn pick(
         let start = start_folder(&cfg, pr.start.as_deref());
         let cmd = launcher.command(pr.kind, start.as_deref());
         info!(kind = pr.kind.name(), dialog = %launcher.describe(), "opening a file dialog");
-        let out = run(&cmd, DIALOG_TIMEOUT, &abandoned).map_err(|e| {
+        let root = cfg.data_root();
+        let out = run(&cmd, DIALOG_TIMEOUT, &abandoned, Some(&root)).map_err(|e| {
             format!(
                 "The file dialog could not start ({}: {e}): {FALLBACK}",
                 cmd.program
@@ -1327,6 +1388,7 @@ mod tests {
             &sh("printf '%s|%s\\n' \"$1\" \"$BOP_T\""),
             Duration::from_secs(10),
             &never,
+            None,
         )
         .unwrap();
         assert_eq!(out.ended, Ended::Exited);
@@ -1335,12 +1397,51 @@ mod tests {
             Outcome::Picked("/x y/é|v".into())
         );
         let t = Instant::now();
-        let out = run(&sh("sleep 30"), Duration::from_millis(300), &never).unwrap();
+        let out = run(&sh("sleep 30"), Duration::from_millis(300), &never, None).unwrap();
         assert_eq!(out.ended, Ended::TimedOut);
         assert!(t.elapsed() < Duration::from_secs(10));
         let gone = AtomicBool::new(true);
-        let out = run(&sh("sleep 30"), Duration::from_secs(60), &gone).unwrap();
+        let out = run(&sh("sleep 30"), Duration::from_secs(60), &gone, None).unwrap();
         assert_eq!(out.ended, Ended::Abandoned);
+    }
+
+    /// RA server-handlers-4: a dialog is listed in the data root's child registry while it is
+    /// open (the next start ends one a crash left behind) and forgotten once it is reaped.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_dialog_is_recorded_until_it_is_reaped() {
+        let root = std::env::temp_dir().join(format!("bop-pick-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let reg = crate::children::Registry::new(&root);
+        let cmd = PickCommand {
+            tool: Tool::Zenity,
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env: vec![],
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let (stop, root) = (stop.clone(), root.clone());
+            std::thread::spawn(move || run(&cmd, Duration::from_secs(60), &stop, Some(&root)))
+        };
+        let until = Instant::now() + Duration::from_secs(20);
+        let entry = loop {
+            if let Some(e) = reg.entries().unwrap().into_iter().next() {
+                break e;
+            }
+            assert!(Instant::now() < until, "the dialog was never recorded");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(entry.kind, "file-dialog");
+        assert_eq!(entry.owner_pid, std::process::id());
+        stop.store(true, Ordering::Relaxed);
+        let out = worker.join().unwrap().unwrap();
+        assert_eq!(out.ended, Ended::Abandoned);
+        assert!(
+            reg.entries().unwrap().is_empty(),
+            "still listed after the reap"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Loopback peers reached through a proxy or under a foreign host name are refused.

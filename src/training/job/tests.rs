@@ -1905,6 +1905,154 @@ fn a_finished_run_frees_its_work_and_a_cancelled_one_too() {
     assert!(!run_dir.join("work").exists());
 }
 
+/// The service's stop is no cancel: the running run's tree is stopped, but the run keeps its
+/// checkpoint and is recorded as interrupted with Retry export open (the words a restart gives a
+/// run a crash left busy), and the queued run is written as interrupted too.
+#[test]
+fn a_run_stopped_for_exit_keeps_its_checkpoint_and_can_be_retried() {
+    let t = tmp("exit");
+    let mut a = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    a.run_dir = t.0.join("training/a");
+    let mut b = job(&t.0, TrainFamily::Yolo26, "s", mps(), Platform::MACOS_ARM64);
+    b.run_dir = t.0.join("training/b");
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        hang: true,
+        ..TrainFake::new()
+    });
+    let store = t.0.join("runs.json");
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(store.clone()),
+    );
+    let run_dir = a.run_dir.clone();
+    let ida = svc.enqueue(a).unwrap();
+    let idb = svc.enqueue(b).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !run_dir.join("work/run/weights/best.pt").is_file() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(svc.stop_for_exit(Instant::now() + Duration::from_secs(10)));
+    let r = svc.get(&ida).unwrap();
+    assert_eq!(r.state, RunState::Failed, "{}", r.describe());
+    assert_eq!(r.stage, Some(TrainStage::Train));
+    let e = r.error.clone().unwrap();
+    assert!(e.starts_with("interrupted: the service stopped"), "{e}");
+    assert!(e.contains("Retry export"), "{e}");
+    assert!(
+        run_dir.join("work/run/weights/best.pt").is_file(),
+        "the checkpoint stays"
+    );
+    assert!(super::super::retry::retry_checkpoint(&r).is_ok());
+    let queued = svc.get(&idb).unwrap();
+    assert_eq!(queued.state, RunState::Failed);
+    assert_eq!(queued.error.as_deref(), Some(e.as_str()));
+    let trained = fake.train_cmds.lock().unwrap().len();
+    // Saved like that; read back after a restart it stays as it is.
+    let back = service::load_records(&store);
+    let saved = back.iter().find(|x| x.id == ida).unwrap();
+    assert_eq!(saved.state, RunState::Failed);
+    assert_eq!(saved.error.as_deref(), Some(e.as_str()));
+    assert!(!svc.busy());
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        fake.train_cmds.lock().unwrap().len(),
+        trained,
+        "b never ran"
+    );
+}
+
+/// A run whose message finds no thread fails at once (never stays queued, which would keep the
+/// queue busy); a retry that cannot reach it goes back to the failure it came from.
+#[test]
+fn a_run_that_finds_no_thread_fails_and_a_retry_goes_back_to_its_failure() {
+    let t = tmp("gone");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = Arc::new(TrainFake::new());
+    let svc = TrainingService::start(fake.clone(), fake.clone(), Arc::new(NoHooks), None);
+    svc.end_thread_only();
+    let id = j.id.clone();
+    let e = svc.enqueue(j.clone()).unwrap_err();
+    assert!(e.contains("never ran"), "{e}");
+    let failed = svc.get(&id).unwrap();
+    assert_eq!(failed.state, RunState::Failed);
+    assert_eq!(failed.error.as_deref(), Some(e.as_str()));
+    assert!(failed.finished.is_some());
+    assert!(!svc.busy());
+    let e = svc.enqueue_retry(retry_of(&j)).unwrap_err();
+    assert!(e.contains("never ran"), "{e}");
+    let back = svc.get(&id).unwrap();
+    assert_eq!(back.state, RunState::Failed);
+    assert!(!back.retrying);
+    assert_eq!(back.error, failed.error);
+    assert_eq!(back.finished, failed.finished);
+    assert!(!svc.busy());
+}
+
+/// Hooks whose register panics the first time (a bug in the caller's code).
+#[derive(Default)]
+struct PanicOnce {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Hooks for PanicOnce {
+    fn register(&self, out: &TrainOutput) -> Result<String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("register broke");
+        }
+        Ok(format!("{} registered", out.name))
+    }
+    fn benchmark(
+        &self,
+        _: &TrainOutput,
+        _: &[String],
+        _: &[String],
+        _: &AtomicBool,
+    ) -> Result<Option<BenchSummary>> {
+        Ok(None)
+    }
+}
+
+/// A panic inside a run fails that run in its stage with the message, keeps its files, and the
+/// queue runs the next one.
+#[test]
+fn a_run_that_panics_fails_in_its_stage_and_the_next_one_runs() {
+    let t = tmp("panic");
+    let mut a = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    a.run_dir = t.0.join("training/a");
+    let mut b = job(&t.0, TrainFamily::Yolo26, "s", mps(), Platform::MACOS_ARM64);
+    b.run_dir = t.0.join("training/b");
+    let fake = Arc::new(TrainFake {
+        checkpoint: true,
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(PanicOnce::default()),
+        None,
+    );
+    let run_dir = a.run_dir.clone();
+    let ida = svc.enqueue(a).unwrap();
+    let idb = svc.enqueue(b).unwrap();
+    let r = svc.wait(&ida, Duration::from_secs(20)).unwrap();
+    assert_eq!(r.state, RunState::Failed, "{}", r.describe());
+    assert_eq!(r.stage, Some(TrainStage::Register));
+    let e = r.error.unwrap();
+    assert!(e.starts_with("internal error: register broke."), "{e}");
+    assert!(
+        run_dir.join("work/run/weights/best.pt").is_file(),
+        "its files are kept"
+    );
+    let r = svc.wait(&idb, Duration::from_secs(20)).unwrap();
+    assert_eq!(r.state, RunState::Done, "{:?}", r.error);
+    assert!(!svc.busy());
+    svc.shutdown();
+}
+
 #[test]
 fn a_retry_cancelled_goes_back_to_the_failure_with_its_checkpoint() {
     let t = tmp("retry-svc");

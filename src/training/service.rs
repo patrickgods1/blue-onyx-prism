@@ -22,6 +22,22 @@
 //! benchmark, a download) finishes first. The queue keeps the job's place (nothing else starts)
 //! until [`TrainingService::resume`] or a cancel. A running run can also finish early
 //! ([`TrainingService::finish`]): the trainer stops after its current epoch and exports the best.
+//!
+//! Stopping. [`TrainingService::shutdown`] is the CLI's stop: the running job is cancelled as by
+//! the user (a cancelled training takes its checkpoints along) and the thread joined.
+//! [`TrainingService::stop_for_exit`] is the service's: the running job's process tree is killed
+//! the same way, but the run is *interrupted* ([`super::job::run_training_or_exit`]): it keeps its
+//! work folder and checkpoint and is recorded as a failure that says the service stopped (the row
+//! offers Retry export when there is a checkpoint), exactly as [`open_records`] marks a run a crash
+//! left busy; queued runs and tasks are written that way at once. The thread is waited for until a
+//! deadline, then left behind, and the queue never writes its files again (a later queue of the
+//! same process, after an in-process restart, owns them). A stopped queue refuses new jobs without
+//! recording them; a job whose message cannot reach the thread is recorded as failed, never left
+//! queued.
+//!
+//! Panics. A panic in a job (dataset assembly, an import, an auto-label, the progress parser) is
+//! caught on the queue's thread: the job's record fails with the panic's message, `current` is
+//! cleared (a drop guard, so every exit path clears it), its files are kept, and the next job runs.
 
 use super::eta::{JobClock, JobTiming};
 use super::job::{
@@ -298,33 +314,77 @@ pub fn new_run_id() -> String {
     )
 }
 
-/// [`task::load_or_move_aside`]; busy records become interrupted failures.
+/// [`task::load_or_move_aside`]; busy records become interrupted failures ([`interrupt`]).
 fn open_records(path: &Path) -> task::Loaded<RunRecord> {
     let mut loaded = task::load_or_move_aside::<RunRecord>(path);
     for r in &mut loaded.records {
         if r.state.is_busy() {
-            if let Some(p) = r.progress.as_mut() {
-                history::refresh_best(p, &r.run_dir);
-            }
-            r.state = RunState::Failed;
-            r.error = Some(match (&r.output, &r.registered) {
-                (Some(o), None) => {
-                    format!("interrupted after the install. {}", not_in_config(o))
-                }
-                (Some(o), Some(_)) => format!(
-                    "interrupted after {} was added to the config: the model is ready, only its \
-                     benchmark did not finish; run it on the Benchmark page",
-                    o.name
-                ),
-                (None, _) => "interrupted: the service stopped while this run was queued or \
-                              running; use Retry export if the row offers it, else queue it again"
-                    .into(),
-            });
-            r.retrying = false;
+            interrupt(r);
         }
     }
     loaded
 }
+
+/// A run the service stopped under (a crash read back at the next start, or
+/// [`TrainingService::stop_for_exit`]): failed, saying how far it got and what to do; its files
+/// stay (Retry export when it left a checkpoint).
+fn interrupt(r: &mut RunRecord) {
+    if let Some(p) = r.progress.as_mut() {
+        history::refresh_best(p, &r.run_dir);
+    }
+    r.state = RunState::Failed;
+    r.error = Some(match (&r.output, &r.registered) {
+        (Some(o), None) => {
+            format!("interrupted after the install. {}", not_in_config(o))
+        }
+        (Some(o), Some(_)) => format!(
+            "interrupted after {} was added to the config: the model is ready, only its \
+             benchmark did not finish; run it on the Benchmark page",
+            o.name
+        ),
+        (None, _) => "interrupted: the service stopped while this run was queued or \
+                      running; use Retry export if the row offers it, else queue it again"
+            .into(),
+    });
+    r.retrying = false;
+}
+
+/// [`interrupt`] for a task: the words [`task::open_records`] gives a task a crash left busy.
+fn interrupt_task(r: &mut TaskRecord) {
+    r.state = RunState::Failed;
+    r.error = Some(
+        "interrupted: the service stopped while this job was queued or running; start it again"
+            .into(),
+    );
+}
+
+/// What a job that panicked tells the user (the panic itself is in the log).
+fn internal_error(panic: &str, run: bool) -> String {
+    let next = if run {
+        "use Retry export if the row offers it, else queue the run again"
+    } else {
+        "start the job again"
+    };
+    format!(
+        "internal error: {panic}. Its files are kept. Please report this with the bug-report \
+         zip (blue-onyx-prism diagnostics), then {next}"
+    )
+}
+
+/// The message of a panic's payload (`panic!` with a literal or a format string).
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic without a message".into())
+}
+
+/// Why a stopped queue takes no job.
+const STOPPED: &str = "the training queue has stopped (the service is stopping or restarting); \
+                       queue it again once the service is back";
+/// Why a job whose message could not reach the queue's thread failed.
+const THREAD_GONE: &str = "the training thread has stopped, so this job never ran; restart the \
+                           service and queue it again";
 
 /// [`open_records`], for a reader that does not save, with each run's epochs
 /// ([`history::attach`]).
@@ -356,7 +416,12 @@ struct Inner {
     /// Serializes snapshot + write, so the file always ends with the latest state (and a
     /// store move never splits an update from its write).
     persist_lock: Mutex<()>,
+    /// No job starts any more (set by [`TrainingService::shutdown`] and
+    /// [`TrainingService::stop_for_exit`]); new jobs are refused.
     stop: AtomicBool,
+    /// The stop is for the process's exit: a job that ends now is interrupted, not cancelled
+    /// ([`TrainingService::stop_for_exit`]). Set before the job's cancel flag.
+    exiting: AtomicBool,
     tasks: Mutex<Vec<TaskRecord>>,
     /// The clock of the job that last held the queue's thread. A leaf lock: nothing is taken
     /// under it.
@@ -516,6 +581,67 @@ impl Inner {
         self.update_task(id, f);
         self.write_tasks();
     }
+
+    /// Mark every run and task whose state `pick` selects interrupted ([`interrupt`],
+    /// [`interrupt_task`]) and write both files; returns how many.
+    fn interrupt_where(&self, pick: impl Fn(RunState) -> bool) -> usize {
+        let _order = self.persist_lock.lock_recover();
+        let stamp = now();
+        let mut n = 0;
+        for r in self
+            .runs
+            .lock_recover()
+            .iter_mut()
+            .filter(|r| pick(r.state))
+        {
+            interrupt(r);
+            r.finished.get_or_insert_with(|| stamp.clone());
+            n += 1;
+        }
+        for r in self
+            .tasks
+            .lock_recover()
+            .iter_mut()
+            .filter(|r| pick(r.state))
+        {
+            interrupt_task(r);
+            r.finished.get_or_insert_with(|| stamp.clone());
+            n += 1;
+        }
+        self.changed.notify_all();
+        self.write_runs();
+        self.write_tasks();
+        n
+    }
+
+    /// Never write `runs.json` or `tasks.json` again (a stopped queue whose thread may still
+    /// end a job: the files are the next queue's).
+    fn forget_stores(&self) {
+        let _order = self.persist_lock.lock_recover();
+        *self.stores.lock_recover() = Stores::default();
+    }
+
+    /// The stage run `id`'s record is in.
+    fn stage_of(&self, id: &str) -> Option<TrainStage> {
+        self.runs
+            .lock_recover()
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.stage)
+    }
+}
+
+/// Clears the queue's `current` job (and the live epochs) when dropped: on the normal path, and
+/// while a panic unwinds out of the job.
+struct ClearCurrent<'a>(&'a Inner);
+
+impl Drop for ClearCurrent<'_> {
+    fn drop(&mut self) {
+        *self.0.current.lock_recover() = None;
+        // Readers go to the file from now on (or to the record, which holds the epochs itself
+        // when the file could not be written).
+        self.0.set_live("", None);
+    }
 }
 
 /// `r` with its epochs: `live`'s when it is that run's ([`history::attach`]).
@@ -573,6 +699,7 @@ impl TrainingService {
             stores: Mutex::new(opened.stores),
             persist_lock: Mutex::new(()),
             stop: AtomicBool::new(false),
+            exiting: AtomicBool::new(false),
             tasks: Mutex::new(opened.tasks),
         });
         if opened.migrated {
@@ -591,6 +718,41 @@ impl TrainingService {
         })
     }
 
+    /// A queue that is stopped from the start: no thread, no store, no records; every job is
+    /// refused. What a server that is stopping hands a late request instead of a new queue.
+    pub fn closed(
+        runner: Arc<dyn CommandRunner>,
+        fetcher: Arc<dyn Fetcher>,
+        hooks: Arc<dyn Hooks>,
+    ) -> Arc<Self> {
+        let (tx, _) = crossbeam_channel::unbounded();
+        Arc::new(Self {
+            inner: Arc::new(Inner {
+                runner,
+                fetcher,
+                hooks,
+                runs: Mutex::new(Vec::new()),
+                changed: Condvar::new(),
+                current: Mutex::new(None),
+                clock: Mutex::new(None),
+                live: Mutex::new(None),
+                cancelled: Mutex::new(HashSet::new()),
+                stores: Mutex::new(Stores::default()),
+                persist_lock: Mutex::new(()),
+                stop: AtomicBool::new(true),
+                exiting: AtomicBool::new(true),
+                tasks: Mutex::new(Vec::new()),
+            }),
+            tx,
+            thread: Mutex::new(None),
+        })
+    }
+
+    /// The queue was stopped ([`Self::shutdown`], [`Self::stop_for_exit`], [`Self::closed`]).
+    pub fn stopped(&self) -> bool {
+        self.inner.stop.load(Ordering::SeqCst)
+    }
+
     /// The `runs.json` the queue keeps (None = memory only).
     pub fn store(&self) -> Option<PathBuf> {
         self.inner.stores.lock_recover().runs.clone()
@@ -607,6 +769,9 @@ impl TrainingService {
         let mut stores = self.inner.stores.lock_recover();
         if stores.runs.as_deref() == Some(store) {
             return Ok(false);
+        }
+        if self.stopped() {
+            return Err(STOPPED.into());
         }
         if runs.iter().any(|r| r.state.is_busy()) || tasks.iter().any(|r| r.state.is_busy()) {
             return Err(
@@ -631,6 +796,10 @@ impl TrainingService {
         let id = job.id.clone();
         {
             let mut runs = self.inner.runs.lock_recover();
+            // Under the runs lock: a stop that comes later finds this record and marks it.
+            if self.stopped() {
+                return Err(STOPPED.into());
+            }
             if runs.iter().any(|r| r.state.is_busy() && r.name == job.name) {
                 return Err(format!(
                     "a run training {} is already queued or running",
@@ -645,9 +814,16 @@ impl TrainingService {
         }
         self.inner.persist();
         self.inner.changed.notify_all();
-        self.tx
-            .send(Msg::Job(Box::new(job)))
-            .map_err(|_| "the training thread has stopped".to_string())?;
+        if self.tx.send(Msg::Job(Box::new(job))).is_err() {
+            self.inner.update_persist(&id, |r| {
+                if r.state == RunState::Queued {
+                    r.state = RunState::Failed;
+                    r.error = Some(THREAD_GONE.into());
+                    r.finished = Some(now());
+                }
+            });
+            return Err(THREAD_GONE.into());
+        }
         Ok(id)
     }
 
@@ -655,8 +831,12 @@ impl TrainingService {
     /// record: same id, folder and history. A cancelled retry goes back to the failure it came from.
     pub fn enqueue_retry(&self, job: TrainJob) -> Result<String, String> {
         let id = job.id.clone();
+        let before;
         {
             let mut runs = self.inner.runs.lock_recover();
+            if self.stopped() {
+                return Err(STOPPED.into());
+            }
             if runs.iter().any(|r| r.state.is_busy() && r.name == job.name) {
                 return Err(format!(
                     "a run training {} is already queued or running",
@@ -669,17 +849,27 @@ impl TrainingService {
             if r.state != RunState::Failed {
                 return Err(format!("run {id} is {}, not failed", r.describe()));
             }
+            before = (r.percent, std::mem::take(&mut r.detail), r.finished.take());
             r.state = RunState::Queued;
             r.retrying = true;
             r.percent = 0;
-            r.detail = String::new();
-            r.finished = None;
         }
         self.inner.persist();
         self.inner.changed.notify_all();
-        self.tx
-            .send(Msg::Job(Box::new(job)))
-            .map_err(|_| "the training thread has stopped".to_string())?;
+        if self.tx.send(Msg::Job(Box::new(job))).is_err() {
+            // Back to the failure it was, its checkpoint still there to retry.
+            let (percent, detail, finished) = before;
+            self.inner.update_persist(&id, |r| {
+                if r.state == RunState::Queued {
+                    r.state = RunState::Failed;
+                    r.retrying = false;
+                    r.percent = percent;
+                    r.detail = detail;
+                    r.finished = finished;
+                }
+            });
+            return Err(THREAD_GONE.into());
+        }
         Ok(id)
     }
 
@@ -703,6 +893,9 @@ impl TrainingService {
         let id = task.id().to_string();
         {
             let mut tasks = self.inner.tasks.lock_recover();
+            if self.stopped() {
+                return Err(NotQueued::Failed(STOPPED.into()));
+            }
             if let Some(why) = refuse(&tasks) {
                 return Err(NotQueued::Refused(why));
             }
@@ -714,9 +907,16 @@ impl TrainingService {
         }
         self.inner.persist_tasks();
         self.inner.changed.notify_all();
-        self.tx
-            .send(Msg::Task(task))
-            .map_err(|_| NotQueued::Failed("the training thread has stopped".to_string()))?;
+        if self.tx.send(Msg::Task(task)).is_err() {
+            self.inner.update_persist_task(&id, |r| {
+                if r.state == RunState::Queued {
+                    r.state = RunState::Failed;
+                    r.error = Some(THREAD_GONE.into());
+                    r.finished = Some(now());
+                }
+            });
+            return Err(NotQueued::Failed(THREAD_GONE.into()));
+        }
         Ok(id)
     }
 
@@ -1061,6 +1261,9 @@ impl TrainingService {
         if r.state.is_busy() {
             return Err("the run is queued or running; cancel it first".into());
         }
+        if self.stopped() {
+            return Err(STOPPED.into());
+        }
         delete(&r).map_err(|e| {
             format!(
                 "the files of run {id} could not be deleted: {e:#}. The run stays in the list; \
@@ -1071,8 +1274,12 @@ impl TrainingService {
         Ok(r)
     }
 
-    /// Forget a finished run or task (its files stay).
+    /// Forget a finished run or task (its files stay). Refused once the queue stopped: its
+    /// files are no longer written, so the record would come back.
     pub fn remove(&self, id: &str) -> Result<(), String> {
+        if self.stopped() {
+            return Err(STOPPED.into());
+        }
         {
             let mut tasks = self.inner.tasks.lock_recover();
             if let Some(i) = tasks.iter().position(|r| r.id == id) {
@@ -1123,10 +1330,72 @@ impl TrainingService {
 
     /// Stop: the running run is cancelled (its processes killed), the thread joined.
     pub fn shutdown(&self) {
-        self.inner.stop.store(true, Ordering::Relaxed);
+        self.inner.stop.store(true, Ordering::SeqCst);
         if let Some(c) = self.inner.current.lock_recover().as_ref() {
             c.cancel.store(true, Ordering::Relaxed);
         }
+        let _ = self.tx.send(Msg::Stop);
+        if let Some(h) = self.thread.lock_recover().take() {
+            let _ = h.join();
+        }
+    }
+
+    /// Stop for the process's exit (see the module docs): queued jobs are written as interrupted,
+    /// the running one has its process tree killed and is recorded as interrupted with its files
+    /// kept, and the thread is waited for until `deadline`. Past it the thread is left behind
+    /// (its record is written as interrupted now) and the queue writes nothing again. Returns
+    /// whether the thread ended in time. Idempotent.
+    pub fn stop_for_exit(&self, deadline: Instant) -> bool {
+        // `exiting` before the cancel flag: the job that sees the cancel sees why.
+        self.inner.exiting.store(true, Ordering::SeqCst);
+        self.inner.stop.store(true, Ordering::SeqCst);
+        let queued = self.inner.interrupt_where(|s| s == RunState::Queued);
+        let running = self.inner.current.lock_recover().as_ref().map(|c| {
+            c.cancel.store(true, Ordering::SeqCst);
+            c.id.clone()
+        });
+        let _ = self.tx.send(Msg::Stop);
+        let ended = self.wait_thread(deadline);
+        if !ended {
+            tracing::warn!(
+                job = running.as_deref().unwrap_or("-"),
+                "the training queue did not stop in time; its job is recorded as interrupted \
+                 and ends with the process"
+            );
+            self.inner.interrupt_where(RunState::is_busy);
+        }
+        self.inner.forget_stores();
+        if running.is_some() || queued > 0 {
+            tracing::info!(
+                job = running.as_deref().unwrap_or("-"),
+                queued,
+                "training queue stopped for exit; interrupted jobs keep their files"
+            );
+        }
+        ended
+    }
+
+    /// Join the queue's thread if it ends by `deadline`; else let it go (a join would block).
+    fn wait_thread(&self, deadline: Instant) -> bool {
+        let Some(h) = self.thread.lock_recover().take() else {
+            return true;
+        };
+        loop {
+            if h.is_finished() {
+                let _ = h.join();
+                return true;
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            std::thread::sleep(left.min(Duration::from_millis(10)));
+        }
+    }
+
+    /// End the queue's thread without stopping the queue: what a thread that died leaves, for
+    /// the tests of the enqueue paths that find no thread.
+    #[cfg(test)]
+    pub(crate) fn end_thread_only(&self) {
         let _ = self.tx.send(Msg::Stop);
         if let Some(h) = self.thread.lock_recover().take() {
             let _ = h.join();
@@ -1165,194 +1434,243 @@ pub fn group_data_dirs(records: &[RunRecord], job: &TrainJob) -> Vec<PathBuf> {
 
 fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
     while let Ok(msg) = rx.recv() {
-        let mut job = match msg {
+        if inner.stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let (id, is_task) = match &msg {
             Msg::Stop => return,
-            Msg::Job(j) => *j,
+            Msg::Job(j) => (j.id.clone(), false),
+            Msg::Task(t) => (t.id().to_string(), true),
+        };
+        // A panic anywhere in a job ends that job, never the queue.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
+            Msg::Job(j) => run_job(inner, *j),
             Msg::Task(t) => {
-                if inner.stop.load(Ordering::Relaxed) {
-                    return;
-                }
                 if !inner.cancelled.lock_recover().remove(t.id()) {
                     run_task(inner, t.as_ref());
                 }
-                if inner.stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                continue;
             }
-        };
-        if inner.stop.load(Ordering::Relaxed) {
+            Msg::Stop => {}
+        }));
+        if let Err(p) = outcome {
+            contain_panic(inner, &id, is_task, &panic_text(p.as_ref()));
+        }
+        if inner.stop.load(Ordering::SeqCst) {
             return;
         }
-        if inner.cancelled.lock_recover().remove(&job.id) {
-            continue;
-        }
-        let id = job.id.clone();
-        let cur = Current::new(&id);
-        let (flag, pause) = (cur.cancel.clone(), cur.pause.clone());
-        *inner.current.lock_recover() = Some(cur);
-        // Queued -> Running under the runs lock: a cancel that marked it Cancelled after the
-        // `cancelled` check above wins (else Running would overwrite it and the cancel be lost).
-        let mut start = false;
-        inner.update(&id, |r| {
-            if r.state == RunState::Queued {
-                r.state = RunState::Running;
-                start = true;
+    }
+}
+
+/// A job's panic that got past its own catch: its record, still busy, fails.
+fn contain_panic(inner: &Inner, id: &str, is_task: bool, panic: &str) {
+    tracing::error!(job = %id, "the training queue caught a panic ({panic}); the job failed and the queue goes on");
+    let error = internal_error(panic, !is_task);
+    if is_task {
+        inner.update_persist_task(id, |r| {
+            if r.state.is_busy() {
+                r.state = RunState::Failed;
+                r.error = Some(error);
+                r.finished = Some(now());
             }
         });
-        if !start {
-            *inner.current.lock_recover() = None;
-            inner.cancelled.lock_recover().remove(&id);
-            continue;
+    } else {
+        inner.update_persist(id, |r| {
+            if r.state.is_busy() {
+                r.state = RunState::Failed;
+                r.error = Some(error);
+                r.retrying = false;
+                r.finished = Some(now());
+            }
+        });
+    }
+}
+
+/// Run one training run on the queue's thread (see [`worker_loop`]).
+fn run_job(inner: &Inner, mut job: TrainJob) {
+    if inner.cancelled.lock_recover().remove(&job.id) {
+        return;
+    }
+    let id = job.id.clone();
+    let cur = Current::new(&id);
+    let (flag, pause) = (cur.cancel.clone(), cur.pause.clone());
+    *inner.current.lock_recover() = Some(cur);
+    let clear = ClearCurrent(inner);
+    // Queued -> Running under the runs lock: a cancel that marked it Cancelled after the
+    // `cancelled` check above wins (else Running would overwrite it and the cancel be lost).
+    let mut start = false;
+    inner.update(&id, |r| {
+        if r.state == RunState::Queued {
+            r.state = RunState::Running;
+            start = true;
         }
-        inner.persist();
-        job.reuse_from = group_data_dirs(&inner.runs.lock_recover(), &job);
-        inner.start_clock(&id);
-        // What an automatic worker count learns from: the runs that recorded their resources.
-        if job.workers == super::job::Workers::Auto && job.past_runs.is_empty() {
-            job.past_runs = inner
-                .runs
-                .lock_recover()
-                .iter()
-                .filter(|r| r.resources.is_some() && r.id != id)
-                .cloned()
-                .collect();
+    });
+    if !start {
+        drop(clear);
+        inner.cancelled.lock_recover().remove(&id);
+        return;
+    }
+    inner.persist();
+    job.reuse_from = group_data_dirs(&inner.runs.lock_recover(), &job);
+    inner.start_clock(&id);
+    // What an automatic worker count learns from: the runs that recorded their resources.
+    if job.workers == super::job::Workers::Auto && job.past_runs.is_empty() {
+        job.past_runs = inner
+            .runs
+            .lock_recover()
+            .iter()
+            .filter(|r| r.resources.is_some() && r.id != id)
+            .cloned()
+            .collect();
+    }
+    tracing::info!(run = %id, model = %job.name, "training started: {} on {}", job.request.recipe.label(), job.accelerator.describe());
+    let started = Instant::now();
+    let mut last_stage = None;
+    let mut last_save = Instant::now();
+    // An export retry trains nothing: it never touches the history its run already has.
+    let mut epochs = job
+        .export_only
+        .is_none()
+        .then(|| history::HistoryLog::new(&job.run_dir));
+    let mut report = |p: TrainReport<'_>| match p {
+        TrainReport::Stage {
+            stage,
+            percent,
+            detail,
+        } => {
+            let new_stage = last_stage != Some(stage);
+            if new_stage {
+                tracing::info!(run = %id, "training stage {}/{}: {}", stage.number(), TrainStage::ALL.len(), stage.label());
+                last_stage = Some(stage);
+            }
+            inner.on_clock(|c| c.report(Instant::now(), stage.number(), percent));
+            inner.update(&id, |r| {
+                r.stage = Some(stage);
+                r.step = stage.number();
+                r.percent = stage.overall(percent);
+                r.detail = detail.chars().take(300).collect();
+            });
+            if progress_save_due(new_stage, last_save.elapsed()) {
+                inner.persist();
+                last_save = Instant::now();
+            }
         }
-        tracing::info!(run = %id, model = %job.name, "training started: {} on {}", job.request.recipe.label(), job.accelerator.describe());
-        let started = Instant::now();
-        let mut last_stage = None;
-        let mut last_save = Instant::now();
-        // An export retry trains nothing: it never touches the history its run already has.
-        let mut epochs = job
-            .export_only
-            .is_none()
-            .then(|| history::HistoryLog::new(&job.run_dir));
-        let mut report = |p: TrainReport<'_>| match p {
-            TrainReport::Stage {
-                stage,
-                percent,
-                detail,
-            } => {
-                let new_stage = last_stage != Some(stage);
-                if new_stage {
-                    tracing::info!(run = %id, "training stage {}/{}: {}", stage.number(), TrainStage::ALL.len(), stage.label());
-                    last_stage = Some(stage);
+        TrainReport::Line(l) => {
+            tracing::debug!(target: "blue_onyx_prism::training::child", run = %id, "{l}");
+            inner.update(&id, |r| {
+                if r.log.len() >= LOG_TAIL {
+                    r.log.remove(0);
                 }
-                inner.on_clock(|c| c.report(Instant::now(), stage.number(), percent));
-                inner.update(&id, |r| {
-                    r.stage = Some(stage);
-                    r.step = stage.number();
-                    r.percent = stage.overall(percent);
-                    r.detail = detail.chars().take(300).collect();
-                });
-                if progress_save_due(new_stage, last_save.elapsed()) {
-                    inner.persist();
-                    last_save = Instant::now();
+                r.log.push(l.chars().take(300).collect());
+            });
+        }
+        TrainReport::Progress(tp) => {
+            let stored = match epochs.as_mut() {
+                Some(log) => {
+                    if log.sync(tp) {
+                        inner.set_live(&id, Some(Arc::new(tp.history.clone())));
+                    }
+                    log.stored(tp)
                 }
-            }
-            TrainReport::Line(l) => {
-                tracing::debug!(target: "blue_onyx_prism::training::child", run = %id, "{l}");
-                inner.update(&id, |r| {
-                    if r.log.len() >= LOG_TAIL {
-                        r.log.remove(0);
-                    }
-                    r.log.push(l.chars().take(300).collect());
-                });
-            }
-            TrainReport::Progress(tp) => {
-                let stored = match epochs.as_mut() {
-                    Some(log) => {
-                        if log.sync(tp) {
-                            inner.set_live(&id, Some(Arc::new(tp.history.clone())));
-                        }
-                        log.stored(tp)
-                    }
-                    None => tp.clone(),
-                };
-                inner.update(&id, |r| r.progress = Some(stored));
-            }
-            TrainReport::Batch(b) => {
-                tracing::warn!(run = %id, "out of GPU memory: retrying at batch {b}");
-                inner.set_live(&id, None);
-                inner.update_persist(&id, |r| {
-                    r.request.recipe.batch = b;
-                    r.progress = None;
-                });
-            }
-            TrainReport::Prepared(p) => {
-                inner.update_persist(&id, |r| r.dataset = Some(DatasetCounts::of(p)));
-            }
-            TrainReport::Installed(o) => {
-                inner.update_persist(&id, |r| r.output = Some(o.clone()));
-            }
-            TrainReport::Registered(m) => {
-                inner.update_persist(&id, |r| r.registered = Some(m.to_string()));
-            }
-            TrainReport::Resources(x) => {
-                inner.update_persist(&id, |r| r.resources = Some(x.clone()));
-            }
-        };
-        let runner = PausableRunner {
-            inner: inner.runner.as_ref(),
-            pause: &pause,
-        };
-        let result = super::job::run_training(
+                None => tp.clone(),
+            };
+            inner.update(&id, |r| r.progress = Some(stored));
+        }
+        TrainReport::Batch(b) => {
+            tracing::warn!(run = %id, "out of GPU memory: retrying at batch {b}");
+            inner.set_live(&id, None);
+            inner.update_persist(&id, |r| {
+                r.request.recipe.batch = b;
+                r.progress = None;
+            });
+        }
+        TrainReport::Prepared(p) => {
+            inner.update_persist(&id, |r| r.dataset = Some(DatasetCounts::of(p)));
+        }
+        TrainReport::Installed(o) => {
+            inner.update_persist(&id, |r| r.output = Some(o.clone()));
+        }
+        TrainReport::Registered(m) => {
+            inner.update_persist(&id, |r| r.registered = Some(m.to_string()));
+        }
+        TrainReport::Resources(x) => {
+            inner.update_persist(&id, |r| r.resources = Some(x.clone()));
+        }
+    };
+    let runner = PausableRunner {
+        inner: inner.runner.as_ref(),
+        pause: &pause,
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::job::run_training_or_exit(
             &job,
             &runner,
             inner.fetcher.as_ref(),
             inner.hooks.as_ref(),
             &mut report,
             &flag,
-        );
-        *inner.current.lock_recover() = None;
-        // Readers go to the file from now on (or to the record, which holds the epochs itself
-        // when the file could not be written).
-        inner.set_live(&id, None);
-        match result {
-            Ok(out) => {
-                tracing::info!(run = %id, model = %job.name, "training finished in {:.0} s: {}", started.elapsed().as_secs_f64(), out.output.onnx.display());
-                inner.update_persist(&id, |r| {
-                    r.state = RunState::Done;
-                    r.percent = 100;
-                    r.output = Some(out.output);
-                    r.registered = Some(out.registered);
-                    r.benchmark = out.benchmark;
-                    r.benchmark_error = out.benchmark_error;
-                    r.baseline = out.baseline;
-                    r.error = None;
-                    r.retrying = false;
-                    r.finished = Some(now());
-                });
-            }
-            Err(TrainError {
-                cancelled: true, ..
-            }) => {
-                tracing::warn!(run = %id, "training cancelled");
-                inner.update_persist(&id, |r| {
-                    // A retry goes back to its failure, unless it got as far as installing: then
-                    // that failure is over.
-                    r.state = if r.retrying && r.output.is_none() {
-                        RunState::Failed
-                    } else {
-                        RunState::Cancelled
-                    };
-                    r.retrying = false;
-                    r.finished = Some(now());
-                });
-            }
-            Err(e) => {
-                tracing::warn!(run = %id, "training failed{}: {}", e.stage.map(|s| format!(" while {}", s.label())).unwrap_or_default(), e.message);
-                inner.update_persist(&id, |r| {
-                    r.state = RunState::Failed;
-                    r.stage = e.stage;
-                    r.error = Some(e.message);
-                    r.retrying = false;
-                    r.finished = Some(now());
-                });
-            }
+            &inner.exiting,
+        )
+    }))
+    .unwrap_or_else(|p| {
+        let panic = panic_text(p.as_ref());
+        tracing::error!(run = %id, "training panicked: {panic}");
+        Err(TrainError {
+            stage: inner.stage_of(&id),
+            message: internal_error(&panic, true),
+            cancelled: false,
+        })
+    });
+    drop(clear);
+    match result {
+        Ok(out) => {
+            tracing::info!(run = %id, model = %job.name, "training finished in {:.0} s: {}", started.elapsed().as_secs_f64(), out.output.onnx.display());
+            inner.update_persist(&id, |r| {
+                r.state = RunState::Done;
+                r.percent = 100;
+                r.output = Some(out.output);
+                r.registered = Some(out.registered);
+                r.benchmark = out.benchmark;
+                r.benchmark_error = out.benchmark_error;
+                r.baseline = out.baseline;
+                r.error = None;
+                r.retrying = false;
+                r.finished = Some(now());
+            });
         }
-        if inner.stop.load(Ordering::Relaxed) {
-            return;
+        // Stopped for the process's exit: interrupted, its files kept for a retry.
+        Err(e) if inner.exiting.load(Ordering::SeqCst) => {
+            tracing::warn!(run = %id, "training interrupted: the service is stopping");
+            inner.update_persist(&id, |r| {
+                r.stage = e.stage.or(r.stage);
+                interrupt(r);
+                r.finished = Some(now());
+            });
+        }
+        Err(TrainError {
+            cancelled: true, ..
+        }) => {
+            tracing::warn!(run = %id, "training cancelled");
+            inner.update_persist(&id, |r| {
+                // A retry goes back to its failure, unless it got as far as installing: then
+                // that failure is over.
+                r.state = if r.retrying && r.output.is_none() {
+                    RunState::Failed
+                } else {
+                    RunState::Cancelled
+                };
+                r.retrying = false;
+                r.finished = Some(now());
+            });
+        }
+        Err(e) => {
+            tracing::warn!(run = %id, "training failed{}: {}", e.stage.map(|s| format!(" while {}", s.label())).unwrap_or_default(), e.message);
+            inner.update_persist(&id, |r| {
+                r.state = RunState::Failed;
+                r.stage = e.stage;
+                r.error = Some(e.message);
+                r.retrying = false;
+                r.finished = Some(now());
+            });
         }
     }
 }
@@ -1385,6 +1703,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
     let cur = Current::new(&id);
     let (flag, pause) = (cur.cancel.clone(), cur.pause.clone());
     *inner.current.lock_recover() = Some(cur);
+    let clear = ClearCurrent(inner);
     // Queued -> Running under the tasks lock, so a cancel just before the start is not lost.
     let mut start = false;
     inner.update_task(&id, |r| {
@@ -1394,7 +1713,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
         }
     });
     if !start {
-        *inner.current.lock_recover() = None;
+        drop(clear);
         inner.cancelled.lock_recover().remove(&id);
         return;
     }
@@ -1449,9 +1768,33 @@ fn run_task(inner: &Inner, t: &dyn Task) {
         runner: &runner,
         fetcher: inner.fetcher.as_ref(),
     };
-    let result = t.run(ctx, &mut report, &flag);
-    *inner.current.lock_recover() = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        t.run(ctx, &mut report, &flag)
+    }))
+    .unwrap_or_else(|p| {
+        let panic = panic_text(p.as_ref());
+        tracing::error!(job = %id, "{} panicked: {panic}", t.kind().as_str());
+        Err(anyhow::anyhow!(internal_error(&panic, false)))
+    });
+    drop(clear);
     match result {
+        // Stopped for the process's exit: interrupted (what it kept, it keeps).
+        Ok(out) if inner.exiting.load(Ordering::SeqCst) => {
+            tracing::warn!(job = %id, "{} interrupted: the service is stopping ({})", t.kind().as_str(), out.summary);
+            inner.update_persist_task(&id, |r| {
+                interrupt_task(r);
+                r.summary = Some(out.summary);
+                r.result = Some(out.result);
+                r.finished = Some(now());
+            });
+        }
+        Err(_) if inner.exiting.load(Ordering::SeqCst) => {
+            tracing::warn!(job = %id, "{} interrupted: the service is stopping", t.kind().as_str());
+            inner.update_persist_task(&id, |r| {
+                interrupt_task(r);
+                r.finished = Some(now());
+            });
+        }
         // Cancelled, but the task stopped cleanly and kept what it had (its summary says what).
         Ok(out) if flag.load(Ordering::Relaxed) => {
             tracing::warn!(job = %id, "{} cancelled: {}", t.kind().as_str(), out.summary);

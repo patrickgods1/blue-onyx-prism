@@ -14,8 +14,13 @@ const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: i32 = 1061;
 const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
 
-/// Start and stop waits (the service has its own bounded shutdown).
-const TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a stop waits for Stopped: longer than the service's own bounded stop (it reports
+/// Stopped at most `runner::SHUTDOWN_DEADLINE` after the Stop control), so a slow stop is not
+/// reported as a failure and a restart still starts the service.
+const STOP_TIMEOUT: Duration = crate::runner::SERVICE_CTL_STOP_WAIT;
+/// How long a start waits for Running: the service stays StartPending until its port is bound,
+/// at most `runner::BIND_GIVE_UP`.
+const START_TIMEOUT: Duration = crate::runner::SERVICE_CTL_START_WAIT;
 const POLL: Duration = Duration::from_millis(250);
 
 /// The Win32 error code of a `windows-service` error.
@@ -82,15 +87,26 @@ pub(super) fn control(action: Action) -> Result<ServiceState> {
         Action::Start => start(&svc, action),
         Action::Stop => stop(&svc, action),
         Action::Restart => {
-            stop(&svc, action)?;
+            // A stop still pending after its wait is not the end of a restart: `start` waits
+            // for it again and starts the service once it is down.
+            if let Err(e) = stop(&svc, action) {
+                if status(&svc)? != WinState::StopPending {
+                    return Err(e);
+                }
+                eprintln!("{e:#}; waiting for it to stop, then starting it");
+            }
             start(&svc, action)
         }
     }
 }
 
-/// Poll while `pending(state)` holds, up to [`TIMEOUT`]; returns the last state.
-fn wait_while(svc: &Service, pending: impl Fn(WinState) -> bool) -> Result<WinState> {
-    let deadline = Instant::now() + TIMEOUT;
+/// Poll while `pending(state)` holds, up to `timeout`; returns the last state.
+fn wait_while(
+    svc: &Service,
+    timeout: Duration,
+    pending: impl Fn(WinState) -> bool,
+) -> Result<WinState> {
+    let deadline = Instant::now() + timeout;
     loop {
         let state = status(svc)?;
         if !pending(state) || Instant::now() >= deadline {
@@ -102,7 +118,7 @@ fn wait_while(svc: &Service, pending: impl Fn(WinState) -> bool) -> Result<WinSt
 
 fn start(svc: &Service, action: Action) -> Result<ServiceState> {
     // A stop in progress has to finish first.
-    let state = wait_while(svc, |s| s == WinState::StopPending)?;
+    let state = wait_while(svc, STOP_TIMEOUT, |s| s == WinState::StopPending)?;
     if state == WinState::Running {
         return Ok(ServiceState::Running);
     }
@@ -121,7 +137,9 @@ fn start(svc: &Service, action: Action) -> Result<ServiceState> {
             }
         }
     }
-    let state = wait_while(svc, |s| s != WinState::Running && s != WinState::Stopped)?;
+    let state = wait_while(svc, START_TIMEOUT, |s| {
+        s != WinState::Running && s != WinState::Stopped
+    })?;
     if state == WinState::Stopped {
         bail!(
             "The service stopped right after starting. See Event Viewer > Windows Logs > \
@@ -134,7 +152,7 @@ fn start(svc: &Service, action: Action) -> Result<ServiceState> {
 
 fn stop(svc: &Service, action: Action) -> Result<ServiceState> {
     // A start in progress cannot take a stop control yet.
-    let state = wait_while(svc, |s| s == WinState::StartPending)?;
+    let state = wait_while(svc, START_TIMEOUT, |s| s == WinState::StartPending)?;
     if state == WinState::Stopped {
         return Ok(ServiceState::Stopped);
     }
@@ -154,14 +172,14 @@ fn stop(svc: &Service, action: Action) -> Result<ServiceState> {
             }
         }
     }
-    let state = wait_while(svc, |s| s != WinState::Stopped)?;
+    let state = wait_while(svc, STOP_TIMEOUT, |s| s != WinState::Stopped)?;
     if state != WinState::Stopped {
         bail!(
             "Stopping the service timed out: it is still {} after {} s. It may still be \
              shutting down; check `blue-onyx-prism service status` again, or end the process \
              in Task Manager.",
             map_state(state).label(),
-            TIMEOUT.as_secs()
+            STOP_TIMEOUT.as_secs()
         );
     }
     Ok(ServiceState::Stopped)

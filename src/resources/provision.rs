@@ -60,11 +60,19 @@ impl std::fmt::Debug for ProvisionOptions {
 }
 
 /// Owns the download manager (and the YOLO26 exporter) across registry generations.
+///
+/// The run's stop calls [`Self::stop_for_exit`] explicitly (RA restart-2): the exporter's and the
+/// manager's own `Drop` would only run once the last `Arc` of this provisioner goes, which a
+/// process-wide holder can delay past the process exit. After the stop both stay in their
+/// slots, stopped: a late caller gets an exporter that refuses new exports and a manager whose
+/// jobs fail at once, never a fresh thread that would outlive the stop.
 #[derive(Debug)]
 pub struct Provisioner {
     manager: std::sync::Mutex<Option<Arc<Manager>>>,
     exporter: std::sync::Mutex<Option<Arc<super::export::Exporter>>>,
     opts: ProvisionOptions,
+    /// [`Self::stop_for_exit`] ran.
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Provisioner {
@@ -74,11 +82,35 @@ impl Default for Provisioner {
 }
 
 impl Provisioner {
-    /// The process is stopping (audit 2026-11 phase 1, step 1 of the stop): cancel a running
-    /// or queued model export and its child tree and stop the download thread, without waiting
-    /// past `deadline`. Idempotent. Phase 1 stub: implemented by the resources work.
+    /// The process (or this run, for an in-process restart) is stopping (audit 2026-11 phase 1,
+    /// step 1 of the stop): cancel every queued and the running model export (its process tree
+    /// is killed and its staging removed, as on a user cancel; the export's in-flight download
+    /// is cancelled with it) and stop the download thread (the running download keeps its
+    /// `.partial` for the next start), without waiting past `deadline`. Both are signalled
+    /// first and then joined, so they stop in parallel. Idempotent.
     pub fn stop_for_exit(&self, deadline: std::time::Instant) {
-        let _ = deadline;
+        use std::sync::atomic::Ordering;
+        self.stopped.store(true, Ordering::SeqCst);
+        let exporter = self.exporter();
+        let manager = self.manager();
+        if let Some(e) = &exporter {
+            e.request_stop();
+        }
+        if let Some(m) = &manager {
+            m.request_stop();
+        }
+        if let Some(e) = &exporter
+            && !e.shutdown_by(deadline)
+        {
+            warn!("the model export did not stop before the service's stop deadline");
+        }
+        if let Some(m) = &manager {
+            m.shutdown_by(deadline);
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn new() -> Self {
@@ -90,6 +122,7 @@ impl Provisioner {
             manager: std::sync::Mutex::new(None),
             exporter: std::sync::Mutex::new(None),
             opts,
+            stopped: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -116,6 +149,10 @@ impl Provisioner {
             ),
         };
         let e = Arc::new(super::export::Exporter::start(runner, fetcher));
+        if self.is_stopped() {
+            // Started after the stop (a late request): refuses every export.
+            e.request_stop();
+        }
         *slot = Some(e.clone());
         e
     }
@@ -149,6 +186,10 @@ impl Provisioner {
             mo.backoff = b;
         }
         let m = Arc::new(Manager::start(mo));
+        if self.is_stopped() {
+            // Started after the stop (a late request): its jobs fail at once.
+            m.shutdown_by(std::time::Instant::now());
+        }
         *slot = Some(m.clone());
         m
     }

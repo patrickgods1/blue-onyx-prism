@@ -6,6 +6,13 @@
 //! settings each tick so a config change applies without a restart. The dataset is pruned on
 //! the collector's own thread (its only writer): the sweeper asks it to. The same thread runs the
 //! storage sweep of rebuildable files once a day ([`crate::storage::sweep`]).
+//!
+//! Stopping (audit 2026-11 phase 1): the dataset prune checks the collector's stop flag
+//! ([`crate::collect::stop_requested`]) between two frames and handles one day at a time, its
+//! `index.jsonl` rewritten as soon as that day's frames are gone, so a stop (or a kill) mid-prune
+//! leaves no index line naming a deleted frame outside the day in hand. The storage sweep gets the
+//! sweeper's cancel token and checks it between items. [`join_within`] is the bounded join of a
+//! stopping thread.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -75,6 +82,8 @@ pub struct PruneReport {
     pub remaining: usize,
     /// The dataset's size after this pass ([`prune_dataset`] only).
     pub usage: DatasetUsage,
+    /// The pass ended early for a stop ([`prune_dataset_until`]); the rest goes at the next one.
+    pub stopped: bool,
 }
 
 /// How the dataset folder's frames (image + sidecar, label files not counted) divide up. The size
@@ -155,16 +164,21 @@ pub fn prune_saved_images(dir: &Path, max_age_days: u32, max_mb: u64) -> Result<
 
 /// The frames of the dataset folder `dir` retention may delete, as (path, modified, bytes), and
 /// how the folder divides up. With `clean`, temporary files of an interrupted write older than an
-/// hour are removed on the way.
+/// hour are removed on the way. `stop` is asked between two day folders: once it says yes the walk
+/// ends there, incomplete (the caller checks `stop` again).
 fn walk_dataset(
     dir: &Path,
     now: SystemTime,
     clean: bool,
+    stop: &dyn Fn() -> bool,
 ) -> (Vec<(PathBuf, SystemTime, u64)>, DatasetUsage) {
     use crate::collect::{labels, layout};
     let mut entries = Vec::new();
     let mut usage = DatasetUsage::default();
     for day in layout::day_dirs(dir) {
+        if stop() {
+            break;
+        }
         let Ok(rd) = std::fs::read_dir(&day) else {
             continue;
         };
@@ -216,7 +230,7 @@ fn walk_dataset(
 /// How the frames of the dataset folder `dir` divide up (reads every label file; call it off the
 /// async runtime). A missing folder is empty.
 pub fn dataset_usage(dir: &Path) -> DatasetUsage {
-    walk_dataset(dir, SystemTime::now(), false).1
+    walk_dataset(dir, SystemTime::now(), false, &|| false).1
 }
 
 /// Delete the oldest frames of the dataset folder `dir` (`<scene>/<camera>/<date>/<stem>.jpg`
@@ -229,88 +243,153 @@ pub fn dataset_usage(dir: &Path) -> DatasetUsage {
 /// never `review-queue.jsonl`); temporary files of an interrupted write older than an hour go
 /// too. A missing folder is not an error. Frames are written only by the collector thread, where
 /// this runs; label files can change at any time, so each frame's is read again, under the label
-/// write lock, right before the frame goes.
+/// write lock, right before the frame goes. Stops between two frames when the collector thread
+/// running it is asked to stop ([`crate::collect::stop_requested`]; never elsewhere).
 pub fn prune_dataset(dir: &Path, max_age_days: u32, max_bytes: u64) -> Result<PruneReport> {
-    use crate::collect::{labels, layout};
+    prune_dataset_until(
+        dir,
+        max_age_days,
+        max_bytes,
+        &crate::collect::stop_requested,
+    )
+}
+
+/// [`prune_dataset`], asking `stop` between two frames (and between two day folders of the walk):
+/// once it says yes the pass ends with [`PruneReport::stopped`]. The doomed frames go one day
+/// folder at a time, the days in the order of their oldest doomed frame, and each day's index is
+/// rewritten (and its emptied folders removed) as soon as its frames are gone, before the next
+/// day starts: a stop, or a kill, leaves at most the day in hand with index lines of deleted
+/// frames, and the readers skip a line whose image is gone.
+pub fn prune_dataset_until(
+    dir: &Path,
+    max_age_days: u32,
+    max_bytes: u64,
+    stop: &dyn Fn() -> bool,
+) -> Result<PruneReport> {
+    use crate::collect::labels;
+    use std::collections::HashMap;
     if !dir.is_dir() {
         return Ok(PruneReport::default());
     }
     let now = SystemTime::now();
-    let (entries, mut usage) = walk_dataset(dir, now, true);
+    let (entries, mut usage) = walk_dataset(dir, now, true, stop);
+    if stop() {
+        // The walk may be incomplete: a cap decided on it would be wrong.
+        tracing::info!(
+            "dataset retention of {} stopped before it deleted anything (the service is \
+             stopping); the next pass applies the caps",
+            dir.display()
+        );
+        return Ok(PruneReport {
+            remaining: entries.len(),
+            usage,
+            stopped: true,
+            ..PruneReport::default()
+        });
+    }
     let age =
         (max_age_days > 0).then(|| Duration::from_secs(u64::from(max_age_days) * SECS_PER_DAY));
     let cap = (max_bytes > 0).then_some(max_bytes);
     let doomed = plan_prune(&entries, now, age, cap);
+    let sizes: HashMap<&Path, u64> = entries.iter().map(|e| (e.0.as_path(), e.2)).collect();
     let mut report = PruneReport {
         remaining: entries.len(),
         ..PruneReport::default()
     };
-    let mut touched: Vec<PathBuf> = Vec::new();
+    // One day folder at a time, oldest doomed frame first.
+    let mut days: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+    let mut day_of: HashMap<PathBuf, usize> = HashMap::new();
     for path in doomed {
-        let size = entries.iter().find(|e| e.0 == path).map_or(0, |e| e.2);
-        let label_file = labels::path_of_frame(&path);
-        let removed = labels::unless_protected(&label_file, || {
-            std::fs::remove_file(&path)?;
-            for extra in [path.with_extension("json"), label_file.clone()] {
-                if let Err(e) = std::fs::remove_file(&extra)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    tracing::debug!("retention: removing {}: {e}", extra.display());
-                }
-            }
-            Ok::<(), std::io::Error>(())
+        let day = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let at = *day_of.entry(day.clone()).or_insert_with(|| {
+            days.push((day, Vec::new()));
+            days.len() - 1
         });
-        match removed {
-            // A reviewer got to it during this pass.
-            None => {
-                usage.prunable_bytes = usage.prunable_bytes.saturating_sub(size);
-                usage.protected_bytes = usage.protected_bytes.saturating_add(size);
-                usage.protected_frames += 1;
-                report.remaining = report.remaining.saturating_sub(1);
+        if let Some((_, frames)) = days.get_mut(at) {
+            frames.push(path);
+        }
+    }
+    for (day, frames) in &days {
+        let mut deleted_here = false;
+        for path in frames {
+            if stop() {
+                report.stopped = true;
+                break;
             }
-            Some(Ok(())) => {
-                usage.prunable_bytes = usage.prunable_bytes.saturating_sub(size);
-                report.deleted += 1;
-                report.freed_bytes = report.freed_bytes.saturating_add(size);
-                report.remaining = report.remaining.saturating_sub(1);
-                if let Some(day) = path.parent()
-                    && !touched.iter().any(|t| t == day)
-                {
-                    touched.push(day.to_path_buf());
+            let size = sizes.get(path.as_path()).copied().unwrap_or(0);
+            let label_file = labels::path_of_frame(path);
+            let removed = labels::unless_protected(&label_file, || {
+                std::fs::remove_file(path)?;
+                for extra in [path.with_extension("json"), label_file.clone()] {
+                    if let Err(e) = std::fs::remove_file(&extra)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::debug!("retention: removing {}: {e}", extra.display());
+                    }
+                }
+                Ok::<(), std::io::Error>(())
+            });
+            match removed {
+                // A reviewer got to it during this pass.
+                None => {
+                    usage.prunable_bytes = usage.prunable_bytes.saturating_sub(size);
+                    usage.protected_bytes = usage.protected_bytes.saturating_add(size);
+                    usage.protected_frames += 1;
+                    report.remaining = report.remaining.saturating_sub(1);
+                }
+                Some(Ok(())) => {
+                    usage.prunable_bytes = usage.prunable_bytes.saturating_sub(size);
+                    report.deleted += 1;
+                    report.freed_bytes = report.freed_bytes.saturating_add(size);
+                    report.remaining = report.remaining.saturating_sub(1);
+                    deleted_here = true;
+                }
+                Some(Err(e)) => {
+                    report.failed += 1;
+                    tracing::debug!("retention: removing {}: {e}", path.display());
                 }
             }
-            Some(Err(e)) => {
-                report.failed += 1;
-                tracing::debug!("retention: removing {}: {e}", path.display());
-            }
+        }
+        if deleted_here {
+            finish_day(day);
+        }
+        if report.stopped {
+            break;
         }
     }
     report.usage = usage;
-    for day in &touched {
-        if let Err(e) = layout::rewrite_index(day) {
-            tracing::warn!("dataset retention: {e:#}");
-        }
-        // Emptied day, camera and scene folders (remove_dir fails on a non-empty one).
-        let mut p = Some(day.as_path());
-        for _ in 0..3 {
-            let Some(d) = p else { break };
-            if std::fs::remove_dir(d).is_err() {
-                break;
-            }
-            p = d.parent();
-        }
-    }
-    if report.deleted > 0 || report.failed > 0 {
+    if report.deleted > 0 || report.failed > 0 || report.stopped {
         tracing::info!(
-            "dataset in {}: deleted {} frame(s) ({} MB), {} failed, {} left",
+            "dataset in {}: deleted {} frame(s) ({} MB), {} failed, {} left{}",
             dir.display(),
             report.deleted,
             report.freed_bytes / BYTES_PER_MB,
             report.failed,
-            report.remaining
+            report.remaining,
+            if report.stopped {
+                "; stopped early because the service is stopping, the next pass goes on"
+            } else {
+                ""
+            }
         );
     }
     Ok(report)
+}
+
+/// After frames of `day` were deleted: its index without them, and the emptied day, camera and
+/// scene folders removed (`remove_dir` fails on a non-empty one).
+fn finish_day(day: &Path) {
+    if let Err(e) = crate::collect::layout::rewrite_index(day) {
+        tracing::warn!("dataset retention: {e:#}");
+    }
+    let mut p = Some(day);
+    for _ in 0..3 {
+        let Some(d) = p else { break };
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        p = d.parent();
+    }
 }
 
 /// A warning text when the file system holding `data_root` has less than `min_free_mb` MB
@@ -370,8 +449,13 @@ fn storage_due(last: Option<Instant>, now: Instant) -> bool {
 }
 
 /// One sweep: prune the saved images, then check free space (`last_warn` throttles the log),
-/// then the storage sweep when it is due (`last_storage`).
-fn sweep(cfg: &SweeperConfig, last_warn: &mut Option<Instant>, last_storage: &mut Option<Instant>) {
+/// then the storage sweep when it is due (`last_storage`), which checks `shutdown` between items.
+fn sweep(
+    cfg: &SweeperConfig,
+    last_warn: &mut Option<Instant>,
+    last_storage: &mut Option<Instant>,
+    shutdown: &CancellationToken,
+) {
     if let Some(dir) = &cfg.save_image_dir
         && let Err(e) = prune_saved_images(dir, cfg.max_age_days, cfg.max_mb)
     {
@@ -394,7 +478,7 @@ fn sweep(cfg: &SweeperConfig, last_warn: &mut Option<Instant>, last_storage: &mu
         let now = Instant::now();
         if storage_due(*last_storage, now) {
             *last_storage = Some(now);
-            crate::storage::sweep::run(st);
+            crate::storage::sweep::run(st, shutdown);
         }
     }
 }
@@ -415,7 +499,9 @@ fn nap(total: Duration, shutdown: &CancellationToken) -> bool {
 /// Run [`prune_saved_images`] and the free-space check every [`SWEEP_INTERVAL`] (first after
 /// [`FIRST_SWEEP_DELAY`]), and the storage sweep once a day, until `shutdown`. `settings` is called on every tick, so config
 /// changes apply at once. The thread runs below normal priority
-/// ([`crate::backend::priority::lower_this_thread`]).
+/// ([`crate::backend::priority::lower_this_thread`]). Once `shutdown` is cancelled the thread
+/// ends within one item of the storage sweep or one saved-image prune; join it with
+/// [`join_within`].
 #[allow(
     clippy::expect_used,
     reason = "the OS can create one more thread; without it the sweeper cannot exist, and it \
@@ -435,11 +521,31 @@ pub fn spawn_sweeper(
             let mut last_storage = None;
             let mut delay = FIRST_SWEEP_DELAY;
             while nap(delay, &shutdown) {
-                sweep(&settings(), &mut last_warn, &mut last_storage);
+                sweep(&settings(), &mut last_warn, &mut last_storage, &shutdown);
                 delay = SWEEP_INTERVAL;
             }
         })
         .expect("spawning the retention thread (OS thread limit or out of memory)")
+}
+
+/// Join `handle` if its thread ends by `deadline` (polled every 10 ms; std has no timed join).
+/// Err(handle) when it is still running then: the caller warns and leaves it (detached when the
+/// handle drops). A thread that panicked counts as ended, with a warning naming `what`.
+pub fn join_within(
+    handle: std::thread::JoinHandle<()>,
+    deadline: Instant,
+    what: &str,
+) -> std::result::Result<(), std::thread::JoinHandle<()>> {
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return Err(handle);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if handle.join().is_err() {
+        tracing::warn!("the {what} thread panicked while stopping");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -740,6 +846,103 @@ mod tests {
             prune_dataset(&p.join("missing"), 1, 1).unwrap(),
             PruneReport::default()
         );
+    }
+
+    /// Audit 2026-11 phase 1: a stop between two frames ends the pass there, and every day whose
+    /// frames went has its index rewritten before the next day starts.
+    #[test]
+    fn a_stopped_prune_ends_between_frames_with_each_days_index_in_step() {
+        use crate::collect::layout::{INDEX_FILE, read_index};
+        let d = Tmp::new();
+        let p = d.path();
+        let (day1, day2) = (p.join("ir/cam/2026-01-01"), p.join("ir/cam/2026-01-02"));
+        for (stem, age) in [("a", 30), ("b", 29), ("c", 28)] {
+            dataset_frame(p, "ir/cam/2026-01-01", stem, 100, age);
+        }
+        for (stem, age) in [("d", 20), ("e", 19), ("f", 18)] {
+            dataset_frame(p, "ir/cam/2026-01-02", stem, 100, age);
+        }
+        let ids = |day: &Path| -> Vec<String> {
+            read_index(&day.join(INDEX_FILE))
+                .into_iter()
+                .map(|l| l.id)
+                .collect()
+        };
+        // Stop once "b" is gone: "c" (same day) and the second day stay.
+        let stop = || !day1.join("b.jpg").exists();
+        let r = prune_dataset_until(p, 0, 1, &stop).unwrap();
+        assert!(r.stopped);
+        assert_eq!((r.deleted, r.remaining), (2, 4));
+        assert_eq!(
+            ids(&day1),
+            ["c"],
+            "the day in hand is rewritten at the stop"
+        );
+        assert_eq!(ids(&day2), ["d", "e", "f"]);
+        assert!(day2.join("d.jpg").is_file());
+
+        // A stop right after the first day: its index (and folder) are done before the next day.
+        let seen_at_stop = std::cell::RefCell::new(None);
+        let stop = || {
+            let gone = !day1.join("c.jpg").exists();
+            if gone && seen_at_stop.borrow().is_none() {
+                *seen_at_stop.borrow_mut() = Some((day1.exists(), ids(&day2)));
+            }
+            gone
+        };
+        let r = prune_dataset_until(p, 0, 1, &stop).unwrap();
+        assert!(r.stopped);
+        assert_eq!(r.deleted, 1);
+        assert_eq!(
+            seen_at_stop.into_inner(),
+            Some((false, vec!["d".to_string(), "e".into(), "f".into()])),
+            "the emptied day was finished before the stop was asked again"
+        );
+
+        // A stop asked before anything: nothing goes, and the next pass does the rest.
+        let r = prune_dataset_until(p, 0, 1, &|| true).unwrap();
+        assert!(r.stopped);
+        assert_eq!((r.deleted, r.remaining), (0, 0), "the walk itself stopped");
+        let r = prune_dataset(p, 0, 1).unwrap();
+        assert!(!r.stopped);
+        assert_eq!(r.deleted, 3);
+        assert!(!day2.exists());
+    }
+
+    /// The collector thread's flag reaches [`prune_dataset`] through the thread it runs on only.
+    #[test]
+    fn prune_dataset_follows_the_stop_flag_of_its_own_thread() {
+        let d = Tmp::new();
+        let p = d.path();
+        dataset_frame(p, "ir/cam/2026-01-01", "a", 100, 3);
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        crate::collect::bind_stop(Some(flag.clone()));
+        let r = prune_dataset(p, 0, 1).unwrap();
+        assert!(r.stopped && r.deleted == 0);
+        // Another thread has no flag.
+        let other = p.to_path_buf();
+        let r = std::thread::spawn(move || prune_dataset(&other, 0, 1).unwrap())
+            .join()
+            .unwrap();
+        assert!(!r.stopped && r.deleted == 1);
+        crate::collect::bind_stop(None);
+    }
+
+    #[test]
+    fn join_within_waits_for_a_thread_that_ends_and_gives_up_on_one_that_does_not() {
+        let quick = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(20)));
+        assert!(join_within(quick, Instant::now() + Duration::from_secs(10), "t").is_ok());
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let started = Instant::now();
+        let back = join_within(stuck, Instant::now() + Duration::from_millis(50), "t").unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        tx.send(()).unwrap();
+        back.join().unwrap();
+        let panics = std::thread::spawn(|| panic!("test panic"));
+        assert!(join_within(panics, Instant::now() + Duration::from_secs(10), "t").is_ok());
     }
 
     #[cfg(unix)]

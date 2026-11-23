@@ -31,10 +31,13 @@
          config, logs and saved images are 0640 / 0750). -->
     <key>Umask</key>
     <integer>23</integer>
-    <!-- Seconds launchd waits after SIGTERM before SIGKILL: time for the graceful drain of
-         in-flight detections (the same 30 s as the Docker stop_grace_period). -->
+    <!-- Seconds launchd waits after SIGTERM before SIGKILL. The daemon bounds its own stop at
+         60 s (jobs, requests, sessions and the log; src/runner.rs, "Stopping"); 75 s leaves that
+         end to it (the same as systemd's TimeoutStopSec and Docker's stop_grace_period).
+         scripts/launchd_common.sh, scripts/uninstall_launchd.sh and `service stop` wait longer
+         than this; a test in src/runner/stop checks them together. -->
     <key>ExitTimeOut</key>
-    <integer>30</integer>
+    <integer>75</integer>
     <!-- At most one restart every 10 s after a crash (the launchd default, stated explicitly). -->
     <key>ThrottleInterval</key>
     <integer>10</integer>

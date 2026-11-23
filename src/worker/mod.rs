@@ -206,6 +206,29 @@ pub const MAX_QUEUE_SIZE: usize = 1024;
 /// How often a blocked worker re-checks the shutdown token.
 const POLL: Duration = Duration::from_millis(250);
 
+/// How often [`lock_unless_cancelled`] tries the lock again.
+const LOCK_POLL: Duration = Duration::from_millis(20);
+
+/// Lock `m`, giving up once `stop` is cancelled (None). std has no timed or cancellable
+/// mutex lock, so a held lock is tried again every [`LOCK_POLL`]: a worker queued behind
+/// another model's compile (the runtimes lock is held for the whole compile, minutes on a first
+/// GPU compile) can still leave when it is stopped. A free lock is taken even when `stop` is
+/// cancelled; the caller checks the token again before it starts work under the lock.
+pub(crate) fn lock_unless_cancelled<'a, T>(
+    m: &'a Mutex<T>,
+    stop: &CancellationToken,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    loop {
+        if let Some(g) = m.try_lock_recover() {
+            return Some(g);
+        }
+        if stop.is_cancelled() {
+            return None;
+        }
+        std::thread::sleep(LOCK_POLL);
+    }
+}
+
 /// Everything a worker needs to load and run one model. Paths are already resolved.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -281,6 +304,9 @@ pub(crate) struct TestFaults {
     pub(crate) warmup_timeout: Option<Duration>,
     /// See [`LoadFault`].
     pub(crate) load: Option<LoadFault>,
+    /// Runs right after a candidate's compile returned (still under the runtimes lock): a
+    /// cancel here is one that arrived during a compile, which cannot be interrupted.
+    pub(crate) compiled: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The image saver to use instead of the process-wide one (e.g. one without a thread, so
     /// a test sees what is queued).
     pub(crate) saver: Option<Arc<save::Saver>>,
@@ -1024,7 +1050,7 @@ pub fn spawn_worker_after(
     let name = cfg.name.clone();
     let join = std::thread::Builder::new()
         .name(format!("worker-{name}"))
-        .spawn(move || ctx.run(receiver, after));
+        .spawn(move || ctx.run_contained(receiver, after));
     let join = match join {
         Ok(j) => Some(j),
         Err(e) => {
