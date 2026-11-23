@@ -118,6 +118,7 @@ pub struct AppState {
     /// The run's stop request (Ctrl-C, SIGTERM, the service's Stop): cancelled once when the
     /// process is going away, never by a generation restart. Long jobs that a restart must not
     /// cut off (a dataset export, an X-AnyLabeling import) stop on this one.
+    #[allow(dead_code, reason = "read by the phase 1 stop work (audit 2026-11)")]
     pub(crate) shutdown: CancellationToken,
     /// Download manager and this generation's provisioning plan (None in tests that do not
     /// exercise resources).

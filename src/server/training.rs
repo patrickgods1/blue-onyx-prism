@@ -61,6 +61,7 @@ pub(super) async fn own_queue(state: &Arc<AppState>) -> tokio::sync::MutexGuard<
 /// user Cancel), leave queued records retryable, shut the queue down and empty the slot so a
 /// later run starts a fresh queue on its own state. Returns by `deadline`. Idempotent. Phase 1
 /// stub: implemented by the training-queue work.
+#[allow(dead_code, reason = "called by the phase 1 stop work (audit 2026-11)")]
 pub(crate) fn stop_for_exit(deadline: std::time::Instant) {
     let _ = deadline;
 }
