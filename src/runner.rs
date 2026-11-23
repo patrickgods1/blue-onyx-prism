@@ -135,7 +135,13 @@ const _: () = {
     assert!(SERVICE_MANAGER_STOP.as_secs() >= SHUTDOWN_DEADLINE.as_secs() + 15);
     assert!(SERVICE_CTL_STOP_WAIT.as_secs() >= SERVICE_MANAGER_STOP.as_secs() + 10);
     assert!(SERVICE_CTL_START_WAIT.as_secs() >= BIND_GIVE_UP.as_secs() + 15);
+    // The registry bounds its own shutdown by one join deadline; the budget must cover it.
+    assert!(crate::registry::RETIRE_JOIN.as_secs() <= REGISTRY_STOP.as_secs());
 };
+
+/// How long dropping the retention sweeper waits for its thread: the storage sweep stops
+/// between two items, so only the item in hand is left to finish.
+const SWEEPER_JOIN: Duration = Duration::from_secs(2);
 
 /// Build the tokio runtime the server runs on: two worker threads (handlers are short; the point
 /// is that one slow handler cannot stall the detection routes) plus the blocking pool that
@@ -422,10 +428,9 @@ impl Sweeper {
 impl Drop for Sweeper {
     fn drop(&mut self) {
         self.stop.cancel();
-        if let Some(j) = self.join.take()
-            && j.join().is_err()
-        {
-            warn!("retention sweeper panicked");
+        if let Some(j) = self.join.take() {
+            // Past the deadline the thread is left to finish its item (logged by join_within).
+            let _ = crate::retention::join_within(j, Instant::now() + SWEEPER_JOIN, "retention");
         }
     }
 }

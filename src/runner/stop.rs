@@ -46,6 +46,29 @@ pub(crate) trait StopTargets: Send + Sync + 'static {
     fn flush_auth(&self);
 }
 
+/// The warning for a benchmark thread still busy after its stop wait (`waited`): it names the
+/// device and how long the run had been going, and says the breadcrumb stays.
+pub(crate) fn abandoned_benchmark(
+    running: Option<&crate::benchmark::service::Running>,
+    waited: Duration,
+) -> String {
+    let device = running
+        .and_then(|r| r.progress.as_ref())
+        .map(|p| p.device.as_str())
+        .filter(|d| !d.is_empty())
+        .unwrap_or("its device");
+    let age = running
+        .and_then(|r| r.started)
+        .map(|s| format!(" (the run started {} s ago)", s.elapsed().as_secs()))
+        .unwrap_or_default();
+    format!(
+        "benchmark thread abandoned on {device} after {} s: still compiling or hung{age}. Its \
+         breadcrumb stays, so the next start names {device}; if the machine hangs again, leave \
+         that device out of benchmarks",
+        waited.as_secs()
+    )
+}
+
 /// The three step-1 hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Hook {
@@ -263,44 +286,13 @@ impl StopTargets for ProcessTargets {
         }
     }
     fn wait_benchmark(&self, deadline: Instant) -> bool {
-        let started = Instant::now();
-        let idle = self
-            .benchmark
-            .wait_idle(deadline.saturating_duration_since(started));
-        if !idle {
-            warn!(
-                "{}",
-                abandoned_benchmark(self.benchmark.running().as_ref(), started.elapsed())
-            );
-        }
-        idle
+        // Cancels, waits, and on a timeout marks the run's breadcrumb as stopped-while-running
+        // and warns with the device (`BenchmarkService::stop_for_exit`).
+        self.benchmark.stop_for_exit(deadline)
     }
     fn flush_auth(&self) {
         self.auth.flush(crate::accounts::now(), true);
     }
-}
-
-/// The warning for a benchmark thread still busy after its stop wait (`waited`): it names the
-/// device and how long the run had been going, and says the breadcrumb stays.
-pub(crate) fn abandoned_benchmark(
-    running: Option<&crate::benchmark::service::Running>,
-    waited: Duration,
-) -> String {
-    let device = running
-        .and_then(|r| r.progress.as_ref())
-        .map(|p| p.device.as_str())
-        .filter(|d| !d.is_empty())
-        .unwrap_or("its device");
-    let age = running
-        .and_then(|r| r.started)
-        .map(|s| format!(" (the run started {} s ago)", s.elapsed().as_secs()))
-        .unwrap_or_default();
-    format!(
-        "benchmark thread abandoned on {device} after {} s: still compiling or hung{age}. Its \
-         breadcrumb stays, so the next start names {device}; if the machine hangs again, leave \
-         that device out of benchmarks",
-        waited.as_secs()
-    )
 }
 
 /// The data roots this process's runs used (where their children are recorded).

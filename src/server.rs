@@ -71,7 +71,6 @@ mod training_tasks;
 pub(crate) use apply::{apply_config, reload_models, sync_config};
 pub(crate) use auth::{FailureLimit, Logins};
 // Step 1 of the runner's stop timeline (`runner::stop`).
-pub(crate) use training::stop_for_exit as stop_training_for_exit;
 use config_page::{
     ConfigView, MessageTemplate, config_loglevel, config_models, config_models_remove, config_page,
     config_restart, config_submit, encode_uri_component, global_device_label, save_config,
@@ -92,6 +91,7 @@ use resources::{
     models_add, resources_add_to_config, resources_download, resources_export,
     resources_export_cancel, resources_json, resources_remove,
 };
+pub(crate) use training::stop_for_exit as stop_training_for_exit;
 
 pub struct AppState {
     pub(crate) registry: Arc<ModelRegistry>,

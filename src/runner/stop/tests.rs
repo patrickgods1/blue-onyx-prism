@@ -306,26 +306,6 @@ fn the_orphan_sweep_runs_once_per_data_root() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-#[test]
-fn an_abandoned_benchmark_names_its_device() {
-    let running = crate::benchmark::service::Running {
-        models: vec![],
-        progress: Some(crate::benchmark::service::ProgressView {
-            device: "openvino:gpu.0".into(),
-            ..Default::default()
-        }),
-        started: Some(Instant::now()),
-    };
-    let msg = abandoned_benchmark(Some(&running), Duration::from_secs(15));
-    assert!(
-        msg.contains("abandoned on openvino:gpu.0 after 15 s"),
-        "{msg}"
-    );
-    assert!(msg.contains("breadcrumb stays"), "{msg}");
-    let msg = abandoned_benchmark(None, Duration::from_secs(30));
-    assert!(msg.contains("abandoned on its device after 30 s"), "{msg}");
-}
-
 /// The repository file `rel` (deploy files, scripts, sources).
 fn repo_file(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
@@ -392,4 +372,24 @@ fn service_manager_stop_budgets_cover_the_app_s_hard_bound() {
     // The Windows installers set the preshutdown timeout through the service binary.
     let ps1 = repo_file("scripts/install_service.ps1");
     assert!(ps1.contains("--set-preshutdown-timeout"));
+}
+
+#[test]
+fn an_abandoned_benchmark_names_its_device() {
+    let running = crate::benchmark::service::Running {
+        models: vec![],
+        progress: Some(crate::benchmark::service::ProgressView {
+            device: "openvino:gpu.0".into(),
+            ..Default::default()
+        }),
+        started: Some(Instant::now()),
+    };
+    let msg = abandoned_benchmark(Some(&running), Duration::from_secs(15));
+    assert!(
+        msg.contains("abandoned on openvino:gpu.0 after 15 s"),
+        "{msg}"
+    );
+    assert!(msg.contains("breadcrumb stays"), "{msg}");
+    let msg = abandoned_benchmark(None, Duration::from_secs(30));
+    assert!(msg.contains("abandoned on its device after 30 s"), "{msg}");
 }
