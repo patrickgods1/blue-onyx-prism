@@ -18,6 +18,10 @@
 //!    beside it instead and swapped in by the next process that loads it (`in_use`).
 //! 6. Optionally mark an ONNX Runtime flavor active (`onnxruntime/active.txt`).
 //!
+//! What an interrupted install leaves (`.partial` files, staging and set-aside folders, verified
+//! archives nothing needs any more) is cleaned by `leftovers` under the same lock: when the download
+//! thread starts, and from the storage sweep at startup and once a day ([`sweep_stale`]).
+//!
 //! Failures are retried with a 30 s -> 5 min exponential backoff ([`backoff`]) when
 //! [`ManagerOptions::retry`] is set (the service); the CLI fails fast. Retries are bounded by
 //! [`ManagerOptions::max_attempts`] (the service uses [`SERVICE_MAX_ATTEMPTS`], 12 attempts over
@@ -868,7 +872,6 @@ impl Manager {
                   process cannot work at all, so failing to spawn is a controlled abort"
     )]
     pub fn start(opts: ManagerOptions) -> Self {
-        cleanup_stale(&opts.root, SystemTime::now());
         let shared = Arc::new(Shared {
             opts,
             statuses: Mutex::new(BTreeMap::new()),
@@ -1188,9 +1191,12 @@ pub fn install_all(opts: ManagerOptions, jobs: Vec<Job>) -> Result<Vec<Status>> 
 }
 
 mod in_use;
+mod leftovers;
 mod progress;
 mod worker;
 
+pub(crate) use in_use::apply_pending;
 pub use in_use::{before_load, pending_dir, staged_version};
+pub(crate) use leftovers::{recover_missing, runtime_targets, set_aside_name, sweep_stale};
 pub use progress::*;
 pub use worker::*;

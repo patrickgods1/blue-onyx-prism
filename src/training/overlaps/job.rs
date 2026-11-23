@@ -6,6 +6,10 @@
 //! like a finished run's (no cancel checks in the write stage) and a rerun skips the pairs with an
 //! answer. A cancel returns `Ok` with a "stopped by Cancel" summary; a failure returns its error, with
 //! how many crops were kept.
+//!
+//! The work folder is held busy while the check runs ([`crate::storage::Busy`]) and removed when
+//! it ends; a removal that fails (a file still open) leaves it with its marker to the next storage
+//! sweep.
 
 use super::OverlapsRequest;
 use super::select::{self, Selection};
@@ -316,8 +320,8 @@ impl Task for OverlapsJob {
         cancel: &AtomicBool,
     ) -> Result<TaskOutcome> {
         // Until this returns, a storage sweep leaves `work` alone; after a crash it removes it
-        // ([`crate::storage::sweep`]).
-        let _busy = crate::storage::Busy::hold(&self.work);
+        // ([`crate::storage::sweep`]), and so it does when the removal below fails.
+        let busy = crate::storage::Busy::hold(&self.work);
         let mut overridden = false;
         let r = self.stages(
             ctx,
@@ -328,7 +332,7 @@ impl Task for OverlapsJob {
             cancel,
         );
         let r = commit::noted(r, overridden);
-        let _ = crate::resources::manager::remove_any(&self.work);
+        busy.finish_removing();
         r
     }
 }

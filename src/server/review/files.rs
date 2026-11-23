@@ -11,7 +11,9 @@
 //!
 //! Stopping (audit 2026-11 phase 1): both check the run's stop token (`AppState.shutdown`)
 //! between two frames and answer 503 with what happened (an export keeps nothing of itself, an
-//! import keeps the frames it did). While they work they hold only what they need, never the
+//! import keeps the frames it did). An export cut off by a kill or a crash instead leaves its
+//! scratch folder, which it records first in the training folder's
+//! [`crate::storage::sweep::EXPORTS_PENDING_DIR`], so the next storage sweep removes it. While they work they hold only what they need, never the
 //! `AppState`: a long export must not keep the stop's last drops (the provisioner, the log
 //! guard) from happening.
 
@@ -291,11 +293,22 @@ pub(in crate::server) async fn export(
             }),
         };
         let (side, shutdown) = (state.side_jobs.clone(), state.shutdown.clone());
+        // Where the export notes its scratch folder, so a sweep after a crash or a kill finds it
+        // in a folder of the user's choice too.
+        let pending = crate::training::training_dir(&state.config_read())
+            .join(crate::storage::sweep::EXPORTS_PENDING_DIR);
         drop(state);
         let job = side.start(SideKind::DatasetExport, export_title(&req));
         let progress = |s| job.report(side_jobs::export_report(s));
         let stop = || shutdown.is_cancelled();
-        let result = export::run_filtered_until(&dir, &classes, &req, &filter, &progress, &stop);
+        let result = export::run_filtered_recorded(
+            &dir,
+            &classes,
+            &req,
+            &filter,
+            (&progress, &stop),
+            Some(&pending),
+        );
         drop(job);
         match result {
             Ok(r) => {

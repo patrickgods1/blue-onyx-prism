@@ -5,8 +5,10 @@
 //! - Ultralytics: `run/weights/best.pt`, else `last.pt`, written after every epoch;
 //! - RF-DETR: `rfdetr-out/checkpoint_best_total.pth` once training ended, else the running best
 //!   `checkpoint_best_ema.pth` / `checkpoint_best_regular.pth` beside `training_config.json`;
-//! - transformers (RT-DETRv2, D-FINE): `hf-best/`, which the script saves at every new best epoch.
-//!   Runs of older versions kept nothing on disk: nothing to retry.
+//! - transformers (RT-DETRv2, D-FINE): `hf-best/`, which the script saves at every new best epoch
+//!   (written as `hf-best.tmp`, the previous one set aside as `hf-best.old` before the rename);
+//!   when a crash came between those renames, `hf-best.old`, else a complete `hf-best.tmp`
+//!   ([`HF_BEST_DIRS`]). Runs of older versions kept nothing on disk: nothing to retry.
 //!
 //! A run that failed while still training gets the best epoch so far, and the row says so. Resuming
 //! the training itself is not offered: Convergence, the selection and the learning-rate bends all
@@ -34,6 +36,12 @@ pub fn work_dir(run_dir: &Path) -> PathBuf {
 /// comfortable bound for the largest family (RF-DETR L, about 500 MB).
 pub const EXPORT_BYTES: u64 = 1 << 30;
 
+/// Where a transformers run's best epoch may be, in order (`save_hf_best` in the script): the
+/// saved best; the one before it, set aside while a newer one is renamed in; a newer one written
+/// but not renamed in yet. A process that died between those renames leaves only the second and
+/// third.
+pub const HF_BEST_DIRS: [&str; 3] = ["hf-best", "hf-best.old", "hf-best.tmp"];
+
 /// The best checkpoint `trainer` left in `work` (see the module docs), if any.
 pub fn best_checkpoint(trainer: Trainer, work: &Path) -> Option<PathBuf> {
     match trainer {
@@ -57,11 +65,10 @@ pub fn best_checkpoint(trainer: Trainer, work: &Path) -> Option<PathBuf> {
             .map(|n| out.join(n))
             .find(|p| p.is_file())
         }
-        Trainer::Transformers => {
-            let dir = work.join("hf-best");
-            (dir.join("model.safetensors").is_file() && dir.join("config.json").is_file())
-                .then_some(dir)
-        }
+        Trainer::Transformers => HF_BEST_DIRS
+            .into_iter()
+            .map(|n| work.join(n))
+            .find(|d| d.join("model.safetensors").is_file() && d.join("config.json").is_file()),
     }
 }
 
@@ -343,6 +350,158 @@ mod tests {
             Some(w.join("hf-best"))
         );
         let _ = std::fs::remove_dir_all(&w);
+    }
+
+    /// A whole `save_pretrained` checkpoint holding `tag`.
+    fn hf(dir: &Path, tag: &str) {
+        put(&dir.join("model.safetensors"), 1);
+        std::fs::write(dir.join("config.json"), tag).unwrap();
+    }
+
+    /// The tag of the checkpoint the Retry export would read in `work`.
+    fn retried(work: &Path) -> Option<String> {
+        best_checkpoint(Trainer::Transformers, work)
+            .map(|d| std::fs::read_to_string(d.join("config.json")).unwrap())
+    }
+
+    /// A transformers run killed between `save_hf_best`'s renames leaves its best epoch as
+    /// `hf-best.old` (the previous best, set aside) or `hf-best.tmp` (the new one, not renamed in):
+    /// the Retry export takes `hf-best`, then `hf-best.old`, then `hf-best.tmp`, each only whole.
+    #[test]
+    fn a_transformers_checkpoint_caught_between_renames_is_still_found() {
+        let w = tmp("hf-fallback");
+        put(&w.join("hf-best.tmp/config.json"), 1);
+        assert_eq!(retried(&w), None, "a partial save is no checkpoint");
+        hf(&w.join("hf-best.tmp"), "new");
+        assert_eq!(retried(&w).as_deref(), Some("new"));
+        hf(&w.join("hf-best.old"), "previous");
+        assert_eq!(retried(&w).as_deref(), Some("previous"));
+        put(&w.join("hf-best/config.json"), 1);
+        assert_eq!(
+            retried(&w).as_deref(),
+            Some("previous"),
+            "hf-best is not whole"
+        );
+        hf(&w.join("hf-best"), "best");
+        assert_eq!(retried(&w).as_deref(), Some("best"));
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    /// The script's `save_hf_best` (skipped without Python 3), killed at each point between its
+    /// steps (a `BaseException` the function does not catch, as `os._exit` or a kill): the work
+    /// folder always holds a whole checkpoint the Retry export finds, and the next save cleans up
+    /// what the killed one left. A failed save keeps the previous best.
+    #[test]
+    fn save_hf_best_leaves_a_whole_checkpoint_wherever_it_is_killed() {
+        let script = include_str!("../../scripts/train_model.py");
+        let root = tmp("hf-save");
+        let code = format!(
+            r#"
+import json, pathlib, shutil, sys
+ns = {{"__name__": "train_model"}}
+exec(compile(sys.stdin.read(), "train_model.py", "exec"), ns)
+root = pathlib.Path({root})
+
+class Killed(BaseException):
+    pass
+
+class Model:
+    def __init__(self, tag, fail=False):
+        self.tag, self.fail = tag, fail
+    def save_pretrained(self, d):
+        d = pathlib.Path(d)
+        d.mkdir(parents=True)
+        (d / "config.json").write_text(self.tag)
+        if self.fail:
+            raise OSError(28, "No space left on device")
+        (d / "model.safetensors").write_bytes(b"w")
+
+real_replace, real_rmtree = pathlib.Path.replace, shutil.rmtree
+def kill_on(when):
+    def replace(self, target):
+        if when == ("replace", pathlib.Path(target).name):
+            raise Killed()
+        return real_replace(self, target)
+    def rmtree(p, *a, **k):
+        if when == ("rmtree", pathlib.Path(p).name):
+            raise Killed()
+        return real_rmtree(p, *a, **k)
+    pathlib.Path.replace, shutil.rmtree = replace, rmtree
+
+def state(w):
+    out = {{}}
+    for n in ("hf-best", "hf-best.old", "hf-best.tmp"):
+        c = w / n / "config.json"
+        out[n] = c.read_text() if c.is_file() and (w / n / "model.safetensors").is_file() else None
+    return out
+
+out = {{}}
+for name, when in [("aside", ("replace", "hf-best.old")), ("in", ("replace", "hf-best")),
+                   ("cleanup", ("rmtree", "hf-best.old")), ("none", None)]:
+    w = root / name
+    w.mkdir()
+    ns["save_hf_best"](Model("e1"), w)
+    kill_on(when)
+    try:
+        ns["save_hf_best"](Model("e2"), w)
+    except Killed:
+        pass
+    finally:
+        pathlib.Path.replace, shutil.rmtree = real_replace, real_rmtree
+    out[name] = state(w)
+    shutil.copytree(w, root / (name + "-killed"))
+    ns["save_hf_best"](Model("e3"), w)
+    out[name + "-next"] = state(w)
+w = root / "full"
+w.mkdir()
+ns["save_hf_best"](Model("e1"), w)
+ns["save_hf_best"](Model("e2", fail=True), w)
+out["full"] = state(w)
+print("RESULT: " + json.dumps(out))
+"#,
+            root = serde_json::to_string(&root.to_string_lossy()).unwrap()
+        );
+        let Some(python) = crate::training::progress::test_python::python3("save_hf_best") else {
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+        let out = crate::training::progress::test_python::run(python, &["-I", "-c", &code], script);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("RESULT: "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no result in {stdout} {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let st = |best: Option<&str>, old: Option<&str>, tmp: Option<&str>| serde_json::json!({"hf-best": best, "hf-best.old": old, "hf-best.tmp": tmp});
+        // Killed before setting the best aside: the previous best stays in place.
+        assert_eq!(v["aside"], st(Some("e1"), None, Some("e2")));
+        // Between the renames: no `hf-best`, the previous best aside, the new one beside it.
+        assert_eq!(v["in"], st(None, Some("e1"), Some("e2")));
+        // After both, before the old one went: the new best in place.
+        assert_eq!(v["cleanup"], st(Some("e2"), Some("e1"), None));
+        assert_eq!(v["none"], st(Some("e2"), None, None));
+        // The next save ends with the one checkpoint, whatever the killed one left.
+        for k in ["aside", "in", "cleanup", "none"] {
+            assert_eq!(v[format!("{k}-next")], st(Some("e3"), None, None), "{k}");
+        }
+        // A failed save (a full disk) keeps the previous best.
+        assert_eq!(v["full"], st(Some("e1"), None, None));
+        // And the Retry export reads a whole checkpoint from what each kill left (copied aside).
+        let expect = [
+            ("aside-killed", "e1"),
+            ("in-killed", "e1"),
+            ("cleanup-killed", "e2"),
+            ("full", "e1"),
+        ];
+        for (k, tag) in expect {
+            assert_eq!(retried(&root.join(k)).as_deref(), Some(tag), "{k}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn record(run_dir: &Path, state: RunState) -> RunRecord {

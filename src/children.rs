@@ -8,9 +8,19 @@
 //! - Each entry also names its owner: the PID and start time of the process that spawned it.
 //!   [`Registry::sweep`] acts only on entries whose owner is gone, so a second live service
 //!   process (a CLI `train` beside the service, a service and its replacement) keeps its own.
-//! - The decision is pure ([`decide`], tested with a fake [`Probe`]): owner alive = keep; child
-//!   gone or its PID reused (start time differs) = forget; exe differs or unreadable = forget
-//!   (not provably ours); everything matches = kill (the group the child leads, then the PID).
+//! - The decision is pure ([`decide`], tested with a fake [`Probe`]): owner alive = keep; child's
+//!   PID reused (start time differs) = forget (a group id is not reused while its group has
+//!   members, so nothing of that group is left); everything matches = kill (the group the child
+//!   leads, then the PID).
+//! - Child gone (or alive but no longer provably the recorded program: exe differs or
+//!   unreadable, e.g. a zombie): the rest of its group may still run (`uv` under a dead leader,
+//!   ffmpeg under yt-dlp). Never a blind `killpg` then: only the group's members that are
+//!   provably ours are killed, one by one by PID ([`Action::KillMembers`]): listed in group
+//!   `pid` ([`process::group_members`], Linux and macOS), started at or after the recorded child,
+//!   exe under `<data root>/tools` (uv, the Python installs and the environments all live
+//!   there), and the entry was recorded in this boot ([`process::boot_id`]; start times of
+//!   another boot prove nothing). None left = forget. Windows lists nothing: the Job held the
+//!   tree.
 //! - Every read-modify-write holds `<data root>/.children.lock` (fs4, through
 //!   [`crate::fsx::lock_wait`]) plus a process mutex, and writes through
 //!   [`crate::fsx::write_atomic`]. A lock the file system cannot take falls back to the process
@@ -20,12 +30,18 @@
 //!
 //! The exe is read when the child is recorded (right after `spawn`, which returns once the child
 //! has exec'd). A child that later execs another program (`sh -c 'exec ...'`, a launcher shim
-//! such as a macOS framework Python re-executing `Python.app`) then no longer matches and is
-//! forgotten, not killed: record the process that stays, or rely on its group leader.
+//! such as a macOS framework Python re-executing `Python.app`) then no longer matches the record:
+//! it is not killed as a tree, only by PID as a member of its own group when its new program
+//! lies under `tools` (see above), else forgotten. Record the process that stays.
 //!
 //! File: `{ "format": 1, "children": [{ "pid", "start_time", "exe", "kind", "started_at" (UTC
-//! RFC 3339), "owner_pid", "owner_start_time" }] }`. `start_time` units are the OS's (see
-//! `process::start_time`), so the file is only meaningful on the machine that wrote it.
+//! RFC 3339), "owner_pid", "owner_start_time", "boot" (optional, absent on Windows and in
+//! entries of earlier versions, which then get no group-member sweep) }] }`. `start_time` units
+//! are the OS's (see `process::start_time`), so the file is only meaningful on the machine that
+//! wrote it.
+//!
+//! [`sweep_orphans_once`] is what the service (`runner`) and the CLI commands that run jobs
+//! (`fetch`, `train ...`) call before they take a job lock or trust a busy marker.
 
 use crate::backend::process;
 use anyhow::{Context, Result, bail};
@@ -65,6 +81,9 @@ pub struct Entry {
     /// The process that spawned it.
     pub owner_pid: u32,
     pub owner_start_time: u64,
+    /// [`process::boot_id`] when it was recorded (`None`: unknown; no group-member sweep).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -78,6 +97,10 @@ struct File {
 pub trait Probe {
     fn start_time(&self, pid: u32) -> Option<u64>;
     fn exe_path(&self, pid: u32) -> Option<PathBuf>;
+    /// The processes of group `pgid` (`None`: this OS cannot list them).
+    fn group_members(&self, pgid: u32) -> Option<Vec<u32>>;
+    /// This boot's identifier (`None`: unknown).
+    fn boot_id(&self) -> Option<String>;
 }
 
 /// [`Probe`] over [`process::start_time`] / [`process::exe_path`].
@@ -91,32 +114,125 @@ impl Probe for OsProbe {
     fn exe_path(&self, pid: u32) -> Option<PathBuf> {
         process::exe_path(pid)
     }
+    fn group_members(&self, pgid: u32) -> Option<Vec<u32>> {
+        process::group_members(pgid)
+    }
+    fn boot_id(&self) -> Option<String> {
+        static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        BOOT.get_or_init(process::boot_id).clone()
+    }
 }
 
 /// What [`Registry::sweep`] does with an entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Its owner is alive: leave the entry and the child alone.
     Keep,
-    /// The owner is gone and the child is gone, reused or not provably ours: drop the entry.
+    /// The owner is gone and nothing of the child is left that is provably ours: drop the entry.
     Forget,
-    /// The owner is gone and the child still matches: kill it and drop the entry.
+    /// The owner is gone and the child still matches: kill its group and it, drop the entry.
     Kill,
+    /// The owner is gone, the child is gone (or no longer provably the recorded program), and
+    /// these members of its group are provably ours ([`group_orphans`]): kill each by PID, drop
+    /// the entry.
+    KillMembers(Vec<u32>),
 }
 
-/// The pure sweep decision for one entry.
-pub fn decide(entry: &Entry, probe: &impl Probe) -> Action {
+/// The pure sweep decision for one entry; `tools` are the data root's `tools` folder (as
+/// written and canonical), under which a group member's exe must lie.
+pub fn decide(entry: &Entry, tools: &[PathBuf], probe: &impl Probe) -> Action {
     if probe.start_time(entry.owner_pid) == Some(entry.owner_start_time) {
         return Action::Keep;
     }
-    if probe.start_time(entry.pid) != Some(entry.start_time) {
-        return Action::Forget;
+    match probe.start_time(entry.pid) {
+        // The PID now names another process. A group id is not handed out while its group has
+        // members, so the child's group is empty.
+        Some(t) if t != entry.start_time => return Action::Forget,
+        Some(_) if probe.exe_path(entry.pid).as_deref() == Some(entry.exe.as_path()) => {
+            return Action::Kill;
+        }
+        _ => {}
     }
-    if probe.exe_path(entry.pid).as_deref() != Some(entry.exe.as_path()) {
-        return Action::Forget;
+    let members = group_orphans(entry, tools, probe);
+    if members.is_empty() {
+        Action::Forget
+    } else {
+        Action::KillMembers(members)
     }
-    Action::Kill
 }
+
+/// The members of the group `entry.pid` led that are provably ours: the entry was recorded in
+/// this boot, and each member started at or after the recorded child and runs a program under
+/// one of `tools`. Sorted, without duplicates; never this process. Empty when the OS cannot list
+/// groups.
+pub fn group_orphans(entry: &Entry, tools: &[PathBuf], probe: &impl Probe) -> Vec<u32> {
+    let same_boot = entry
+        .boot
+        .as_deref()
+        .is_some_and(|b| probe.boot_id().as_deref() == Some(b));
+    if !same_boot || tools.is_empty() {
+        return Vec::new();
+    }
+    let Some(listed) = probe.group_members(entry.pid) else {
+        return Vec::new();
+    };
+    let me = std::process::id();
+    let mut found: Vec<u32> = listed
+        .into_iter()
+        .filter(|&pid| pid != me && pid > 1)
+        .filter(|&pid| probe.start_time(pid).is_some_and(|t| t >= entry.start_time))
+        .filter(|&pid| {
+            probe
+                .exe_path(pid)
+                .is_some_and(|exe| tools.iter().any(|t| exe.starts_with(t)))
+        })
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// `<data_root>/tools`, as written and canonical (exe paths the OS reports are resolved, a data
+/// root may not be: `/var` vs `/private/var` on macOS).
+pub fn tools_dirs(data_root: &Path) -> Vec<PathBuf> {
+    let tools = data_root.join(crate::resources::export::TOOLS_DIR);
+    let mut dirs = vec![tools.clone()];
+    if let Ok(real) = std::fs::canonicalize(&tools)
+        && real != tools
+    {
+        dirs.push(real);
+    }
+    dirs
+}
+
+/// What a sweep kills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// A live recorded child: its group, then the PID.
+    Tree(u32),
+    /// One process of a group whose leader is gone: this PID only, never the group.
+    Process(u32),
+}
+
+/// The real kill of a [`Target`].
+fn os_kill(target: Target) -> std::result::Result<(), String> {
+    match target {
+        // The child leads its own group (`process::prepare`): end the tree, then the PID in case
+        // it left the group (both are tried; the first error is reported).
+        Target::Tree(pid) => {
+            let group = process::kill_group(pid);
+            let one = process::kill_pid(pid);
+            group.and(one)
+        }
+        // Never the group: its leader is gone, so only proven members are ended.
+        Target::Process(pid) => process::kill_pid(pid),
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// How many times a sweep lists a leaderless group again after killing its members (a member
+/// may have started another process meanwhile).
+const MEMBER_ROUNDS: usize = 4;
 
 /// A child [`Registry::sweep`] killed (or tried to).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +317,7 @@ impl Registry {
             started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             owner_pid,
             owner_start_time,
+            boot: probe.boot_id(),
         };
         self.modify(|children| {
             children.retain(|c| !(c.pid == entry.pid && c.start_time == entry.start_time));
@@ -215,25 +332,22 @@ impl Registry {
     }
 
     /// Kill the recorded children of processes that are gone (when PID, start time and exe still
-    /// match) and drop every stale entry. Entries of live owners, this process's included, stay.
+    /// match), and what is provably ours of the group of a child that is gone ([`decide`]), and
+    /// drop every stale entry. Entries of live owners, this process's included, stay.
     pub fn sweep(&self) -> SweepReport {
-        self.sweep_with(&OsProbe, &mut |pid| {
-            // The child leads its own group (`process::prepare`): end the tree, then the PID in
-            // case it left the group (both are tried; the first error is reported).
-            let group = process::kill_group(pid);
-            let one = process::kill_pid(pid);
-            group.and(one).map_err(|e| e.to_string())
-        })
+        let tools = tools_dirs(&self.root);
+        self.sweep_with(&OsProbe, &tools, &mut os_kill)
     }
 
     fn sweep_with(
         &self,
         probe: &impl Probe,
-        kill: &mut dyn FnMut(u32) -> std::result::Result<(), String>,
+        tools: &[PathBuf],
+        kill: &mut dyn FnMut(Target) -> std::result::Result<(), String>,
     ) -> SweepReport {
         let mut report = SweepReport::default();
         let done = self.modify(|children| {
-            children.retain(|entry| match decide(entry, probe) {
+            children.retain(|entry| match decide(entry, tools, probe) {
                 Action::Keep => {
                     report.kept += 1;
                     true
@@ -242,8 +356,12 @@ impl Registry {
                     report.forgotten += 1;
                     false
                 }
+                Action::KillMembers(first) => {
+                    kill_members(entry, first, tools, probe, kill, &mut report.killed);
+                    false
+                }
                 Action::Kill => {
-                    let error = kill(entry.pid).err();
+                    let error = kill(Target::Tree(entry.pid)).err();
                     match &error {
                         None => tracing::info!(
                             "ended orphaned {} process {} ({}) left by an earlier run",
@@ -378,6 +496,97 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+/// Kill `first`, members of the group of `entry`'s gone child, by PID; then list the group
+/// again (up to [`MEMBER_ROUNDS`] times) for processes they started meanwhile. Each kill is
+/// logged and pushed to `killed`.
+fn kill_members(
+    entry: &Entry,
+    first: Vec<u32>,
+    tools: &[PathBuf],
+    probe: &impl Probe,
+    kill: &mut dyn FnMut(Target) -> std::result::Result<(), String>,
+    killed: &mut Vec<Swept>,
+) {
+    let mut done: Vec<u32> = Vec::new();
+    let mut batch = first;
+    for _ in 0..MEMBER_ROUNDS {
+        batch.retain(|p| !done.contains(p));
+        if batch.is_empty() {
+            return;
+        }
+        for pid in std::mem::take(&mut batch) {
+            let exe = probe.exe_path(pid).unwrap_or_default();
+            let error = kill(Target::Process(pid)).err();
+            match &error {
+                None => tracing::info!(
+                    "ended process {pid} ({}) left in the process group of {} process {} by an \
+                     earlier run",
+                    exe.display(),
+                    entry.kind,
+                    entry.pid
+                ),
+                Some(e) => tracing::warn!(
+                    "could not end process {pid} ({}), left in the process group of {} process {} \
+                     by an earlier run: {e}. End it by hand if it is still running",
+                    exe.display(),
+                    entry.kind,
+                    entry.pid
+                ),
+            }
+            killed.push(Swept {
+                pid,
+                kind: entry.kind.clone(),
+                exe,
+                error,
+            });
+            done.push(pid);
+        }
+        batch = group_orphans(entry, tools, probe);
+    }
+}
+
+/// Data roots already swept by [`sweep_orphans_once`] in this process.
+static SWEPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Kill the children that earlier, now dead, processes left in `data_root`'s `.children.json`
+/// ([`Registry::sweep`]), once per data root and process, and log what happened; `None` when
+/// this process swept `data_root` already. Call it before anything that trusts a job's lock or
+/// busy marker: the service before its retention sweeper starts, the CLI's `fetch` and `train`
+/// commands before they run (their job locks die with a crashed process while its children may
+/// still write; the sweep ends those children first).
+pub fn sweep_orphans_once(data_root: &Path) -> Option<SweepReport> {
+    {
+        let mut swept = SWEPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if swept.iter().any(|r| r == data_root) {
+            return None;
+        }
+        swept.push(data_root.to_path_buf());
+    }
+    let report = Registry::new(data_root).sweep();
+    if let Some(e) = &report.error {
+        tracing::warn!(
+            "the orphaned-process check of {} could not run: {e}. A training, export or \
+             auto-label process an earlier run left may still be running; end it by hand if so",
+            data_root.display()
+        );
+    }
+    if !report.killed.is_empty() {
+        tracing::info!(
+            killed = report.killed.len(),
+            forgotten = report.forgotten,
+            "ended processes an earlier run left behind (listed above)"
+        );
+    } else if report.forgotten > 0 {
+        tracing::debug!(
+            forgotten = report.forgotten,
+            "dropped child-process entries of earlier runs (those processes are gone)"
+        );
+    }
+    Some(report)
+}
+
 /// A recorded child; dropping it (or [`Self::forget`]) removes the entry. Hold it until the
 /// child has been reaped.
 #[derive(Debug)]
@@ -424,12 +633,22 @@ mod tests {
     struct Fake {
         start: HashMap<u32, u64>,
         exe: HashMap<u32, PathBuf>,
+        groups: HashMap<u32, Vec<u32>>,
+        boot: Option<String>,
     }
 
     impl Fake {
         fn with(mut self, pid: u32, start: u64, exe: &str) -> Self {
             self.start.insert(pid, start);
             self.exe.insert(pid, PathBuf::from(exe));
+            self
+        }
+        fn group(mut self, pgid: u32, members: &[u32]) -> Self {
+            self.groups.insert(pgid, members.to_vec());
+            self
+        }
+        fn booted(mut self, id: &str) -> Self {
+            self.boot = Some(id.to_string());
             self
         }
     }
@@ -441,6 +660,17 @@ mod tests {
         fn exe_path(&self, pid: u32) -> Option<PathBuf> {
             self.exe.get(&pid).cloned()
         }
+        fn group_members(&self, pgid: u32) -> Option<Vec<u32>> {
+            Some(self.groups.get(&pgid).cloned().unwrap_or_default())
+        }
+        fn boot_id(&self) -> Option<String> {
+            self.boot.clone()
+        }
+    }
+
+    /// The data root's `tools` folder of these tests.
+    fn tools() -> Vec<PathBuf> {
+        vec![PathBuf::from("/tools")]
     }
 
     fn entry(pid: u32, start: u64, exe: &str, owner: u32, owner_start: u64) -> Entry {
@@ -452,6 +682,7 @@ mod tests {
             started_at: "2026-11-22T00:00:00Z".into(),
             owner_pid: owner,
             owner_start_time: owner_start,
+            boot: None,
         }
     }
 
@@ -462,27 +693,183 @@ mod tests {
         let e = entry(500, 77, PY, 100, 11);
         // Owner alive: keep, whatever the child is.
         let alive = Fake::default().with(100, 11, "/svc").with(500, 77, PY);
-        assert_eq!(decide(&e, &alive), Action::Keep);
+        assert_eq!(decide(&e, &tools(), &alive), Action::Keep);
         let alive_child_gone = Fake::default().with(100, 11, "/svc");
-        assert_eq!(decide(&e, &alive_child_gone), Action::Keep);
+        assert_eq!(decide(&e, &tools(), &alive_child_gone), Action::Keep);
         // Owner pid reused by another process (start differs): the owner is gone.
         let reused_owner = Fake::default().with(100, 12, "/other").with(500, 77, PY);
-        assert_eq!(decide(&e, &reused_owner), Action::Kill);
+        assert_eq!(decide(&e, &tools(), &reused_owner), Action::Kill);
         // Owner gone, child matches: kill.
         let orphan = Fake::default().with(500, 77, PY);
-        assert_eq!(decide(&e, &orphan), Action::Kill);
+        assert_eq!(decide(&e, &tools(), &orphan), Action::Kill);
         // Child pid reused (start differs): forget.
         let reused = Fake::default().with(500, 78, PY);
-        assert_eq!(decide(&e, &reused), Action::Forget);
+        assert_eq!(decide(&e, &tools(), &reused), Action::Forget);
         // Exe differs: forget.
         let other_exe = Fake::default().with(500, 77, "/usr/bin/vim");
-        assert_eq!(decide(&e, &other_exe), Action::Forget);
+        assert_eq!(decide(&e, &tools(), &other_exe), Action::Forget);
         // Exe unreadable: not provably ours.
         let mut no_exe = Fake::default().with(500, 77, PY);
         no_exe.exe.clear();
-        assert_eq!(decide(&e, &no_exe), Action::Forget);
+        assert_eq!(decide(&e, &tools(), &no_exe), Action::Forget);
         // Child gone: forget.
-        assert_eq!(decide(&e, &Fake::default()), Action::Forget);
+        assert_eq!(decide(&e, &tools(), &Fake::default()), Action::Forget);
+    }
+
+    /// The leader of a recorded group is gone and its owner too: only the members that are
+    /// provably ours (this boot, started at or after the leader, exe under `tools`) are killed.
+    #[test]
+    fn decide_kills_only_provable_members_of_a_leaderless_group() {
+        let mut e = entry(500, 77, PY, 100, 11);
+        e.boot = Some("b1".into());
+        let os = || {
+            Fake::default()
+                .booted("b1")
+                .with(600, 80, "/tools/uv/uv") // ours
+                .with(601, 70, "/tools/uv/uv") // started before the leader
+                .with(602, 90, "/usr/bin/ffmpeg") // not under tools
+                .with(603, 91, PY) // exe unreadable (below)
+                .group(500, &[602, 600, 601, 603, 604]) // 604: gone since the listing
+        };
+        let mut probe = os();
+        probe.exe.remove(&603);
+        assert_eq!(decide(&e, &tools(), &probe), Action::KillMembers(vec![600]));
+        // Our own process is never listed as a target, whatever it runs.
+        let me = std::process::id();
+        let with_me = os().with(me, 99, PY).group(500, &[me, 600]);
+        assert_eq!(
+            decide(&e, &tools(), &with_me),
+            Action::KillMembers(vec![600])
+        );
+        // Another boot: start times prove nothing.
+        assert_eq!(decide(&e, &tools(), &os().booted("b2")), Action::Forget);
+        // Recorded by an earlier version (no boot): no member sweep.
+        let mut old = e.clone();
+        old.boot = None;
+        assert_eq!(decide(&old, &tools(), &os()), Action::Forget);
+        // Owner alive: nothing.
+        assert_eq!(
+            decide(&e, &tools(), &os().with(100, 11, "/svc")),
+            Action::Keep
+        );
+        // Leader PID reused: its group is empty by definition, members are someone else's.
+        assert_eq!(decide(&e, &tools(), &os().with(500, 5, PY)), Action::Forget);
+        // Leader alive and still the recorded program: the whole tree, as before.
+        assert_eq!(decide(&e, &tools(), &os().with(500, 77, PY)), Action::Kill);
+        // Leader alive but now another program (a launcher that re-executed itself): it and
+        // the members are killed by PID when their exe is under tools.
+        let shim = os()
+            .with(500, 77, "/tools/python/Python.app/Contents/MacOS/Python")
+            .group(500, &[500, 600]);
+        assert_eq!(
+            decide(&e, &tools(), &shim),
+            Action::KillMembers(vec![500, 600])
+        );
+        let outside = os().with(500, 77, "/usr/bin/osascript").group(500, &[500]);
+        assert_eq!(decide(&e, &tools(), &outside), Action::Forget);
+        // No group listing on this OS (Windows): forget.
+        assert_eq!(decide(&e, &[], &os()), Action::Forget);
+    }
+
+    #[test]
+    fn a_sweep_kills_leaderless_members_one_by_one_and_drops_the_entry() {
+        let dir = temp();
+        let reg = Registry::new(dir.path());
+        let at_record = Fake::default().booted("b1").with(500, 77, PY);
+        std::mem::forget(
+            reg.record_as("export", 500, 100, 11, &at_record)
+                .expect("record"),
+        );
+        assert_eq!(
+            reg.entries().expect("entries")[0].boot.as_deref(),
+            Some("b1")
+        );
+        // Leader gone; two members left, one not ours.
+        let now = Fake::default()
+            .booted("b1")
+            .with(600, 80, "/tools/uv/uv")
+            .with(601, 81, "/usr/bin/vim")
+            .group(500, &[600, 601]);
+        let mut killed = Vec::new();
+        let report = reg.sweep_with(&now, &tools(), &mut |target| {
+            killed.push(target);
+            Ok(())
+        });
+        // Listed again after the kill (the fake does not change), never killed twice, and the
+        // group itself is never signalled.
+        assert_eq!(killed, vec![Target::Process(600)]);
+        assert_eq!(report.killed.len(), 1);
+        assert_eq!(report.killed[0].pid, 600);
+        assert_eq!(report.killed[0].exe, PathBuf::from("/tools/uv/uv"));
+        assert_eq!(report.error, None);
+        assert!(reg.entries().expect("entries").is_empty());
+    }
+
+    /// The real OS: a recorded leader exits and leaves a member in its group. While the owner
+    /// lives the sweep keeps it; once the owner is gone the member is killed by PID. (macOS kills
+    /// a copied system binary, so the member is the system `sleep` and the "tools" folder of
+    /// this sweep is its folder; the tools rule itself is covered by the fake-probe tests.)
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_real_leaderless_member_is_killed_only_when_its_owner_is_gone() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = temp();
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find_map(|p| std::fs::canonicalize(p).ok())
+            .expect("a sleep binary");
+        let tools = vec![sleep.parent().expect("folder").to_path_buf()];
+        // The leader starts the member, prints its pid, and waits for a line on stdin.
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "'{}' 30 >/dev/null 2>&1 & echo $!; read x",
+                sleep.display()
+            ))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        process::prepare(&mut cmd);
+        let mut leader = cmd.spawn().expect("spawn");
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("read");
+        let member: u32 = line.trim().parse().expect("member pid");
+        let reg = Registry::new(dir.path());
+        std::mem::forget(reg.record("export", leader.id()).expect("record"));
+        // The leader exits; the member stays in its group.
+        let mut stdin = leader.stdin.take().expect("stdin");
+        stdin.write_all(b"\n").expect("write");
+        drop(stdin);
+        leader.wait().expect("wait");
+        let alive = |pid: u32| process::start_time(pid).is_some();
+        assert!(alive(member), "the member ended with its leader");
+        // Our own entry: kept, the member untouched.
+        let report = reg.sweep_with(&OsProbe, &tools, &mut os_kill);
+        assert_eq!(report.kept, 1, "{report:?}");
+        assert!(alive(member));
+        // The owner is gone (another start time recorded for it).
+        reg.modify(|c| {
+            for e in c.iter_mut() {
+                e.owner_start_time = e.owner_start_time.wrapping_add(1);
+            }
+        })
+        .expect("modify");
+        let report = reg.sweep_with(&OsProbe, &tools, &mut os_kill);
+        assert_eq!(report.error, None);
+        let pids: Vec<u32> = report.killed.iter().map(|k| k.pid).collect();
+        assert_eq!(pids, vec![member], "{report:?}");
+        assert_eq!(report.killed[0].error, None);
+        let gone = (0..100).any(|_| {
+            // A killed child of init may linger as a zombie for a moment.
+            if process::exe_path(member).is_none() || !alive(member) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            false
+        });
+        assert!(gone, "member {member} survived");
+        assert!(reg.entries().expect("entries").is_empty());
     }
 
     /// A scratch folder removed on drop.
@@ -592,11 +979,11 @@ mod tests {
             .with(502, 79, "/bin/other")
             .with(504, 81, PY);
         let mut killed = Vec::new();
-        let report = reg.sweep_with(&now, &mut |pid| {
-            killed.push(pid);
+        let report = reg.sweep_with(&now, &tools(), &mut |target| {
+            killed.push(target);
             Ok(())
         });
-        assert_eq!(killed, vec![500]);
+        assert_eq!(killed, vec![Target::Tree(500)]);
         assert_eq!(report.killed.len(), 1);
         assert_eq!(report.killed[0].pid, 500);
         assert_eq!(report.killed[0].error, None);
@@ -617,7 +1004,7 @@ mod tests {
             reg.record_as("export", 500, 100, 11, &probe)
                 .expect("record"),
         );
-        let report = reg.sweep_with(&probe, &mut |_| Err("EPERM".into()));
+        let report = reg.sweep_with(&probe, &tools(), &mut |_| Err("EPERM".into()));
         assert_eq!(report.killed.len(), 1);
         assert_eq!(report.killed[0].error.as_deref(), Some("EPERM"));
         assert!(reg.entries().expect("entries").is_empty());
@@ -629,7 +1016,7 @@ mod tests {
         let reg = Registry::new(dir.path());
         std::fs::write(reg.path(), b"{not json").expect("write");
         assert!(reg.entries().expect("entries").is_empty());
-        let report = reg.sweep_with(&Fake::default(), &mut |_| Ok(()));
+        let report = reg.sweep_with(&Fake::default(), &tools(), &mut |_| Ok(()));
         assert_eq!(report.error, None);
         let probe = Fake::default().with(500, 77, PY);
         let r = reg
@@ -650,7 +1037,7 @@ mod tests {
             .record_as("export", 500, 100, 11, &probe)
             .expect_err("newer refused");
         assert!(format!("{err:#}").contains("newer"), "{err:#}");
-        let report = reg.sweep_with(&probe, &mut |_| panic!("no kill"));
+        let report = reg.sweep_with(&probe, &tools(), &mut |_| panic!("no kill"));
         assert!(report.error.is_some());
         assert_eq!(std::fs::read(reg.path()).expect("read"), newer);
     }
@@ -669,7 +1056,7 @@ mod tests {
             .modified()
             .expect("mtime");
         std::thread::sleep(Duration::from_millis(20));
-        let report = reg.sweep_with(&probe, &mut |_| panic!("no kill"));
+        let report = reg.sweep_with(&probe, &tools(), &mut |_| panic!("no kill"));
         assert_eq!(report.kept, 1);
         let after = std::fs::metadata(reg.path())
             .expect("meta")

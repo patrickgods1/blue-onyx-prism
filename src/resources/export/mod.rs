@@ -81,7 +81,10 @@
 //! and prints the versions, so a broken environment fails in seconds, before the weights) ->
 //! weights -> export -> install. The result, `models/<name>.onnx` + `.yaml`, is moved into place
 //! from a staging directory and recorded in `models/.<name>.installed.json` like a downloaded
-//! model (an older version's manifest makes the file "needs export" again).
+//! model (an older version's manifest makes the file "needs export" again). The staging folder is
+//! held busy (`storage::busy`) and removed however the export ends; what a crash or kill leaves
+//! (staging and work folders, set-aside files, the manifest temp) is cleaned by the storage sweep
+//! (`leftovers`).
 //!
 //! `run_export` is the stage machine over two seams, [`CommandRunner`] (processes) and
 //! [`Fetcher`] (verified downloads), so it is tested without network or Python.
@@ -510,6 +513,22 @@ struct ExportLock {
 }
 
 impl ExportLock {
+    /// Take the lock if it is free, without waiting; None when an export or a training
+    /// environment setup holds it. The lock file is created in an existing folder only.
+    fn try_acquire(path: &Path) -> std::io::Result<Option<Self>> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
     fn acquire(
         path: &Path,
         cancel: &AtomicBool,
@@ -681,6 +700,7 @@ mod exporter;
 mod failure;
 #[cfg(test)]
 pub(crate) mod fake;
+mod leftovers;
 mod seams;
 mod stages;
 #[cfg(test)]
@@ -689,5 +709,6 @@ pub mod train;
 pub mod vc_runtime;
 
 pub use exporter::*;
+pub(crate) use leftovers::sweep_leftovers;
 pub use seams::*;
 pub use stages::*;

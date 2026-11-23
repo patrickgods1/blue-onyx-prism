@@ -2,7 +2,11 @@
 //! near-duplicate dedup per camera, the atomic writes of image + sidecar + index line, the size /
 //! age caps (through [`crate::retention::prune_dataset`]) and the disk guard that stops collection
 //! on low free space or a full disk and re-arms it once space is back. Single-threaded: only the
-//! collector thread owns a [`Store`], so it is the only writer of the frame files and index files.
+//! collector thread owns a [`Store`], and it runs both the collector's writes and retention, so
+//! those two never meet. It is not the only writer of the dataset folder: an import
+//! ([`crate::training::import::write`], on a job thread or in a `train import` process) adds frames
+//! and index lines to the same day folders, so index lines go through [`layout::append_index`]
+//! (the dataset's cross-process index lock, which retention's rewrite also takes).
 //!
 //! Dedup (`collect.dedup_mode`, [`DedupMode`]): each saved frame that was not itself a near
 //! duplicate is remembered as a reference: its time, dHash, scene and, in `both` mode, its block
@@ -776,7 +780,8 @@ impl Store {
             stem: stem.clone(),
         };
         let day = dir.join(&rel.scene).join(&rel.camera).join(&date);
-        std::fs::create_dir_all(&day)?;
+        // Decoded before the day folder is made, so an image that does not decode leaves no
+        // empty folder (retention removes one a failed write leaves anyway).
         let (bytes, original) = if image.starts_with(&[0xFF, 0xD8]) {
             (std::borrow::Cow::Borrowed(image), true)
         } else {
@@ -784,6 +789,7 @@ impl Store {
             let jpeg = crate::image::encode_jpeg(&img, 92).map_err(std::io::Error::other)?;
             (std::borrow::Cow::Owned(jpeg), false)
         };
+        std::fs::create_dir_all(&day)?;
         r.id = stem.clone();
         r.image = super::record::ImageInfo {
             file: format!("{stem}.jpg"),
@@ -791,7 +797,7 @@ impl Store {
             original,
         };
         let jpg = day.join(format!("{stem}.jpg"));
-        layout::write_atomic(&jpg, &bytes)?;
+        layout::write_in_day(&day, &jpg, &bytes)?;
         let json = serde_json::to_vec_pretty(&*r).map_err(std::io::Error::other)?;
         if let Err(e) = layout::write_atomic(&day.join(format!("{stem}.json")), &json) {
             let _ = std::fs::remove_file(&jpg);
@@ -799,8 +805,7 @@ impl Store {
         }
         let total = (bytes.len() + json.len()) as u64;
         let line = IndexLine::of(r, total);
-        let text = serde_json::to_string(&line).map_err(std::io::Error::other)?;
-        layout::append_line(&day.join(layout::INDEX_FILE), &text)?;
+        layout::append_index(&day, &line)?;
         self.summary.add(&line, &date);
         self.usage.prunable_bytes = self.usage.prunable_bytes.saturating_add(total);
         Ok(rel.jpg())
@@ -815,7 +820,10 @@ impl Store {
             settings.max_bytes,
         ) {
             Ok(r)
-                if r.deleted > 0 || r.failed > 0 || self.dir.as_deref() != Some(&settings.dir) =>
+                if r.deleted > 0
+                    || r.failed > 0
+                    || r.repaired_days > 0
+                    || self.dir.as_deref() != Some(&settings.dir) =>
             {
                 self.adopt(&settings.dir, r.usage);
             }

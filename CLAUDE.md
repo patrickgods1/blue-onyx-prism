@@ -263,7 +263,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   - `heldout-days.json` (review folder) only grows: one writer, `labels::heldout::update` under `.heldout-days.lock`
     (fs4, never under `.labels.lock`); a newer or damaged one refuses the export and is never moved aside.
   - Exports are built hidden, then renamed. A crashed auto-label's `proposals.jsonl` is written through the job's own
-    path first (`autolabel::job::recover_crashed`) and kept on failure.
+    path first (`autolabel::job::recover_crashed`; refused while the review folder is unavailable, renamed
+    `.applied` once written) and kept on failure. Every `index.jsonl` writer and retention's folder removals take
+    `<dataset root>/.index.lock` (`layout::append_index`, `rewrite_index`).
   - An unavailable review folder is `folder_missing`, never an empty dataset. Uninstall keeps data unless asked.
 
 - **Review labels** (`src/collect/labels/`, `/train/review`, `assets/review.js`; formats and rules in docs/DATASET.md
@@ -389,7 +391,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
 
 - **Storage and memory** (`src/storage/`): the sweeper deletes only rebuildable files (caches unused 60 days by a
   `.last-used` marker, no marker = the clock starts; stale compiled models; staging and job `work` whose `.busy` marker,
-  `storage::busy`, is unlocked). Never labels, datasets, exports, models, runs, a failed run's `work` (the retry
+  `storage::busy`, is unlocked, `Busy::finish_removing` leaves it unlocked on a failed removal; crash leftovers matched
+  by exact name only: atomic-write temps after 1 h, review-export `.building-*`, export staging, download leftovers
+  under a try of the download / export lock, `manager::leftovers`, `export::leftovers`). Never labels, datasets, exports, models, runs, a failed run's `work` (the retry
   checkpoint) or logs. GPU memory: jobs warn, never refuse, on short free memory (except a labeler that cannot fit the
   card at all, `autolabel::memory::too_big`); loaded models register as holders (`vram::hold`). `MALLOC_ARENA_MAX=2` in
   the systemd unit and the Docker image.

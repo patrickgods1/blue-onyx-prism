@@ -7,7 +7,11 @@
 //! while it can take that lock exclusively ([`place`]); otherwise the new version is kept, complete
 //! and with its manifest, as `<parent>/.<name>.pending`, and the next process that loads the
 //! runtime swaps it in before loading ([`before_load`]): an update of a loaded runtime is used
-//! after a restart.
+//! after a restart. The service also applies it when it plans a generation that loads the runtime
+//! ([`apply_pending`]); a staged update of a runtime the config no longer loads is left as it is
+//! (shown with its size on the Resources card, where Remove deletes it, also when the install it
+//! was meant for is gone). A swap that a crash cut between its two renames is put back before a
+//! load ([`before_load`], `super::leftovers`).
 //!
 //! Why not swap in place: on Windows the directory of a loaded DLL cannot be renamed, so the swap
 //! failed and was retried for the whole backoff series; on Unix the rename works, but libraries a
@@ -46,7 +50,7 @@ pub fn pending_dir(target: &Path) -> Option<PathBuf> {
     staged_sibling(target, PENDING)
 }
 
-fn lock_path(target: &Path) -> Option<PathBuf> {
+pub(super) fn lock_path(target: &Path) -> Option<PathBuf> {
     staged_sibling(target, IN_USE)
 }
 
@@ -137,6 +141,14 @@ pub(super) fn place(res: &Resource, staging: &Path, target: &Path) -> Result<Pla
         && read_manifest(&target.join(MANIFEST_FILE)).is_some_and(|m| m.id == res.id);
     let Some(pending) = pending_dir(target).filter(|_| ours) else {
         put_in_place(res, staging, target)?;
+        // A fresh install where the previous one is gone: an update staged beside that one is
+        // superseded (nothing would swap it in over this version).
+        if is_runtime(res.kind)
+            && let Some(p) = pending_dir(target).filter(|p| p.exists())
+            && let Err(e) = remove_any(&p)
+        {
+            tracing::warn!("{e:#}; Remove on the Resources card deletes it");
+        }
         return Ok(Placed::InPlace);
     };
     let exclusive = ExclusiveUse::try_take(target);
@@ -179,10 +191,18 @@ pub(super) fn place(res: &Resource, staging: &Path, target: &Path) -> Result<Pla
 /// Shared locks this process holds, by runtime directory (kept for the life of the process).
 static HELD: Mutex<Vec<(PathBuf, File)>> = Mutex::new(Vec::new());
 
+/// This process loaded the runtime in `dir` (holds its shared lock, see [`before_load`]).
+pub(super) fn loaded_here(dir: &Path) -> bool {
+    HELD.lock_recover().iter().any(|(d, _)| d == dir)
+}
+
 /// Call right before this process loads a runtime from `dir` (idempotent per directory): when
 /// `dir` is an install of ours, swap in a staged update while no other process has it loaded,
 /// then mark it in use for the life of the process. Failures are logged; loading goes on.
 pub fn before_load(dir: &Path) {
+    if std::fs::symlink_metadata(dir).is_err() {
+        recover_missing_runtime(dir);
+    }
     let Some(id) = read_manifest(&dir.join(MANIFEST_FILE)).map(|m| m.id) else {
         return;
     };
@@ -190,19 +210,7 @@ pub fn before_load(dir: &Path) {
     if held.iter().any(|(d, _)| d == dir) {
         return;
     }
-    if let Some(pending) = pending_dir(dir).filter(|p| p.is_dir()) {
-        match ExclusiveUse::try_take(dir) {
-            Ok(Some(_exclusive)) => apply_staged(&id, &pending, dir),
-            Ok(None) => tracing::info!(
-                "a downloaded update of {id} waits in {}, but another process has {} loaded; \
-                 this process uses the installed version, and the update is applied at the first \
-                 start after every process using it has stopped",
-                pending.display(),
-                dir.display()
-            ),
-            Err(e) => tracing::debug!("{}: no in-use lock: {e}", dir.display()),
-        }
-    }
+    apply_if_staged(&id, dir);
     match shared_lock(dir) {
         Ok(Some(file)) => held.push((dir.to_path_buf(), file)),
         Ok(None) => tracing::warn!(
@@ -211,6 +219,69 @@ pub fn before_load(dir: &Path) {
             SHARED_WAIT.as_secs()
         ),
         Err(e) => tracing::debug!("{}: no in-use lock: {e}", dir.display()),
+    }
+}
+
+/// Before a generation loads the runtime in `dir` (`Provisioner::prepare`, RA resources-11): swap
+/// in a staged update now, as [`before_load`] would right after, while no process has it loaded.
+/// Nothing when this process loaded it already or it is no install of ours. True when applied.
+pub(crate) fn apply_pending(dir: &Path) -> bool {
+    let Some(id) = read_manifest(&dir.join(MANIFEST_FILE)).map(|m| m.id) else {
+        return false;
+    };
+    let held = HELD.lock_recover();
+    if held.iter().any(|(d, _)| d == dir) {
+        return false;
+    }
+    apply_if_staged(&id, dir)
+}
+
+/// Swap the staged update of `dir` in when there is one and no process has `dir` loaded (the
+/// caller holds [`HELD`]). True when applied.
+fn apply_if_staged(id: &str, dir: &Path) -> bool {
+    let Some(pending) = pending_dir(dir).filter(|p| p.is_dir()) else {
+        return false;
+    };
+    match ExclusiveUse::try_take(dir) {
+        Ok(Some(_exclusive)) => apply_staged(id, &pending, dir),
+        Ok(None) => {
+            tracing::info!(
+                "a downloaded update of {id} waits in {}, but another process has {} loaded; \
+                 this process uses the installed version, and the update is applied at the first \
+                 start after every process using it has stopped",
+                pending.display(),
+                dir.display()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::debug!("{}: no in-use lock: {e}", dir.display());
+            false
+        }
+    }
+}
+
+/// `dir` is missing: when a crash cut a swap of it between its two renames, its set-aside install
+/// (`.<name>.old-<pid>`, whose manifest names the resource and so its download root) is put back
+/// ([`super::leftovers::recover_missing`]).
+fn recover_missing_runtime(dir: &Path) {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let Ok(rd) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let root = rd.flatten().find_map(|e| {
+        let n = e.file_name();
+        let (stem, _) = super::leftovers::set_aside_name(n.to_str()?)?;
+        let m = read_manifest(&e.path().join(MANIFEST_FILE))?;
+        (stem == name)
+            .then(|| super::leftovers::root_of(dir, &m.id))
+            .flatten()
+    });
+    if let Some(root) = root {
+        super::leftovers::recover_missing(&root, dir);
     }
 }
 
@@ -229,8 +300,9 @@ fn shared_lock(dir: &Path) -> std::io::Result<Option<File>> {
 }
 
 /// Swap the staged update `pending` of resource `id` into `target` (the caller holds the
-/// exclusive lock). An incomplete one is deleted (the resolver then plans the update again).
-fn apply_staged(id: &str, pending: &Path, target: &Path) {
+/// exclusive lock). An incomplete one is deleted (the resolver then plans the update again). True
+/// when swapped in.
+fn apply_staged(id: &str, pending: &Path, target: &Path) -> bool {
     let path = pending.join(MANIFEST_FILE);
     let manifest = read_manifest(&path).filter(|m| m.id == id);
     let damage = manifest
@@ -245,19 +317,25 @@ fn apply_staged(id: &str, pending: &Path, target: &Path) {
             damage.unwrap_or_default()
         );
         let _ = remove_any(pending);
-        return;
+        return false;
     };
     match swap_owned(pending, target) {
-        Ok(()) => tracing::info!(
-            "installed the downloaded {id} {} into {} (it was staged while the previous version \
-             was in use)",
-            m.version,
-            target.display()
-        ),
-        Err(e) => tracing::warn!(
-            "{e:#}; staying on the installed version, the update stays in {}",
-            pending.display()
-        ),
+        Ok(()) => {
+            tracing::info!(
+                "installed the downloaded {id} {} into {} (it was staged while the previous \
+                 version was in use)",
+                m.version,
+                target.display()
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                "{e:#}; staying on the installed version, the update stays in {}",
+                pending.display()
+            );
+            false
+        }
     }
 }
 
@@ -402,6 +480,67 @@ mod tests {
         assert_eq!(content(&dir), b"mine");
         assert!(pending.exists());
         assert!(!lock_path(&dir).unwrap().exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RA resources-11: an install into a folder that is gone (deleted by hand) supersedes the
+    /// update staged beside it, which nothing would ever swap in.
+    #[test]
+    fn a_fresh_install_supersedes_a_pending_without_its_install() {
+        let root = tmp("fresh-pending");
+        let res = openvino();
+        let target = root.join("openvino");
+        let pending = pending_dir(&target).unwrap();
+        install(&pending, res.id, "older", b"v0");
+        let staging = root.join(".openvino.staging");
+        install(&staging, res.id, res.version, b"v1");
+        assert_eq!(place(res, &staging, &target).unwrap(), Placed::InPlace);
+        assert_eq!(content(&target), b"v1");
+        assert!(!pending.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RA resources-11: `apply_pending` (a generation about to load the runtime) swaps a staged
+    /// update in when no process has the runtime loaded, and leaves it while one has.
+    #[test]
+    fn apply_pending_swaps_in_only_while_nobody_loads_it() {
+        let root = tmp("apply");
+        let res = openvino();
+        let target = root.join("openvino");
+        install(&target, res.id, "old", b"v1");
+        let pending = pending_dir(&target).unwrap();
+        install(&pending, res.id, res.version, b"v2");
+        let other = open_lock(&target).unwrap();
+        other.lock_shared().unwrap();
+        assert!(!apply_pending(&target));
+        assert_eq!(content(&target), b"v1");
+        other.unlock().unwrap();
+        drop(other);
+        assert!(apply_pending(&target));
+        assert_eq!(content(&target), b"v2");
+        assert!(!pending.exists());
+        assert!(!apply_pending(&target), "nothing staged any more");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RA resources-10: a runtime missing after a swap that a crash cut between its renames is
+    /// put back by the next load.
+    #[test]
+    fn before_load_restores_a_runtime_cut_mid_swap() {
+        let root = tmp("cut");
+        let res = openvino();
+        let target = root.join(res.dest);
+        let parent = target.parent().unwrap();
+        let name = target.file_name().unwrap().to_str().unwrap();
+        install(
+            &parent.join(format!(".{name}.old-4242")),
+            res.id,
+            "1",
+            b"v1",
+        );
+        before_load(&target);
+        assert_eq!(content(&target), b"v1");
+        assert!(!parent.join(format!(".{name}.old-4242")).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 

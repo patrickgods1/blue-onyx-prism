@@ -1,28 +1,58 @@
 //! The storage sweep: at startup and once a day on the retention thread
 //! ([`crate::retention::spawn_sweeper`]), and piece by piece from the Storage card's Clear.
 //!
-//! In order: crash-left temporary files of the atomic writes ([`sweep_temp_files`]); cache folders unused for [`super::caches::UNUSED_DAYS`] and the CoreML orphans
-//! ([`super::caches`]); `.<name>.train-staging` folders no running training holds; work folders
-//! of auto-label, import, overlap and dataset-check jobs that crashed ([`super::busy`]; a dataset
-//! check's fold folders on the dataset's volume too, [`NEAR_WORK_DIRS`], [`ELSEWHERE_FILE`]), an
-//! auto-label's finished proposals written to their frames first
-//! ([`crate::training::autolabel::job::recover_crashed`],
-//! the folder kept and the reason logged when that fails); then `review-queue.jsonl` compaction
-//! of the dataset and review folders ([`crate::collect::layout::compact_review`]). Every removal is
-//! logged with its size ([`super::remove_counted`]), and the sweep ends with one summary line.
+//! What it removes, in order, each shape matched exactly and only when its owner is provably gone:
+//! - crash-left temporary files of the atomic writes ([`sweep_temp_files`]: `.<name>.<32 hex>.tmp`
+//!   and the old fixed names, at least [`TEMP_MIN_AGE`] old) in [`Settings::temp_dirs`];
+//! - hard-link probes (`.bop-link-probe-*`, [`LINK_PROBE_PREFIX`], at least [`TEMP_MIN_AGE`] old)
+//!   in [`Settings::link_probe_dirs`];
+//! - cache folders unused for [`super::caches::UNUSED_DAYS`] and the CoreML orphans
+//!   ([`super::caches`]);
+//! - `.<name>.train-staging` folders no running training holds, in the models folder and every
+//!   `install_dir` a run record names ([`Settings::staging_dirs`]);
+//! - review exports' scratch folders (`.<name>.building-<32 hex>`, `.building-<32 hex>`,
+//!   [`is_building_name`]) whose export crashed ([`super::busy`] says so): in
+//!   `<training dir>/exports`, in its first-level folders, and wherever a record in
+//!   [`EXPORTS_PENDING_DIR`] names one; one with no marker (an older version, or a finished export
+//!   whose final move failed and was kept on purpose) is only listed ([`export_scratch`]);
+//! - work folders of auto-label, import, overlap and dataset-check jobs that crashed
+//!   ([`super::busy`]; a dataset check's fold folders on the dataset's volume too,
+//!   [`NEAR_WORK_DIRS`], [`ELSEWHERE_FILE`], and the then empty `<sub>/` and [`NEAR_DATASET_DIR`]
+//!   above them), an auto-label's finished proposals written to their frames first
+//!   ([`crate::training::autolabel::job::recover_crashed`], the folder kept and the reason logged
+//!   when that fails);
+//! - download and model-export leftovers ([`crate::resources::manager::sweep_stale`],
+//!   [`crate::resources::export::sweep_leftovers`]);
+//! - then `review-queue.jsonl` compaction of the dataset and review folders
+//!   ([`crate::collect::layout::compact_review`]).
+//!
+//! Every removal is logged with its size ([`super::remove_counted`]), and the sweep ends with one
+//! summary line.
 //!
 //! Stopping: [`run`] takes the retention thread's cancel token and checks it between items (each
-//! temporary file, the two cache steps, each staging folder, each crashed work folder, each
-//! compaction). An item is never cut in the middle, and one not reached stays for the next sweep:
-//! a crashed job's busy claim is dropped unfinished, so its marker stays. Not interruptible inside
-//! one item: a large folder's removal, or an auto-label recovery writing its frames
-//! ([`crate::training::autolabel::job::recover_crashed`]).
+//! temporary file or probe, the two cache steps, each staging or scratch folder, each crashed work
+//! folder, each compaction). An item is never cut in the middle, and one not reached stays for the
+//! next sweep: a crashed job's busy claim is dropped unfinished, so its marker stays. Not
+//! interruptible inside one item: a large folder's removal, or an auto-label recovery writing its
+//! frames ([`crate::training::autolabel::job::recover_crashed`]).
 
 use super::busy::{self, State};
 use super::{Removed, caches, remove_counted};
 use crate::config::Config;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+
+/// Name prefix of the hard-link probe files ([`crate::training::preflight`], the dataset check's
+/// placement): made in folders the sweep owns, so one a crash left is removed after
+/// [`TEMP_MIN_AGE`].
+pub const LINK_PROBE_PREFIX: &str = ".bop-link-probe-";
+
+/// The folder of the training folder that holds one record per review export being built
+/// ([`write_export_record`]): `<32 hex>.txt`, naming the export's scratch folder, written before
+/// the folder is made and removed once it is dealt with. A sweep after a crash finds the scratch
+/// folder of an export into a folder of the user's choice through it (one under
+/// `<training dir>/exports` is found by its name too).
+pub const EXPORTS_PENDING_DIR: &str = "exports-pending";
 
 /// Time between storage sweeps.
 pub const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -113,19 +143,35 @@ impl Settings {
 
     /// The folders whose crash-left temporary files [`sweep_temp_files`] removes (not recursive):
     /// the config's folder, the data root, `auth/` and `auth/tls/`, `tools/hf/`, the ONNX Runtime
-    /// folder, the training folder, the dataset and review folders and `save_image_path`.
-    /// Dataset day folders are covered by the dataset prune.
+    /// folder, the training folder and its [`EXPORTS_PENDING_DIR`], the dataset and review folders
+    /// with their `spots/` and `refine/`, the review folder's day folders when it is not the
+    /// dataset folder, and `save_image_path`. The dataset folder's day folders are covered by the
+    /// dataset prune ([`crate::retention`]).
     pub fn temp_dirs(&self) -> Vec<PathBuf> {
         let root = self.config.data_root();
         let auth = root.join(crate::private_dir::DIR_NAME);
+        let training = self.training_dir();
         let mut v = vec![
             root.clone(),
             auth.join(crate::tls::DIR_NAME),
             auth,
             root.join(crate::resources::export::TOOLS_DIR).join("hf"),
             root.join("onnxruntime"),
-            self.training_dir(),
+            training.join(EXPORTS_PENDING_DIR),
+            training,
         ];
+        let dataset_dirs = self.dataset_dirs();
+        for d in &dataset_dirs {
+            v.push(d.join(crate::collect::labels::spots::SPOTS_DIR));
+            v.push(d.join(crate::training::refine::report::REPORT_DIR));
+        }
+        // The review folder's day folders: label saves write there, and only the dataset folder's
+        // are pruned. Listed from the known layout (scene/camera/day), never deeper.
+        if let [dataset, review] = dataset_dirs.as_slice()
+            && dataset != review
+        {
+            v.extend(crate::collect::layout::day_dirs(review));
+        }
         if let Some(dir) = self.config_path.as_deref().and_then(Path::parent) {
             v.push(if dir.as_os_str().is_empty() {
                 PathBuf::from(".")
@@ -133,7 +179,7 @@ impl Settings {
                 dir.to_path_buf()
             });
         }
-        v.extend(self.dataset_dirs());
+        v.extend(dataset_dirs);
         if let Some(p) = self.config.save_image_path.as_deref() {
             v.push(crate::resolve_path(p));
         }
@@ -176,6 +222,42 @@ impl Settings {
 
     pub fn training_dir(&self) -> PathBuf {
         crate::training::training_dir(&self.config)
+    }
+
+    /// Where training runs stage their model (`.<name>.train-staging`): the models folder and
+    /// every distinct `install_dir` the run records name. `runs.json` is only read
+    /// ([`crate::training::task::read_records`]: never moved aside or written, whatever it holds;
+    /// the training queue deals with damage).
+    pub fn staging_dirs(&self) -> Vec<PathBuf> {
+        let runs: Vec<crate::training::service::RunRecord> =
+            crate::training::task::read_records(&crate::training::runs_file(&self.config));
+        let mut v = vec![self.models_dir()];
+        v.extend(runs.iter().filter_map(|r| {
+            r.request
+                .install_dir
+                .as_deref()
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| self.config.data_path(d))
+        }));
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    /// Where hard-link probes ([`LINK_PROBE_PREFIX`]) are made: `<training dir>/runs` (a run's
+    /// preflight), each [`Settings::near_dataset_bases`] (the dataset check's placement), and the
+    /// training folder itself (where versions before the probes had a folder of their own made
+    /// them).
+    pub fn link_probe_dirs(&self) -> Vec<PathBuf> {
+        let training = self.training_dir();
+        let mut v = vec![
+            training.join(crate::training::preflight::LINK_PROBE_DIR),
+            training,
+        ];
+        v.extend(self.near_dataset_bases());
+        v.sort();
+        v.dedup();
+        v
     }
 
     /// The model files there are now: `.onnx` files of the models folder and every configured
@@ -254,13 +336,28 @@ pub fn run_until(s: &Settings, stop: &dyn Fn() -> bool) -> Report {
     let mut rep = Report::default();
     temp_files_until(s, now, &mut rep.removed, stop);
     if !stop() {
-        sweep_caches_until(s, now, &mut rep.removed, stop);
+        link_probes_until(s, now, &mut rep.removed, stop);
     }
     if !stop() {
-        staging_until(&s.models_dir(), &mut rep.removed, stop);
+        sweep_caches_until(s, now, &mut rep.removed, stop);
+    }
+    for dir in s.staging_dirs() {
+        if stop() {
+            break;
+        }
+        staging_until(&dir, &mut rep.removed, stop);
+    }
+    if !stop() {
+        export_scratch_until(s, now, &mut rep.removed, stop);
     }
     if !stop() {
         work_until(s, &mut rep, stop);
+    }
+    if !stop() {
+        crate::resources::manager::sweep_stale(s.config(), &mut rep.removed, stop);
+    }
+    if !stop() {
+        crate::resources::export::sweep_leftovers(s.config(), &mut rep.removed, stop);
     }
     for dir in s.dataset_dirs() {
         if stop() {
@@ -334,32 +431,91 @@ fn temp_files_until(
 ) {
     let legacy = s.legacy_temp_names();
     for dir in s.temp_dirs() {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            if stop() {
-                return;
-            }
-            let Some(name) = e.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if !is_leftover_temp(&name, &legacy) {
-                continue;
-            }
-            let Ok(meta) = std::fs::symlink_metadata(e.path()) else {
-                continue;
-            };
-            let old = meta
-                .modified()
-                .ok()
-                .and_then(|m| now.duration_since(m).ok())
-                .is_some_and(|age| age >= TEMP_MIN_AGE);
-            if meta.is_file() && old {
-                remove_counted(&e.path(), "temporary file of a write a crash cut off", out);
-            }
+        let done = old_files_in(
+            &dir,
+            now,
+            &|name| is_leftover_temp(name, &legacy),
+            "temporary file of a write a crash cut off",
+            out,
+            stop,
+        );
+        if !done {
+            return;
         }
     }
+}
+
+/// Whether `name` is a hard-link probe's ([`LINK_PROBE_PREFIX`] and something after it).
+pub fn is_link_probe(name: &str) -> bool {
+    name.len() > LINK_PROBE_PREFIX.len() && name.starts_with(LINK_PROBE_PREFIX)
+}
+
+/// Remove the hard-link probes a crash left between their link and unlink in
+/// [`Settings::link_probe_dirs`]: regular files named [`is_link_probe`], at least
+/// [`TEMP_MIN_AGE`] old (a probe lives for microseconds). A probe is a second name of a frame:
+/// removing it frees nothing but lets the frame's own deletion free its bytes.
+pub fn sweep_link_probes(s: &Settings, now: SystemTime, out: &mut Vec<Removed>) {
+    link_probes_until(s, now, out, &|| false);
+}
+
+/// [`sweep_link_probes`], asking `stop` before each file.
+fn link_probes_until(
+    s: &Settings,
+    now: SystemTime,
+    out: &mut Vec<Removed>,
+    stop: &dyn Fn() -> bool,
+) {
+    for dir in s.link_probe_dirs() {
+        let done = old_files_in(
+            &dir,
+            now,
+            &is_link_probe,
+            "hard-link probe a crash left (a second name of a frame)",
+            out,
+            stop,
+        );
+        if !done {
+            return;
+        }
+    }
+}
+
+/// Whether `p` was last modified at least [`TEMP_MIN_AGE`] before `now` (False when unknown).
+fn old_enough(p: &Path, now: SystemTime) -> bool {
+    std::fs::symlink_metadata(p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|m| now.duration_since(m).ok())
+        .is_some_and(|age| age >= TEMP_MIN_AGE)
+}
+
+/// Remove the regular files directly in `dir` (never a folder or a link's target) whose name
+/// `wanted` accepts and that are at least [`TEMP_MIN_AGE`] old. False when `stop` ended it.
+fn old_files_in(
+    dir: &Path,
+    now: SystemTime,
+    wanted: &dyn Fn(&str) -> bool,
+    why: &str,
+    out: &mut Vec<Removed>,
+    stop: &dyn Fn() -> bool,
+) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    for e in rd.flatten() {
+        if stop() {
+            return false;
+        }
+        if !e.file_name().to_str().is_some_and(wanted) {
+            continue;
+        }
+        let p = e.path();
+        let is_file = std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file());
+        if is_file && old_enough(&p, now) {
+            remove_counted(&p, why, out);
+        }
+    }
+    true
 }
 
 /// Unused cache folders and the CoreML orphans.
@@ -452,6 +608,238 @@ fn staging_until(models_dir: &Path, out: &mut Vec<Removed>, stop: &dyn Fn() -> b
                     claim.finish();
                 }
             }
+        }
+    }
+}
+
+/// [`leftover_staging`] of every [`Settings::staging_dirs`] entry.
+pub fn leftover_staging_all(s: &Settings) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = s
+        .staging_dirs()
+        .iter()
+        .flat_map(|d| leftover_staging(d))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The 32 hex digits of a review export's scratch folder name (`.building-<id>` inside an
+/// existing target, `.<target name>.building-<id>` beside a new one), None for any other name.
+fn building_id(name: &str) -> Option<&str> {
+    let (head, id) = name.rsplit_once(".building-")?;
+    let hex = id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let head_ok = head.is_empty() || (head.len() > 1 && head.starts_with('.'));
+    (hex && head_ok).then_some(id)
+}
+
+/// Whether `name` is a review export's scratch folder
+/// ([`crate::collect::labels::export`]'s staging): `.building-<32 hex>` or
+/// `.<name>.building-<32 hex>`, nothing else.
+pub fn is_building_name(name: &str) -> bool {
+    building_id(name).is_some()
+}
+
+/// Write the record of the export scratch folder `scratch` into `pending_dir`
+/// ([`EXPORTS_PENDING_DIR`]) before the folder is made; the export removes it once the folder is
+/// dealt with. Its path, or why it could not be written (`scratch` must have an
+/// [`is_building_name`] name).
+pub fn write_export_record(pending_dir: &Path, scratch: &Path) -> std::io::Result<PathBuf> {
+    let id = scratch
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(building_id)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} is no export scratch folder", scratch.display()),
+            )
+        })?;
+    let record = pending_dir.join(format!("{id}.txt"));
+    let abs = std::path::absolute(scratch)?;
+    let opts = crate::fsx::Options {
+        create_parent: true,
+        ..Default::default()
+    };
+    crate::fsx::write_atomic_with(&record, abs.to_string_lossy().as_bytes(), &opts)
+        .map_err(std::io::Error::from)?;
+    Ok(record)
+}
+
+/// One record of [`EXPORTS_PENDING_DIR`]: the file, and the scratch folder it names when it names
+/// one that can only be that export's (an absolute path whose name is a scratch folder's with the
+/// record's id; anything else in the file is ignored, so a sweep never removes a folder a stray
+/// file names).
+struct ExportRecord {
+    file: PathBuf,
+    scratch: Option<PathBuf>,
+}
+
+fn export_records(pending_dir: &Path) -> Vec<ExportRecord> {
+    let Ok(rd) = std::fs::read_dir(pending_dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ExportRecord> = rd
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            let id = name.strip_suffix(".txt").filter(|id| {
+                id.len() == 32
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })?;
+            let scratch = std::fs::read_to_string(e.path())
+                .ok()
+                .map(|t| PathBuf::from(t.trim()))
+                .filter(|p| {
+                    p.is_absolute()
+                        && p.file_name().and_then(|n| n.to_str()).and_then(building_id) == Some(id)
+                });
+            Some(ExportRecord {
+                file: e.path(),
+                scratch,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.file.cmp(&b.file));
+    out
+}
+
+/// The scratch folders (and the markers of scratch folders) directly in `dir`.
+fn scratch_in(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        let Ok(kind) = e.file_type() else { continue };
+        if kind.is_dir() && e.file_name().to_str().is_some_and(is_building_name) {
+            out.push(path);
+        } else if kind.is_file()
+            && let Some(t) = busy::target_of(&path)
+            && t.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_building_name)
+        {
+            out.push(t);
+        }
+    }
+}
+
+/// The scratch folders under `<training dir>/exports`: in it and in each of its first-level
+/// folders (an export into an existing folder builds inside it), never deeper or through a link.
+fn scratch_under_exports(training_dir: &Path) -> Vec<PathBuf> {
+    let exports = training_dir.join("exports");
+    let mut out = Vec::new();
+    scratch_in(&exports, &mut out);
+    if let Ok(rd) = std::fs::read_dir(&exports) {
+        for e in rd.flatten() {
+            let named_scratch = e.file_name().to_str().is_some_and(is_building_name);
+            if e.file_type().is_ok_and(|t| t.is_dir()) && !named_scratch {
+                scratch_in(&e.path(), &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// A review export's scratch folder no running export holds ([`export_scratch`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExportScratch {
+    pub path: PathBuf,
+    /// Its export crashed (the sweep removes it); else there is no marker: an older version's,
+    /// or a finished export whose final move failed, kept on purpose (only listed).
+    pub crashed: bool,
+}
+
+/// The scratch folders of review exports that exist and that no running export holds: under
+/// `<training dir>/exports` and those the [`EXPORTS_PENDING_DIR`] records name.
+pub fn export_scratch(s: &Settings) -> Vec<ExportScratch> {
+    let training = s.training_dir();
+    let mut paths = scratch_under_exports(&training);
+    paths.extend(
+        export_records(&training.join(EXPORTS_PENDING_DIR))
+            .into_iter()
+            .filter_map(|r| r.scratch),
+    );
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter(|p| p.is_dir())
+        .filter_map(|path| match busy::probe(&path) {
+            State::Live => None,
+            State::Ended => Some(ExportScratch {
+                path,
+                crashed: false,
+            }),
+            // Probed without keeping the claim: the sweep claims it again.
+            State::Crashed(_) => Some(ExportScratch {
+                path,
+                crashed: true,
+            }),
+        })
+        .collect()
+}
+
+/// Remove the scratch folders of review exports that crashed (and their markers), then the
+/// [`EXPORTS_PENDING_DIR`] records nothing needs any more.
+pub fn sweep_export_scratch(s: &Settings, now: SystemTime, out: &mut Vec<Removed>) {
+    export_scratch_until(s, now, out, &|| false);
+}
+
+/// [`sweep_export_scratch`], asking `stop` before each folder and record.
+fn export_scratch_until(
+    s: &Settings,
+    now: SystemTime,
+    out: &mut Vec<Removed>,
+    stop: &dyn Fn() -> bool,
+) {
+    let training = s.training_dir();
+    let records = export_records(&training.join(EXPORTS_PENDING_DIR));
+    let mut targets = scratch_under_exports(&training);
+    targets.extend(records.iter().filter_map(|r| r.scratch.clone()));
+    targets.sort();
+    targets.dedup();
+    let mut removed: Vec<PathBuf> = Vec::new();
+    for t in targets {
+        if stop() {
+            return;
+        }
+        // Only a crash is provably orphan: a folder with no marker may be a finished export
+        // kept on purpose, or an older version's (listed on the Storage card, never removed).
+        if let State::Crashed(claim) = busy::probe(&t)
+            && (!t.exists()
+                || remove_counted(&t, "unfinished review export a crash or stop cut off", out))
+        {
+            claim.finish();
+            removed.push(t);
+        }
+    }
+    for r in records {
+        if stop() {
+            return;
+        }
+        // A record goes once its folder is dealt with: removed now, or ended (no marker) for at
+        // least TEMP_MIN_AGE, which a record made just before its export's marker never is.
+        let done = match &r.scratch {
+            Some(t) if removed.contains(t) => true,
+            Some(t) => matches!(busy::probe(t), State::Ended) && old_enough(&r.file, now),
+            None => old_enough(&r.file, now),
+        };
+        if done
+            && let Err(e) = std::fs::remove_file(&r.file)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                "storage: removing the export record {}: {e}",
+                r.file.display()
+            );
         }
     }
 }
@@ -574,7 +962,21 @@ fn work_until(s: &Settings, rep: &mut Report, stop: &dyn Fn() -> bool) {
         }
         if remove_counted(&w.dir, &why, &mut rep.removed) {
             claim.finish();
+            remove_empty_near(&w.dir);
         }
+    }
+}
+
+/// After a fold folder near the dataset (`<..>/.blue-onyx-prism-work/<sub>/<id>`) is removed, its
+/// `<sub>/` and the [`NEAR_DATASET_DIR`] above it when they are empty now, as the check's own end
+/// does: they sit in the user's folder. Nothing for any other path (a work folder in the training
+/// folder); a folder that is not empty stays (`remove_dir` refuses it).
+fn remove_empty_near(removed: &Path) {
+    let Some(sub) = removed.parent() else { return };
+    let Some(base) = sub.parent() else { return };
+    if base.file_name().is_some_and(|n| n == NEAR_DATASET_DIR) {
+        let _ = std::fs::remove_dir(sub);
+        let _ = std::fs::remove_dir(base);
     }
 }
 
@@ -608,10 +1010,17 @@ fn sweep_elsewhere(far: &Path, why: &str, rep: &mut Report) -> bool {
             let gone = !far.exists() || remove_counted(far, why, &mut rep.removed);
             if gone {
                 claim.finish();
+                remove_empty_near(far);
             }
             gone
         }
-        State::Ended => !far.exists() || remove_counted(far, why, &mut rep.removed),
+        State::Ended => {
+            let gone = !far.exists() || remove_counted(far, why, &mut rep.removed);
+            if gone {
+                remove_empty_near(far);
+            }
+            gone
+        }
     }
 }
 
@@ -720,7 +1129,13 @@ pub fn clear(s: &Settings, what: &Clear) -> anyhow::Result<Report> {
                 })?;
             caches::clear(&dir, &mut rep.removed);
         }
-        Clear::Staging => sweep_staging(&s.models_dir(), &mut rep.removed),
+        Clear::Staging => {
+            for dir in s.staging_dirs() {
+                sweep_staging(&dir, &mut rep.removed);
+            }
+            sweep_export_scratch(s, SystemTime::now(), &mut rep.removed);
+            crate::resources::export::sweep_leftovers(s.config(), &mut rep.removed, &|| false);
+        }
         Clear::Work => sweep_work(s, &mut rep),
         Clear::Logs => {
             if let Some(dir) = s.log_dir() {
@@ -1189,6 +1604,415 @@ mod tests {
         );
         for p in &data {
             assert!(p.is_file(), "{} must stay", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 32 lowercase hex digits, as a scratch folder's id.
+    fn hex(i: u128) -> String {
+        format!("{i:032x}")
+    }
+
+    /// Leave a crashed job's marker beside `target`: there, unlocked.
+    fn crash(target: &Path) {
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(busy::marker_of(target), b"1\n").unwrap();
+    }
+
+    #[test]
+    fn building_names_are_matched_exactly() {
+        let id = hex(0xabc_def);
+        assert!(is_building_name(&format!(".building-{id}")));
+        assert!(is_building_name(&format!(".20261123-1200.building-{id}")));
+        assert!(is_building_name(&format!(".export-20261123.building-{id}")));
+        assert!(!is_building_name(&format!("x.building-{id}")));
+        assert!(!is_building_name(&format!("..building-{id}")));
+        assert!(!is_building_name(&format!(".building-{}", &id[1..])));
+        assert!(!is_building_name(&format!(".building-{id}0")));
+        assert!(!is_building_name(&format!(
+            ".building-{}",
+            id.to_uppercase()
+        )));
+        assert!(!is_building_name(&format!(".building-{id}.busy")));
+        assert!(!is_building_name("building"));
+    }
+
+    /// Audit 2026-11 phase 2 (RA-055, RA-060, RA-056a): a crashed review export's scratch folder
+    /// under exports/ goes (beside a new target, inside an existing one); a running export's, one
+    /// without a marker (an older version's, or a complete export kept on purpose) and anything of
+    /// another shape or deeper stay.
+    #[test]
+    fn a_crashed_exports_scratch_goes_a_running_or_kept_one_stays() {
+        let root = tmp("building");
+        let s = settings(&root);
+        let ex = s.training_dir().join("exports");
+        let crashed_new = ex.join(format!(".20261123-1200.building-{}", hex(1)));
+        let crashed_inside = ex.join("chosen").join(format!(".building-{}", hex(2)));
+        let crashed_beside = ex
+            .join("full")
+            .join(format!(".export-20261123-1200.building-{}", hex(3)));
+        let running = ex.join(format!(".run.building-{}", hex(4)));
+        let unmarked = ex.join(format!(".old.building-{}", hex(5)));
+        let lone = ex.join(format!(".gone.building-{}", hex(6)));
+        let too_deep = ex.join("a/b").join(format!(".building-{}", hex(7)));
+        let other_shapes = [
+            ex.join(format!("x.building-{}", hex(8))),
+            ex.join(format!(".x.building-{}", &hex(9)[1..])),
+        ];
+        let crashed = [&crashed_new, &crashed_inside, &crashed_beside];
+        for d in crashed.iter().copied().chain([&unmarked, &too_deep]) {
+            put(&d.join("export/images/a.jpg"), 10);
+        }
+        for d in crashed.iter().copied().chain([&lone, &too_deep]) {
+            crash(d);
+        }
+        for d in &other_shapes {
+            put(&d.join("a"), 1);
+            crash(d);
+        }
+        let hold = busy::Busy::hold(&running);
+        put(&running.join("export/images/a.jpg"), 10);
+        put(&ex.join("e1/classes.txt"), 3);
+        put(&ex.join("full/old-export/classes.txt"), 3);
+
+        let mut listed = export_scratch(&s);
+        listed.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut want: Vec<ExportScratch> = crashed
+            .iter()
+            .map(|p| ExportScratch {
+                path: (*p).clone(),
+                crashed: true,
+            })
+            .chain([ExportScratch {
+                path: unmarked.clone(),
+                crashed: false,
+            }])
+            .collect();
+        want.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(listed, want);
+
+        let mut out = Vec::new();
+        sweep_export_scratch(&s, SystemTime::now(), &mut out);
+        let mut gone: Vec<&PathBuf> = out.iter().map(|r| &r.path).collect();
+        gone.sort();
+        let mut want: Vec<&PathBuf> = crashed.to_vec();
+        want.sort();
+        assert_eq!(gone, want);
+        for d in crashed.iter().copied().chain([&lone]) {
+            assert!(
+                !d.exists() && !busy::marker_of(d).exists(),
+                "{}",
+                d.display()
+            );
+        }
+        assert!(running.join("export/images/a.jpg").is_file(), "running");
+        assert!(busy::marker_of(&running).is_file());
+        assert!(unmarked.join("export/images/a.jpg").is_file(), "no marker");
+        assert!(too_deep.join("export/images/a.jpg").is_file(), "too deep");
+        for d in &other_shapes {
+            assert!(d.join("a").is_file(), "{}", d.display());
+        }
+        assert!(ex.join("e1/classes.txt").is_file());
+        assert!(ex.join("full/old-export/classes.txt").is_file());
+        assert!(ex.join("chosen").is_dir(), "the user's folder stays");
+        // Clear 'staging' does the same.
+        let again = ex.join(format!(".again.building-{}", hex(10)));
+        put(&again.join("export/a.jpg"), 4);
+        crash(&again);
+        let rep = clear(&s, &Clear::Staging).unwrap();
+        assert_eq!(rep.removed.len(), 1, "{rep:?}");
+        assert!(!again.exists());
+        drop(hold);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An export into a folder of the user's choice is found through its record: a crashed one
+    /// goes with its record; a running one, one about to start and one kept on purpose stay; a
+    /// record naming anything but its own scratch folder never removes what it names.
+    #[test]
+    fn an_export_elsewhere_is_found_through_its_record() {
+        let root = tmp("export-record");
+        let s = settings(&root);
+        let pending = s.training_dir().join(EXPORTS_PENDING_DIR);
+        let user = root.join("my exports");
+        let hour = Duration::from_secs(3600);
+
+        let crashed = user.join(format!(".mine.building-{}", hex(1)));
+        let rec_crashed = write_export_record(&pending, &crashed).unwrap();
+        assert_eq!(rec_crashed, pending.join(format!("{}.txt", hex(1))));
+        put(&crashed.join("export/images/a.jpg"), 10);
+        crash(&crashed);
+
+        let running = user.join(format!(".building-{}", hex(2)));
+        let rec_running = write_export_record(&pending, &running).unwrap();
+        let hold = busy::Busy::hold(&running);
+        put(&running.join("a.jpg"), 10);
+        age(&rec_running, 2 * hour);
+
+        // Recorded, not yet held or made.
+        let starting = user.join(format!(".s.building-{}", hex(3)));
+        let rec_starting = write_export_record(&pending, &starting).unwrap();
+
+        // A complete export whose final move failed: kept, its record goes once old.
+        let kept = user.join(format!(".k.building-{}", hex(4)));
+        let rec_kept = write_export_record(&pending, &kept).unwrap();
+        put(&kept.join("export/classes.txt"), 3);
+        age(&rec_kept, 2 * hour);
+
+        // A record naming a folder of the user's, crashed marker and all: never removed.
+        let photos = root.join("photos");
+        put(&photos.join("keep.jpg"), 3);
+        crash(&photos);
+        assert!(write_export_record(&pending, &photos).is_err());
+        let rec_stray = pending.join(format!("{}.txt", hex(5)));
+        std::fs::write(&rec_stray, photos.display().to_string()).unwrap();
+        age(&rec_stray, 2 * hour);
+        // A record whose id is not its folder's.
+        let other = user.join(format!(".o.building-{}", hex(6)));
+        put(&other.join("export/a.jpg"), 3);
+        crash(&other);
+        let rec_other = pending.join(format!("{}.txt", hex(7)));
+        std::fs::write(&rec_other, other.display().to_string()).unwrap();
+
+        let mut out = Vec::new();
+        sweep_export_scratch(&s, SystemTime::now(), &mut out);
+        assert_eq!(
+            out.iter().map(|r| &r.path).collect::<Vec<_>>(),
+            [&crashed],
+            "{out:?}"
+        );
+        assert!(!crashed.exists() && !busy::marker_of(&crashed).exists());
+        assert!(!rec_crashed.exists(), "its record goes with it");
+        assert!(running.join("a.jpg").is_file() && rec_running.is_file());
+        assert!(
+            rec_starting.is_file(),
+            "too young to tell from a starting export"
+        );
+        assert!(kept.join("export/classes.txt").is_file());
+        assert!(!rec_kept.exists());
+        assert!(photos.join("keep.jpg").is_file() && busy::marker_of(&photos).is_file());
+        assert!(
+            !rec_stray.exists(),
+            "an old record naming no scratch folder goes"
+        );
+        assert!(
+            other.join("export/a.jpg").is_file(),
+            "not its record's folder"
+        );
+        assert!(rec_other.is_file(), "young");
+        drop(hold);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 phase 2 (RA-071, RA-056c): a crashed run's staging in an install folder a run
+    /// record names goes; a running one's stays; runs.json is only read.
+    #[test]
+    fn staging_in_an_install_folder_a_run_names_goes_too() {
+        let root = tmp("install-dir");
+        let s = settings(&root);
+        let custom = root.join("srv-models");
+        let runs = crate::training::runs_file(s.config());
+        let recipe =
+            crate::training::TrainRecipe::new(crate::resources::catalog::TrainFamily::Yolo26, "n")
+                .unwrap();
+        let record = |id: &str, install: Option<&str>| {
+            serde_json::json!({
+                "id": id, "name": "m", "created": "",
+                "request": {"recipe": recipe, "datasets": [], "install_dir": install},
+                "device": "cpu", "state": crate::training::service::RunState::Failed,
+                "stage": "train", "step": 1, "steps": 8,
+                "percent": 10, "detail": "", "run_dir": root.join(id)
+            })
+        };
+        let list = serde_json::json!([
+            record("r1", Some(&custom.display().to_string())),
+            record("r2", Some("rel-models")),
+            record("r3", None),
+        ]);
+        put(&runs, 1);
+        std::fs::write(&runs, list.to_string()).unwrap();
+        let mut want = vec![s.models_dir(), custom.clone(), root.join("rel-models")];
+        want.sort();
+        assert_eq!(s.staging_dirs(), want);
+
+        let crashed = custom.join(".a.train-staging");
+        let live = custom.join(".b.train-staging");
+        let rel = root.join("rel-models/.c.train-staging");
+        put(&crashed.join("m.onnx"), 10);
+        crash(&crashed);
+        put(&rel.join("m.onnx"), 10);
+        let hold = busy::Busy::hold(&live);
+        put(&live.join("m.onnx"), 10);
+        put(&custom.join("keep.onnx"), 10);
+        put(&custom.join(".notes/x"), 1);
+        let mut want = vec![crashed.clone(), rel.clone()];
+        want.sort();
+        assert_eq!(leftover_staging_all(&s), want);
+        let rep = run(&s, &tokio_util::sync::CancellationToken::new());
+        assert!(
+            !crashed.exists() && !busy::marker_of(&crashed).exists(),
+            "{rep:?}"
+        );
+        assert!(!rel.exists());
+        assert!(
+            live.join("m.onnx").is_file(),
+            "a running run's staging stays"
+        );
+        assert!(custom.join("keep.onnx").is_file() && custom.join(".notes/x").is_file());
+        // Clear 'staging' covers it too.
+        put(&crashed.join("m.onnx"), 10);
+        crash(&crashed);
+        let rep = clear(&s, &Clear::Staging).unwrap();
+        assert_eq!(rep.removed.len(), 1, "{rep:?}");
+        drop(hold);
+
+        // A damaged runs.json: the models folder only, and the file is left as it is.
+        std::fs::write(&runs, b"[{not json").unwrap();
+        assert_eq!(s.staging_dirs(), [s.models_dir()]);
+        assert_eq!(std::fs::read(&runs).unwrap(), b"[{not json");
+        let aside = std::fs::read_dir(runs.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
+            .count();
+        assert_eq!(aside, 0, "never moved aside");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 phase 2 (RA-045): once the last crashed fold folder near the dataset is
+    /// removed, the empty `refine/` and `.blue-onyx-prism-work/` go too; a base holding anything
+    /// else stays, and so does a training folder's emptied `refine/`.
+    #[test]
+    fn the_empty_near_folders_go_with_the_last_crashed_fold_folder() {
+        let root = tmp("near-empty");
+        let s = settings(&root);
+        let t = s.training_dir();
+        let base = s.near_dataset_bases()[0].clone();
+        let work = t.join("refine/20261123-1");
+        let far = base.join("refine/20261123-1");
+        put(&work.join("tighten.jsonl"), 1);
+        put(&far.join("fold-1/export/a.jpg"), 10);
+        std::fs::write(work.join(ELSEWHERE_FILE), far.display().to_string()).unwrap();
+        crash(&work);
+        crash(&far);
+        let lone = base.join("refine/20261123-2");
+        put(&lone.join("fold-2/m.onnx"), 10);
+        crash(&lone);
+        let mut rep = Report::default();
+        sweep_work(&s, &mut rep);
+        assert!(!far.exists() && !lone.exists() && !work.exists(), "{rep:?}");
+        assert!(
+            !base.exists(),
+            "the empty program folder in the user's folder goes"
+        );
+        assert!(t.join("refine").is_dir(), "the training folder's own stays");
+
+        // Something else in the base: only the emptied refine/ goes.
+        let lone = base.join("refine/20261123-3");
+        put(&lone.join("fold-1/a.jpg"), 1);
+        crash(&lone);
+        put(&base.join("notes.txt"), 1);
+        let mut rep = Report::default();
+        sweep_work(&s, &mut rep);
+        assert!(!base.join("refine").exists());
+        assert!(base.join("notes.txt").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 phase 2 (RA-074): hard-link probes a crash left go once old, in the folders
+    /// probes are made in; the frame they name keeps its bytes.
+    #[test]
+    fn hard_link_probes_a_crash_left_go_once_old() {
+        let root = tmp("probes");
+        let s = settings(&root);
+        let t = s.training_dir();
+        let runs = t.join("runs");
+        let base = s.near_dataset_bases()[0].clone();
+        let frame = s.dataset_dirs()[0].join("night/cam/2026-11-23/a.jpg");
+        put(&frame, 5);
+        let hour = Duration::from_secs(3600);
+        let probe = |dir: &Path, tag: &str| dir.join(format!("{LINK_PROBE_PREFIX}{tag}"));
+        let old = [
+            probe(&runs, "11111111-1111-1111-1111-111111111111"),
+            probe(&base, "2"),
+            probe(&t, "3"),
+        ];
+        for p in &old {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::hard_link(&frame, p).unwrap();
+            age(p, 2 * hour);
+        }
+        // Another frame: the links of one share its modification time.
+        let other_frame = s.dataset_dirs()[0].join("night/cam/2026-11-23/b.jpg");
+        put(&other_frame, 5);
+        let young = probe(&runs, "young");
+        std::fs::hard_link(&other_frame, &young).unwrap();
+        let elsewhere = probe(&s.dataset_dirs()[0], "x");
+        put(&elsewhere, 1);
+        age(&elsewhere, 2 * hour);
+        let bare = runs.join(LINK_PROBE_PREFIX);
+        put(&bare, 1);
+        age(&bare, 2 * hour);
+        let folder = probe(&runs, "dir");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut out = Vec::new();
+        sweep_link_probes(&s, SystemTime::now() + Duration::from_secs(1), &mut out);
+        let mut gone: Vec<&PathBuf> = out.iter().map(|r| &r.path).collect();
+        gone.sort();
+        let mut want: Vec<&PathBuf> = old.iter().collect();
+        want.sort();
+        assert_eq!(gone, want);
+        assert_eq!(
+            std::fs::read(&frame).unwrap(),
+            vec![1u8; 5],
+            "the frame stays"
+        );
+        for p in [&young, &elsewhere, &bare, &folder] {
+            assert!(p.exists(), "{} stays", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 phase 2 (RA-066, RA-065): temporary files in the dataset and review folders'
+    /// `spots/` and `refine/`, in a separate review folder's day folders and in the export records'
+    /// folder go once old; the dataset folder's day folders are the prune's, nothing deeper is
+    /// looked at.
+    #[test]
+    fn temps_in_spots_refine_and_a_separate_review_folders_days_go() {
+        let root = tmp("temps-review");
+        let mut c = settings(&root).config().clone();
+        c.collect.review_dir = Some(root.join("review"));
+        let s = Settings::for_config(&c);
+        let dirs = s.dataset_dirs();
+        assert_eq!(dirs.len(), 2);
+        let (dataset, review) = (&dirs[0], &dirs[1]);
+        let id = hex(0xfeed);
+        let tmp_in = |d: &Path, name: &str| d.join(format!(".{name}.{id}.tmp"));
+        let old = [
+            tmp_in(&dataset.join("spots"), "cam.json"),
+            tmp_in(&review.join("spots"), "cam.json"),
+            tmp_in(&review.join("refine"), "report.json"),
+            tmp_in(&review.join("night/cam/2026-11-07"), "a.labels.json"),
+            tmp_in(&s.training_dir().join(EXPORTS_PENDING_DIR), "x.txt"),
+        ];
+        let kept = [
+            // The dataset folder's day folders are the dataset prune's.
+            tmp_in(&dataset.join("night/cam/2026-11-07"), "a.labels.json"),
+            // Deeper than the known layout.
+            tmp_in(&review.join("night/cam/2026-11-07/sub"), "a.json"),
+            tmp_in(&review.join("night/cam/not-a-day"), "a.json"),
+        ];
+        for p in old.iter().chain(&kept) {
+            put(p, 2);
+            age(p, Duration::from_secs(7200));
+        }
+        let mut out = Vec::new();
+        sweep_temp_files(&s, SystemTime::now(), &mut out);
+        for p in &old {
+            assert!(!p.exists(), "{} should be gone", p.display());
+        }
+        for p in &kept {
+            assert!(p.exists(), "{} should stay", p.display());
         }
         let _ = std::fs::remove_dir_all(&root);
     }

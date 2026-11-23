@@ -15,7 +15,10 @@
 //!   before the process restarts; it is downloaded and marked active for the next start.
 //! - **Updates** (an installed runtime or model file from an older pin, [`Need::update_from`]):
 //!   queued like any need but blocking no model, which keeps running on the installed version; a
-//!   loaded runtime's update is used after the process restarts (`manager::in_use`).
+//!   loaded runtime's update is used after the process restarts (`manager::in_use`). Before
+//!   planning, a staged update of a runtime this generation loads is swapped in and a runtime
+//!   that a crash left missing mid-swap is put back; a staged update of a runtime nothing loads
+//!   stays as it is (the Resources card shows it with its size; Remove deletes it).
 //! - **`auto_download: false`**: nothing is downloaded; blocked models are `Failed` with
 //!   [`Resolution::manual_message`] (the missing resources and the command to run).
 //! - Downloads are queued model files first, then CPU-fallback runtimes (small, so something can
@@ -201,6 +204,15 @@ impl Provisioner {
     pub fn prepare(&self, config: &Config, loaded_ort: Option<Flavor>) -> Provision {
         let root = config.data_root();
         let hw = crate::backend::detect::hardware();
+        // Before anything looks at what is installed: a runtime a crash left missing in the
+        // middle of an update's swap is put back (RA resources-10), and the staged update of a
+        // runtime this generation loads is swapped in, as loading it would (RA resources-11).
+        for target in manager::runtime_targets(&root) {
+            manager::recover_missing(&root, &target);
+        }
+        for dir in runtimes_to_load(config, &root, loaded_ort, hw) {
+            manager::apply_pending(&dir);
+        }
         let mut installed = resolve::detect_installed(config, &root, None);
         installed.extra_models = self.opts.extra_models.clone();
         if loaded_ort.is_some() {
@@ -313,6 +325,44 @@ impl Provisioner {
             in_flight,
         }
     }
+}
+
+/// The install folders of the runtimes a generation of `config` loads (see `backend::Runtimes`):
+/// OpenVINO from the download root unless `openvino_dir` names another one; the ONNX Runtime the
+/// loader finds, unless an earlier generation of this process loaded one already; the CUDA
+/// libraries with the CUDA flavor on an NVIDIA machine. A staged update of a runtime outside this
+/// list is left for the start that loads it ([`manager::apply_pending`] only swaps our installs).
+fn runtimes_to_load(
+    config: &Config,
+    root: &std::path::Path,
+    loaded_ort: Option<Flavor>,
+    hw: &crate::backend::detect::HardwareInfo,
+) -> Vec<std::path::PathBuf> {
+    use crate::backend::libs;
+    let mut dirs = Vec::new();
+    if config.openvino_dir.is_none() {
+        dirs.push(root.join(libs::BUNDLED_DIR_NAME));
+    }
+    if cfg!(feature = "onnxruntime") && loaded_ort.is_none() {
+        let env = std::env::var_os(libs::ENV_ORT_DYLIB_PATH)
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from);
+        let lookup = libs::find_onnxruntime_from(
+            config.onnxruntime_dir.as_deref(),
+            env.as_deref(),
+            &root.join(libs::ORT_DIR_NAME),
+        );
+        if let Some(dir) = lookup.library.as_deref().and_then(std::path::Path::parent) {
+            let cuda = libs::read_ort_flavor(dir).and_then(|f| Flavor::parse(&f))
+                == Some(Flavor::Cuda)
+                && hw.has_vendor(crate::backend::detect::GpuVendor::Nvidia);
+            dirs.push(dir.to_path_buf());
+            if cuda {
+                dirs.push(root.join(super::catalog::CUDA_LIBS_DEST));
+            }
+        }
+    }
+    dirs
 }
 
 /// Download order: model files, then CPU fallbacks (they block nothing and are small, so a

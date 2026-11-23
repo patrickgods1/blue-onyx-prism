@@ -218,6 +218,12 @@ impl Probe for OsView {
             .find(|p| p.0 == pid)
             .map(|p| PathBuf::from(p.2))
     }
+    fn group_members(&self, _pgid: u32) -> Option<Vec<u32>> {
+        None
+    }
+    fn boot_id(&self) -> Option<String> {
+        None
+    }
 }
 
 fn entry(pid: u32, start: u64, exe: &str, owner: (u32, u64)) -> Entry {
@@ -229,6 +235,7 @@ fn entry(pid: u32, start: u64, exe: &str, owner: (u32, u64)) -> Entry {
         started_at: "2026-11-22T00:00:00Z".into(),
         owner_pid: owner.0,
         owner_start_time: owner.1,
+        boot: None,
     }
 }
 

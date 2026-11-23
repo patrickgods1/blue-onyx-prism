@@ -73,7 +73,8 @@ in a diagnostics bundle, never deleted by the storage sweeper, git-ignored.
   - A sidecar always has its image.
   - A frame counts as complete once its sidecar exists.
   - Temporary files of an interrupted write (`.<name>.<uuid>.tmp`) are deleted by retention after an
-    hour.
+    hour. So is a sidecar left without its image (`<stem>.json` older than an hour, no `.jpg`, no
+    protected `.labels.json`).
 
 ## Buckets
 
@@ -313,6 +314,10 @@ One JSON object per line, appended when a frame is saved:
 
 - `bytes` is the image plus the sidecar.
 - When frames are deleted, retention rewrites the day's index atomically.
+- Every writer of an index takes `<dataset root>/.index.lock`: the collector's and an import's appends,
+  and retention's rewrite together with its removal of emptied day, camera and scene folders. A day
+  whose index names frames that are gone (an interrupted prune), and an empty day folder, are repaired
+  by the next retention pass the same way.
 - At startup, the service rebuilds the Collect tab's summary (counts by scene x bucket, by detected
   class and per camera, bytes, the newest 8 frames per bucket) from the index files.
 
@@ -343,7 +348,8 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
 
 - **Caps:** `collect.max_gb` (default 5) and `collect.max_age_days` (default 90, 0 = keep) are applied
   by `retention::prune_dataset`, oldest first.
-  - It runs on the collector thread, the only writer: every 10 minutes (asked by the retention sweeper,
+  - It runs on the collector thread, which writes frames; an import (a job thread or a `train import`
+    process) writes frames and index lines too, under the index lock above. It runs every 10 minutes (asked by the retention sweeper,
     also while collection is off, as long as the folder exists) and right after a write that crossed
     the size cap.
   - It deletes only frames in the layout above: the image, the sidecar and the frame's `.labels.json`.
@@ -1444,7 +1450,11 @@ become the frame's complete set of training boxes:
 - **Build and report:** an export is built in a hidden folder and appears under its name only once
   complete, so a failed one is never offered to training. The answer's `lost_frames` and
   `unreadable_folders` count reviewed frames left out because their image or sidecar is gone or a
-  folder could not be read, and warnings name up to 20 of them.
+  folder could not be read, and warnings name up to 20 of them. The hidden folder is held busy while
+  it is built: one a kill or crash cut off is removed by the next storage sweep (also for an export
+  into a folder of your choice, found through `<training dir>/exports-pending/`). One kept because its
+  final move failed, or left by an older version, is only listed on the Storage card ("Unfinished
+  review exports"): it hard-links frames, so it can hold frames retention has since deleted.
 - **An unavailable folder:** a folder under review that is not there, such as an unplugged drive, is
   not an empty dataset. `/v1/review/next` answers `folder_missing: true`, the routes that need the
   folder answer 503, and the Train strip says so. Nothing is rejected or pruned meanwhile.

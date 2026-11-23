@@ -18,9 +18,10 @@
 //!   up, a console window closing) call [`before_forced_exit`]: it kills the child trees this
 //!   process recorded in `.children.json` ([`crate::children`]) of every data root the run used,
 //!   proven by PID + start time + exe, then flushes the file log ([`crate::cli::flush_logs`]).
-//! - [`sweep_orphans_once`] runs [`crate::children::Registry::sweep`] once per data root and
-//!   process, before the run spawns the retention sweeper (whose storage sweep would otherwise
-//!   take a dead job's unlocked work folder while its orphaned child still writes into it).
+//! - [`sweep_orphans_once`] runs [`crate::children::sweep_orphans_once`] (the sweep, once per
+//!   data root and process; the CLI's `fetch` and `train` commands call the same function) before
+//!   the run spawns the retention sweeper (whose storage sweep would otherwise take a dead job's
+//!   unlocked work folder while its orphaned child still writes into it).
 
 use crate::children::{Entry, OsProbe, Probe, Registry};
 use crate::sync::LockExt;
@@ -306,40 +307,12 @@ pub(crate) fn remember_data_root(root: &Path) {
     }
 }
 
-/// Data roots already swept by [`sweep_orphans_once`] in this process.
-static SWEPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
-/// Kill the children that earlier, now dead, processes left in `data_root`'s `.children.json`
-/// ([`Registry::sweep`]), once per data root and process, and log what happened. Call it before
-/// anything that trusts a job's lock or busy marker (the retention sweeper's storage sweep).
+/// Kill the children that earlier, now dead, processes left in `data_root`'s `.children.json`,
+/// once per data root and process ([`crate::children::sweep_orphans_once`], which logs what it
+/// did). Call it before anything that trusts a job's lock or busy marker (the retention
+/// sweeper's storage sweep).
 pub(crate) fn sweep_orphans_once(data_root: &Path) {
-    {
-        let mut swept = SWEPT.lock_recover();
-        if swept.iter().any(|r| r == data_root) {
-            return;
-        }
-        swept.push(data_root.to_path_buf());
-    }
-    let report = Registry::new(data_root).sweep();
-    if let Some(e) = &report.error {
-        warn!(
-            "the orphaned-process check of {} could not run: {e}. A training, export or \
-             auto-label process an earlier run left may still be running; end it by hand if so",
-            data_root.display()
-        );
-    }
-    if !report.killed.is_empty() {
-        info!(
-            killed = report.killed.len(),
-            forgotten = report.forgotten,
-            "ended processes an earlier run left behind (listed above)"
-        );
-    } else if report.forgotten > 0 {
-        debug!(
-            forgotten = report.forgotten,
-            "dropped child-process entries of earlier runs (those processes are gone)"
-        );
-    }
+    let _ = crate::children::sweep_orphans_once(data_root);
 }
 
 /// The entries among `entries` that this process (`me_pid`, started at `me_start`) recorded and

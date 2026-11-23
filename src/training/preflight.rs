@@ -7,7 +7,9 @@
 //! - [`refusals`]: data a run must not start on, with the next action;
 //! - [`report`]: boxes per class and scene, the splits, the bulk-accepted share, frames dropped;
 //! - [`run_needs`], [`combine`], [`refusal`]: disk needed against disk free, the volumes and the free
-//!   space kept ([`disk::margin`]) as for an import;
+//!   space kept ([`disk::margin`]) as for an import; frames that cannot be hard-linked count as
+//!   copies, probed with a link made in `<training dir>/runs` ([`LINK_PROBE_DIR`], where the
+//!   storage sweep clears a probe a crash left);
 //! - [`gpu_need`], [`gpu_warning`]: the run's estimated GPU memory against what the card has free
 //!   now ([`crate::backend::vram`]), naming the service's models loaded on it; a warning, never a
 //!   refusal, and none when the card cannot be read.
@@ -507,28 +509,82 @@ pub const MODELS_ADVICE: &str = "free some space, or install the model in a fold
 /// [`VolumeNeed::advice`] of the tools folder (environment, base weights).
 pub const TOOLS_ADVICE: &str = "free some space, or set download_dir to a bigger disk";
 
-/// Whether `file` can be hard-linked into `dir` (or its nearest existing ancestor): the same
-/// volume, and a file system that has hard links (exFAT does not, so a same-volume dataset can still
-/// be a full copy). Probed with a link that is removed at once; a folder that refuses the probe
-/// says nothing about the volume, so it counts as linkable.
-pub(crate) fn hard_links_work(file: &Path, dir: &Path) -> bool {
+/// The folder of the training folder the hard-link probes of [`copied_bytes`] go in:
+/// `<training dir>/runs`, which the storage sweep clears of probes a crash left
+/// ([`crate::storage::sweep::LINK_PROBE_PREFIX`]).
+pub const LINK_PROBE_DIR: &str = "runs";
+
+/// Whether `file` can be hard-linked into `dir`: the same volume, and a file system that has hard
+/// links (exFAT does not, so a same-volume dataset can still be a full copy). Probed with a link
+/// (named [`crate::storage::sweep::LINK_PROBE_PREFIX`]) made in `probe_in`, which must be a folder
+/// on `dir`'s volume, and removed at once; a folder that refuses the probe says nothing about the
+/// volume, so it counts as linkable.
+pub(crate) fn hard_links_work(file: &Path, dir: &Path, probe_in: &Path) -> bool {
     if !disk::same_volume(file, dir) {
         return false;
     }
-    let Some(parent) = dir
-        .ancestors()
-        .find(|p| !p.as_os_str().is_empty() && p.is_dir())
-    else {
-        return false;
-    };
-    let probe = parent.join(format!(".bop-link-probe-{}", uuid::Uuid::new_v4()));
+    let probe = probe_path(probe_in);
     match std::fs::hard_link(file, &probe) {
         Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
+            remove_probe(&probe);
             true
         }
         Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
     }
+}
+
+/// A new probe's path in `probe_in`.
+fn probe_path(probe_in: &Path) -> PathBuf {
+    probe_in.join(format!(
+        "{}{}",
+        crate::storage::sweep::LINK_PROBE_PREFIX,
+        uuid::Uuid::new_v4()
+    ))
+}
+
+/// How long [`remove_probe`] waits before its second try: long enough for a scanner that opened the
+/// new link (Windows) to let go, short enough for a page's pre-flight.
+const PROBE_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Remove the probe link `probe`, once more after [`PROBE_RETRY`]; one that stays is named in a
+/// warning (a second name of a frame, so deleting the frame would not free its bytes) and left to
+/// the storage sweep.
+fn remove_probe(probe: &Path) {
+    let gone = |r: std::io::Result<()>| match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    };
+    if gone(std::fs::remove_file(probe)).is_ok() {
+        return;
+    }
+    std::thread::sleep(PROBE_RETRY);
+    if let Err(e) = gone(std::fs::remove_file(probe)) {
+        tracing::warn!(
+            "could not remove the hard-link probe {} ({e}), a second name of a frame; the next \
+             storage sweep removes it",
+            probe.display()
+        );
+    }
+}
+
+/// The folder [`copied_bytes`] probes `run_dir`'s links in: [`LINK_PROBE_DIR`] of its training
+/// folder (`run_dir`'s parent: every run folder and the preview's are `<training dir>/<name>`),
+/// made when missing, when that folder exists and is on `run_dir`'s volume. Else, as before, the
+/// nearest existing ancestor of `run_dir`: a training folder that is not there may be a drive not
+/// plugged in, and folders made under its mount point would be on another disk.
+fn probe_dir(run_dir: &Path) -> Option<PathBuf> {
+    let swept = run_dir
+        .parent()
+        .filter(|t| !t.as_os_str().is_empty() && t.is_dir())
+        .map(|t| t.join(LINK_PROBE_DIR))
+        .filter(|d| std::fs::create_dir_all(d).is_ok() && disk::same_volume(d, run_dir));
+    swept.or_else(|| {
+        run_dir
+            .ancestors()
+            .find(|p| !p.as_os_str().is_empty() && p.is_dir())
+            .map(Path::to_path_buf)
+    })
 }
 
 /// Bytes of the plan's frames that cannot be hard-linked into `run_dir`
@@ -541,14 +597,18 @@ fn copied_bytes(plan: &Plan, sources: &[Source], run_dir: &Path) -> u64 {
         .chain(plan.valid.iter().copied())
         .chain(plan.heldout.iter().copied())
         .collect();
+    // Found (and made) at the first probe only.
+    let mut probe_in: Option<Option<PathBuf>> = None;
     let mut linked: BTreeMap<usize, bool> = BTreeMap::new();
     let mut bytes = 0u64;
     for r in frames {
         let Some(f) = frame(sources, r) else { continue };
-        if *linked
-            .entry(r.0)
-            .or_insert_with(|| hard_links_work(&f.image, run_dir))
-        {
+        if *linked.entry(r.0).or_insert_with(|| {
+            probe_in
+                .get_or_insert_with(|| probe_dir(run_dir))
+                .as_deref()
+                .is_some_and(|p| hard_links_work(&f.image, run_dir, p))
+        }) {
             continue;
         }
         bytes = bytes.saturating_add(std::fs::metadata(&f.image).map_or(0, |m| m.len()));

@@ -14,6 +14,10 @@
 //! be extracted again is skipped with a warning). The space is checked before the extraction and
 //! before the write ([`disk::check`]) and watched while helpers run ([`disk::Guard`]): a trip or
 //! a full disk stops the helpers through the cancel flag and ends the import with advice.
+//!
+//! The work folder is held busy while the import runs ([`crate::storage::Busy`]) and removed when
+//! it ends, unless `keep_work`; a removal that fails (a file still open) leaves the folder with its
+//! marker to the next storage sweep.
 
 use super::disk::{self, Guard, Trip};
 use super::parallel;
@@ -1539,9 +1543,7 @@ impl ImportJob {
         let (scenes, cameras) =
             self.record_written(zone, &frames, &rels, &license, kind, attribution)?;
         crate::collect::global().rescan_if_running(&self.dataset_dir);
-        if !r.keep_work {
-            let _ = crate::resources::manager::remove_any(&self.work);
-        }
+        // The work folder goes in `run_guarded`, with the hold on it.
         self.step(report, 7, 100, &format!("{} frames", rels.len()));
         let rep = ImportReport {
             import_id: self.id.clone(),
@@ -1621,7 +1623,13 @@ impl Drop for SetOnDrop<'_> {
 impl ImportJob {
     /// [`Task::run`] with `guard`: the task's `cancel` is mirrored into the guard's stop flag
     /// (every helper and pool watches that one), a trip or a full disk becomes the actionable
-    /// error, and a failed run removes the work folder (unless `keep_work`).
+    /// error, and the run's end removes the work folder (unless `keep_work`).
+    ///
+    /// Until this returns, a storage sweep leaves `work` alone; after a crash it removes it
+    /// ([`crate::storage::sweep`]). A kept work folder (`keep_work`) outlives the marker; one that
+    /// cannot be removed keeps it, unlocked, for the next sweep ([`Busy::finish_removing`]).
+    ///
+    /// [`Busy::finish_removing`]: crate::storage::Busy::finish_removing
     fn run_guarded(
         &self,
         ctx: TaskContext<'_>,
@@ -1629,6 +1637,7 @@ impl ImportJob {
         cancel: &AtomicBool,
         guard: Guard,
     ) -> Result<TaskOutcome> {
+        let busy = crate::storage::Busy::hold(&self.work);
         let finished = AtomicBool::new(false);
         let r = std::thread::scope(|s| {
             s.spawn(|| {
@@ -1643,8 +1652,8 @@ impl ImportJob {
             self.stages(ctx, report, &guard)
         });
         let r = r.map_err(|e| self.explain(e, &guard));
-        if r.is_err() && !self.request.keep_work {
-            let _ = crate::resources::manager::remove_any(&self.work);
+        if !self.request.keep_work {
+            busy.finish_removing();
         }
         r
     }
@@ -1699,9 +1708,6 @@ impl Task for ImportJob {
         report: &mut dyn FnMut(TaskReport<'_>),
         cancel: &AtomicBool,
     ) -> Result<TaskOutcome> {
-        // Until this returns, a storage sweep leaves `work` alone; after a crash it removes it
-        // ([`crate::storage::sweep`]). A kept work folder (`keep_work`) outlives the marker.
-        let _busy = crate::storage::Busy::hold(&self.work);
         let mut overridden = false;
         let r = self.run_guarded(
             ctx,
