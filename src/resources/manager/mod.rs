@@ -239,7 +239,11 @@ pub(crate) struct DownloadLock {
 }
 
 impl DownloadLock {
-    /// Take the lock if it is free; None when another process (or handle) holds it.
+    /// Take the lock if it is free; None when another process (or handle) holds it after
+    /// [`crate::resources::export::train::LOCK_GRACE`] of retries. A child process spawned at the
+    /// moment a lock file is open shares that open file until it execs, so a lock just released
+    /// can look held for a moment (the same grace as `TrainLock`); a real holder keeps it for the
+    /// whole download.
     pub fn try_acquire(root: &Path) -> Result<Option<Self>> {
         std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
         let path = root.join(LOCK_FILE);
@@ -250,17 +254,22 @@ impl DownloadLock {
             .write(true)
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
-        match file.try_lock() {
-            Ok(()) => {
+        let waited = crate::fsx::lock_wait_with(
+            &file,
+            crate::fsx::LockKind::Exclusive,
+            crate::fsx::deadline_after(crate::resources::export::train::LOCK_GRACE),
+            crate::fsx::Pauses::fixed(Duration::from_millis(20)),
+            || true,
+        )
+        .with_context(|| format!("locking {}", path.display()))?;
+        match waited {
+            crate::fsx::Waited::Held => {
                 // For humans looking at a stuck lock; the OS lock is what counts.
                 let _ = file.set_len(0);
                 let _ = writeln!(file, "{}", std::process::id());
                 Ok(Some(Self { _file: file }))
             }
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => {
-                Err(e).with_context(|| format!("locking {}", path.display()))
-            }
+            crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped => Ok(None),
         }
     }
 

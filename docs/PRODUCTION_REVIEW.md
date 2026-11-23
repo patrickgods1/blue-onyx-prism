@@ -4742,7 +4742,11 @@ are unchanged. Injecting 105 ms per request failed the old test 10/10 and the ne
 two `storage::usage` tests: the Storage card's cache held one report for the whole process, so two callers of
 different folders (tests with their own data roots) took turns overwriting it, and each measured again, round after
 round, until its 60 s wait ran out (measuring an empty folder there takes less than one 25 ms look). It now keeps
-one report per set of folders (#231); a test with another caller measuring in a loop failed 10/10 before, 0/10 after.
+one report per set of folders (#231); a test with another caller measuring in a loop failed 10/10 before, 0/10 after. Then main's OpenVINO-only test run failed `superseded_archives_go_kept_ones_stay`: the download and export locks'
+`try_acquire` (used only by the new sweeps) gave up at once, so a lock just dropped read as held while a child that a
+parallel test forked still shared its file. Both now retry for `LOCK_GRACE` (1 s) like `TrainLock`; with another
+thread forking children that pause 30 ms before exec, 50 back-to-back takes missed 48 times in 10/10 runs before,
+0/10 after (#232).
 
 Measured after this phase (release build on the development Mac, short smoke run): unchanged from phase 1. After
 kill -9 and after a graceful stop, no process survives; the data root holds only its own files, now including

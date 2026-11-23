@@ -513,8 +513,10 @@ struct ExportLock {
 }
 
 impl ExportLock {
-    /// Take the lock if it is free, without waiting; None when an export or a training
-    /// environment setup holds it. The lock file is created in an existing folder only.
+    /// Take the lock if it is free; None when an export or a training environment setup still
+    /// holds it after [`train::LOCK_GRACE`] of retries (a child spawned while a lock file is open
+    /// shares it until it execs, so a lock just released can look held for a moment; a real
+    /// holder keeps it for the whole export). The lock file is created in an existing folder only.
     fn try_acquire(path: &Path) -> std::io::Result<Option<Self>> {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -522,11 +524,14 @@ impl ExportLock {
             .read(true)
             .write(true)
             .open(path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(e)) => Err(e),
-        }
+        let waited = crate::fsx::lock_wait_with(
+            &file,
+            crate::fsx::LockKind::Exclusive,
+            crate::fsx::deadline_after(train::LOCK_GRACE),
+            crate::fsx::Pauses::fixed(Duration::from_millis(20)),
+            || true,
+        )?;
+        Ok(matches!(waited, crate::fsx::Waited::Held).then_some(Self { _file: file }))
     }
 
     fn acquire(
