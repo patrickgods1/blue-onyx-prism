@@ -381,23 +381,10 @@ pub fn draw_predictions(img: &RgbImage, preds: &[Prediction]) -> RgbImage {
 /// Longest file stem [`save_annotated`] keeps from a client-supplied name.
 const MAX_STEM_LEN: usize = 64;
 
-/// Windows reserved device names: `CON.jpg` (any extension, any case) opens the device.
-fn is_windows_reserved(stem: &str) -> bool {
-    let base = stem.split('.').next().unwrap_or(stem).to_ascii_uppercase();
-    match base.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" => true,
-        _ => {
-            let b = base.as_bytes();
-            b.len() == 4
-                && (base.starts_with("COM") || base.starts_with("LPT"))
-                && b.get(3).is_some_and(u8::is_ascii_digit)
-        }
-    }
-}
-
 /// The file stem of an untrusted (client-supplied) name, safe on every platform: characters
 /// outside `[A-Za-z0-9._-]` become `_`, leading/trailing dots are dropped, at most
-/// [`MAX_STEM_LEN`] characters; `None` when nothing usable is left or it names a Windows device.
+/// [`MAX_STEM_LEN`] characters; `None` when nothing usable is left or it names a Windows device
+/// ([`crate::fsx::is_windows_reserved`]).
 fn safe_stem(name: &str) -> Option<String> {
     // Both separators, whatever the host OS (a Windows client may send `C:\cam\x.jpg`).
     let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
@@ -417,12 +404,14 @@ fn safe_stem(name: &str) -> Option<String> {
         .take(MAX_STEM_LEN)
         .collect();
     let clean = clean.trim_matches('.');
-    (!clean.is_empty() && !is_windows_reserved(clean)).then(|| clean.to_string())
+    (!clean.is_empty() && !crate::fsx::is_windows_reserved(clean)).then(|| clean.to_string())
 }
 
 /// Write `<stem>_od.jpg` (annotated) into `dir`, plus `<stem>.jpg` (unannotated) when
 /// `save_ref` is set. `name` is untrusted (client-supplied): only a sanitized form of its file
-/// stem is used (`safe_stem`), else a random `image_<uuid>` name.
+/// stem is used (`safe_stem`), else a random `image_<uuid>` name. Each file goes through a hidden
+/// temporary file and a rename ([`crate::fsx::write_atomic`]), so a crash or a full disk never
+/// leaves a truncated JPEG under a real name (a leftover is `.<name>.<uuid>.tmp`, never `.jpg`).
 ///
 /// The unannotated `<stem>.jpg` is `upload`, the bytes as the client sent them, when they are a
 /// JPEG ([`is_jpeg`]; what Blue Iris sends): no second encode, and no second generation of JPEG
@@ -441,13 +430,13 @@ pub fn save_annotated(
 
     let annotated = draw_predictions(img, preds);
     let od_path = dir.join(format!("{stem}_od.jpg"));
-    std::fs::write(&od_path, encode_jpeg(&annotated, 95)?)
+    crate::fsx::write_atomic(&od_path, &encode_jpeg(&annotated, 95)?)
         .with_context(|| format!("writing {}", od_path.display()))?;
     if save_ref {
         let ref_path = dir.join(format!("{stem}.jpg"));
         let written = match upload.filter(|b| is_jpeg(b)) {
-            Some(bytes) => std::fs::write(&ref_path, bytes),
-            None => std::fs::write(&ref_path, encode_jpeg(img, 95)?),
+            Some(bytes) => crate::fsx::write_atomic(&ref_path, bytes),
+            None => crate::fsx::write_atomic(&ref_path, &encode_jpeg(img, 95)?),
         };
         written.with_context(|| format!("writing {}", ref_path.display()))?;
     }
@@ -663,6 +652,30 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
         assert!(names.iter().all(|n| n.starts_with("image_")), "{names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Saves go through a temporary file and a rename: a write that fails keeps no partial or
+    /// temporary file, and a successful one leaves only the final names.
+    #[test]
+    fn saves_are_atomic() {
+        let dir = std::env::temp_dir().join(format!("bo_img_atomic_{}", uuid::Uuid::new_v4()));
+        let img = synthetic(8, 8);
+        let names = || -> Vec<String> {
+            let mut n: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            n.sort();
+            n
+        };
+        save_annotated(&dir, "a.jpg", &img, &[], true, None).unwrap();
+        assert_eq!(names(), ["a.jpg", "a_od.jpg"]);
+        // `<stem>_od.jpg` cannot be replaced (a folder with something in it is in the way).
+        std::fs::create_dir_all(dir.join("b_od.jpg").join("x")).unwrap();
+        let e = save_annotated(&dir, "b.jpg", &img, &[], true, None).unwrap_err();
+        assert!(format!("{e:#}").contains("b_od.jpg"), "{e:#}");
+        assert_eq!(names(), ["a.jpg", "a_od.jpg", "b_od.jpg"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

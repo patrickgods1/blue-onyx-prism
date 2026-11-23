@@ -218,17 +218,14 @@ pub fn before_load(dir: &Path) {
 /// exclusively; None when it is still held.
 fn shared_lock(dir: &Path) -> std::io::Result<Option<File>> {
     let file = open_lock(dir)?;
-    let started = Instant::now();
-    loop {
-        match file.try_lock_shared() {
-            Ok(()) => return Ok(Some(file)),
-            Err(TryLockError::WouldBlock) if started.elapsed() < SHARED_WAIT => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(TryLockError::WouldBlock) => return Ok(None),
-            Err(TryLockError::Error(e)) => return Err(e),
-        }
-    }
+    let waited = crate::fsx::lock_wait_with(
+        &file,
+        crate::fsx::LockKind::Shared,
+        crate::fsx::deadline_after(SHARED_WAIT),
+        crate::fsx::Pauses::fixed(Duration::from_millis(100)),
+        || true,
+    )?;
+    Ok((waited == crate::fsx::Waited::Held).then_some(file))
 }
 
 /// Swap the staged update `pending` of resource `id` into `target` (the caller holds the

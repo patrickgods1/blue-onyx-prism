@@ -1582,29 +1582,28 @@ fn folder_lock(path: &Path, wait: Duration) -> Option<std::fs::File> {
     } else {
         wait
     };
-    let start = Instant::now();
-    let mut pause = Duration::from_micros(100);
-    loop {
-        match fs4::FileExt::try_lock(&file) {
-            Ok(()) => break,
-            Err(fs4::TryLockError::WouldBlock) if start.elapsed() < wait => {
-                std::thread::sleep(pause);
-                pause = (pause * 2).min(LOCK_POLL);
-            }
-            Err(fs4::TryLockError::WouldBlock) => {
-                long_held().insert(lock.clone());
-                tracing::warn!(
-                    "{} stayed held for {wait:?}, so this one label write goes on without it: \
-                     another process may have stopped while writing. If it is running, its \
-                     change to the same frame could be overwritten",
-                    lock.display()
-                );
-                return None;
-            }
-            Err(fs4::TryLockError::Error(e)) => {
-                without_folder_lock(&lock, &format!("it cannot be locked ({e})"));
-                return None;
-            }
+    let waited = crate::fsx::lock_wait_with(
+        &file,
+        crate::fsx::LockKind::Exclusive,
+        crate::fsx::deadline_after(wait),
+        crate::fsx::Pauses::doubling(Duration::from_micros(100), LOCK_POLL),
+        || true,
+    );
+    match waited {
+        Ok(crate::fsx::Waited::Held) => {}
+        Ok(crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped) => {
+            long_held().insert(lock.clone());
+            tracing::warn!(
+                "{} stayed held for {wait:?}, so this one label write goes on without it: \
+                 another process may have stopped while writing. If it is running, its \
+                 change to the same frame could be overwritten",
+                lock.display()
+            );
+            return None;
+        }
+        Err(e) => {
+            without_folder_lock(&lock, &format!("it cannot be locked ({e})"));
+            return None;
         }
     }
     long_held().remove(&lock);

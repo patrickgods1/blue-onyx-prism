@@ -16,16 +16,15 @@
 //!     that names the file; a folder where the file cannot be created or locked (read-only, a
 //!     network share) goes on under the process slot alone, with one warning per folder.
 //! - **Whole files** ([`write_atomic`]): each save writes its own temporary file in the target's
-//!   folder (`.<name>.<pid>.<n>.tmp`, opened with `create_new`, so two writers never share one),
-//!   flushes it and renames it over the target: a reader sees the old file or the new one.
+//!   folder (`.<name>.<uuid>.tmp`, opened with `create_new`, so two writers never share one;
+//!   [`crate::fsx::write_atomic_with`]), flushes it and renames it over the target: a reader sees
+//!   the old file or the new one.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::sync::LockExt;
 
@@ -175,68 +174,47 @@ fn file_lock(results: &Path, wait: Duration) -> Result<Option<std::fs::File>> {
             return Ok(None);
         }
     };
-    let start = Instant::now();
-    let mut pause = Duration::from_millis(1);
-    loop {
-        match fs4::FileExt::try_lock(&file) {
-            Ok(()) => return Ok(Some(file)),
-            Err(fs4::TryLockError::WouldBlock) if start.elapsed() < wait => {
-                std::thread::sleep(pause);
-                pause = (pause * 2).min(FILE_POLL);
-            }
-            Err(fs4::TryLockError::WouldBlock) => bail!(
-                "{} stayed locked by another process for {} s (a `blue-onyx-prism benchmark` \
-                 run or re-score?): the benchmark results were not saved. Let it finish, then \
-                 try again",
-                path.display(),
-                wait.as_secs()
-            ),
-            Err(fs4::TryLockError::Error(e)) => {
-                without(format!("cannot be locked ({e})"));
-                return Ok(None);
-            }
+    let waited = crate::fsx::lock_wait_with(
+        &file,
+        crate::fsx::LockKind::Exclusive,
+        crate::fsx::deadline_after(wait),
+        crate::fsx::Pauses::doubling(Duration::from_millis(1), FILE_POLL),
+        || true,
+    );
+    match waited {
+        Ok(crate::fsx::Waited::Held) => Ok(Some(file)),
+        Ok(crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped) => bail!(
+            "{} stayed locked by another process for {} s (a `blue-onyx-prism benchmark` \
+             run or re-score?): the benchmark results were not saved. Let it finish, then \
+             try again",
+            path.display(),
+            wait.as_secs()
+        ),
+        Err(e) => {
+            without(format!("cannot be locked ({e})"));
+            Ok(None)
         }
     }
 }
 
-/// Temporary files made so far by this process (part of their names).
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Write `bytes` to `path` through a temporary file of its own in the same folder, flushed to
-/// disk, then renamed over `path` (see the module docs). The folder is created when missing.
+/// disk, then renamed over `path` ([`crate::fsx::write_atomic_with`], see the module docs). The
+/// folder is created when missing.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir).ok();
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".into());
-    let tmp = dir.join(format!(
-        ".{name}.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let write = || -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()
+    let opts = crate::fsx::Options {
+        create_parent: true,
+        ..crate::fsx::Options::default()
     };
-    if let Err(e) = write() {
-        std::fs::remove_file(&tmp).ok();
-        return Err(e).with_context(|| format!("writing {}", tmp.display()));
-    }
-    std::fs::rename(&tmp, path).map_err(|e| {
-        std::fs::remove_file(&tmp).ok();
-        anyhow::anyhow!("writing {}: {e}", path.display())
+    crate::fsx::write_atomic_with(path, bytes, &opts).map_err(|e| match e.step {
+        crate::fsx::Step::Rename => anyhow::anyhow!("writing {}: {}", path.display(), e.source),
+        _ => anyhow::Error::new(e.source).context(format!("writing {}", e.temp.display())),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn tmp() -> PathBuf {
         let d = std::env::temp_dir().join(format!("bop-results-io-{}", uuid::Uuid::new_v4()));

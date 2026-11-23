@@ -147,8 +147,12 @@ impl Identity {
     }
 }
 
+/// How long `scutil --get LocalHostName` may take at certificate generation (macOS).
+const SCUTIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The computer's name: `COMPUTERNAME` on Windows, `/proc/sys/kernel/hostname` on Linux, `scutil
-/// --get LocalHostName` on macOS (the Bonjour name), else `HOSTNAME`. None when nothing answers.
+/// --get LocalHostName` on macOS (the Bonjour name, at most `SCUTIL_TIMEOUT` through
+/// [`crate::command::run_within`]), else `HOSTNAME`. None when nothing answers.
 pub fn hostname() -> Option<String> {
     let clean = |s: String| {
         let s = s.trim().to_string();
@@ -159,14 +163,12 @@ pub fn hostname() -> Option<String> {
     } else if cfg!(target_os = "linux") {
         std::fs::read_to_string("/proc/sys/kernel/hostname").ok()
     } else if cfg!(target_os = "macos") {
-        std::process::Command::new("/usr/sbin/scutil")
-            .args(["--get", "LocalHostName"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
+        let mut cmd = std::process::Command::new("/usr/sbin/scutil");
+        cmd.args(["--get", "LocalHostName"]);
+        crate::command::run_within(cmd, SCUTIL_TIMEOUT, None)
             .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .filter(crate::command::RunOutput::success)
+            .map(|o| o.stdout_text())
     } else {
         None
     };

@@ -44,15 +44,15 @@
 
 use super::guard::{host_part, request_host};
 use super::{AppState, blocking, loopback_peer};
+use crate::command::{Ended, RunOutput};
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -63,9 +63,6 @@ pub(super) const DIALOG_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Largest request body taken (a kind and a path).
 const BODY_LIMIT: usize = 64 * 1024;
-
-/// Bytes of the child's stdout/stderr kept (the rest is read and dropped).
-const OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Set while a dialog is open (one at a time, process-wide).
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -535,28 +532,17 @@ fn find_in_path(name: &str, path_var: Option<&std::ffi::OsStr>) -> Option<String
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// This process's effective uid, from `/usr/bin/id -u` (no `unsafe` outside `backend/`).
-#[cfg(target_os = "macos")]
-fn euid() -> Option<u32> {
-    static EUID: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *EUID.get_or_init(|| {
-        let out = Command::new("/usr/bin/id")
-            .arg("-u")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
-    })
-}
-
 /// How this host shows a dialog, or why it cannot (the message for the page).
 fn host_launcher() -> Result<Launcher, String> {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::MetadataExt;
         let console = std::fs::metadata("/dev/console").ok().map(|m| m.uid());
-        mac_decision(euid(), console, Path::new("/usr/bin/osascript").is_file())
+        mac_decision(
+            crate::command::euid(),
+            console,
+            Path::new("/usr/bin/osascript").is_file(),
+        )
     }
     #[cfg(windows)]
     {
@@ -725,114 +711,6 @@ pub(super) fn picked_covers(p: &Path) -> bool {
     picked().covers_at(p, Instant::now())
 }
 
-/// How a run ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Ended {
-    Exited,
-    TimedOut,
-    /// The HTTP request went away (tab closed, navigated away).
-    Abandoned,
-}
-
-#[derive(Debug)]
-pub(super) struct RunOutput {
-    pub(super) code: Option<i32>,
-    pub(super) stdout: Vec<u8>,
-    pub(super) stderr: Vec<u8>,
-    pub(super) ended: Ended,
-}
-
-/// Read `r` to its end, keeping the first [`OUTPUT_LIMIT`] bytes.
-fn drain(mut r: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut buf = [0u8; 8192];
-        while let Ok(n) = r.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            let room = OUTPUT_LIMIT.saturating_sub(kept.len());
-            kept.extend_from_slice(buf.get(..n.min(room)).unwrap_or_default());
-        }
-        kept
-    })
-}
-
-/// Stop a dialog process: SIGTERM to its process group first (sudo relays it, osascript
-/// closes its dialog), then a kill.
-fn stop(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let group = format!("-{}", child.id());
-        for kill in ["/bin/kill", "/usr/bin/kill"] {
-            if Path::new(kill).is_file() {
-                let _ = Command::new(kill)
-                    .args(["-s", "TERM", "--", &group])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                break;
-            }
-        }
-        let until = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < until {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// A running dialog process as [`wait_for`] sees it (a fake in the tests).
-trait Waitable {
-    type Status;
-    fn try_wait(&mut self) -> std::io::Result<Option<Self::Status>>;
-    fn stop(&mut self);
-}
-
-impl Waitable for std::process::Child {
-    type Status = std::process::ExitStatus;
-    fn try_wait(&mut self) -> std::io::Result<Option<Self::Status>> {
-        std::process::Child::try_wait(self)
-    }
-    fn stop(&mut self) {
-        stop(self);
-    }
-}
-
-/// Wait until `p` exits, `timeout` passes or `abandoned` is set; in the last two cases, and
-/// when its state cannot be read, the process is stopped (the dialog is never left open).
-fn wait_for<W: Waitable>(
-    p: &mut W,
-    timeout: Duration,
-    abandoned: &AtomicBool,
-) -> std::io::Result<(Option<W::Status>, Ended)> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match p.try_wait() {
-            Ok(Some(s)) => return Ok((Some(s), Ended::Exited)),
-            Ok(None) => {}
-            Err(e) => {
-                p.stop();
-                return Err(e);
-            }
-        }
-        if abandoned.load(Ordering::Relaxed) {
-            p.stop();
-            return Ok((None, Ended::Abandoned));
-        }
-        if Instant::now() >= deadline {
-            p.stop();
-            return Ok((None, Ended::TimedOut));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 /// The process of `cmd`: program, argv and extra environment. Windows PowerShell goes through
 /// [`crate::system_info::windows_powershell_command`] (no inherited `PSModulePath`, so
 /// `Add-Type` loads when the service was started from a PowerShell 7 terminal).
@@ -845,41 +723,16 @@ fn process(cmd: &PickCommand) -> Command {
     c
 }
 
-/// Run `cmd` until it exits, `timeout` passes or `abandoned` is set (then it is stopped).
+/// Run `cmd` until it exits, `timeout` passes or `abandoned` is set (then its process group is
+/// stopped: SIGTERM first, so sudo relays it and osascript closes its dialog, then a kill), through
+/// the shared [`crate::command::run_within`] (own process group, `CREATE_NO_WINDOW`, output
+/// drained and capped at 64 KiB).
 pub(super) fn run(
     cmd: &PickCommand,
     timeout: Duration,
     abandoned: &AtomicBool,
 ) -> std::io::Result<RunOutput> {
-    let mut c = process(cmd);
-    c.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        // Its own process group, so [`stop`] reaches sudo's child too.
-        use std::os::unix::process::CommandExt;
-        c.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        c.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = c.spawn()?;
-    let out = child.stdout.take().map(drain);
-    let err = child.stderr.take().map(drain);
-    let (status, ended) = wait_for(&mut child, timeout, abandoned)?;
-    let join = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
-        h.and_then(|h| h.join().ok()).unwrap_or_default()
-    };
-    Ok(RunOutput {
-        code: status.and_then(|s| s.code()),
-        stdout: join(out),
-        stderr: join(err),
-        ended,
-    })
+    crate::command::run_within(process(cmd), timeout, Some(abandoned))
 }
 
 /// Holds [`BUSY`] while a dialog is open.
@@ -1551,68 +1404,6 @@ mod tests {
             REMOTE,
         );
         assert!(refusal(&r).unwrap().contains("another machine"));
-    }
-
-    /// A process whose state cannot be read is stopped before the error is returned.
-    #[test]
-    fn wait_errors_stop_the_dialog() {
-        struct FakeProc {
-            calls: usize,
-            fail_at: usize,
-            stopped: bool,
-        }
-        impl Waitable for FakeProc {
-            type Status = i32;
-            fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-                self.calls += 1;
-                if self.calls >= self.fail_at {
-                    Err(std::io::Error::other("waitpid failed"))
-                } else {
-                    Ok(None)
-                }
-            }
-            fn stop(&mut self) {
-                self.stopped = true;
-            }
-        }
-        let never = AtomicBool::new(false);
-        for fail_at in [1, 2] {
-            let mut p = FakeProc {
-                calls: 0,
-                fail_at,
-                stopped: false,
-            };
-            let e = wait_for(&mut p, Duration::from_secs(60), &never).unwrap_err();
-            assert_eq!(e.to_string(), "waitpid failed");
-            assert!(p.stopped, "stopped after a try_wait error ({fail_at})");
-        }
-        // An exit is not stopped; a timeout is.
-        struct Exits(bool);
-        impl Waitable for Exits {
-            type Status = i32;
-            fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-                Ok(Some(0))
-            }
-            fn stop(&mut self) {
-                self.0 = true;
-            }
-        }
-        let mut p = Exits(false);
-        assert_eq!(
-            wait_for(&mut p, Duration::from_secs(60), &never).unwrap(),
-            (Some(0), Ended::Exited)
-        );
-        assert!(!p.0);
-        let mut p = FakeProc {
-            calls: 0,
-            fail_at: usize::MAX,
-            stopped: false,
-        };
-        assert_eq!(
-            wait_for(&mut p, Duration::ZERO, &never).unwrap(),
-            (None, Ended::TimedOut)
-        );
-        assert!(p.stopped);
     }
 
     /// Remote peers (even signed in, with the API token) never open a dialog; a held flag answers

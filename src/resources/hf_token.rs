@@ -266,26 +266,6 @@ pub fn env_overrides_login(data_root: &Path) -> bool {
     env_overrides_login_with(&process_env, data_root)
 }
 
-/// Write `value` to a new file only this account can read: mode 0600 on Unix, on Windows the
-/// protected ACL of its folder (`folder_acl`). `path` must not exist yet: nothing is ever
-/// written through a file or link already there.
-pub(crate) fn write_private(path: &Path, value: &str) -> Result<()> {
-    use std::io::Write;
-    let mut open = std::fs::OpenOptions::new();
-    open.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open.mode(0o600);
-    }
-    let mut f = open
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(value.as_bytes())
-        .and_then(|()| f.sync_all())
-        .with_context(|| format!("writing {}", path.display()))
-}
-
 /// Run as root, the data root's owner has to own what was made, or the service cannot read the
 /// token (nor add its own folders to a `tools` that root created).
 #[cfg(any(unix, test))]
@@ -583,16 +563,31 @@ fn save_with(
     if let Some(w) = &warning {
         tracing::warn!("{w}");
     }
-    let tmp = dir.join(format!(".token.{}.tmp", uuid::Uuid::new_v4()));
-    let replaced = write_private(&tmp, token.secret()).and_then(|()| {
+    // `.token.<uuid>.tmp`, 0600 from its first byte, synced, then renamed over the old login
+    // (`crate::fsx::write_atomic_with`; a failure removes it).
+    #[cfg(unix)]
+    let hand_over =
+        |tmp: &Path| hand_over(data_root, tmp).map_err(|e| std::io::Error::other(format!("{e:#}")));
+    let opts = crate::fsx::Options {
+        private: true,
         #[cfg(unix)]
-        hand_over(data_root, &tmp)?;
-        std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
-    });
-    if let Err(e) = replaced {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
+        before_rename: Some(&hand_over),
+        ..crate::fsx::Options::default()
+    };
+    crate::fsx::write_atomic_with(&path, token.secret().as_bytes(), &opts).map_err(
+        |e| match e.step {
+            crate::fsx::Step::Create | crate::fsx::Step::CreateParent => {
+                anyhow::Error::new(e.source).context(format!("creating {}", e.temp.display()))
+            }
+            crate::fsx::Step::Write => {
+                anyhow::Error::new(e.source).context(format!("writing {}", e.temp.display()))
+            }
+            crate::fsx::Step::Prepare => anyhow::Error::new(e.source),
+            crate::fsx::Step::Rename => {
+                anyhow::Error::new(e.source).context(format!("writing {}", path.display()))
+            }
+        },
+    )?;
     Ok(Saved { path, warning })
 }
 

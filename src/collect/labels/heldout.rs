@@ -330,18 +330,17 @@ fn folder_lock(dir: &Path, wait: Duration) -> FolderLock {
         Ok(f) => f,
         Err(e) => return FolderLock::Broken(format!("{} cannot be opened ({e})", path.display())),
     };
-    let start = std::time::Instant::now();
-    loop {
-        match fs4::FileExt::try_lock(&file) {
-            Ok(()) => return FolderLock::Held(file),
-            Err(fs4::TryLockError::WouldBlock) if start.elapsed() < wait => {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            Err(fs4::TryLockError::WouldBlock) => return FolderLock::Busy,
-            Err(fs4::TryLockError::Error(e)) => {
-                return FolderLock::Broken(format!("{} cannot be locked ({e})", path.display()));
-            }
-        }
+    let waited = crate::fsx::lock_wait_with(
+        &file,
+        crate::fsx::LockKind::Exclusive,
+        crate::fsx::deadline_after(wait),
+        crate::fsx::Pauses::fixed(Duration::from_millis(2)),
+        || true,
+    );
+    match waited {
+        Ok(crate::fsx::Waited::Held) => FolderLock::Held(file),
+        Ok(crate::fsx::Waited::TimedOut | crate::fsx::Waited::Stopped) => FolderLock::Busy,
+        Err(e) => FolderLock::Broken(format!("{} cannot be locked ({e})", path.display())),
     }
 }
 

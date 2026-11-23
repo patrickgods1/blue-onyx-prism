@@ -3142,10 +3142,7 @@ mod tests {
             .open(s.build.join("export.json"))
             .unwrap();
         let refused = std::fs::rename(&s.build, &target).unwrap_err();
-        assert!(
-            crate::private_dir::is_sharing_violation(&refused),
-            "{refused:?}"
-        );
+        assert!(crate::fsx::is_sharing_violation(&refused), "{refused:?}");
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(600));
             drop(held);

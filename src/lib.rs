@@ -38,7 +38,7 @@
 //! - [`parallel`]  work-stealing maps on scoped threads (import analysis, dataset walks)
 //! - [`fsx`]       atomic writes, file-lock waits and safe on-disk names shared by every writer
 //! - [`children`]  registry of child processes the service started; the post-crash orphan sweep
-//! - [`command`]   the bounded runner for short helper programs (output drained, tree killed at the deadline)
+//! - [`command`]   the bounded runner for short helper programs (output drained and capped, stopped at the deadline)
 //! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
 
 //! # Lint policy

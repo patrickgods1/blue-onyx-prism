@@ -2,8 +2,8 @@
 //! `start|stop|restart`, which block until the job is done).
 
 use super::{
-    Action, SYSTEMD_UNIT, ServiceState, admin_rights_error, is_root, not_installed_error,
-    output_text, parse_systemctl_show, run,
+    Action, CHANGE_TIMEOUT, QUERY_TIMEOUT, SYSTEMD_UNIT, ServiceState, admin_rights_error, is_root,
+    not_installed_error, output_text, parse_systemctl_show, run,
 };
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -20,8 +20,9 @@ pub(super) fn query() -> Result<ServiceState> {
     let out = run(
         "systemctl",
         &["show", "-p", "LoadState", "-p", "ActiveState", SYSTEMD_UNIT],
+        QUERY_TIMEOUT,
     )?;
-    if !out.status.success() {
+    if !out.success() {
         bail!(
             "Could not ask systemd for the service state: `systemctl show {SYSTEMD_UNIT}` said: \
              {}",
@@ -46,8 +47,9 @@ pub(super) fn control(action: Action) -> Result<ServiceState> {
     let out = run(
         "systemctl",
         &["--no-ask-password", action.verb(), SYSTEMD_UNIT],
+        CHANGE_TIMEOUT,
     )?;
-    if !out.status.success() {
+    if !out.success() {
         let text = output_text(&out);
         let denied = text.contains("Access denied")
             || text.contains("authentication required")

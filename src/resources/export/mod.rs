@@ -522,32 +522,30 @@ impl ExportLock {
             .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
         let mut told = false;
-        let started = Instant::now();
-        loop {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(std::fs::TryLockError::WouldBlock) => {}
-                Err(std::fs::TryLockError::Error(e)) => {
-                    return Err(e).with_context(|| format!("locking {}", path.display()));
+        let waited = crate::fsx::lock_wait_with(
+            &file,
+            crate::fsx::LockKind::Exclusive,
+            crate::fsx::deadline_after(wait),
+            crate::fsx::Pauses::fixed(Duration::from_millis(250)),
+            || {
+                if !told {
+                    waiting();
+                    told = true;
                 }
-            }
-            if !told {
-                waiting();
-                told = true;
-            }
-            if cancel.load(Ordering::Relaxed) {
-                return Err(anyhow!(Cancelled));
-            }
-            if started.elapsed() >= wait {
-                bail!(
-                    "another process (the service or a `fetch` command) has been exporting a \
-                     model for over {} min and holds {}; wait for it to finish (the Config \
-                     page shows its progress) or cancel it, then try again",
-                    wait.as_secs() / 60,
-                    path.display()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(250));
+                !cancel.load(Ordering::Relaxed)
+            },
+        )
+        .with_context(|| format!("locking {}", path.display()))?;
+        match waited {
+            crate::fsx::Waited::Held => Ok(Self { _file: file }),
+            crate::fsx::Waited::Stopped => Err(anyhow!(Cancelled)),
+            crate::fsx::Waited::TimedOut => bail!(
+                "another process (the service or a `fetch` command) has been exporting a \
+                 model for over {} min and holds {}; wait for it to finish (the Config \
+                 page shows its progress) or cancel it, then try again",
+                wait.as_secs() / 60,
+                path.display()
+            ),
         }
     }
 }
