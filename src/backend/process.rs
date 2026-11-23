@@ -499,10 +499,19 @@ mod tests {
         let mut child = spawn("exec sleep 30");
         let pid = child.id();
         let a = start_time(pid).expect("child start time");
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // `spawn` returns once `sh` runs; its `exec sleep` comes a moment later (on Linux the
+        // exe still reads `dash` right after spawn). Exec keeps the process, so the start time
+        // must not change while the exe does.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut exe = exe_path(pid).expect("child exe");
+        while exe.file_name().and_then(|n| n.to_str()) != Some("sleep")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            exe = exe_path(pid).expect("child exe");
+        }
         assert_eq!(start_time(pid), Some(a));
         assert_ne!(Some(a), start_time(std::process::id()));
-        let exe = exe_path(pid).expect("child exe");
         assert_eq!(
             exe.file_name().and_then(|n| n.to_str()),
             Some("sleep"),
