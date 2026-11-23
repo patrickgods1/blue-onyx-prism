@@ -1061,26 +1061,54 @@ fn system_runner_pauses_resumes_and_cancels_while_paused() {
         .strip_prefix("pid ")
         .unwrap()
         .to_string();
-    // `T` is a stopped process in `ps` on Linux and macOS.
+    // The tree (the group the child leads) is paused when none of it can run: every member is
+    // stopped (`T` in `ps` on Linux and macOS), or blocked behind a stopped one (`D`, `U` on
+    // macOS): `sh` starts a command with vfork and waits uninterruptibly until the child execs,
+    // so a SIGSTOP that lands between the vfork and the exec stops the child and leaves the shell
+    // in `D` until a SIGCONT (seen on the Ubuntu CI runner, about 1 run in 8); or a zombie (`Z`,
+    // an ended `sleep` the stopped shell has not reaped yet; seen on macOS). At least one is `T`.
     let stopped = || {
         let out = std::process::Command::new("ps")
-            .args(["-o", "state=", "-p", &pid])
+            .args(["-e", "-o", "pgid=,state="])
             .output()
             .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().starts_with('T')
+        let states: Vec<char> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                (f.next()? == pid).then(|| f.next()?.chars().next())?
+            })
+            .collect();
+        states.contains(&'T') && states.iter().all(|c| matches!(c, 'T' | 'D' | 'U' | 'Z'))
     };
-    let wait_stopped = || {
+    let diag = |what: &str| {
+        let ps = std::process::Command::new("sh")
+            .args(["-c", &format!("ps -e -o pid,ppid,pgid,sid,stat,etimes,args | awk 'NR==1 || $3=={pid} || $1=={pid} || $2=={pid}'; echo ---; cat /proc/{pid}/status 2>&1 | head -12; echo ---; cat /proc/{pid}/stat 2>&1")])
+            .output()
+            .unwrap();
+        format!(
+            "DIAG {what}: lines={} worker_finished={}\n{}",
+            count(),
+            worker.is_finished(),
+            String::from_utf8_lossy(&ps.stdout)
+        )
+    };
+    let wait_stopped = |which: &str| {
         let until = Instant::now() + patience;
         while !stopped() {
-            assert!(Instant::now() < until, "the child {pid} was not stopped");
+            if Instant::now() >= until {
+                panic!("the child {pid} was not stopped ({which})\n{}", diag(which));
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     };
     pause.store(true, Ordering::Relaxed);
-    wait_stopped();
+    wait_stopped("first pause");
     let since = Instant::now();
+    let at_pause = count();
     while since.elapsed() < allowed + Duration::from_millis(500) {
         assert!(stopped(), "the child {pid} ran while paused");
+        assert_eq!(count(), at_pause, "output while paused");
         assert!(
             !worker.is_finished(),
             "paused time counted toward the timeout"
@@ -1099,7 +1127,7 @@ fn system_runner_pauses_resumes_and_cancels_while_paused() {
     );
     assert!(!stopped(), "the child {pid} was not resumed");
     pause.store(true, Ordering::Relaxed);
-    wait_stopped();
+    wait_stopped("second pause");
     cancel.store(true, Ordering::Relaxed);
     let until = Instant::now() + patience;
     while !worker.is_finished() {
