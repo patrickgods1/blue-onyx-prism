@@ -15,8 +15,16 @@ NotifyAccess=main
 # server stops answering, the pings stop, and systemd restarts it (Restart=on-failure covers
 # watchdog kills).
 WatchdogSec=120
-# Seconds systemd waits after SIGTERM (graceful drain) before SIGKILL.
-TimeoutStopSec=30
+# Seconds systemd waits after SIGTERM before SIGKILL. The service bounds its own stop: it ends
+# within 60 s of SIGTERM (runner::SHUTDOWN_DEADLINE: jobs stopped keeping their checkpoints,
+# requests drained, sessions and the log flushed, or, past the bound, a logged exit 1 after it
+# killed its own child processes). 75 s (runner::SERVICE_MANAGER_STOP) leaves that end to the
+# service; a test in src/runner/stop checks this value.
+TimeoutStopSec=75
+# The default, stated so it is not changed by accident: SIGTERM goes to every process of the unit
+# at once (training / export children included, besides the service's own stop of them) and
+# SIGKILL to whatever is left at the timeout, the backstop for a child nothing else could end.
+KillMode=control-group
 # Program (binary, openvino/, onnxruntime/) in /opt/blue-onyx-prism, owned by root and read-only
 # to the service. Everything the service writes (config, models, cache, downloads, benchmark.json,
 # model-export tools) lives in /var/lib/blue-onyx-prism, owned by the service user.

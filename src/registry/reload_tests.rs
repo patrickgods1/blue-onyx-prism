@@ -733,3 +733,81 @@ fn a_save_during_the_takeover_wait_reaches_the_new_generation() {
     drop(state);
     f.stop();
 }
+
+/// RA-050: a model whose worker panics while loading is `Failed` (and reloaded by the
+/// supervisor), and the next model in config order still loads: the panicking worker's load
+/// gate opens.
+#[test]
+fn a_panicking_load_fails_its_model_and_the_next_model_still_loads() {
+    let f = Fixture::start(&["a", "b"], |l| {
+        l.set_probe(|n| {
+            if n == 1 {
+                panic!("boom while loading a");
+            }
+        });
+    });
+    let b = f.ready("b");
+    assert!(detect(&b).success);
+    let a = f.handle("a");
+    let ModelState::Failed(msg) = a.state.get() else {
+        panic!("a is {:?}", a.state.get());
+    };
+    assert!(msg.contains("panicked: boom while loading a"), "{msg}");
+    assert_eq!(Status::of(&a), Status::Stuck);
+    f.stop();
+}
+
+/// RA-016: every worker's token is cancelled before the first join. A model whose compile
+/// cannot be interrupted does not keep the one after it (waiting for its load gate) from
+/// stopping: that one ends and is joined, the first is left behind at the deadline.
+#[test]
+fn shutdown_stops_every_worker_before_waiting_for_any() {
+    let f = Fixture::start(&["a", "b"], |l| l.hold_after(0));
+    wait_until("a to reach its compile", || f.loads.tried().len() == 1);
+    let t = Instant::now();
+    // The generation token is not cancelled first: the registry cancels its workers itself.
+    let stopped = f.reg.shutdown_by(Instant::now() + Duration::from_secs(2));
+    let took = t.elapsed();
+    assert_eq!(stopped.left, ["a"], "{stopped:?}");
+    assert_eq!(stopped.joined, 1, "{stopped:?}");
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    assert_eq!(f.loads.tried().len(), 1, "b never loaded");
+    f.loads.release();
+    f.stop();
+}
+
+/// RA-016: shutting down with several workers stuck in a compile takes about one deadline (one
+/// shared by all), not one per worker, and leaves them behind instead of blocking.
+#[test]
+fn shutdown_with_several_slow_workers_takes_one_deadline() {
+    let names = ["a", "b", "c", "d"];
+    let f = Fixture::start(&names, |_| {});
+    for n in names {
+        f.ready(n);
+    }
+    let before = f.loads.tried().len();
+    f.loads.hold_after(before);
+    for n in names {
+        assert!(matches!(
+            f.reload(n),
+            Reload::Spawned { replaced: true, .. }
+        ));
+    }
+    wait_until("every replacement to reach its compile", || {
+        f.loads.tried().len() == before + names.len()
+    });
+    let wait = Duration::from_millis(500);
+    let t = Instant::now();
+    let stopped = f.reg.shutdown_by(Instant::now() + wait);
+    let took = t.elapsed();
+    assert!(took >= wait, "{took:?}");
+    // One deadline per worker would be 2 s; no deadline, until the loads are released (30 s).
+    assert!(took < wait * 3, "{took:?}");
+    let mut left = stopped.left.clone();
+    left.sort();
+    assert_eq!(left, names, "{stopped:?}");
+    assert_eq!(stopped.joined, names.len(), "the serving workers stopped");
+    // Released, the replacements see their cancelled tokens and end.
+    f.loads.release();
+    f.stop();
+}

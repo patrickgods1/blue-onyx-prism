@@ -4,15 +4,20 @@
 //! (`assets/training.js` polls `GET /v1/training`), finished runs with their benchmark and the
 //! "Use as default / night model / verify model" actions (written with [`save_config`]).
 //!
-//! The queue ([`TrainingService`]) is one per process, started on first use with the download
-//! manager of the resources context; its [`Hooks`] add a finished model to the config through
-//! [`save_config`] (the `add-model` code) and benchmark it on its held-out frames with the
-//! generation's benchmark runner, both on the generation current at that moment.
+//! The queue ([`TrainingService`]) is one per process at a time, started on first use. It acts on
+//! the run (`runner`'s one `run_server` call) that started it: its downloads go through that run's
+//! download manager, looked up per download, and its [`Hooks`] add a finished model to the config
+//! through [`save_config`] (the `add-model` code) and benchmark it on its held-out frames with the
+//! generation's benchmark runner, both on the generation current at that moment. When the run
+//! stops, [`stop_for_exit`] interrupts the job (its checkpoint kept), shuts the queue down and
+//! empties its slot: nothing of the finished run is kept, and the next run of the same process (an
+//! in-process restart of the Windows service) starts a fresh queue on its own state.
 
 use super::train_area::{AUTOLABEL, IMPORT, MODELS, TRAIN, jobs_tab, tab_title};
 use super::{AppState, Shared, blocking, render, save_config};
 use crate::resources::catalog::{self, Platform};
 use crate::resources::export::train::{self as env, TrainPaths};
+use crate::sync::LockExt;
 use crate::training::capability::Capability;
 use crate::training::compare::{self, CompareRun, Comparison};
 use crate::training::dataset::{Balance, BalanceAxis, Excluded, SceneFilter};
@@ -35,20 +40,21 @@ mod poll;
 /// Built-in benchmark sets offered besides the held-out frames.
 const EXTRA_SETS: [&str; 3] = ["nir-night", "exdark-ir", "exdark-night"];
 
-static SERVICE: OnceLock<Arc<TrainingService>> = OnceLock::new();
+/// The process's training queue: started on first use, emptied by [`stop_for_exit`].
+static QUEUE: QueueSlot = QueueSlot::new();
 
-/// Serializes the tests that queue jobs or move the process's queue ([`SERVICE`]).
+/// Serializes the tests that queue jobs or move the process's queue ([`QUEUE`]).
 #[cfg(test)]
 pub(super) static QUEUE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// [`QUEUE_TEST_LOCK`] with the queue idle, then moved to `state`'s training folder, for a test
-/// that asserts what the queue holds: [`SERVICE`] is one for the process, so it holds what the
+/// that asserts what the queue holds: [`QUEUE`] is one for the process, so it holds what the
 /// last job left whatever folder the test configured, and only [`service`] moves it.
 #[cfg(test)]
 pub(super) async fn own_queue(state: &Arc<AppState>) -> tokio::sync::MutexGuard<'static, ()> {
     let queue = QUEUE_TEST_LOCK.lock().await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while SERVICE.get().is_some_and(|s| s.busy()) {
+    while QUEUE.get().is_some_and(|s| s.busy()) {
         assert!(std::time::Instant::now() < deadline, "the queue stays busy");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -56,31 +62,210 @@ pub(super) async fn own_queue(state: &Arc<AppState>) -> tokio::sync::MutexGuard<
     queue
 }
 
-/// The process's training queue, started on first use.
+/// The process (or this run, for an in-process restart) is stopping: the running job's child tree
+/// is killed with the run's retry checkpoint kept (not a user Cancel), queued jobs are written as
+/// interrupted, the queue is shut down by `deadline` ([`TrainingService::stop_for_exit`]) and the
+/// slot emptied, so a later run starts a fresh queue on its own state and nothing keeps this run's
+/// [`AppState`] alive. Idempotent.
+#[allow(
+    dead_code,
+    reason = "called from runner::stop through server::stop_training_for_exit (audit 2026-11 phase 1)"
+)]
+pub(crate) fn stop_for_exit(deadline: std::time::Instant) {
+    QUEUE.stop_for_exit(deadline);
+}
+
+/// The process's training queue, started on first use. A run that is stopping gets a closed
+/// queue ([`TrainingService::closed`]) that refuses every job: a late request never starts a
+/// queue that would outlive its run.
 pub(super) fn service(shared: &Shared) -> Arc<TrainingService> {
-    let svc = SERVICE
-        .get_or_init(|| {
-            let state = shared.current();
-            let config = state.config_read().clone();
-            let fetcher: Arc<dyn crate::resources::export::Fetcher> = match &state.resources {
-                Some(ctx) => Arc::new(crate::resources::export::ManagerFetcher::new(
-                    ctx.provisioner.manager_for(&config),
-                )),
-                None => Arc::new(crate::resources::export::cli_fetcher(&config.data_root())),
-            };
-            TrainingService::start(
-                Arc::new(crate::resources::export::SystemRunner),
-                fetcher,
-                Arc::new(ServerHooks {
-                    shared: shared.clone(),
-                }),
-                Some(crate::training::runs_file(&config)),
-            )
-        })
-        .clone();
+    let svc = QUEUE.get_or_start(shared);
     let want = crate::training::runs_file(&shared.current().config_read());
     sync_store(&svc, &want);
     svc
+}
+
+/// The started queue, if any (readers: they show the files otherwise).
+fn started_queue() -> Option<Arc<TrainingService>> {
+    QUEUE.get()
+}
+
+/// What the queue's hooks and downloads act on: the [`Shared`] of the run that started the queue
+/// (so a generation restart is followed), until that run stops ([`Self::detach`]). A finished
+/// run's [`AppState`] (its registry and runtimes, provisioner and download manager, benchmark
+/// runner, config store) is never kept by the queue: a hook of a detached target fails with a
+/// message instead of acting on a dead run (audit RA-006 / RA-008 / RA-021).
+struct Target {
+    shared: std::sync::Mutex<Option<Shared>>,
+}
+
+impl Target {
+    fn new(shared: &Shared) -> Arc<Self> {
+        Arc::new(Self {
+            shared: std::sync::Mutex::new(Some(shared.clone())),
+        })
+    }
+
+    /// The run's current generation, while the run serves.
+    fn state(&self) -> Option<Arc<AppState>> {
+        self.shared.lock_recover().as_ref().map(Shared::current)
+    }
+
+    /// [`Self::state`], or why `what` cannot be done.
+    fn require(&self, what: &str) -> anyhow::Result<Arc<AppState>> {
+        self.state().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot {what}: the server is stopping or restarting. The run keeps its files; \
+                 once the service is back, use Retry export on its row, or queue it again"
+            )
+        })
+    }
+
+    fn shared(&self) -> Option<Shared> {
+        self.shared.lock_recover().clone()
+    }
+
+    /// Let go of the run (its stop).
+    fn detach(&self) {
+        self.shared.lock_recover().take();
+    }
+}
+
+/// A started queue and what it acts on.
+struct Queue {
+    svc: Arc<TrainingService>,
+    target: Arc<Target>,
+}
+
+#[derive(Default)]
+struct Slot {
+    queue: Option<Queue>,
+    /// The run whose queue was stopped last (compared by address only, never upgraded): a late
+    /// request of that run gets a closed queue.
+    stopped: Option<std::sync::Weak<std::sync::RwLock<Arc<AppState>>>>,
+}
+
+/// The resettable home of the process's queue ([`QUEUE`]; tests make their own).
+pub(super) struct QueueSlot {
+    slot: std::sync::Mutex<Slot>,
+}
+
+impl QueueSlot {
+    pub(super) const fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(Slot {
+                queue: None,
+                stopped: None,
+            }),
+        }
+    }
+
+    pub(super) fn get(&self) -> Option<Arc<TrainingService>> {
+        self.slot
+            .lock_recover()
+            .queue
+            .as_ref()
+            .map(|q| q.svc.clone())
+    }
+
+    /// The queue, started on `shared`'s run when there is none (a closed one while that run
+    /// stops).
+    pub(super) fn get_or_start(&self, shared: &Shared) -> Arc<TrainingService> {
+        let mut slot = self.slot.lock_recover();
+        if let Some(q) = &slot.queue {
+            return q.svc.clone();
+        }
+        let state = shared.current();
+        let target = Target::new(shared);
+        let stopped_run = slot
+            .stopped
+            .as_ref()
+            .is_some_and(|w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(&shared.current)));
+        if state.shutdown.is_cancelled() || stopped_run {
+            target.detach();
+            return TrainingService::closed(
+                Arc::new(crate::resources::export::SystemRunner),
+                Arc::new(RunFetcher::new(target.clone())),
+                Arc::new(ServerHooks { target }),
+            );
+        }
+        let store = crate::training::runs_file(&state.config_read());
+        drop(state);
+        let svc = TrainingService::start(
+            Arc::new(crate::resources::export::SystemRunner),
+            Arc::new(RunFetcher::new(target.clone())),
+            Arc::new(ServerHooks {
+                target: target.clone(),
+            }),
+            Some(store),
+        );
+        slot.queue = Some(Queue {
+            svc: svc.clone(),
+            target,
+        });
+        svc
+    }
+
+    /// [`stop_for_exit`] on this slot.
+    pub(super) fn stop_for_exit(&self, deadline: std::time::Instant) {
+        let q = {
+            let mut slot = self.slot.lock_recover();
+            let q = slot.queue.take();
+            if let Some(sh) = q.as_ref().and_then(|q| q.target.shared()) {
+                slot.stopped = Some(Arc::downgrade(&sh.current));
+            }
+            q
+        };
+        let Some(q) = q else { return };
+        // The hooks keep the run while its job is being stopped (a register or benchmark in
+        // progress ends on the cancel), then let go.
+        q.svc.stop_for_exit(deadline);
+        q.target.detach();
+    }
+}
+
+/// The queue's downloads: through the serving run's download manager, looked up per download and
+/// held only while it runs, so a finished run's manager is never kept (and stops with its run).
+/// Without a resources context (tests), one manager of the queue's own on the data root.
+struct RunFetcher {
+    target: Arc<Target>,
+    own: OnceLock<crate::resources::export::ManagerFetcher>,
+}
+
+impl RunFetcher {
+    fn new(target: Arc<Target>) -> Self {
+        Self {
+            target,
+            own: OnceLock::new(),
+        }
+    }
+}
+
+impl crate::resources::export::Fetcher for RunFetcher {
+    fn fetch(
+        &self,
+        res: &'static crate::resources::catalog::Resource,
+        dir: &Path,
+        progress: &mut dyn FnMut(u64, u64),
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        let state = self.target.require(&format!("download {}", res.title))?;
+        let config = state.config_read().clone();
+        let manager = state
+            .resources
+            .as_ref()
+            .map(|ctx| ctx.provisioner.manager_for(&config));
+        drop(state);
+        match manager {
+            Some(m) => {
+                crate::resources::export::ManagerFetcher::new(m).fetch(res, dir, progress, cancel)
+            }
+            None => self
+                .own
+                .get_or_init(|| crate::resources::export::cli_fetcher(&config.data_root()))
+                .fetch(res, dir, progress, cancel),
+        }
+    }
 }
 
 /// Keep the started queue on the configured training folder (`training.dir` saved on this page,
@@ -97,7 +282,7 @@ fn sync_store(svc: &TrainingService, want: &std::path::Path) {
 
 /// The import and auto-label jobs (the queue's, else `tasks.json`).
 pub(super) fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> {
-    match SERVICE.get() {
+    match started_queue() {
         Some(s) => s.tasks(),
         None => crate::training::task::load_records(&crate::training::task::tasks_file(
             &crate::training::runs_file(&state.config_read()),
@@ -108,18 +293,18 @@ pub(super) fn tasks(state: &AppState) -> Vec<crate::training::task::TaskRecord> 
 /// A training run or task of this process's queue is queued or running, so it may be using the
 /// GPU. A `train` command in another process is not seen.
 pub(crate) fn queue_busy() -> bool {
-    SERVICE.get().is_some_and(|s| s.busy())
+    started_queue().is_some_and(|s| s.busy())
 }
 
 /// The clock of job `id` ([`TrainingService::timing`]).
 pub(super) fn job_timing(id: &str) -> Option<crate::training::eta::JobTiming> {
-    SERVICE.get()?.timing(id)
+    started_queue()?.timing(id)
 }
 
 /// [`runs`] without their epochs, for readers that do not show them (the Jobs list, the storage
 /// card): no history file is read and no history cloned.
 pub(super) fn records(state: &AppState) -> Vec<RunRecord> {
-    match SERVICE.get() {
+    match started_queue() {
         Some(s) => s.records(),
         None => crate::training::service::load_bare_records(&crate::training::runs_file(
             &state.config_read(),
@@ -131,7 +316,7 @@ pub(super) fn records(state: &AppState) -> Vec<RunRecord> {
 /// records of `runs.json` that parse ([`crate::training::task::read_records`]), the file left as it
 /// is, damaged or not (the queue moves a damaged one aside when it starts).
 pub(super) fn records_read_only(state: &AppState) -> Vec<RunRecord> {
-    match SERVICE.get() {
+    match started_queue() {
         Some(s) => s.records(),
         None => {
             crate::training::task::read_records(&crate::training::runs_file(&state.config_read()))
@@ -141,7 +326,7 @@ pub(super) fn records_read_only(state: &AppState) -> Vec<RunRecord> {
 
 /// The queue if it was started (the page shows `runs.json` otherwise).
 pub(super) fn runs(state: &AppState) -> Vec<RunRecord> {
-    match SERVICE.get() {
+    match started_queue() {
         Some(s) => s.runs(),
         None => crate::training::service::load_records(&crate::training::runs_file(
             &state.config_read(),
@@ -149,13 +334,42 @@ pub(super) fn runs(state: &AppState) -> Vec<RunRecord> {
     }
 }
 
+/// The queue's [`Hooks`] on the [`Target`] run.
 struct ServerHooks {
-    shared: Shared,
+    target: Arc<Target>,
+}
+
+impl ServerHooks {
+    /// The benchmark context of the serving generation at each call (`held`, the generation the
+    /// hook started on, once the run stopped: the hook ends on the job's cancel then).
+    fn context(
+        &self,
+        held: &Arc<AppState>,
+        results_path: Option<PathBuf>,
+    ) -> impl Fn() -> crate::benchmark::service::RunContext + use<> {
+        let (target, held) = (self.target.clone(), held.clone());
+        move || {
+            let st = target.state().unwrap_or_else(|| held.clone());
+            crate::benchmark::service::RunContext {
+                config: st.config_read().clone(),
+                results_path: results_path
+                    .clone()
+                    .unwrap_or_else(|| crate::benchmark::results_path(&st.config_path)),
+                runtimes: st.registry.runtimes().cloned(),
+                loaded: super::benchmark::loaded_devices(&st),
+                resources: st.resources.clone(),
+                profile: st.registry.profile().map(|(p, _)| p.clone()),
+                metrics: Some(st.metrics.clone()),
+            }
+        }
+    }
 }
 
 impl Hooks for ServerHooks {
     fn register(&self, out: &TrainOutput) -> anyhow::Result<String> {
-        let state = self.shared.current();
+        let state = self
+            .target
+            .require(&format!("add {} to the config", out.name))?;
         let mut msg = String::new();
         let saved = save_config(&state, "training", |c| {
             msg = crate::training::cli::add_trained_model(c, out)?;
@@ -171,20 +385,8 @@ impl Hooks for ServerHooks {
         devices: &[String],
         cancel: &AtomicBool,
     ) -> anyhow::Result<Option<BenchSummary>> {
-        let state = self.shared.current();
-        let shared = self.shared.clone();
-        let ctx = move || {
-            let st = shared.current();
-            crate::benchmark::service::RunContext {
-                config: st.config_read().clone(),
-                results_path: crate::benchmark::results_path(&st.config_path),
-                runtimes: st.registry.runtimes().cloned(),
-                loaded: super::benchmark::loaded_devices(&st),
-                resources: st.resources.clone(),
-                profile: st.registry.profile().map(|(p, _)| p.clone()),
-                metrics: Some(st.metrics.clone()),
-            }
-        };
+        let state = self.target.require(&format!("benchmark {}", out.name))?;
+        let ctx = self.context(&state, None);
         bench::run(
             &state.benchmark,
             &ctx,
@@ -207,7 +409,7 @@ impl Hooks for ServerHooks {
         if sets.is_empty() {
             return Ok(None);
         }
-        let state = self.shared.current();
+        let state = self.target.require("benchmark the default model")?;
         let config = state.config_read().clone();
         let default = crate::training::switch::current_default(&config);
         let name = default.clone().unwrap_or_default();
@@ -240,19 +442,7 @@ impl Hooks for ServerHooks {
         // Its own results file: see `bench`'s module docs.
         let dir = run_dir.join("baseline");
         let results_path = dir.join(crate::benchmark::report::RESULTS_FILE);
-        let shared = self.shared.clone();
-        let ctx = move || {
-            let st = shared.current();
-            crate::benchmark::service::RunContext {
-                config: st.config_read().clone(),
-                results_path: results_path.clone(),
-                runtimes: st.registry.runtimes().cloned(),
-                loaded: super::benchmark::loaded_devices(&st),
-                resources: st.resources.clone(),
-                profile: st.registry.profile().map(|(p, _)| p.clone()),
-                metrics: Some(st.metrics.clone()),
-            }
-        };
+        let ctx = self.context(&state, Some(results_path));
         // What it would measure (None: cannot tell, measured as before); a baseline of the same
         // inputs measured for another run of this comparison group is taken over.
         let resolved = bench::resolve_devices(&mut ctx(), &name, devices).ok();
@@ -2328,7 +2518,7 @@ pub(super) async fn json(
     blocking(move || {
         let all = runs(&state);
         let columns = state.config_read().training.effective_metric_columns();
-        let busy = SERVICE.get().is_some_and(|s| s.busy());
+        let busy = started_queue().is_some_and(|s| s.busy());
         let tasks = tasks(&state);
         if q.poll.as_deref().is_some_and(|p| !p.is_empty() && p != "0") {
             let have = q.have.as_deref().map(poll::parse_have);
@@ -2975,7 +3165,7 @@ pub(super) async fn cancel(
         let f = super::dataset::parse_form(&body);
         let tab = jobs_tab(field(&f, "tab"), TRAIN);
         let id = field(&f, "id").unwrap_or_default().to_string();
-        let ok = SERVICE.get().is_some_and(|s| s.cancel(&id));
+        let ok = started_queue().is_some_and(|s| s.cancel(&id));
         if ok {
             render(&view(
                 &state,
@@ -3005,8 +3195,7 @@ pub(super) async fn finish(
         let f = super::dataset::parse_form(&body);
         let tab = jobs_tab(field(&f, "tab"), TRAIN);
         let id = field(&f, "id").unwrap_or_default().to_string();
-        let r = SERVICE
-            .get()
+        let r = started_queue()
             .ok_or_else(|| format!("no run {id}"))
             .and_then(|s| s.finish(&id));
         match r {
@@ -3041,9 +3230,7 @@ async fn pause_or_resume(state: Arc<AppState>, body: axum::body::Bytes, pause: b
         let f = super::dataset::parse_form(&body);
         let tab = jobs_tab(field(&f, "tab"), TRAIN);
         let id = field(&f, "id").unwrap_or_default().to_string();
-        let ok = SERVICE
-            .get()
-            .is_some_and(|s| if pause { s.pause(&id) } else { s.resume(&id) });
+        let ok = started_queue().is_some_and(|s| if pause { s.pause(&id) } else { s.resume(&id) });
         match (ok, pause) {
             (true, true) => render(&view(
                 &state,
@@ -3404,7 +3591,7 @@ pub(super) async fn set_dir(
     body: axum::body::Bytes,
 ) -> Response {
     blocking(move || {
-        if SERVICE.get().is_some_and(|s| s.busy()) {
+        if started_queue().is_some_and(|s| s.busy()) {
             return (
                 StatusCode::CONFLICT,
                 render(&view(
@@ -3439,8 +3626,8 @@ pub(super) async fn set_dir(
                 Ok(())
             })?;
             let now = crate::training::training_dir(&state.config_read());
-            if let Some(svc) = SERVICE.get() {
-                sync_store(svc, &now.join(crate::training::service::RUNS_FILE));
+            if let Some(svc) = started_queue() {
+                sync_store(&svc, &now.join(crate::training::service::RUNS_FILE));
             }
             Ok(if now == old {
                 saved
@@ -3469,7 +3656,7 @@ pub(super) async fn set_dir(
 /// `POST /training/remove-env`: delete the training environment (refused while a run is busy).
 pub(super) async fn remove_env(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
-        if SERVICE.get().is_some_and(|s| s.busy()) {
+        if started_queue().is_some_and(|s| s.busy()) {
             return (
                 StatusCode::CONFLICT,
                 render(&view(
@@ -3506,6 +3693,118 @@ pub(super) mod tests {
     use crate::backend::detect::{HardwareInfo, apple_gpu};
     use crate::config::Config;
     use crate::model::ModelFamilyKind;
+
+    /// The in-process restart (audit RA-006 / RA-008 / RA-021): once the run stopped, its slot is
+    /// empty, nothing of the queue keeps the run's `AppState` alive (not even a request still
+    /// holding the stopped queue), a late request of that run gets a closed queue instead of a new
+    /// one, and the next run gets a fresh queue on its own state.
+    #[test]
+    fn a_stopped_run_leaves_no_queue_and_keeps_no_state_alive() {
+        let control = super::super::test_util::test_state();
+        let control_weak = Arc::downgrade(&control);
+        drop(control);
+        assert!(control_weak.upgrade().is_none(), "a test state alone frees");
+
+        let slot = QueueSlot::new();
+        let state = super::super::test_util::test_state();
+        let weak = Arc::downgrade(&state);
+        let shared = Shared::from(state.clone());
+        let svc = slot.get_or_start(&shared);
+        assert!(!svc.stopped());
+        assert!(Arc::ptr_eq(&svc, &slot.get_or_start(&shared)), "one queue");
+        assert!(slot.get().is_some_and(|s| Arc::ptr_eq(&s, &svc)));
+
+        slot.stop_for_exit(std::time::Instant::now() + std::time::Duration::from_secs(10));
+        assert!(slot.get().is_none(), "the slot is empty");
+        assert!(svc.stopped());
+        // A late request of the stopped run: a closed queue, never stored.
+        let late = slot.get_or_start(&shared);
+        assert!(late.stopped());
+        assert!(slot.get().is_none());
+        drop(late);
+        drop((shared, state));
+        assert!(
+            weak.upgrade().is_none(),
+            "the stopped queue (still held by a request) keeps no AppState"
+        );
+        drop(svc);
+
+        // The next run of the process.
+        let next = super::super::test_util::test_state();
+        let next_shared = Shared::from(next.clone());
+        let fresh = slot.get_or_start(&next_shared);
+        assert!(!fresh.stopped());
+        assert!(slot.get().is_some());
+        slot.stop_for_exit(std::time::Instant::now() + std::time::Duration::from_secs(10));
+    }
+
+    /// A run whose stop request came (its `shutdown` token) never starts a queue.
+    #[test]
+    fn a_stopping_run_gets_a_closed_queue() {
+        let slot = QueueSlot::new();
+        let state = super::super::test_util::test_state();
+        state.shutdown.cancel();
+        let svc = slot.get_or_start(&Shared::from(state.clone()));
+        assert!(svc.stopped());
+        assert!(slot.get().is_none());
+        let weak = Arc::downgrade(&state);
+        drop(state);
+        assert!(weak.upgrade().is_none());
+        drop(svc);
+    }
+
+    /// The hooks follow a generation restart (the run's `Shared` swaps its state) and fail with a
+    /// message, never act on a dead run, once detached.
+    #[test]
+    fn the_target_follows_the_run_until_it_is_detached() {
+        let first = super::super::test_util::test_state();
+        let shared = Shared::from(first.clone());
+        let target = Target::new(&shared);
+        assert!(target.state().is_some_and(|s| Arc::ptr_eq(&s, &first)));
+        let second = super::super::test_util::test_state();
+        shared.swap(second.clone());
+        assert!(target.state().is_some_and(|s| Arc::ptr_eq(&s, &second)));
+        target.detach();
+        assert!(target.state().is_none());
+        let e = target
+            .require("add m to the config")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("cannot add m to the config: the server is stopping"),
+            "{e}"
+        );
+        let hooks = ServerHooks {
+            target: target.clone(),
+        };
+        let out = TrainOutput {
+            name: "m".into(),
+            onnx: "m.onnx".into(),
+            yaml: "m.yaml".into(),
+            provenance: "m.provenance.json".into(),
+            family: ModelFamilyKind::Yolo26,
+            classes: vec!["person".into()],
+            license: "test".into(),
+            heldout: None,
+            device: "cpu".into(),
+            train_seconds: 1.0,
+        };
+        assert!(
+            hooks.register(&out).is_err(),
+            "nothing is saved for a stopped run"
+        );
+        let fetch = RunFetcher::new(target);
+        let res = crate::resources::catalog::all().next().unwrap();
+        let e = crate::resources::export::Fetcher::fetch(
+            &fetch,
+            res,
+            Path::new("/nonexistent"),
+            &mut |_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("the server is stopping"), "{e}");
+    }
 
     #[test]
     fn the_preview_counts_unreviewed_frames_from_the_strips_walk_and_never_walks_itself() {
@@ -4406,7 +4705,7 @@ pub(super) mod tests {
         // (once the process's queue is idle: another test's job may still run).
         assert!(page.contains("action=\"/training/dir\""));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        while SERVICE.get().is_some_and(|s| s.busy()) {
+        while started_queue().is_some_and(|s| s.busy()) {
             assert!(std::time::Instant::now() < deadline, "the queue stays busy");
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

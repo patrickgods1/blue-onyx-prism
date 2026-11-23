@@ -454,6 +454,53 @@ fn the_resolver_follows_the_files_and_renews_by_its_clock() {
     assert_eq!(on_disk.fingerprint, r.fingerprint());
 }
 
+/// Audit 2026-11 phase 1: a panic in the reload thread must not leave `busy` set, which would stop
+/// every later reload and renewal.
+#[test]
+fn a_panic_in_the_reload_thread_lets_the_next_check_run() {
+    let root = scratch();
+    let source = generated_source(&root);
+    // Panics from the second reading on: `with` reads it once, the reload thread next.
+    let reads = Arc::new(AtomicU64::new(0));
+    let panic_on = Arc::new(AtomicBool::new(true));
+    let clock: Clock = {
+        let (reads, panic_on) = (reads.clone(), panic_on.clone());
+        Arc::new(move || {
+            if reads.fetch_add(1, Ordering::SeqCst) > 0 && panic_on.load(Ordering::SeqCst) {
+                panic!("test: the clock panics in the reload");
+            }
+            SystemTime::now()
+        })
+    };
+    let r = Resolver::with(source, identity_fn(), clock, Duration::ZERO).unwrap();
+    // A changed pair: `needs_refresh` says so from the stamp alone, without the clock.
+    let written = regenerate(&root.0, &identity(), SystemTime::now()).unwrap();
+    let wait_idle = |r: &Resolver| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while r.inner.busy.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "busy stayed set after the panic");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    r.maybe_check();
+    assert!(reads.load(Ordering::SeqCst) >= 1);
+    wait_idle(&r);
+    assert!(
+        reads.load(Ordering::SeqCst) >= 2,
+        "the reload ran (and panicked)"
+    );
+    assert_ne!(r.fingerprint(), written.fingerprint);
+    // The next check reloads.
+    panic_on.store(false, Ordering::SeqCst);
+    r.maybe_check();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while r.fingerprint() != written.fingerprint {
+        assert!(Instant::now() < deadline, "the next check never reloaded");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    wait_idle(&r);
+}
+
 /// A handshake is what triggers the check: the next handshakes get the new certificate.
 #[tokio::test]
 async fn a_handshake_picks_up_a_new_certificate() {

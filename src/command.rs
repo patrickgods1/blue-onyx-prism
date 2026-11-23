@@ -107,10 +107,23 @@ pub fn run_within(
 
 /// [`run_within`] keeping `limit` bytes of stdout and of stderr each.
 pub fn run_capped(
+    cmd: Command,
+    timeout: Duration,
+    abandoned: Option<&AtomicBool>,
+    limit: usize,
+) -> std::io::Result<RunOutput> {
+    run_capped_with(cmd, timeout, abandoned, limit, |_| Ok(()))
+}
+
+/// [`run_capped`] with `guard` called right after the spawn: what it returns is kept until the
+/// child has been reaped (a Windows Job Object holding the child's tree, a
+/// [`crate::children::Recorded`] entry). A guard that fails stops the child and is the error.
+pub fn run_capped_with<G>(
     mut cmd: Command,
     timeout: Duration,
     abandoned: Option<&AtomicBool>,
     limit: usize,
+    guard: impl FnOnce(&std::process::Child) -> std::io::Result<G>,
 ) -> std::io::Result<RunOutput> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -122,6 +135,13 @@ pub fn run_capped(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let mut child = cmd.spawn()?;
+    let _guard = match guard(&child) {
+        Ok(g) => g,
+        Err(e) => {
+            stop(&mut child);
+            return Err(e);
+        }
+    };
     let out = match child.stdout.take().map(|r| drain(r, limit)).transpose() {
         Ok(d) => d,
         Err(e) => {
@@ -379,6 +399,64 @@ mod tests {
         let out = run_within(sh("exit 7"), Duration::from_secs(10), None).unwrap();
         assert_eq!((out.ended, out.code), (Ended::Exited, Some(7)));
         assert!(!out.success());
+    }
+
+    /// The guard lives until the child is reaped; a failing guard stops the child and is the
+    /// error.
+    #[cfg(unix)]
+    #[test]
+    fn the_guard_lives_until_the_child_is_reaped() {
+        struct Flag(Arc<AtomicBool>);
+        impl Drop for Flag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(None::<u32>));
+        let (d, s) = (dropped.clone(), seen.clone());
+        let out = run_capped_with(
+            sh("sleep 0.3; echo done"),
+            Duration::from_secs(10),
+            None,
+            DEFAULT_OUTPUT_LIMIT,
+            move |child| {
+                *s.lock().unwrap() = Some(child.id());
+                Ok(Flag(d))
+            },
+        )
+        .unwrap();
+        assert_eq!(out.stdout_text(), "done\n");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "guard not dropped after the run"
+        );
+        assert!(seen.lock().unwrap().is_some());
+
+        let pid = Arc::new(Mutex::new(0u32));
+        let p = pid.clone();
+        let t = Instant::now();
+        let e = run_capped_with(
+            sh("sleep 30"),
+            Duration::from_secs(60),
+            None,
+            DEFAULT_OUTPUT_LIMIT,
+            move |child| -> std::io::Result<()> {
+                *p.lock().unwrap() = child.id();
+                Err(std::io::Error::other("no job object"))
+            },
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no job object"), "{e}");
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "the child was waited for"
+        );
+        let pid = *pid.lock().unwrap();
+        assert!(
+            gone_within(pid, Duration::from_secs(5)),
+            "child {pid} survived"
+        );
     }
 
     #[test]

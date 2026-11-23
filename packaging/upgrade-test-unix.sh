@@ -59,8 +59,9 @@ case "$(uname -s)" in
     install_pkg() { sudo installer -pkg "$1" -target /; }
     svc_stop() {
       sudo launchctl bootout system/com.blueonyx.prism 2>/dev/null || true
-      for _ in $(seq 1 40); do sudo launchctl print system/com.blueonyx.prism >/dev/null 2>&1 || return 0; sleep 1; done
-      fail "the daemon did not stop within 40 s"
+      # The plist's ExitTimeOut is 75 s.
+      for _ in $(seq 1 80); do sudo launchctl print system/com.blueonyx.prism >/dev/null 2>&1 || return 0; sleep 1; done
+      fail "the daemon did not stop within 80 s"
     }
     svc_start() { sudo launchctl bootstrap system "$PLIST"; }
     svc_pid() { sudo launchctl print system/com.blueonyx.prism 2>/dev/null | awk '/^\tpid = / { print $3 }'; }

@@ -15,8 +15,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 300s
-    # Time for the graceful drain after SIGTERM before Docker sends SIGKILL.
-    stop_grace_period: 30s
+    # Seconds Docker waits after SIGTERM before SIGKILL. The service bounds its own stop at 60 s
+    # (jobs, requests, sessions and the log; README, "Running as a service"); 75 s leaves that end
+    # to it. The image's entrypoint is tini, which reaps the orphans of killed job processes, so
+    # `init: true` is not needed (it does no harm either).
+    stop_grace_period: 75s
     # Least privilege: the image's root filesystem (binaries, runtimes, default config) is
     # read-only; the service writes only to the volumes below and /tmp. What breaks if tightened
     # further: without the tmpfs, model export and some runtime temp files fail; without a

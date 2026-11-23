@@ -490,3 +490,128 @@ async fn a_browser_signs_in_by_hand_over_real_sockets() {
     assert!(r.text().await.unwrap().contains(TEST_USER));
     running.stop().await;
 }
+
+/// One plain accept loop on 127.0.0.1 serving `app` (not the real router), with `limits`:
+/// (port, stop token, the loop's task).
+async fn plain_loop(
+    app: Router,
+    limits: Limits,
+) -> (u16, CancellationToken, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shutdown = CancellationToken::new();
+    let l = Loop {
+        app,
+        shared: Shared::from(test_state()),
+        shutdown: shutdown.clone(),
+        caps: Arc::new(ConnCaps::default()),
+        limits,
+        accept: Accept::Plain,
+    };
+    (port, shutdown, tokio::spawn(accept_loop(listener, l)))
+}
+
+/// RA-023: a request that never finishes holds its connection only for the grace. After it the
+/// connection is closed, the loop returns, and no connection task keeps a copy of the router
+/// (which holds the server's state) alive.
+#[tokio::test]
+async fn a_stuck_request_is_closed_after_the_grace_and_drops_the_router() {
+    let probe = Arc::new(());
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = {
+        let (probe, entered) = (probe.clone(), entered.clone());
+        Router::new().route(
+            "/stuck",
+            axum::routing::get(move || {
+                let (probe, entered) = (probe.clone(), entered.clone());
+                async move {
+                    let _held = probe;
+                    entered.store(true, Ordering::SeqCst);
+                    std::future::pending::<&'static str>().await
+                }
+            }),
+        )
+    };
+    let limits = Limits {
+        graceful: Duration::from_millis(300),
+        hard_close: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let (port, stop, task) = plain_loop(app, limits).await;
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    client
+        .write_all(b"GET /stuck HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the handler never ran");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let started = Instant::now();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the accept loop returns")
+        .unwrap();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(300) && took < Duration::from_secs(3),
+        "returned after {took:?}"
+    );
+    assert!(
+        closed_within(&mut client, Duration::from_secs(1)).await,
+        "the stuck connection is closed"
+    );
+    assert_eq!(
+        Arc::strong_count(&probe),
+        1,
+        "a connection task still holds the router"
+    );
+}
+
+/// An idle keep-alive connection does not hold the stop: it is closed at once, well within the
+/// grace.
+#[tokio::test]
+async fn an_idle_keep_alive_connection_is_closed_at_once() {
+    let app = Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
+    let limits = Limits {
+        graceful: Duration::from_secs(5),
+        ..Limits::default()
+    };
+    let (port, stop, task) = plain_loop(app, limits).await;
+    let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    client
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    // The whole answer (keep-alive: the server leaves the connection open after it).
+    let mut got = Vec::new();
+    let mut buf = [0u8; 512];
+    while !String::from_utf8_lossy(&got).ends_with("ok") {
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("an answer")
+            .unwrap();
+        assert!(n > 0, "closed before the answer");
+        got.extend_from_slice(buf.get(..n).unwrap());
+    }
+    let started = Instant::now();
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the accept loop returns")
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "an idle connection held the stop for {:?}",
+        started.elapsed()
+    );
+    assert!(closed_within(&mut client, Duration::from_secs(1)).await);
+}

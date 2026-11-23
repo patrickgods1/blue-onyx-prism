@@ -20,6 +20,11 @@
 //! that does not serve (failed, stuck, still loading) has nothing worth keeping: its worker
 //! retires first and the replacement loads once that freed the device, at most [`FREE_WAIT`]
 //! later, so a dead device is not held while the reload runs.
+//!
+//! Stopping is bounded: [`ModelRegistry::shutdown`] cancels every worker's token before the
+//! first join and waits for all of them against one deadline ([`RETIRE_JOIN`]), and a
+//! `stop-{name}` helper waits at most that long for its worker. A worker still inside a compile
+//! (which cannot be interrupted) is left behind, logged; it exits once the compile returns.
 
 use crate::backend::Candidate;
 use crate::backend::plan::Better;
@@ -540,6 +545,19 @@ const FREE_DRAIN: Duration = Duration::from_millis(1500);
 /// How often a `swap-{name}` thread looks at its replacement.
 const SWAP_POLL: Duration = Duration::from_millis(50);
 
+/// Longest [`ModelRegistry::shutdown`] waits for its threads, all of them together (one deadline
+/// shared by every worker and helper, after every worker's token is cancelled), and longest a
+/// `stop-{name}` helper waits for its worker once it is cancelled and settled. A cancelled worker
+/// sees its token within a quarter second (its poll), then frees its engine: ONNX Runtime waits
+/// up to its `ABORT_TIMEOUT` (10 s) for an inference in flight, so this is that plus a margin. A worker still inside a compile (which cannot be interrupted) is left behind
+/// at the deadline, logged with what it was doing: it holds only shared handles and a cancelled
+/// token, and exits on its own once the compile returns. The whole process stop budgets this
+/// (`runner`).
+pub const RETIRE_JOIN: Duration = Duration::from_secs(15);
+
+#[cfg(feature = "onnxruntime")]
+const _: () = assert!(RETIRE_JOIN.as_secs() > crate::backend::ort::ABORT_TIMEOUT.as_secs());
+
 /// How [`retire_worker`] stops a worker.
 struct Stop {
     /// How long its requests may finish before its token is cancelled.
@@ -548,6 +566,8 @@ struct Stop {
     settle: Duration,
     /// Opened once it is free, or those waits ran out.
     freed: Option<LoadGate>,
+    /// How long after that to wait for its thread before leaving it behind ([`RETIRE_JOIN`]).
+    join: Duration,
 }
 
 impl Stop {
@@ -561,6 +581,7 @@ impl Stop {
                 .saturating_add(Duration::from_secs(1)),
             settle: Duration::ZERO,
             freed: None,
+            join: RETIRE_JOIN,
         }
     }
 
@@ -570,6 +591,7 @@ impl Stop {
             drain: Duration::ZERO,
             settle: Duration::ZERO,
             freed: None,
+            join: RETIRE_JOIN,
         }
     }
 
@@ -579,6 +601,7 @@ impl Stop {
             drain: Duration::ZERO,
             settle: FREE_WAIT,
             freed: Some(freed),
+            join: RETIRE_JOIN,
         }
     }
 
@@ -588,6 +611,7 @@ impl Stop {
             drain: FREE_DRAIN,
             settle: FREE_WAIT.saturating_sub(FREE_DRAIN),
             freed: Some(freed),
+            join: RETIRE_JOIN,
         }
     }
 }
@@ -611,27 +635,56 @@ fn wait_finished(join: &JoinHandle<()>, deadline: Instant) {
     }
 }
 
+/// What [`ModelRegistry::shutdown_by`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stopped {
+    /// Worker threads that ended and were joined.
+    pub joined: usize,
+    /// Workers left behind: still running at the deadline (a compile in progress) or stuck in
+    /// an inference. Their threads end on their own.
+    pub left: Vec<String>,
+    /// `stop-{name}` / `swap-{name}` helper threads still running at the deadline.
+    pub helpers_left: usize,
+    /// See [`crate::worker::save::Flushed`].
+    pub saves: Option<crate::worker::save::Flushed>,
+}
+
+/// Starts a helper thread (`Builder::spawn`; tests make it fail).
+type SpawnHelper =
+    fn(std::thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>;
+
 /// Stop a worker that left the registry without blocking the caller, on a helper thread: as
-/// `how` says, then cancel its token and join it. Returns the helper thread (None: the worker
-/// had no thread, or the helper could not be spawned).
+/// `how` says, then cancel its token and join it (at most [`RETIRE_JOIN`] after the cancel and
+/// settle). Returns the helper thread (None: the worker had no thread, or the helper could not
+/// be spawned; its token is cancelled either way).
 fn retire_worker(slot: WorkerSlot, how: Stop) -> Option<JoinHandle<()>> {
+    retire_worker_with(slot, how, |b, f| b.spawn(f))
+}
+
+/// [`retire_worker`], starting its helper with `spawn`.
+fn retire_worker_with(slot: WorkerSlot, how: Stop, spawn: SpawnHelper) -> Option<JoinHandle<()>> {
     let WorkerSlot { handle, stop, join } = slot;
     let Stop {
         drain,
         settle,
         freed,
+        join: join_wait,
     } = how;
     let freed = OpensGate(freed);
     let name = handle.name.clone();
     let stuck = handle.stuck_flag();
+    let state = handle.state.clone();
     drop(handle);
     let Some(join) = join else {
         stop.cancel();
         return None;
     };
-    let spawned = std::thread::Builder::new()
-        .name(format!("stop-{name}"))
-        .spawn(move || {
+    // The closure owns `stop`: a helper that cannot start drops it uncancelled.
+    let cancel_on_fail = stop.clone();
+    let builder = std::thread::Builder::new().name(format!("stop-{name}"));
+    let spawned = spawn(
+        builder,
+        Box::new(move || {
             wait_finished(&join, Instant::now() + drain);
             stop.cancel();
             let settled = Instant::now() + settle;
@@ -650,17 +703,35 @@ fn retire_worker(slot: WorkerSlot, how: Stop) -> Option<JoinHandle<()>> {
                 );
                 return;
             }
+            // Cancelled: it leaves at its next check, unless a compile is in progress.
+            wait_finished(&join, Instant::now() + join_wait);
+            if !join.is_finished() {
+                warn!(
+                    model = %name,
+                    "previous worker is still running ({}) {} s after it was stopped, probably \
+                     inside a compile, which cannot be interrupted; leaving its thread behind, \
+                     it exits once the compile returns",
+                    state.describe(),
+                    join_wait.as_secs()
+                );
+                return;
+            }
             if join.join().is_err() {
                 error!(model = %name, "worker thread panicked");
             } else {
                 info!(model = %name, "previous worker stopped");
             }
-        });
+        }),
+    );
     match spawned {
         Ok(helper) => Some(helper),
         Err(e) => {
             // The thread still stops (its token is cancelled); it is just not joined.
-            warn!("could not spawn a thread to stop a worker: {e}");
+            cancel_on_fail.cancel();
+            warn!(
+                "could not spawn a thread to stop a worker ({e}); it was stopped at once and is \
+                 not joined; the system is out of threads or memory"
+            );
             None
         }
     }
@@ -1605,11 +1676,25 @@ impl ModelRegistry {
     }
 
     /// Stop every worker and join the threads (the registry is left empty, so a straggling
-    /// request of a retired generation gets "no model"). Workers no other thread holds a handle of exit
-    /// once their channel is empty; the others are cancelled. Cancel the shutdown token first
-    /// for a prompt exit (it also cuts short the drain of workers retired by a reload). Joins
-    /// the live workers, then the helper threads stopping retired ones.
+    /// request of a retired generation gets "no model"), within [`RETIRE_JOIN`] in all: see
+    /// [`Self::shutdown_by`].
     pub fn shutdown(&self) {
+        self.shutdown_by(Instant::now() + RETIRE_JOIN);
+    }
+
+    /// Stop every worker, then join the threads until `deadline` and leave the rest behind.
+    ///
+    /// Every worker's token is cancelled before the first join, so they all stop at once and
+    /// the whole stop takes about the slowest one, never their sum: a cancelled worker answers
+    /// what it holds ("shutting down") and exits, a loading one at its next check (between
+    /// candidates, waiting for the runtimes lock, after the compile, during the warm-up). One
+    /// that is still running at `deadline` (inside a compile, which cannot be interrupted) or is
+    /// stuck in an inference is logged with what it was doing and left behind: its thread holds
+    /// only shared handles and ends on its own. Then the helper threads stopping retired workers
+    /// get what is left of the same deadline, and the image saver writes its queue
+    /// ([`crate::worker::save::flush`]). Cancel the generation's token first for a prompt exit
+    /// (it also cuts short the drain of workers retired by a reload).
+    pub fn shutdown_by(&self, deadline: Instant) -> Stopped {
         // Taken out of the registry (not consumed): a handler of a retired generation may still
         // hold an `Arc` of it while its connection winds down; it then sees no models.
         let mut slots = {
@@ -1619,27 +1704,44 @@ impl ModelRegistry {
         };
         // Replacements served nothing yet.
         let replacements = std::mem::take(&mut slots.pending);
-        for r in replacements.into_values() {
-            r.slot.stop.cancel();
-            slots.workers.push(r.slot);
+        slots
+            .workers
+            .extend(replacements.into_values().map(|r| r.slot));
+        // Every token first: the workers stop in parallel.
+        for slot in &slots.workers {
+            slot.stop.cancel();
         }
-        for WorkerSlot { handle, stop, join } in slots.workers {
+        let mut report = Stopped::default();
+        for WorkerSlot { handle, join, .. } in slots.workers {
             let name = handle.name.clone();
-            if handle.is_stuck() {
-                // Its thread may never return from the runtime: do not join it.
-                stop.cancel();
+            let state = handle.state.clone();
+            let stuck = handle.is_stuck();
+            // The sender goes with the last handle (an HTTP handler may hold one a bit longer).
+            drop(handle);
+            let Some(j) = join else {
+                continue;
+            };
+            if stuck && !j.is_finished() {
+                // Its thread may never return from the runtime: do not wait for it.
                 warn!(model = %name, "worker is stuck in an inference; not waiting for it");
+                report.left.push(name);
                 continue;
             }
-            if Arc::try_unwrap(handle).is_err() {
-                // Someone still holds the sender: do not wait for the disconnect.
-                stop.cancel();
+            wait_finished(&j, deadline);
+            if !j.is_finished() {
+                warn!(
+                    model = %name,
+                    "worker did not stop in time ({}), probably inside a compile, which cannot \
+                     be interrupted; leaving its thread behind, it exits once the compile returns",
+                    state.describe()
+                );
+                report.left.push(name);
+                continue;
             }
-            if let Some(j) = join
-                && j.join().is_err()
-            {
+            if j.join().is_err() {
                 error!(model = %name, "worker thread panicked");
             }
+            report.joined += 1;
             info!(model = %name, "worker stopped");
         }
         // A `swap-{name}` thread that was finishing a swap may add a helper of its own.
@@ -1649,11 +1751,25 @@ impl ModelRegistry {
                 break;
             }
             for helper in retiring {
+                wait_finished(&helper, deadline);
+                if !helper.is_finished() {
+                    report.helpers_left += 1;
+                    continue;
+                }
                 if helper.join().is_err() {
                     error!("thread stopping a retired worker panicked");
                 }
             }
         }
+        if report.helpers_left > 0 {
+            warn!(
+                threads = report.helpers_left,
+                "threads stopping retired workers did not end in time; leaving them behind"
+            );
+        }
+        // The workers are gone, so their last saves are queued.
+        report.saves = Some(crate::worker::save::flush(deadline));
+        report
     }
 }
 
@@ -1700,6 +1816,90 @@ mod tests {
         drop(g);
         assert_eq!(h.join().unwrap(), Some(1));
         assert_eq!(RELOAD_LOCK_WAIT, Duration::from_secs(2));
+    }
+
+    /// A slot whose "worker" thread runs until its token is cancelled, or for `ignore` when it
+    /// ignores the token (a compile that cannot be interrupted).
+    fn slot_of(name: &str, ignore: Option<Duration>) -> WorkerSlot {
+        let stop = CancellationToken::new();
+        let seen = stop.clone();
+        let join = std::thread::spawn(move || match ignore {
+            Some(d) => std::thread::sleep(d),
+            None => {
+                while !seen.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+        let metrics = Arc::new(crate::metrics::ModelMetrics::new(name, "auto", ""));
+        WorkerSlot {
+            handle: Arc::new(WorkerHandle::failed(name, "test", metrics)),
+            stop,
+            join: Some(join),
+        }
+    }
+
+    /// RA-038: a helper that cannot be started still cancels the worker's token, as its comment
+    /// always claimed (before, the token was dropped uncancelled with the closure).
+    #[test]
+    fn a_retire_whose_helper_cannot_start_still_stops_the_worker() {
+        let slot = slot_of("m", None);
+        let stop = slot.stop.clone();
+        let helper = retire_worker_with(slot, Stop::at_once(), |_, _| {
+            Err(std::io::Error::other("no more threads"))
+        });
+        assert!(helper.is_none());
+        assert!(stop.is_cancelled());
+    }
+
+    /// RA-016: the `stop-{name}` helper leaves a worker that does not end after its cancel
+    /// (inside a compile) behind after its join wait, instead of blocking in `join` (and with
+    /// it `ModelRegistry::shutdown`).
+    #[test]
+    fn a_retire_helper_leaves_a_worker_that_does_not_stop() {
+        let slot = slot_of("m", Some(Duration::from_secs(5)));
+        let how = Stop {
+            join: Duration::from_millis(200),
+            ..Stop::at_once()
+        };
+        let t = Instant::now();
+        let helper = retire_worker(slot, how).unwrap();
+        helper.join().unwrap();
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(200), "{took:?}");
+        assert!(took < Duration::from_secs(4), "{took:?}");
+        // A worker that does stop is joined.
+        let slot = slot_of("n", None);
+        let helper = retire_worker(slot, Stop::at_once()).unwrap();
+        let t = Instant::now();
+        helper.join().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(4));
+    }
+
+    /// `shutdown_by` over hand-built slots: the ones that stop are joined, the others left
+    /// behind at the shared deadline, and an empty registry has nothing to wait for.
+    #[test]
+    fn shutdown_by_joins_what_stops_and_leaves_the_rest() {
+        let reg = ModelRegistry::from_handles(Vec::new(), None, RuntimeInfo::default());
+        {
+            let mut s = reg.write();
+            s.workers = vec![
+                slot_of("slow1", Some(Duration::from_secs(5))),
+                slot_of("quick", None),
+                slot_of("slow2", Some(Duration::from_secs(5))),
+            ];
+            s.rebuild_names();
+        }
+        let t = Instant::now();
+        let stopped = reg.shutdown_by(Instant::now() + Duration::from_millis(300));
+        let took = t.elapsed();
+        assert_eq!(stopped.joined, 1, "{stopped:?}");
+        assert_eq!(stopped.left, ["slow1", "slow2"], "{stopped:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(reg.names().is_empty());
+        let again = reg.shutdown_by(Instant::now());
+        assert_eq!(again.joined, 0);
+        assert!(again.left.is_empty());
     }
 
     #[test]

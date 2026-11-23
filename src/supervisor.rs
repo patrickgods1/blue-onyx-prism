@@ -60,7 +60,8 @@ const POLL: Duration = Duration::from_millis(500);
 pub enum Status {
     /// Serving.
     Ready,
-    /// Marked `Failed` after it had loaded: a stuck inference or a dead session.
+    /// Marked `Failed` after it had loaded (a stuck inference or a dead session), or its
+    /// worker thread panicked (while loading too).
     Stuck,
     /// An automatic reload that loaded on no device: the model is still down.
     ReloadFailed,

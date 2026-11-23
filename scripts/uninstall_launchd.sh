@@ -55,14 +55,14 @@ PROGRAM_DIR="$(program_dir)"
 
 if launchctl print "system/$LABEL" >/dev/null 2>&1; then
   launchctl bootout "system/$LABEL" || true
-  # bootout returns before the daemon has exited (the plist allows ExitTimeOut 30 s); launchd
+  # bootout returns before the daemon has exited (the plist allows ExitTimeOut 75 s); launchd
   # keeps the job listed until then.
-  for _ in $(seq 1 40); do
+  for _ in $(seq 1 80); do
     launchctl print "system/$LABEL" >/dev/null 2>&1 || break
     sleep 1
   done
   if launchctl print "system/$LABEL" >/dev/null 2>&1; then
-    echo "$LABEL is still loaded 40 s after bootout; check 'launchctl print system/$LABEL'." >&2
+    echo "$LABEL is still loaded 80 s after bootout; check 'launchctl print system/$LABEL'." >&2
     exit 1
   fi
 fi

@@ -7,8 +7,17 @@
 //! ([`blue_onyx_prism::runner`]). A config created outside the exe dir keeps its downloads, cache
 //! and logs next to it ([`blue_onyx_prism::cli::service_default_config`]).
 //!
-//! Controls: Stop / Shutdown, Interrogate, and the user-defined codes 130 (stop) and 131 (restart: cancel the running server, reload the
+//! Controls: Stop / Preshutdown, Interrogate, and the user-defined codes 130 (stop) and 131 (restart: cancel the running server, reload the
 //! service config, start again), e.g. `sc.exe control BlueOnyxPrismService 131`.
+//!
+//! Stop: the server follows the runner's stop timeline (`runner`, "Stopping") while this thread
+//! reports StopPending every 500 ms, for at most `runner::SHUTDOWN_DEADLINE` (60 s); past it the
+//! service ends the child processes it recorded, writes the log's tail and reports Stopped.
+//! The service accepts PRESHUTDOWN (not SHUTDOWN, which gets only the ~5 s
+//! WaitToKillServiceTimeout at an OS restart), so an OS shutdown gets the same stop: the SCM waits
+//! up to the service's preshutdown timeout, which `blue-onyx-prism-service.exe
+//! --set-preshutdown-timeout` (run by `scripts/install_service.ps1`, elevated) sets to
+//! `runner::SERVICE_MANAGER_STOP` (75 s; Windows' default is 10 s).
 //!
 //! Start: StartPending (the checkpoint moves every second) until the HTTP listener is bound, then
 //! Running (models compile while the service runs). When no listener could be bound for
@@ -38,12 +47,23 @@
 )]
 #![deny(unsafe_code)]
 
-/// `--version` / `-V`: version, git sha and build date. The only other argument is
-/// `--config <path>` / `--config=<path>` ([`blue_onyx_prism::cli::service_config_arg`]).
+/// `--version` / `-V`: version, git sha and build date. The other arguments are
+/// `--config <path>` / `--config=<path>` ([`blue_onyx_prism::cli::service_config_arg`]) and
+/// [`SET_PRESHUTDOWN`].
 fn version_requested() -> bool {
     std::env::args()
         .skip(1)
         .any(|a| a == "--version" || a == "-V")
+}
+
+/// Install-time argument (elevated, not as the service): set the installed service's
+/// preshutdown timeout to `runner::SERVICE_MANAGER_STOP` and exit.
+#[cfg(windows)]
+const SET_PRESHUTDOWN: &str = "--set-preshutdown-timeout";
+
+#[cfg(windows)]
+fn set_preshutdown_requested() -> bool {
+    std::env::args().skip(1).any(|a| a == SET_PRESHUTDOWN)
 }
 
 #[cfg(windows)]
@@ -55,6 +75,9 @@ fn main() -> std::process::ExitCode {
             blue_onyx_prism::cli::long_version_str()
         );
         return std::process::ExitCode::SUCCESS;
+    }
+    if set_preshutdown_requested() {
+        return service::set_preshutdown_timeout();
     }
     service::main()
 }
@@ -117,6 +140,8 @@ mod service {
     const START_WAIT_HINT: Duration = Duration::from_secs(10);
     /// How often StartPending is reported again with the next checkpoint.
     const START_TICK: Duration = Duration::from_secs(1);
+    /// Wait hint of each StopPending report (the checkpoint moves every 500 ms; the whole stop is
+    /// bounded by `runner::SHUTDOWN_DEADLINE`).
     const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
     const RETRY_DELAY: Duration = Duration::from_secs(5);
     /// Service-specific exit code: the server thread ended unexpectedly (a panic, logged with
@@ -182,9 +207,39 @@ mod service {
         }
     }
 
+    /// `--set-preshutdown-timeout`: the SCM waits this long at an OS shutdown for the service to
+    /// stop (ChangeServiceConfig2, takes effect at once). Run elevated by the installer.
+    pub fn set_preshutdown_timeout() -> ExitCode {
+        use windows_service::service::ServiceAccess;
+        use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+        let timeout = runner::SERVICE_MANAGER_STOP;
+        let done = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .and_then(|m| m.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG))
+            .and_then(|svc| svc.set_preshutdown_timeout(timeout));
+        match done {
+            Ok(()) => {
+                println!(
+                    "{SERVICE_NAME}: preshutdown timeout set to {} s",
+                    timeout.as_secs()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!(
+                    "could not set the preshutdown timeout of {SERVICE_NAME}: {e}. Run this from \
+                     an administrator prompt after the service is installed; without it an OS \
+                     shutdown gives the service Windows' default 10 s to stop"
+                );
+                ExitCode::FAILURE
+            }
+        }
+    }
+
     fn status(state: ServiceState, wait_hint: Duration, checkpoint: u32) -> ServiceStatus {
+        // PRESHUTDOWN and SHUTDOWN are mutually exclusive: preshutdown gives the stop the
+        // service's preshutdown timeout instead of the ~5 s an OS shutdown allows otherwise.
         let controls_accepted = match state {
-            ServiceState::Running => ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            ServiceState::Running => ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN,
             _ => ServiceControlAccept::empty(),
         };
         ServiceStatus {
@@ -279,6 +334,8 @@ mod service {
         if let Err(e) = run_service(first, config_path, log) {
             error!("service failed: {e:#}");
         }
+        // The file log's last lines (RA-024): the process may end right after this returns.
+        cli::flush_logs();
     }
 
     fn run_service(
@@ -300,8 +357,10 @@ mod service {
             move |control: ServiceControl| -> ServiceControlHandlerResult {
                 match control {
                     ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-                    ServiceControl::Stop | ServiceControl::Shutdown => {
-                        info!("stop requested by the service control manager");
+                    ServiceControl::Stop
+                    | ServiceControl::Preshutdown
+                    | ServiceControl::Shutdown => {
+                        info!("stop requested by the service control manager ({control:?})");
                         stop.cancel();
                         let _ = tx.send(Event::Stop);
                         ServiceControlHandlerResult::NoError
@@ -452,10 +511,13 @@ mod service {
         } else {
             error!(
                 "the server did not stop within {} s (a model compile or a request is still \
-                 running); reporting the service as stopped anyway. If this repeats, check the \
-                 log for the model that was loading",
+                 running); ending its child processes and reporting the service as stopped \
+                 anyway. If this repeats, check the log for the model that was loading",
                 runner::SHUTDOWN_DEADLINE.as_secs()
             );
+            // The process ends right after Stopped is reported, with the server thread still
+            // running: no destructor runs (RA-029 / RA-024).
+            runner::before_forced_exit();
             // A stop someone asked for stays a clean stop: with the failure flag set
             // (`sc failureflag`, so a start that gives up is restarted), a non-zero code here
             // would restart a service its user just stopped. A stop the server's own failure
@@ -468,6 +530,8 @@ mod service {
                 ServiceExitCode::ServiceSpecific(EXIT_STOP_TIMED_OUT)
             }
         };
+        // Before Stopped: at an OS shutdown the process may be ended right after it.
+        cli::flush_logs();
         let mut s = status(ServiceState::Stopped, Duration::ZERO, 0);
         s.exit_code = exit;
         set_status(&handle, s);

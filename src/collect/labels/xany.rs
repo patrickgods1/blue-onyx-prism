@@ -10,7 +10,10 @@
 //! counts as reviewed when `checked` is true (or the caller treats unchecked files as reviewed,
 //! except one with no shapes: nobody looked at that frame) and its shapes become the frame's
 //! complete set of training boxes (see [`apply_import`]). [`import_dir_with`] reports the files
-//! looked at, for a caller that shows a running import.
+//! looked at, for a caller that shows a running import; [`import_dir_until`] also stops between
+//! two files when its caller asks ([`super::export::Stopped`]: the service is stopping). Each
+//! frame is its own label write, so the frames done before a stop are saved and whole, and an
+//! import of the same folder again gives them the same labels.
 
 use super::export::parse_flat_name;
 use super::{BoxState, Frame, LabelBox, LabelFile, Source, Status, iou, normalize};
@@ -337,6 +340,35 @@ pub fn import_dir_with(
     now: &str,
     progress: &dyn Fn(usize, usize),
 ) -> Result<ImportReport> {
+    import_dir_until(
+        dir,
+        src,
+        classes,
+        hidden,
+        treat_unchecked_as_reviewed,
+        now,
+        progress,
+        &|| false,
+    )
+}
+
+/// [`import_dir_with`], asking `stop` before each file: once it says yes the import ends with an
+/// error whose cause is [`super::export::Stopped`] and that says how many files were done (their
+/// frames are saved).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "import_dir_with's inputs and the caller's stop"
+)]
+pub fn import_dir_until(
+    dir: &Path,
+    src: &Path,
+    classes: &[String],
+    hidden: &[String],
+    treat_unchecked_as_reviewed: bool,
+    now: &str,
+    progress: &dyn Fn(usize, usize),
+    stop: &dyn Fn() -> bool,
+) -> Result<ImportReport> {
     let mut names: Vec<String> = std::fs::read_dir(src)
         .with_context(|| format!("reading {}", src.display()))?
         .flatten()
@@ -357,6 +389,12 @@ pub fn import_dir_with(
     let of = names.len();
     progress(0, of);
     for (i, name) in names.into_iter().enumerate() {
+        if stop() {
+            return Err(anyhow::Error::new(super::export::Stopped).context(format!(
+                "the import stopped after {i} of {of} files ({} frame(s) imported and saved)",
+                r.imported
+            )));
+        }
         let path = src.join(&name);
         let one = (|| -> Result<Option<()>> {
             let bytes = super::read_capped(&path, MAX_IMPORT_FILE_BYTES)?;
@@ -705,6 +743,44 @@ mod tests {
         assert_eq!(r.imported, 2, "{r:?}");
         let l = unseen.labels().unwrap().unwrap();
         assert!(l.empty_confirmed && l.status == Status::Reviewed);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 phase 1: a stop between two files ends the import there; the files done are
+    /// saved and the error says how far it got.
+    #[test]
+    fn a_stopped_import_keeps_the_frames_it_did_and_says_so() {
+        let root = std::env::temp_dir().join(format!("bop-xany-{}", uuid::Uuid::new_v4()));
+        let (dir, src) = (root.join("dataset"), root.join("src"));
+        let classes = crate::collect::config::default_classes();
+        let frames: Vec<Frame> = ["a", "b", "c"]
+            .iter()
+            .map(|stem| {
+                let rel = put_frame(&dir, stem);
+                put_shapeless(&src, stem, true);
+                Frame::resolve(&dir, &rel).unwrap()
+            })
+            .collect();
+        let looked = std::cell::Cell::new(0usize);
+        let progress = |done: usize, _of: usize| looked.set(done);
+        // Stop once the first file is done.
+        let stop = || looked.get() >= 1;
+        let e =
+            import_dir_until(&dir, &src, &classes, &[], false, "t", &progress, &stop).unwrap_err();
+        assert!(super::super::export::is_stopped(&e), "{e:#}");
+        let text = format!("{e:#}");
+        assert!(text.contains("after 1 of 3 files"), "{text}");
+        assert!(text.contains("1 frame(s) imported"), "{text}");
+        assert!(frames[0].labels().unwrap().is_some(), "the first is saved");
+        assert!(frames[1].labels().unwrap().is_none() && frames[2].labels().unwrap().is_none());
+        // Again, to the end: the first frame comes out the same.
+        let first = frames[0].labels().unwrap();
+        let r = import_dir(&dir, &src, &classes, &[], false, "t").unwrap();
+        assert_eq!(r.imported, 3);
+        assert_eq!(
+            frames[0].labels().unwrap().map(|l| l.boxes),
+            first.map(|l| l.boxes)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -26,7 +26,9 @@ RUN cargo build --release --locked
 # Manifest of openvino/ubuntu24_runtime:2026.4.1 (amd64 only), read 2026-11-07.
 FROM openvino/ubuntu24_runtime:2026.4.1@sha256:ef00731944b89db0148ff41bae9ef5f581dc9a1a2de90b1dd9a8ce1af69dc7b5
 USER root
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+# tini: PID 1 of the container (ENTRYPOINT below), so the orphans of a killed training or export
+# process tree are reaped instead of staying zombies for the container's lifetime.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl tini && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /src/target/release/blue-onyx-prism /app/blue-onyx-prism
 COPY --from=builder /src/target/release/blue-onyx-prism-benchmark /app/blue-onyx-prism-benchmark
@@ -63,5 +65,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
     CMD curl -fsS -o /dev/null http://127.0.0.1:32168/v1/status || exit 1
 # The config lives in the /app/config volume; the entrypoint (deploy/docker-entrypoint.sh, no
 # network access) checks that the volumes are writable, copies the image's default config there on
-# first start and execs the service with any extra arguments.
-ENTRYPOINT ["/bin/sh", "/app/docker-entrypoint.sh"]
+# first start and execs the service with any extra arguments. tini runs it, forwards SIGTERM to
+# the service and reaps orphans; `-s` keeps it a reaper when `docker run --init` or compose's
+# `init: true` puts another init in front. Stop with a grace above the service's own 60 s bound:
+# `docker stop -t 75` (compose sets stop_grace_period: 75s).
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "/bin/sh", "/app/docker-entrypoint.sh"]

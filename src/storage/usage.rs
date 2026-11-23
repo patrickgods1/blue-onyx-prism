@@ -338,6 +338,28 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache {
     running: false,
 });
 
+/// Clears [`Cache::running`] when the measuring thread ends, also by a panic in [`measure`] (which
+/// would otherwise leave every later look waiting on a measurement that never ends).
+struct Measuring;
+
+impl Drop for Measuring {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            tracing::warn!(
+                "storage: measuring the folders panicked; the Storage card measures again on the \
+                 next look (please report this with the log)"
+            );
+        }
+        CACHE.lock_recover().running = false;
+    }
+}
+
+/// Tests: [`measure`] panics for settings of this data root (and says it did).
+#[cfg(test)]
+static PANIC_FOR: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static PANICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The measurement to show: a fresh one of the same folders ([`key_of`]) is returned at once;
 /// otherwise one is started on its own thread (after a measurement of other folders has ended,
 /// and again when a Clear forgot it before it was read) and awaited for at most `wait`. Returns the report of these folders (None before the first
@@ -367,17 +389,21 @@ pub fn current(s: Settings, runs: Vec<RunRecord>, wait: Duration) -> (Option<Arc
                 let spawned = std::thread::Builder::new()
                     .name("storage-usage".into())
                     .spawn(move || {
+                        let _measuring = Measuring;
                         crate::backend::priority::lower_this_thread(
                             crate::backend::priority::ThreadRole::Background,
                         );
+                        #[cfg(test)]
+                        if PANIC_FOR.lock_recover().as_deref() == Some(&s.config().data_root()) {
+                            PANICKED.store(true, std::sync::atomic::Ordering::SeqCst);
+                            panic!("test: measuring panics");
+                        }
                         let report = Arc::new(measure(&s, &runs));
-                        let mut c = CACHE.lock_recover();
-                        c.last = Some(Measured {
+                        CACHE.lock_recover().last = Some(Measured {
                             at: Instant::now(),
                             key: k,
                             report,
                         });
-                        c.running = false;
                     });
                 if let Err(e) = spawned {
                     c.running = false;
@@ -466,6 +492,41 @@ mod tests {
         for r in [ra, rb] {
             std::fs::remove_dir_all(r).ok();
         }
+    }
+
+    /// Audit 2026-11 phase 1: a panic while measuring must not leave the card "measuring" for
+    /// good; the next look measures again.
+    #[test]
+    fn a_panic_while_measuring_lets_the_next_look_measure_again() {
+        let root = std::env::temp_dir().join(format!("bop-usage-panic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut c = crate::config::Config {
+            download_dir: Some(root.clone()),
+            cache_dir: root.join("cache").display().to_string(),
+            ..Default::default()
+        };
+        c.models.clear();
+        let s = Settings::for_config(&c);
+        *PANIC_FOR.lock().unwrap() = Some(c.data_root());
+        // Other tests share the cache and may be measuring their own folders: wait for ours.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !PANICKED.load(std::sync::atomic::Ordering::SeqCst) {
+            let (r, _) = current(s.clone(), Vec::new(), Duration::ZERO);
+            assert!(r.is_none(), "nothing measured yet");
+            assert!(Instant::now() < deadline, "the measurement never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while CACHE.lock_recover().running {
+            assert!(
+                Instant::now() < deadline,
+                "still running long after the measuring thread panicked"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        *PANIC_FOR.lock().unwrap() = None;
+        let (r, running) = current(s, Vec::new(), Duration::from_secs(60));
+        assert!(r.is_some() && !running);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

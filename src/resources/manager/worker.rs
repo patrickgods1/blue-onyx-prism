@@ -64,6 +64,10 @@ pub(super) fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
         let (due, later): (Vec<_>, Vec<_>) = retries.drain(..).partition(|(d, _, _)| *d <= now);
         retries = later;
         for (_, job, attempts) in due {
+            // A retry cancelled while it waited stays cancelled.
+            if shared.is_cancelled(&job.key()) {
+                continue;
+            }
             shared.set(&job, State::Queued);
             queue.push_back((job, attempts));
         }
@@ -74,7 +78,44 @@ pub(super) fn worker_loop(shared: &Shared, rx: &Receiver<Msg>) {
         if job.resource.id == TEST_PANIC_ID {
             panic!("test: download worker panics");
         }
-        match run_job(shared, &client, &rt, &job) {
+        let key = job.key();
+        {
+            let mut cancels = shared.cancels.lock_recover();
+            if cancels.keys.contains(&key) {
+                // Cancelled while queued: its status says so already.
+                continue;
+            }
+            cancels.running = Some(key.clone());
+            shared.abort.store(false, Ordering::SeqCst);
+            if shared.stop.load(Ordering::SeqCst) {
+                shared.abort.store(true, Ordering::SeqCst);
+            }
+        }
+        let result = run_job(shared, &client, &rt, &job);
+        let cancelled = {
+            let mut cancels = shared.cancels.lock_recover();
+            cancels.running = None;
+            cancels.keys.contains(&key)
+        };
+        if cancelled && result.is_err() && !shared.stop.load(Ordering::Relaxed) {
+            tracing::info!("download of {} stopped: cancelled", job.resource.id);
+            shared.set(
+                &job,
+                State::Failed {
+                    error: CANCELLED.to_string(),
+                    retry_at: None,
+                    attempts,
+                },
+            );
+            shared.emit(Event::Failed {
+                key,
+                id: job.resource.id,
+                error: CANCELLED.to_string(),
+                retry_at: None,
+            });
+            continue;
+        }
+        match result {
             Ok(()) => {
                 shared.set(&job, State::Installed);
                 shared.emit(Event::Installed {
@@ -263,7 +304,7 @@ fn run_job(
     if !local && done() {
         return Ok(());
     }
-    let _lock = DownloadLock::acquire(&shared.opts.root, shared.opts.lock_wait, &shared.stop)?;
+    let _lock = DownloadLock::acquire(&shared.opts.root, shared.opts.lock_wait, &shared.abort)?;
     if !local && done() {
         return Ok(());
     }
@@ -297,7 +338,7 @@ fn run_job(
             if std::fs::metadata(&dest).is_ok_and(|m| m.len() == part.size) {
                 shared.set(job, State::Verifying);
             }
-            if file_matches(&dest, part.size, part.sha256, &shared.stop)? {
+            if file_matches(&dest, part.size, part.sha256, &shared.abort)? {
                 done += part.size;
             } else {
                 let partial = job.target.join(format!("{}.partial", part.file_name));
@@ -306,12 +347,12 @@ fn run_job(
                     client,
                     part,
                     &partial,
-                    &shared.stop,
+                    &shared.abort,
                     gate.as_ref(),
                     |b| progress(done + b, false),
                 ))?;
                 shared.set(job, State::Verifying);
-                verify(&partial, part, &shared.stop)?;
+                verify(&partial, part, &shared.abort)?;
                 std::fs::rename(&partial, &dest)
                     .with_context(|| format!("renaming to {}", dest.display()))?;
                 done += part.size;
@@ -352,19 +393,19 @@ fn run_job(
                 .with_context(|| format!("creating {}", downloads.display()))?;
             for part in res.parts {
                 let file = downloads.join(part.file_name);
-                if !file_matches(&file, part.size, part.sha256, &shared.stop)? {
+                if !file_matches(&file, part.size, part.sha256, &shared.abort)? {
                     let partial = downloads.join(format!("{}.partial", part.file_name));
                     let gate = gate_of(shared, res);
                     rt.block_on(download_part(
                         client,
                         part,
                         &partial,
-                        &shared.stop,
+                        &shared.abort,
                         gate.as_ref(),
                         |b| progress(done + b, false),
                     ))?;
                     shared.set(job, State::Verifying);
-                    verify(&partial, part, &shared.stop)?;
+                    verify(&partial, part, &shared.abort)?;
                     std::fs::rename(&partial, &file)
                         .with_context(|| format!("renaming to {}", file.display()))?;
                 }
@@ -393,7 +434,7 @@ fn run_job(
                 None => part.archive,
             }
             .with_context(|| format!("{} is not an archive", archive.display()))?;
-            if shared.stop.load(Ordering::Relaxed) {
+            if shared.abort.load(Ordering::Relaxed) {
                 bail!("cancelled before extracting {}", archive.display());
             }
             got.extend(extract::extract_part_until(
@@ -403,7 +444,7 @@ fn run_job(
                 res.flavor(),
                 target,
                 &staging,
-                &shared.stop,
+                &shared.abort,
             )?);
         }
         extract::finalize(res, job.version(), target, &staging, &mut got)?;
@@ -951,6 +992,8 @@ mod tests {
         refuse: Option<&'static str>,
         /// Answer every request with a 302 to this location.
         redirect_always: Option<String>,
+        /// Send the body in 4 KiB pieces with this pause between them (a slow link).
+        drip: Option<Duration>,
     }
 
     /// Minimal HTTP/1.1 file server: honors `Range: bytes=N-`, misbehaves per [`Mode`].
@@ -1059,7 +1102,19 @@ mod tests {
                 } else {
                     slice
                 };
-                let _ = s.write_all(send);
+                match mode.drip {
+                    Some(pause) => {
+                        for piece in send.chunks(4096) {
+                            if s.write_all(piece).and_then(|()| s.flush()).is_err() {
+                                break;
+                            }
+                            std::thread::sleep(pause);
+                        }
+                    }
+                    None => {
+                        let _ = s.write_all(send);
+                    }
+                }
                 let pad = vec![0u8; mode.extra_announced + mode.extra_silent];
                 let _ = s.write_all(&pad);
                 let _ = s.flush();
@@ -2118,6 +2173,162 @@ mod tests {
             .filter(|n| n.starts_with('.') && n != ".cpu.in-use")
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Wait until `key`'s state passes `pred` (or fail after 30 s).
+    fn wait_state(m: &Manager, key: &str, what: &str, pred: impl Fn(&State) -> bool) -> State {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(st) = m.status(key)
+                && pred(&st.state)
+            {
+                return st.state;
+            }
+            assert!(Instant::now() < until, "{what}: {:?}", m.status(key));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn is_cancelled(state: &State) -> bool {
+        matches!(state, State::Failed { error, retry_at: None, .. } if error == CANCELLED)
+    }
+
+    /// RA resources-4: cancelling the running download stops it at the next chunk (long before
+    /// the slow link would finish), keeps the `.partial`, and a later enqueue resumes it.
+    #[test]
+    fn cancel_stops_the_running_download_and_keeps_the_partial() {
+        let data = body();
+        // 74 pieces of 4 KiB, 100 ms apart: ~7 s for the whole file.
+        let server = serve_with(
+            data.clone(),
+            Mode {
+                drip: Some(Duration::from_millis(100)),
+                ..Mode::default()
+            },
+        );
+        let res = model_resource(&server.url, &data, None);
+        let root = tmp("cancel-running");
+        let m = Manager::start(ManagerOptions {
+            retry: true,
+            ..ManagerOptions::new(&root)
+        });
+        let dir = root.join("models");
+        let key = m.enqueue(Job::into_dir(res, dir.clone()));
+        wait_state(
+            &m,
+            &key,
+            "downloading",
+            |s| matches!(s, State::Downloading { bytes, .. } if *bytes > 0),
+        );
+        let t = Instant::now();
+        assert!(m.cancel(&key));
+        let st = wait_state(&m, &key, "cancelled", |s| s.is_final());
+        assert!(is_cancelled(&st), "{st:?}");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let partial = dir.join("test-model.onnx.partial");
+        let kept = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+        assert!(kept > 0 && kept < data.len() as u64, "{kept}");
+        // Nothing to cancel any more, and nothing retries it.
+        assert!(!m.cancel(&key));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(is_cancelled(&m.status(&key).unwrap().state));
+        // Queued again it resumes and installs.
+        m.enqueue(Job::into_dir(res, dir.clone()));
+        let st = m.wait(std::slice::from_ref(&key), Some(Duration::from_secs(60)));
+        assert_eq!(st[0].state, State::Installed, "{st:?}");
+        assert!(server.ranged.load(Ordering::SeqCst) >= 1);
+        assert_eq!(std::fs::read(dir.join("test-model.onnx")).unwrap(), data);
+        m.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A dead port: every attempt fails, retried after `backoff`. Returns the port and the
+    /// number of connections it saw.
+    fn dead_port() -> (u16, Arc<AtomicUsize>) {
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = dead.local_addr().unwrap().port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let n = seen.clone();
+        std::thread::spawn(move || {
+            for stream in dead.incoming() {
+                n.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (port, seen)
+    }
+
+    /// RA resources-4: a cancelled retry is never attempted again.
+    #[test]
+    fn cancel_stops_the_retries() {
+        let (port, seen) = dead_port();
+        let data = body();
+        let res = model_resource(&format!("http://127.0.0.1:{port}/gone"), &data, None);
+        let root = tmp("cancel-retry");
+        let m = Manager::start(ManagerOptions {
+            retry: true,
+            backoff: |_| Duration::from_millis(300),
+            ..ManagerOptions::new(&root)
+        });
+        let key = m.enqueue(Job::into_dir(res, root.join("models")));
+        wait_state(&m, &key, "retrying", |s| {
+            matches!(
+                s,
+                State::Failed {
+                    retry_at: Some(_),
+                    ..
+                }
+            )
+        });
+        assert!(m.cancel(&key));
+        assert!(is_cancelled(&m.status(&key).unwrap().state));
+        let tried = seen.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            tried,
+            "retried after the cancel"
+        );
+        assert!(is_cancelled(&m.status(&key).unwrap().state));
+        m.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A waiter's give-up cancels only a job nobody else wants: not while another waiter or a
+    /// plain enqueue (a Download button) wants it, and dropping a waiter cancels nothing.
+    #[test]
+    fn a_waiter_gives_up_only_its_own_job() {
+        let (port, _) = dead_port();
+        let data = body();
+        let res = model_resource(&format!("http://127.0.0.1:{port}/gone"), &data, None);
+        let root = tmp("waiters");
+        let m = Manager::start(ManagerOptions {
+            retry: true,
+            backoff: |_| Duration::from_secs(60),
+            ..ManagerOptions::new(&root)
+        });
+        let job = || Job::into_dir(res, root.join("models"));
+        let live = |key: &str| !m.status(key).unwrap().state.is_final();
+        // Two waiters: the first give-up leaves it to the second.
+        let a = m.enqueue_waiting(job());
+        let b = m.enqueue_waiting(job());
+        let key = a.key().to_string();
+        assert!(!a.give_up());
+        assert!(live(&key));
+        assert!(b.give_up());
+        assert!(is_cancelled(&m.status(&key).unwrap().state));
+        // A plain enqueue pins it: a waiter's give-up does not cancel it.
+        let w = m.enqueue_waiting(job());
+        m.enqueue(job());
+        assert!(!w.give_up());
+        assert!(live(&key));
+        assert!(m.cancel(&key));
+        // Dropped without a give-up: nothing is cancelled.
+        let w = m.enqueue_waiting(job());
+        drop(w);
+        assert!(live(&key));
+        m.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

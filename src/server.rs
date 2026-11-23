@@ -70,6 +70,7 @@ mod training_tasks;
 
 pub(crate) use apply::{apply_config, reload_models, sync_config};
 pub(crate) use auth::{FailureLimit, Logins};
+// Step 1 of the runner's stop timeline (`runner::stop`).
 use config_page::{
     ConfigView, MessageTemplate, config_loglevel, config_models, config_models_remove, config_page,
     config_restart, config_submit, encode_uri_component, global_device_label, save_config,
@@ -81,7 +82,7 @@ use devices::model_selection;
 use devices::{DevicesSnapshot, devices_json, devices_snapshot};
 #[cfg(test)]
 use listen::HEADER_READ_TIMEOUT;
-pub use listen::{HttpsPlan, HttpsPort, Listeners, bind, serve_on};
+pub use listen::{HttpsPlan, HttpsPort, Listeners, SERVER_STOP_BOUND, bind, serve_on};
 use pages::{
     apple_touch_icon, favicon, live_js, logs_json, logs_page, prometheus, static_asset, stats_json,
     stats_page, style_css, test_page, test_submit, update_available, welcome,
@@ -90,6 +91,7 @@ use resources::{
     models_add, resources_add_to_config, resources_download, resources_export,
     resources_export_cancel, resources_json, resources_remove,
 };
+pub(crate) use training::stop_for_exit as stop_training_for_exit;
 
 pub struct AppState {
     pub(crate) registry: Arc<ModelRegistry>,
@@ -115,6 +117,10 @@ pub struct AppState {
     /// This generation's token, cancelled by `POST /config/restart`: the run loop
     /// (`runner`) then builds the next generation and swaps it in ([`Shared::swap`]).
     pub(crate) restart: CancellationToken,
+    /// The run's stop request (Ctrl-C, SIGTERM, the service's Stop): cancelled once when the
+    /// process is going away, never by a generation restart. Long jobs that a restart must not
+    /// cut off (a dataset export, an X-AnyLabeling import) stop on this one.
+    pub(crate) shutdown: CancellationToken,
     /// Download manager and this generation's provisioning plan (None in tests that do not
     /// exercise resources).
     pub(crate) resources: Option<crate::resources::status::ResourcesCtx>,
@@ -173,6 +179,7 @@ impl AppState {
             config_path,
             log_reload: None,
             restart: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
             resources: None,
             benchmark: crate::benchmark::service::BenchmarkService::new(),
             side_jobs: Arc::default(),

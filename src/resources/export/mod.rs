@@ -55,11 +55,17 @@
 //!    come the exporter's own [`Cmd::env`] entries: `UV_NO_CONFIG`, `UV_PYTHON_INSTALL_DIR`,
 //!    the offline switches and the cache dirs under `tools/`; uv also runs `--no-config`.
 //! 3. **Whole process tree is killed** (RS-02) on cancel, stage timeout and service stop: on
-//!    Unix the child leads its own process group and the group gets `SIGTERM`, then `SIGKILL`
-//!    after 1.5 s; on Windows the child is put in a Job Object with kill-on-close
-//!    (`crate::backend::job`), so helpers that uv or PyTorch spawn die with it, also when the
-//!    service process itself dies. Processes a child starts before the job assignment on
-//!    Windows (microseconds after spawn) are the one gap.
+//!    Unix the child leads its own process group and the group gets `SIGTERM`, then `SIGCONT` +
+//!    `SIGKILL` after 1.5 s (through `killpg(2)`, never an external `kill` program); on Windows
+//!    the child is started suspended, put in a Job Object with kill-on-close
+//!    (`crate::backend::job`) and only then resumed, so every helper uv or PyTorch spawns is in
+//!    it and dies with it, also when the service process itself dies (a job that cannot be made
+//!    fails the stage instead of running an unprotected tree). The tree also dies with the
+//!    service on Unix (audit 2026-11, RA resources-1, recovery-1): Linux sends the child
+//!    `SIGKILL` when the service dies (`PR_SET_PDEATHSIG`), every child's stdin is a pipe the
+//!    service never writes, whose end of file the scripts' `watch_parent()` turns into a kill of
+//!    their process group, and each child is listed in `<data root>/.children.json` for the next
+//!    start's sweep. The run's stop cancels exports explicitly (`Provisioner::stop_for_exit`).
 //! 4. **Bounded output** (RS-08): stdout and stderr are read line by line (`\n` or `\r` ends a
 //!    line), each line is cut at `MAX_OUTPUT_LINE` bytes, and at most `MAX_OUTPUT_LINES`
 //!    lines wait between the reader threads and the log; a child that outruns the log blocks
@@ -86,7 +92,7 @@ use crate::sync::LockExt;
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};

@@ -12,15 +12,17 @@
 //! in the models folder or the request's `install_dir`, [`TrainJob::install_dir`]) -> register
 //! ([`Hooks::register`], the `add-model` code, with the installed path) -> benchmark
 //! ([`Hooks::benchmark`] on the held-out `dir:` set; a failure there is reported but does not
-//! undo the model). Cancellation kills the child's process tree (the runner's job).
+//! undo the model). Cancellation kills the child's process tree (the runner's job). A stop for the
+//! process's exit ([`run_training_or_exit`]) kills it the same way but is no cancel: the run is
+//! interrupted and keeps its checkpoints.
 //!
 //! The installed model goes on the run's record at once ([`TrainReport::Installed`]): from then on
 //! the run owns a file that blocks its name, however it ends. The checkpoints (`<run>/work`) go once
-//! the model is registered, or when the run is cancelled before it installed. A failed run keeps
-//! them: training and export share one process, so a late failure would otherwise cost the whole
-//! training. [`TrainJob::export_only`] exports such a run again ([`super::retry`]): setup,
-//! self-check, then only the export and the stages after it. A run out of memory restarts only
-//! while that costs little ([`keeps_checkpoints`]).
+//! the model is registered, or when the run is cancelled before it installed. A failed or
+//! interrupted run keeps them: training and export share one process, so a late failure would
+//! otherwise cost the whole training. [`TrainJob::export_only`] exports such a run again
+//! ([`super::retry`]): setup, self-check, then only the export and the stages after it. A run out
+//! of memory restarts only while that costs little ([`keeps_checkpoints`]).
 
 use super::capability::Accelerator;
 use super::dataset::{self, Prepared, SceneFilter};
@@ -585,7 +587,33 @@ pub fn run_training(
     report: &mut dyn FnMut(TrainReport<'_>),
     cancel: &AtomicBool,
 ) -> Result<RunOutcome, TrainError> {
-    run_training_with(job, None, runner, fetcher, hooks, report, cancel)
+    run_training_with(job, None, runner, fetcher, hooks, report, cancel, None)
+}
+
+/// [`run_training`] for the queue, which can stop for the process's exit: `exit` set together
+/// with `cancel` kills the child tree like a cancel, but the run is interrupted, not given up. It
+/// keeps its work folder (the checkpoints a Retry export makes the model from) and the self-check
+/// marker, and fails with `cancelled: false` and an "interrupted" message, as a run the process
+/// stopped under reads after a restart.
+pub fn run_training_or_exit(
+    job: &TrainJob,
+    runner: &dyn CommandRunner,
+    fetcher: &dyn Fetcher,
+    hooks: &dyn Hooks,
+    report: &mut dyn FnMut(TrainReport<'_>),
+    cancel: &AtomicBool,
+    exit: &AtomicBool,
+) -> Result<RunOutcome, TrainError> {
+    run_training_with(
+        job,
+        None,
+        runner,
+        fetcher,
+        hooks,
+        report,
+        cancel,
+        Some(exit),
+    )
 }
 
 /// [`run_training`] for a task that holds the training lock already, across several training runs
@@ -601,9 +629,22 @@ pub fn run_training_holding(
     report: &mut dyn FnMut(TrainReport<'_>),
     cancel: &AtomicBool,
 ) -> Result<RunOutcome, TrainError> {
-    run_training_with(job, Some(lock), runner, fetcher, hooks, report, cancel)
+    run_training_with(
+        job,
+        Some(lock),
+        runner,
+        fetcher,
+        hooks,
+        report,
+        cancel,
+        None,
+    )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the run's seams and its two stop flags, passed straight through"
+)]
 fn run_training_with(
     job: &TrainJob,
     held: Option<&TrainLock>,
@@ -612,6 +653,7 @@ fn run_training_with(
     hooks: &dyn Hooks,
     report: &mut dyn FnMut(TrainReport<'_>),
     cancel: &AtomicBool,
+    exit: Option<&AtomicBool>,
 ) -> Result<RunOutcome, TrainError> {
     let mut stage = None;
     let mut unregistered = None;
@@ -627,11 +669,14 @@ fn run_training_with(
         job, held, runner, fetcher, hooks, &mut watch, cancel, &mut stage,
     );
     r.map_err(|e| {
-        let cancelled = e.downcast_ref::<Cancelled>().is_some() || cancel.load(Ordering::Relaxed);
+        // Stopped for the process's exit: neither a failure of the run nor the user's cancel.
+        let exiting = exit.is_some_and(|x| x.load(Ordering::SeqCst));
+        let cancelled =
+            !exiting && (e.downcast_ref::<Cancelled>().is_some() || cancel.load(Ordering::Relaxed));
         let work = super::retry::work_dir(&job.run_dir);
         // A training process that failed: the next run runs the self-check again, whether this
         // one skipped it or not ([`super::self_check`]).
-        if !cancelled && stage == Some(TrainStage::Train) {
+        if !cancelled && !exiting && stage == Some(TrainStage::Train) {
             super::self_check::forget(
                 &super::self_check::marker_path(&job.paths),
                 &super::self_check::key(
@@ -646,6 +691,9 @@ fn run_training_with(
         TrainError {
             stage,
             message: match &unregistered {
+                _ if exiting => {
+                    format!("interrupted: the service stopped{}", kept_note(job, &work))
+                }
                 _ if cancelled => "cancelled".into(),
                 Some(note) => format!("{e:#}. {note}"),
                 None => format!("{e:#}{}", kept_note(job, &work)),

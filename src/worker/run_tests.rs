@@ -612,6 +612,17 @@ fn candidate(spec: &str, fell_back: bool) -> Candidate {
 /// A worker on the fake runtime, not waited for: `script` as given, `faults` on.
 fn spawn_faulty(script: &FakeScript, faults: TestFaults) -> (WorkerHandle, CancellationToken) {
     let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    let shutdown = CancellationToken::new();
+    let handle = spawn_on(runtimes, faults, shutdown.clone());
+    (handle, shutdown)
+}
+
+/// [`spawn_faulty`] on the given `runtimes`, stopped by `shutdown`.
+fn spawn_on(
+    runtimes: Arc<Mutex<Runtimes>>,
+    faults: TestFaults,
+    shutdown: CancellationToken,
+) -> WorkerHandle {
     let path = PathBuf::from("fake.onnx");
     let cfg = WorkerConfig {
         name: "fake".into(),
@@ -642,9 +653,7 @@ fn spawn_faulty(script: &FakeScript, faults: TestFaults) -> (WorkerHandle, Cance
         faults,
     };
     let metrics = Arc::new(ModelMetrics::new("fake", "auto", ""));
-    let shutdown = CancellationToken::new();
-    let handle = spawn_worker(runtimes, cfg, metrics, shutdown.clone());
-    (handle, shutdown)
+    spawn_worker(runtimes, cfg, metrics, shutdown)
 }
 
 /// A warm-up that never answers: the worker goes on to the next candidate at once, and the
@@ -1687,4 +1696,259 @@ fn the_worker_compiles_with_the_shared_tuning() {
         );
         h.stop();
     }
+}
+
+/// Wait for `handle`'s thread to end, at most [`SOON`]; returns how long that took.
+fn joined_within_soon(handle: WorkerHandle) -> Duration {
+    let t = Instant::now();
+    assert_eq!(
+        handle.join_within(t + SOON),
+        Joined::Ended,
+        "the worker did not exit"
+    );
+    t.elapsed()
+}
+
+fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    let t = Instant::now();
+    while !cond() {
+        assert!(t.elapsed() < SOON, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn stopped_loading(handle: &WorkerHandle) -> bool {
+    matches!(handle.state.get(), ModelState::Failed(m) if m.contains("stopped loading"))
+}
+
+/// RA-015: a worker queued behind another model's compile (the runtimes lock is held for all
+/// of it) leaves when it is stopped instead of waiting for the lock and compiling anyway.
+#[test]
+fn a_stopped_worker_waiting_for_the_runtimes_lock_leaves_without_compiling() {
+    let script = FakeScript::new(1, INPUT);
+    let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    let held = runtimes.lock().unwrap();
+    let shutdown = CancellationToken::new();
+    let handle = spawn_on(runtimes.clone(), TestFaults::default(), shutdown.clone());
+    std::thread::sleep(Duration::from_millis(100));
+    shutdown.cancel();
+    let t = Instant::now();
+    while !handle.join.as_ref().unwrap().is_finished() {
+        assert!(t.elapsed() < SOON, "still waiting for the lock");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(stopped_loading(&handle), "{:?}", handle.state.get());
+    drop(held);
+    joined_within_soon(handle);
+    assert!(
+        script.compiles().is_empty(),
+        "nothing compiled after the stop"
+    );
+}
+
+/// RA-015: a stop while a candidate fails tries no further device and never asks the serving
+/// copy for room (which would retire the previous generation's worker for nothing).
+#[test]
+fn a_stop_between_candidates_tries_no_further_device_and_makes_no_room() {
+    let script = FakeScript::new(1, INPUT);
+    let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    let shutdown = CancellationToken::new();
+    let tried: Arc<Mutex<Vec<String>>> = Arc::default();
+    let rooms = Arc::new(AtomicUsize::new(0));
+    let faults = TestFaults {
+        candidates: Some(vec![
+            candidate("openvino:gpu", false),
+            candidate("openvino:cpu", true),
+        ]),
+        load: Some(Arc::new({
+            let tried = tried.clone();
+            let shutdown = shutdown.clone();
+            move |c: &Candidate| {
+                tried.lock().unwrap().push(c.device.to_string());
+                // The stop arrives while this candidate runs out of memory.
+                shutdown.cancel();
+                anyhow::bail!("[GPU] clEnqueueMapBuffer, error code: -5 CL_OUT_OF_RESOURCES")
+            }
+        })),
+        ..TestFaults::default()
+    };
+    let path = PathBuf::from("fake.onnx");
+    let cfg = WorkerConfig {
+        name: "fake".into(),
+        model: ModelConfig {
+            path: path.clone(),
+            family: ModelFamilyKind::Yolo26,
+            ..ModelConfig::default()
+        },
+        device: DeviceSpec::Auto,
+        load: LoadRequest {
+            path,
+            requested: "auto".into(),
+            gpu_precision: None,
+            no_cache: false,
+        },
+        classes: classes(),
+        live: LiveSettings::default().shared(),
+        queue_size: QUEUE,
+        lazy: false,
+        can_use_gpu: false,
+        wait: None,
+        concurrency: None,
+        prep: Some(PrepPool::new(1)),
+        peers: Peers::new(),
+        only: None,
+        make_room: Some(MakeRoom::new({
+            let rooms = rooms.clone();
+            move || {
+                rooms.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+        })),
+        recovering_from: None,
+        faults,
+    };
+    let metrics = Arc::new(ModelMetrics::new("fake", "auto", ""));
+    let handle = spawn_worker(runtimes, cfg, metrics, shutdown);
+    wait_until("the load to end", || {
+        matches!(handle.state.get(), ModelState::Failed(_))
+    });
+    assert!(stopped_loading(&handle), "{:?}", handle.state.get());
+    assert!(handle.better().is_none(), "a stop is no device failure");
+    joined_within_soon(handle);
+    assert_eq!(*tried.lock().unwrap(), ["openvino:gpu"]);
+    assert_eq!(
+        rooms.load(Ordering::SeqCst),
+        0,
+        "no room made for a stopped load"
+    );
+    assert!(script.compiles().is_empty());
+}
+
+/// RA-015: a stop that arrives during a compile (which cannot be interrupted) drops the
+/// compiled model unused: no warm-up, nothing left alive.
+#[test]
+fn a_stop_during_the_compile_drops_the_model_without_warming_it_up() {
+    let script = FakeScript::new(2, INPUT);
+    let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    let shutdown = CancellationToken::new();
+    let faults = TestFaults {
+        compiled: Some(Arc::new({
+            let shutdown = shutdown.clone();
+            move || shutdown.cancel()
+        })),
+        ..TestFaults::default()
+    };
+    let handle = spawn_on(runtimes, faults, shutdown);
+    let took = joined_within_soon(handle);
+    assert!(took < SOON, "{took:?}");
+    assert_eq!(script.compiles().len(), 1);
+    assert!(
+        script.calls().is_empty(),
+        "never warmed up: {:?}",
+        script.calls()
+    );
+    assert_eq!(script.alive(), 0, "the compiled model was dropped");
+}
+
+/// RA-015: a stop during a warm-up that never answers ends the load within a poll slice (not
+/// the 180 s warm-up timeout); the backend goes to a reaper, which stops and frees it.
+#[test]
+fn a_stop_during_a_hung_warm_up_frees_the_backend_and_exits() {
+    let mut script = FakeScript::new(1, INPUT);
+    script.warmup_hangs = true;
+    let runtimes = Arc::new(Mutex::new(Runtimes::fake(script.clone())));
+    let shutdown = CancellationToken::new();
+    let handle = spawn_on(runtimes, TestFaults::default(), shutdown.clone());
+    wait_until("the warm-up to start", || {
+        script.calls().contains(&Call::WarmupSubmit { slot: 0 })
+    });
+    shutdown.cancel();
+    let took = joined_within_soon(handle);
+    assert!(took < Duration::from_secs(10), "{took:?}");
+    wait_until("the reaper to stop the warm-up", || {
+        script.calls().contains(&Call::Abort)
+    });
+    wait_until("the backend to be freed", || script.alive() == 0);
+}
+
+/// RA-050: a panic while loading fails the model (reloaded by the supervisor as a stuck one)
+/// and opens its load gate, so the models after it in config order still load.
+#[test]
+fn a_panic_while_loading_fails_the_model_and_opens_its_gate() {
+    let script = FakeScript::new(1, INPUT);
+    let faults = TestFaults {
+        load: Some(Arc::new(|_: &Candidate| panic!("boom in the loader"))),
+        ..TestFaults::default()
+    };
+    let (handle, _shutdown) = spawn_faulty(&script, faults);
+    let gate = handle.load_gate();
+    wait_until("the gate to open", || gate.is_open());
+    wait_until("the model to fail", || {
+        matches!(handle.state.get(), ModelState::Failed(_))
+    });
+    let ModelState::Failed(msg) = handle.state.get() else {
+        unreachable!();
+    };
+    assert!(
+        msg.starts_with("worker thread panicked: boom in the loader"),
+        "{msg}"
+    );
+    assert!(handle.is_stuck());
+    assert_eq!(
+        crate::supervisor::Status::of(&handle),
+        crate::supervisor::Status::Stuck,
+        "the supervisor reloads it"
+    );
+    joined_within_soon(handle);
+}
+
+/// RA-050: a panic while serving no longer leaves the model `Ready` with no thread behind its
+/// channel: it is `Failed` (reloaded by the supervisor) and the request in hand gets an answer
+/// at once (its reply is dropped, so its handler stops waiting).
+#[test]
+fn a_panic_while_serving_fails_the_model() {
+    let on = Arc::new(AtomicBool::new(false));
+    let faults = TestFaults {
+        submit: Some(Arc::new({
+            let on = on.clone();
+            move || {
+                if on.load(Ordering::SeqCst) {
+                    panic!("boom in a request");
+                }
+                Ok(())
+            }
+        })),
+        ..TestFaults::default()
+    };
+    let live = LiveSettings {
+        request_timeout: Duration::from_secs(30),
+        ..LiveSettings::default()
+    };
+    let h = Harness::start_faulty("fake", 1, live, Peers::new(), faults);
+    on.store(true, Ordering::SeqCst);
+    h.script.push([det(1, 0)]);
+    let mut reply = h.send("a.jpg");
+    let t = Instant::now();
+    loop {
+        match reply.0.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => {
+                assert!(t.elapsed() < SOON, "no answer");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(oneshot::error::TryRecvError::Closed) => break,
+            Ok(r) => panic!("answered: {r:?}"),
+        }
+    }
+    h.wait_for("the model to fail", || {
+        matches!(h.handle.state.get(), ModelState::Failed(_))
+    });
+    let ModelState::Failed(msg) = h.handle.state.get() else {
+        unreachable!();
+    };
+    assert!(msg.contains("boom in a request"), "{msg}");
+    assert_eq!(
+        crate::supervisor::Status::of(&h.handle),
+        crate::supervisor::Status::Stuck
+    );
+    assert!(h.stop() < SOON);
 }

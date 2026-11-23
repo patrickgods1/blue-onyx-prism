@@ -774,8 +774,10 @@ impl Resolver {
         let spawned = std::thread::Builder::new()
             .name("tls-reload".into())
             .spawn(move || {
+                // Cleared however the refresh ends: a panic in it (a PEM or rcgen path) would
+                // otherwise stop every later reload and renewal until a restart.
+                let _busy = Busy(&me.inner.busy);
                 me.refresh();
-                me.inner.busy.store(false, Ordering::Release);
             });
         if let Err(e) = spawned {
             self.inner.busy.store(false, Ordering::Release);
@@ -876,6 +878,21 @@ impl Resolver {
                 }
             }
         }
+    }
+}
+
+/// Clears [`Inner::busy`] when the reload thread ends, also by a panic (logged).
+struct Busy<'a>(&'a AtomicBool);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            warn!(
+                "the HTTPS certificate check panicked; the certificate in use keeps serving and \
+                 the next handshake checks again (please report this with the log)"
+            );
+        }
+        self.0.store(false, Ordering::Release);
     }
 }
 

@@ -29,7 +29,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn main() -> ExitCode {
     blue_onyx_prism::panic::install();
@@ -57,7 +57,15 @@ fn cli_main() -> ExitCode {
     for (level, msg) in blue_onyx_prism::logbuf::take_early() {
         eprintln!("{level}: {msg}");
     }
+    // The file log's last lines (RA-024): nothing else drops its writer guard.
+    cli::flush_logs();
     code
+}
+
+/// `std::process::exit(code)` after the file log's last lines are written (RA-024).
+fn exit_flushed(code: i32) -> ! {
+    cli::flush_logs();
+    std::process::exit(code);
 }
 
 /// `service start|stop|restart|status`: prints the resulting state. The exit code (`Ok`) is
@@ -451,14 +459,14 @@ fn run(cli: Cli) -> Result<()> {
             // Sets up its own stderr logging (warn, or info with --verbose).
             let code = blue_onyx_prism::benchmark::cli::main(*args, cli.config.clone());
             if code != ExitCode::SUCCESS {
-                std::process::exit(1);
+                exit_flushed(1);
             }
             return Ok(());
         }
         Some(Command::Train(args)) => {
             let code = blue_onyx_prism::training::cli::main(*args, cli.config.clone());
             if code != ExitCode::SUCCESS {
-                std::process::exit(1);
+                exit_flushed(1);
             }
             return Ok(());
         }
@@ -517,7 +525,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Command::Service { action }) => {
             let code = service_command(action)?;
             if code != 0 {
-                std::process::exit(code);
+                exit_flushed(code);
             }
             return Ok(());
         }
@@ -561,16 +569,30 @@ fn run(cli: Cli) -> Result<()> {
     {
         let token = shutdown.clone();
         rt.spawn(async move {
-            wait_for_signal().await;
-            info!(
-                "shutdown requested; waiting for running work to finish (press Ctrl-C again \
-                 to exit at once)"
-            );
+            let first = wait_for_signal().await;
+            match first {
+                Signal::Interrupt => info!(
+                    "shutdown requested; waiting for running work to finish, at most {} s \
+                     (press Ctrl-C again to exit at once)",
+                    runner::SHUTDOWN_DEADLINE.as_secs()
+                ),
+                Signal::Closing(what) => warn!(
+                    "{what}: stopping now; Windows ends the process within seconds, so the \
+                     stop is cut short after {} s",
+                    URGENT_DEADLINE.as_secs()
+                ),
+            }
             token.cancel();
-            spawn_shutdown_deadline();
-            // CO-12: a second signal exits at once.
+            spawn_shutdown_deadline(match first {
+                Signal::Interrupt => runner::SHUTDOWN_DEADLINE,
+                Signal::Closing(_) => URGENT_DEADLINE,
+            });
+            // CO-12: a second signal exits at once (after ending this process's child trees and
+            // writing the log's tail, RA-029 / RA-024).
             wait_for_signal().await;
             eprintln!("second interrupt: exiting without waiting for running work");
+            info!("second interrupt: exiting without waiting for running work");
+            runner::before_forced_exit();
             std::process::exit(130);
         });
     }
@@ -581,22 +603,30 @@ fn run(cli: Cli) -> Result<()> {
     result
 }
 
-/// CO-12: after a shutdown request the process exits within [`runner::SHUTDOWN_DEADLINE`]
-/// even when a worker is stuck (e.g. a GPU compile that takes minutes).
-fn spawn_shutdown_deadline() {
+/// How long the stop may take when Windows is closing the console (window closed, logoff,
+/// shutdown): the OS ends the process about 5 s after the event, so the forced exit (child trees
+/// ended, log flushed) comes first.
+const URGENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// CO-12: after a shutdown request the process exits within `deadline`
+/// ([`runner::SHUTDOWN_DEADLINE`]) even when a worker is stuck (e.g. a GPU compile that takes
+/// minutes). Before it exits it ends the child trees this process recorded and writes the file
+/// log's tail ([`runner::before_forced_exit`]).
+fn spawn_shutdown_deadline(deadline: std::time::Duration) {
     let spawned = std::thread::Builder::new()
         .name("shutdown-deadline".into())
-        .spawn(|| {
-            std::thread::sleep(runner::SHUTDOWN_DEADLINE);
+        .spawn(move || {
+            std::thread::sleep(deadline);
             error!(
                 "shutdown did not finish within {} s (a model compile or a request is still \
-                 running); exiting anyway",
-                runner::SHUTDOWN_DEADLINE.as_secs()
+                 running); ending this process's child processes and exiting anyway",
+                deadline.as_secs()
             );
             eprintln!(
                 "shutdown did not finish within {} s; exiting anyway",
-                runner::SHUTDOWN_DEADLINE.as_secs()
+                deadline.as_secs()
             );
+            runner::before_forced_exit();
             std::process::exit(1);
         });
     if let Err(e) = spawned {
@@ -604,7 +634,18 @@ fn spawn_shutdown_deadline() {
     }
 }
 
-async fn wait_for_signal() {
+/// What asked the process to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signal {
+    /// Ctrl-C, SIGTERM, Ctrl-Break: the normal bounded stop.
+    Interrupt,
+    /// Windows is closing the console (window closed, logoff, shutdown) and ends the process
+    /// within seconds.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "Windows console events only"))]
+    Closing(&'static str),
+}
+
+async fn wait_for_signal() -> Signal {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -619,9 +660,42 @@ async fn wait_for_signal() {
                 let _ = tokio::signal::ctrl_c().await;
             }
         }
+        Signal::Interrupt
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows_signal().await
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        Signal::Interrupt
+    }
+}
+
+/// Ctrl-C and Ctrl-Break, and the console's close, logoff and shutdown events (RA-027). A handler
+/// the OS refuses is left out (that event then ends the process the OS's way).
+#[cfg(windows)]
+async fn windows_signal() -> Signal {
+    use tokio::signal::windows;
+    let mut c = windows::ctrl_c().ok();
+    let mut brk = windows::ctrl_break().ok();
+    let mut close = windows::ctrl_close().ok();
+    let mut logoff = windows::ctrl_logoff().ok();
+    let mut shutdown = windows::ctrl_shutdown().ok();
+    // A receiver that could not be registered is `None`: its branch is disabled at once.
+    tokio::select! {
+        Some(()) = async { c.as_mut()?.recv().await } => Signal::Interrupt,
+        Some(()) = async { brk.as_mut()?.recv().await } => Signal::Interrupt,
+        Some(()) = async { close.as_mut()?.recv().await } => {
+            Signal::Closing("the console window is closing")
+        }
+        Some(()) = async { logoff.as_mut()?.recv().await } => {
+            Signal::Closing("the user is logging off")
+        }
+        Some(()) = async { shutdown.as_mut()?.recv().await } => {
+            Signal::Closing("Windows is shutting down")
+        }
+        else => std::future::pending::<Signal>().await,
     }
 }

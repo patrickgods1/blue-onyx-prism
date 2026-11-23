@@ -64,6 +64,12 @@
 //! Progress ([`run_filtered_with`], [`ExportStep`]): the label files read, every image placed and
 //! per-frame label file written, then the publish, for a caller that shows a running export (the
 //! Jobs tab of the Train area). The plain entry points report to nobody.
+//!
+//! Stopping ([`run_filtered_until`]): a caller's stop (the service stopping) is asked between two
+//! label files read and two files written; once it says yes the export ends with [`Stopped`]
+//! (before the held-out list is touched when it comes during the walk) and its staging folder is
+//! removed. [`Staging`] also removes itself when dropped unpublished, so a panic leaves no
+//! `.building-<id>` folder either.
 
 use super::super::layout::{self, Rel, Walker};
 use super::super::record::{Bucket, Record};
@@ -77,6 +83,21 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// An export or import ended early because its caller asked it to stop ([`StopFn`]): the service
+/// is stopping. An export keeps nothing of itself; an import keeps the frames it had done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("stopped because the service is stopping")]
+pub struct Stopped;
+
+/// Whether `e` (or its cause chain) is a [`Stopped`].
+pub fn is_stopped(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<Stopped>().is_some())
+}
+
+/// Asked between two steps of an export or import: true = stop now ([`Stopped`]). Called from the
+/// walk's threads too, so it must be `Sync` and cheap.
+pub type StopFn<'a> = &'a (dyn Fn() -> bool + Sync);
 
 /// Default share of (camera, day) groups held out for validation.
 pub const DEFAULT_HOLDOUT_FRACTION: f32 = 0.2;
@@ -861,7 +882,7 @@ pub fn reviewed_frames_filtered(
     split: &SplitConfig,
     filter: &ClassFilter,
 ) -> Selection {
-    select_with(dir, classes, split, filter, false, &|_| {})
+    select_with(dir, classes, split, filter, false, &|_| {}, &|| false)
 }
 
 /// [`reviewed_frames_filtered`] for a reader that keeps what it read beside the label files (the
@@ -875,14 +896,16 @@ pub fn reviewed_snapshot(
     split: &SplitConfig,
     filter: &ClassFilter,
 ) -> Selection {
-    select_with(dir, classes, split, filter, true, &|_| {})
+    select_with(dir, classes, split, filter, true, &|_| {}, &|| false)
 }
 
 /// Label files read between two [`ExportStep::Reading`] reports (the walk's threads share one
 /// count), and always the last one.
 const READ_REPORT_EVERY: usize = 64;
 
-/// [`reviewed_frames_filtered`], telling `progress` how far the walk is.
+/// [`reviewed_frames_filtered`], telling `progress` how far the walk is. Once `stop` says yes the
+/// walk reads no more label files: the selection is then incomplete, and the caller must ask
+/// `stop` again before using it.
 fn select_with(
     dir: &Path,
     classes: &[String],
@@ -890,6 +913,7 @@ fn select_with(
     filter: &ClassFilter,
     recheck: bool,
     progress: ProgressFn<'_>,
+    stop: StopFn<'_>,
 ) -> Selection {
     let mut filtered_out = 0;
     let mut changed = 0;
@@ -922,6 +946,9 @@ fn select_with(
         let mut walker = walker.clone();
         day.iter()
             .filter_map(|(rel, path)| {
+                if stop() {
+                    return None;
+                }
                 let read = read_reviewed(&mut walker, rel, path, recheck);
                 let done = read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if done.is_multiple_of(READ_REPORT_EVERY) || done == of {
@@ -1070,6 +1097,9 @@ thread_local! {
     /// [`write_file`] fails on a file of this name: a full disk at a chosen point of an export.
     static FAIL_WRITE: std::cell::RefCell<Option<std::ffi::OsString>> =
         const { std::cell::RefCell::new(None) };
+    /// [`write_file`] panics on a file of this name: a bug in the middle of an export.
+    static PANIC_WRITE: std::cell::RefCell<Option<std::ffi::OsString>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Hard-link `src` to `dst`, else copy it.
@@ -1086,6 +1116,10 @@ fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(test)]
     if FAIL_WRITE.with_borrow(|n| path.file_name().is_some_and(|f| Some(f.to_owned()) == *n)) {
         bail!("{}: writing failed (test)", path.display());
+    }
+    #[cfg(test)]
+    if PANIC_WRITE.with_borrow(|n| path.file_name().is_some_and(|f| Some(f.to_owned()) == *n)) {
+        panic!("{}: writing panicked (test)", path.display());
     }
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
@@ -1183,6 +1217,8 @@ struct Staging {
     scratch: PathBuf,
     /// `target` is an existing folder ([`Self::publish`] moves the files).
     inside: bool,
+    /// Published, kept on purpose by a failed publish, or discarded: the drop leaves it alone.
+    settled: std::cell::Cell<bool>,
 }
 
 impl Staging {
@@ -1213,11 +1249,13 @@ impl Staging {
             build,
             scratch,
             inside,
+            settled: std::cell::Cell::new(false),
         })
     }
 
     /// Give up: nothing of the export stays (the dataset is its source).
     fn discard(&self) {
+        self.settled.set(true);
         if let Err(e) = std::fs::remove_dir_all(&self.scratch) {
             tracing::warn!(
                 "export: could not remove the unfinished {}: {e}; delete it by hand",
@@ -1246,6 +1284,8 @@ impl Staging {
     /// The finished export takes its place. A failure keeps what was built (it is complete, and
     /// its `data.yaml` already names the target) and says where.
     fn publish(&self) -> Result<()> {
+        // Whatever happens now, what was built is either in place or kept and named.
+        self.settled.set(true);
         let moved = if self.inside {
             self.move_up()
         } else {
@@ -1267,6 +1307,16 @@ impl Staging {
             );
         }
         Ok(())
+    }
+}
+
+/// An export that never got to [`Staging::publish`] or [`Staging::discard`] (a panic, or an
+/// early return) goes like a failed one.
+impl Drop for Staging {
+    fn drop(&mut self) {
+        if !self.settled.get() {
+            self.discard();
+        }
     }
 }
 
@@ -1316,16 +1366,33 @@ pub fn run_filtered_with(
     filter: &ClassFilter,
     progress: ProgressFn<'_>,
 ) -> Result<ExportReport> {
+    run_filtered_until(dir, classes, req, filter, progress, &|| false)
+}
+
+/// [`run_filtered_with`], asking `stop` between two label files read and two files written: once
+/// it says yes the export ends with [`Stopped`] and nothing of it stays (the held-out list is
+/// left alone when the stop comes before the split).
+pub fn run_filtered_until(
+    dir: &Path,
+    classes: &[String],
+    req: &ExportRequest,
+    filter: &ClassFilter,
+    progress: ProgressFn<'_>,
+    stop: StopFn<'_>,
+) -> Result<ExportReport> {
     if req.formats.is_empty() {
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
     }
     filter.check(classes)?;
-    let mut selected = select_with(dir, classes, &req.split, filter, false, progress);
+    let mut selected = select_with(dir, classes, &req.split, filter, false, progress, stop);
+    if stop() {
+        return Err(Stopped.into());
+    }
     let held = match &req.heldout {
         Some(policy) => Some(frozen_split(dir, &mut selected, &req.split, policy)?),
         None => None,
     };
-    run_selected_with(dir, classes, req, filter, selected, held, progress)
+    run_selected_with(dir, classes, req, filter, selected, held, progress, stop)
 }
 
 /// The split of `selected` by [`heldout::apply`] (the listed days held out, the list grown by an
@@ -1374,10 +1441,17 @@ pub fn run_selected(
     filter: &ClassFilter,
     selected: Selection,
 ) -> Result<ExportReport> {
-    run_selected_with(dir, classes, req, filter, selected, None, &|_| {})
+    run_selected_with(dir, classes, req, filter, selected, None, &|_| {}, &|| {
+        false
+    })
 }
 
-/// [`run_selected`], telling `progress` where it is; `heldout` is what [`frozen_split`] did.
+/// [`run_selected`], telling `progress` where it is and asking `stop` between two files;
+/// `heldout` is what [`frozen_split`] did.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the export's inputs, what the split did, and the caller's progress and stop"
+)]
 fn run_selected_with(
     dir: &Path,
     classes: &[String],
@@ -1386,6 +1460,7 @@ fn run_selected_with(
     selected: Selection,
     heldout: Option<HeldoutReport>,
     progress: ProgressFn<'_>,
+    stop: StopFn<'_>,
 ) -> Result<ExportReport> {
     if req.formats.is_empty() {
         bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
@@ -1425,6 +1500,9 @@ fn run_selected_with(
             dir.display()
         );
     }
+    if stop() {
+        return Err(Stopped.into());
+    }
     let target = prepare_out(dir, &req.out_dir, std::time::SystemTime::now())?;
     let staging = Staging::new(&target)?;
     let report = build_export(
@@ -1433,10 +1511,9 @@ fn run_selected_with(
         classes,
         req,
         filter,
-        &target,
-        &staging.build,
+        (&target, &staging.build),
         heldout,
-        progress,
+        (progress, stop),
     );
     match report {
         Ok(r) => {
@@ -1463,10 +1540,9 @@ fn build_export(
     classes: &[String],
     req: &ExportRequest,
     filter: &ClassFilter,
-    out: &Path,
-    build: &Path,
+    (out, build): (&Path, &Path),
     heldout: Option<HeldoutReport>,
-    progress: ProgressFn<'_>,
+    (progress, stop): (ProgressFn<'_>, StopFn<'_>),
 ) -> Result<ExportReport> {
     let Selection {
         mut frames,
@@ -1541,6 +1617,7 @@ fn build_export(
         done: 0,
         of: written_files(&frames, unreviewed.len(), req, &in_bench),
         progress,
+        stop,
     };
     written.report();
     if (wants(Format::Yolo) || wants(Format::Coco)) && !frames.is_empty() {
@@ -1550,7 +1627,7 @@ fn build_export(
                 std::fs::create_dir_all(p)?;
             }
             link_or_copy(&f.image, &dst)?;
-            written.one();
+            written.one()?;
         }
     }
     if wants(Format::Yolo) && !frames.is_empty() {
@@ -1564,7 +1641,7 @@ fn build_export(
                     .join(format!("{stem}.txt")),
                 txt.as_bytes(),
             )?;
-            written.one();
+            written.one()?;
         }
         let mut names = classes.join("\n");
         names.push('\n');
@@ -1610,23 +1687,23 @@ fn build_export(
         std::fs::create_dir_all(&xdir)?;
         for f in &frames {
             link_or_copy(&f.image, &xdir.join(&f.name))?;
-            written.one();
+            written.one()?;
             // Every training box, the floor regardless: an import treats a box missing here as
             // rejected, and `difficult` on it would stay in the label file for good.
             let x = xany::to_xany(&f.name, f.width, f.height, f.training_boxes(), true);
             let stem = f.name.trim_end_matches(".jpg");
             write_file(&xdir.join(format!("{stem}.json")), &json_bytes(&x)?)?;
-            written.one();
+            written.one()?;
         }
         for (frame, labels, w, h) in unreviewed {
             let name = flat_name(&frame.rel);
             link_or_copy(&frame.jpg, &xdir.join(&name))?;
-            written.one();
+            written.one()?;
             let preview = preview(labels).boxes;
             let x = xany::to_xany(&name, *w, *h, &preview, false);
             let stem = name.trim_end_matches(".jpg");
             write_file(&xdir.join(format!("{stem}.json")), &json_bytes(&x)?)?;
-            written.one();
+            written.one()?;
         }
         let mut names = classes.join("\n");
         names.push('\n');
@@ -1648,7 +1725,7 @@ fn build_export(
             std::fs::create_dir_all(&img)?;
             for f in &list {
                 link_or_copy(&f.image, &img.join(&f.name))?;
-                written.one();
+                written.one()?;
             }
             let id = out
                 .file_name()
@@ -1733,11 +1810,12 @@ fn written_files(
     of
 }
 
-/// The count of [`ExportStep::Writing`].
+/// The count of [`ExportStep::Writing`], and where the caller's stop is asked.
 struct Written<'a> {
     done: usize,
     of: usize,
     progress: ProgressFn<'a>,
+    stop: StopFn<'a>,
 }
 
 impl Written<'_> {
@@ -1748,10 +1826,14 @@ impl Written<'_> {
         });
     }
 
-    /// One more file written.
-    fn one(&mut self) {
+    /// One more file written; [`Stopped`] when the caller asks to stop.
+    fn one(&mut self) -> Result<()> {
         self.done += 1;
         self.report();
+        if (self.stop)() {
+            return Err(Stopped.into());
+        }
+        Ok(())
     }
 }
 
@@ -2962,6 +3044,82 @@ mod tests {
             assert_eq!(names_in(&chosen), Vec::<String>::new(), "{name}");
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    /// Audit 2026-11 phase 1: an export stopped by the service, or cut by a panic, leaves no
+    /// `.building-*` folder (and a stop during the walk leaves the held-out list alone).
+    #[test]
+    fn a_stopped_or_panicking_export_leaves_no_staging_behind() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        for stem in ["a", "b", "c"] {
+            put_reviewed(
+                &dir,
+                "drive",
+                "2026-10-21",
+                stem,
+                vec![lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted)],
+                false,
+            );
+        }
+        let exports = root.join("exports");
+        let chosen = root.join("chosen");
+        std::fs::create_dir_all(&chosen).unwrap();
+        let none = || false;
+        for out in [exports.join("new"), chosen.clone()] {
+            // Stop after the second file written.
+            let files = std::sync::atomic::AtomicUsize::new(0);
+            let progress = |s: ExportStep| {
+                if let ExportStep::Writing { done, .. } = s {
+                    files.store(done, std::sync::atomic::Ordering::SeqCst);
+                }
+            };
+            let stop = || files.load(std::sync::atomic::Ordering::SeqCst) >= 2;
+            let req = all_formats(out.clone());
+            let filter = ClassFilter::default();
+            let e =
+                run_filtered_until(&dir, &classes(), &req, &filter, &progress, &stop).unwrap_err();
+            assert!(is_stopped(&e), "{e:#}");
+            let left = |p: &Path| if p.exists() { names_in(p) } else { Vec::new() };
+            assert_eq!(left(&exports), Vec::<String>::new(), "{}", out.display());
+            assert_eq!(left(&chosen), Vec::<String>::new(), "{}", out.display());
+            // A panic in the middle (here: writing ignore.json) unwinds past the error path.
+            PANIC_WRITE.with_borrow_mut(|n| *n = Some(IGNORE_FILE.into()));
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_filtered_until(&dir, &classes(), &req, &filter, &|_| {}, &none)
+            }));
+            PANIC_WRITE.with_borrow_mut(|n| *n = None);
+            assert!(panicked.is_err());
+            assert_eq!(left(&exports), Vec::<String>::new(), "{}", out.display());
+            assert_eq!(left(&chosen), Vec::<String>::new(), "{}", out.display());
+        }
+        // A stop during the walk: no export, and the held-out list is never written.
+        let mut req = all_formats(exports.join("walk"));
+        req.heldout = Some(HeldoutPolicy { seen: None });
+        let e = run_filtered_until(
+            &dir,
+            &classes(),
+            &req,
+            &ClassFilter::default(),
+            &|_| {},
+            &|| true,
+        )
+        .unwrap_err();
+        assert!(is_stopped(&e), "{e:#}");
+        assert!(!exports.join("walk").exists());
+        assert!(!dir.join(heldout::FILE).exists(), "the list is left alone");
+        // Not stopped: the same export goes through.
+        run_filtered_until(
+            &dir,
+            &classes(),
+            &req,
+            &ClassFilter::default(),
+            &|_| {},
+            &none,
+        )
+        .unwrap();
+        assert!(exports.join("walk/export.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

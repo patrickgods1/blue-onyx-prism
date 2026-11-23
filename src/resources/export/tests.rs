@@ -463,6 +463,246 @@ fn exporter_queues_cancels_and_reports() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Commands of `fake` that ran the export script for `name`.
+fn exports_of(fake: &Fake, name: &str) -> usize {
+    fake.cmds()
+        .iter()
+        .filter(|c| c.contains(SCRIPT_NAME) && c.contains(&format!("--name {name} ")))
+        .count()
+}
+
+/// Wait until `id` is `Running` in the export stage.
+fn wait_exporting(ex: &Exporter, id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let st = ex.status(id).unwrap();
+        if matches!(
+            st.state,
+            ExportState::Running {
+                stage: Stage::Export,
+                ..
+            }
+        ) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{st:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// QA resources-7: a queued export that is cancelled and queued again runs once.
+#[test]
+fn a_cancelled_export_queued_again_runs_once() {
+    let root = tmp("requeue");
+    let fake = Arc::new(Fake {
+        hang_on: Some("--name yolo26s "),
+        ..Fake::new()
+    });
+    let ex = Exporter::start(fake.clone(), fake.clone());
+    let mut blocker = job(&root, MAC);
+    blocker.resource = catalog::export_model("yolo26s").unwrap();
+    ex.enqueue(ExportRequest {
+        job: blocker,
+        on_done: None,
+    })
+    .unwrap();
+    wait_exporting(&ex, "model:yolo26s");
+    let a = || ExportRequest {
+        job: job(&root, MAC),
+        on_done: None,
+    };
+    ex.enqueue(a()).unwrap();
+    assert!(ex.cancel("model:yolo26n"));
+    ex.enqueue(a()).unwrap();
+    assert_eq!(
+        ex.status("model:yolo26n").unwrap().state,
+        ExportState::Queued
+    );
+    assert!(ex.cancel("model:yolo26s"));
+    let st = ex
+        .wait("model:yolo26n", Some(Duration::from_secs(30)))
+        .unwrap();
+    assert_eq!(st.state, ExportState::Installed);
+    // Both messages were seen by now; give a second run the time it would need.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(exports_of(&fake, "yolo26n"), 1, "{:?}", fake.cmds());
+    ex.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// QA resources-7 (+extra): a cancel that lands after the worker received the request but before
+/// it picked it up is not lost: the export never runs.
+#[test]
+fn a_cancel_during_the_pickup_is_not_lost() {
+    let root = tmp("pickup");
+    let fake = Arc::new(Fake::new());
+    let ex = Exporter::start(fake.clone(), fake.clone());
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    let first = Arc::new(AtomicBool::new(true));
+    {
+        let (gate, first) = (gate.clone(), first.clone());
+        ex.set_pickup_hook(move || {
+            if first.swap(false, Ordering::SeqCst) {
+                gate.wait(); // the worker has the request
+                gate.wait(); // the test has cancelled it
+            }
+        });
+    }
+    ex.enqueue(ExportRequest {
+        job: job(&root, MAC),
+        on_done: None,
+    })
+    .unwrap();
+    gate.wait();
+    assert!(ex.cancel("model:yolo26n"));
+    gate.wait();
+    let st = ex
+        .wait("model:yolo26n", Some(Duration::from_secs(30)))
+        .unwrap();
+    assert_eq!(st.state, ExportState::Cancelled);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        ex.status("model:yolo26n").unwrap().state,
+        ExportState::Cancelled
+    );
+    assert_eq!(fake.runs.load(Ordering::SeqCst), 0, "{:?}", fake.cmds());
+    assert!(fake.fetched.lock().unwrap().is_empty());
+    ex.shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A runner that panics on its first command, then behaves like `inner`.
+struct PanicOnce {
+    inner: Arc<Fake>,
+    armed: AtomicBool,
+}
+
+impl CommandRunner for PanicOnce {
+    fn run(&self, cmd: &Cmd, on_line: &mut dyn FnMut(&str), cancel: &AtomicBool) -> Result<()> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            panic!("test: the runner panics");
+        }
+        self.inner.run(cmd, on_line, cancel)
+    }
+}
+
+/// QA resources-6: a panic inside an export fails that export (it never stays `Running`) and the
+/// thread keeps serving; after the thread stopped, an enqueue is refused and leaves nothing
+/// `Queued`.
+#[test]
+fn a_panicking_export_fails_and_the_thread_keeps_serving() {
+    let root = tmp("panic");
+    let fake = Arc::new(Fake::new());
+    let runner = Arc::new(PanicOnce {
+        inner: fake.clone(),
+        armed: AtomicBool::new(true),
+    });
+    let ex = Exporter::start(runner, fake.clone());
+    let req = || ExportRequest {
+        job: job(&root, MAC),
+        on_done: None,
+    };
+    ex.enqueue(req()).unwrap();
+    let st = ex
+        .wait("model:yolo26n", Some(Duration::from_secs(30)))
+        .unwrap();
+    match &st.state {
+        ExportState::Failed { error, .. } => {
+            assert!(error.contains("internal error"), "{error}");
+            assert!(error.contains("the runner panics"), "{error}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // A panicking completion callback is contained the same way.
+    ex.enqueue(ExportRequest {
+        job: job(&root, MAC),
+        on_done: Some(Box::new(|_| panic!("test: the callback panics"))),
+    })
+    .unwrap();
+    let st = ex
+        .wait("model:yolo26n", Some(Duration::from_secs(30)))
+        .unwrap();
+    assert!(
+        matches!(&st.state, ExportState::Failed { error, .. } if error.contains("callback panics")),
+        "{st:?}"
+    );
+    // The thread still serves.
+    ex.enqueue(req()).unwrap();
+    let st = ex
+        .wait("model:yolo26n", Some(Duration::from_secs(30)))
+        .unwrap();
+    assert_eq!(st.state, ExportState::Installed);
+    // Stopped: refused, and the earlier status is not turned into a stale `Queued`.
+    ex.shutdown();
+    assert!(ex.enqueue(req()).is_err());
+    assert_eq!(
+        ex.status("model:yolo26n").unwrap().state,
+        ExportState::Installed
+    );
+    assert!(!ex.busy());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// RA restart-2: the run's stop cancels a running export (tree killed through the runner's
+/// cancel, staging removed) and the queued ones within its deadline; afterwards the provisioner
+/// refuses new exports instead of starting a thread past the stop.
+#[test]
+fn stop_for_exit_cancels_the_exports_within_the_deadline() {
+    let root = tmp("stop-for-exit");
+    let fake = Arc::new(Fake {
+        hang_on: Some(" --out-dir "),
+        ..Fake::new()
+    });
+    let prov = crate::resources::provision::Provisioner::with_options(
+        crate::resources::provision::ProvisionOptions {
+            export_hooks: Some((fake.clone(), fake.clone())),
+            ..Default::default()
+        },
+    );
+    let config = crate::config::Config::default();
+    let ex = prov.exporter_for(&config);
+    let j = job(&root, MAC);
+    ex.enqueue(ExportRequest {
+        job: j.clone(),
+        on_done: None,
+    })
+    .unwrap();
+    let mut queued = j.clone();
+    queued.resource = catalog::export_model("yolo26s").unwrap();
+    ex.enqueue(ExportRequest {
+        job: queued,
+        on_done: None,
+    })
+    .unwrap();
+    wait_exporting(&ex, "model:yolo26n");
+    let t0 = Instant::now();
+    prov.stop_for_exit(Instant::now() + Duration::from_secs(10));
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    assert_eq!(
+        ex.status("model:yolo26n").unwrap().state,
+        ExportState::Cancelled
+    );
+    assert_eq!(
+        ex.status("model:yolo26s").unwrap().state,
+        ExportState::Cancelled
+    );
+    assert!(!j.paths.staging("yolo26n").exists());
+    assert_eq!(exports_of(&fake, "yolo26s"), 0);
+    // Idempotent, and the stopped exporter refuses new work.
+    prov.stop_for_exit(Instant::now() + Duration::from_secs(1));
+    let again = prov.exporter_for(&config);
+    assert!(Arc::ptr_eq(&again, &ex));
+    assert!(
+        again
+            .enqueue(ExportRequest {
+                job: j,
+                on_done: None,
+            })
+            .is_err()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn exporter_failure_and_success_with_callback() {
     let root = tmp("exporter2");
@@ -572,7 +812,10 @@ fn system_runner_streams_fails_times_out_and_cancels() {
         for l in &lines {
             let key = l.split('=').next().unwrap_or_default();
             assert!(
-                inherited(key) || key == "BOP_TEST" || key == "PYTHONPATH",
+                inherited(key)
+                    || key == "BOP_TEST"
+                    || key == "PYTHONPATH"
+                    || key == PARENT_PIPE_ENV,
                 "leaked {l}"
             );
         }

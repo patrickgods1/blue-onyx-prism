@@ -10,6 +10,13 @@
 //! the folder kept and the reason logged when that fails); then `review-queue.jsonl` compaction
 //! of the dataset and review folders ([`crate::collect::layout::compact_review`]). Every removal is
 //! logged with its size ([`super::remove_counted`]), and the sweep ends with one summary line.
+//!
+//! Stopping: [`run`] takes the retention thread's cancel token and checks it between items (each
+//! temporary file, the two cache steps, each staging folder, each crashed work folder, each
+//! compaction). An item is never cut in the middle, and one not reached stays for the next sweep:
+//! a crashed job's busy claim is dropped unfinished, so its marker stays. Not interruptible inside
+//! one item: a large folder's removal, or an auto-label recovery writing its frames
+//! ([`crate::training::autolabel::job::recover_crashed`]).
 
 use super::busy::{self, State};
 use super::{Removed, caches, remove_counted};
@@ -232,17 +239,33 @@ pub struct Report {
     pub kept: Vec<String>,
     /// Review queues compacted: (folder, lines dropped).
     pub compacted: Vec<(PathBuf, usize)>,
+    /// The sweep ended early for a stop; what it did not reach waits for the next one.
+    pub stopped: bool,
 }
 
-/// One full sweep (see the module docs).
-pub fn run(s: &Settings) -> Report {
+/// One full sweep (see the module docs), ending between two items once `cancel` is cancelled.
+pub fn run(s: &Settings, cancel: &tokio_util::sync::CancellationToken) -> Report {
+    run_until(s, &|| cancel.is_cancelled())
+}
+
+/// [`run`], asking `stop` between two items.
+pub fn run_until(s: &Settings, stop: &dyn Fn() -> bool) -> Report {
     let now = SystemTime::now();
     let mut rep = Report::default();
-    sweep_temp_files(s, now, &mut rep.removed);
-    sweep_caches(s, now, &mut rep.removed);
-    sweep_staging(&s.models_dir(), &mut rep.removed);
-    sweep_work(s, &mut rep);
+    temp_files_until(s, now, &mut rep.removed, stop);
+    if !stop() {
+        sweep_caches_until(s, now, &mut rep.removed, stop);
+    }
+    if !stop() {
+        staging_until(&s.models_dir(), &mut rep.removed, stop);
+    }
+    if !stop() {
+        work_until(s, &mut rep, stop);
+    }
     for dir in s.dataset_dirs() {
+        if stop() {
+            break;
+        }
         match crate::collect::layout::compact_review(&dir) {
             Ok(Some(c)) if c.dropped() > 0 => {
                 tracing::info!(
@@ -262,16 +285,22 @@ pub fn run(s: &Settings) -> Report {
             ),
         }
     }
+    rep.stopped = stop();
     let freed = super::total(&rep.removed);
-    if !rep.removed.is_empty() || !rep.kept.is_empty() {
+    if !rep.removed.is_empty() || !rep.kept.is_empty() || rep.stopped {
         tracing::info!(
-            "storage sweep: {} item(s) removed, {} freed{}",
+            "storage sweep: {} item(s) removed, {} freed{}{}",
             rep.removed.len(),
             crate::resources::catalog::format_size(freed),
             if rep.kept.is_empty() {
                 String::new()
             } else {
                 format!("; kept: {}", rep.kept.join("; "))
+            },
+            if rep.stopped {
+                "; stopped early because the service is stopping, the next sweep goes on"
+            } else {
+                ""
             }
         );
     }
@@ -293,12 +322,25 @@ pub fn is_leftover_temp(name: &str, legacy: &[String]) -> bool {
 /// accepts, last modified at least [`TEMP_MIN_AGE`] before `now` (a write in progress is never
 /// that old).
 pub fn sweep_temp_files(s: &Settings, now: SystemTime, out: &mut Vec<Removed>) {
+    temp_files_until(s, now, out, &|| false);
+}
+
+/// [`sweep_temp_files`], asking `stop` before each file.
+fn temp_files_until(
+    s: &Settings,
+    now: SystemTime,
+    out: &mut Vec<Removed>,
+    stop: &dyn Fn() -> bool,
+) {
     let legacy = s.legacy_temp_names();
     for dir in s.temp_dirs() {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
         for e in rd.flatten() {
+            if stop() {
+                return;
+            }
             let Some(name) = e.file_name().to_str().map(str::to_string) else {
                 continue;
             };
@@ -322,10 +364,20 @@ pub fn sweep_temp_files(s: &Settings, now: SystemTime, out: &mut Vec<Removed>) {
 
 /// Unused cache folders and the CoreML orphans.
 pub fn sweep_caches(s: &Settings, now: SystemTime, out: &mut Vec<Removed>) {
+    sweep_caches_until(s, now, out, &|| false);
+}
+
+/// [`sweep_caches`], asking `stop` between its two steps.
+fn sweep_caches_until(
+    s: &Settings,
+    now: SystemTime,
+    out: &mut Vec<Removed>,
+    stop: &dyn Fn() -> bool,
+) {
     let Some(root) = s.cache_root() else { return };
     caches::sweep_unused(&root, now, out);
     let coreml = root.join("coreml");
-    if coreml.is_dir() {
+    if coreml.is_dir() && !stop() {
         caches::sweep_coreml(&coreml, &s.model_files(), now, out);
     }
 }
@@ -356,6 +408,11 @@ pub fn leftover_staging(models_dir: &Path) -> Vec<PathBuf> {
 
 /// Remove the leftover staging folders of `models_dir` and the markers of crashed runs.
 pub fn sweep_staging(models_dir: &Path, out: &mut Vec<Removed>) {
+    staging_until(models_dir, out, &|| false);
+}
+
+/// [`sweep_staging`], asking `stop` before each folder.
+fn staging_until(models_dir: &Path, out: &mut Vec<Removed>, stop: &dyn Fn() -> bool) {
     let Ok(rd) = std::fs::read_dir(models_dir) else {
         return;
     };
@@ -378,6 +435,9 @@ pub fn sweep_staging(models_dir: &Path, out: &mut Vec<Removed>) {
     targets.sort();
     targets.dedup();
     for t in targets {
+        if stop() {
+            return;
+        }
         match busy::probe(&t) {
             State::Live => {}
             State::Ended => {
@@ -477,7 +537,15 @@ fn crashed_in(root: &Path, dirs: &[(&str, WorkKind)]) -> Vec<CrashedWork> {
 /// folder goes. A folder whose proposals could not all be written stays (with its marker, so the
 /// next sweep tries again) and the reason goes to `rep.kept`.
 pub fn sweep_work(s: &Settings, rep: &mut Report) {
+    work_until(s, rep, &|| false);
+}
+
+/// [`sweep_work`], asking `stop` before each folder (one not reached keeps its marker).
+fn work_until(s: &Settings, rep: &mut Report, stop: &dyn Fn() -> bool) {
     for w in crashed_all(s) {
+        if stop() {
+            return;
+        }
         let State::Crashed(claim) = busy::probe(&w.dir) else {
             continue;
         };
@@ -1036,6 +1104,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Audit 2026-11 phase 1: a stop between two items ends the sweep there; what it did not
+    /// reach (a crashed job's marker included) waits for the next sweep.
+    #[test]
+    fn a_stopped_sweep_ends_between_items_and_the_next_one_goes_on() {
+        let root = tmp("stop");
+        let s = settings(&root);
+        let t = s.training_dir();
+        let crashed: Vec<PathBuf> = (1..=3)
+            .map(|i| t.join(format!("imports/20261122-{i}")))
+            .collect();
+        for d in &crashed {
+            put(&d.join("frames/a.jpg"), 10);
+            std::fs::write(busy::marker_of(d), b"1\n").unwrap();
+        }
+        let id = "0123456789abcdef0123456789abcdef";
+        let temp = root.join(format!(".children.json.{id}.tmp"));
+        put(&temp, 3);
+        age(&temp, Duration::from_secs(2 * 3600));
+        // Cancelled before anything: nothing goes.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let rep = run(&s, &cancel);
+        assert!(rep.stopped && rep.removed.is_empty(), "{rep:?}");
+        assert!(temp.is_file());
+        // Stop once the first work folder is gone: the other two stay, markers and all.
+        let first_gone = || !crashed[0].exists();
+        let rep = run_until(&s, &first_gone);
+        assert!(rep.stopped);
+        assert_eq!(
+            rep.removed.len(),
+            2,
+            "the temp file and one work folder: {rep:?}"
+        );
+        assert!(!temp.exists());
+        for d in &crashed[1..] {
+            assert!(d.join("frames/a.jpg").is_file(), "{}", d.display());
+            assert!(busy::marker_of(d).exists(), "{}", d.display());
+        }
+        let rep = run(&s, &tokio_util::sync::CancellationToken::new());
+        assert!(!rep.stopped);
+        assert_eq!(rep.removed.len(), 2);
+        assert!(crashed.iter().all(|d| !d.exists()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_full_sweep_never_touches_data() {
         let root = tmp("data");
@@ -1068,7 +1181,8 @@ mod tests {
             "1000000\n", // 1970
         )
         .unwrap();
-        let rep = run(&s);
+        let rep = run(&s, &tokio_util::sync::CancellationToken::new());
+        assert!(!rep.stopped);
         assert_eq!(
             rep.removed.iter().map(|r| &r.path).collect::<Vec<_>>(),
             [&cache]

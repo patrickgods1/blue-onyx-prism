@@ -1386,13 +1386,23 @@ Once installed, control the background service with the same binary:
 `not installed`) and exits 0 when it is running, 3 otherwise, so scripts can test it. Starting and
 stopping need administrator rights: run `sudo blue-onyx-prism service start|stop|restart` on macOS
 and Linux, or `blue-onyx-prism service start|stop|restart` from an administrator terminal on
-Windows. The command waits until the service has actually started or stopped (up to about a
-minute) and prints the result. It drives the platform's own service manager (the Windows service
+Windows. The command waits until the service has actually started or stopped (up to 75 s for a
+start and 85 s for a stop) and prints the result. It drives the platform's own service manager (the Windows service
 `BlueOnyxPrismService`, the launchd daemon `com.blueonyx.prism`, the systemd unit
 `blue-onyx-prism`), so `sc`/`services.msc`, `launchctl` and `systemctl` keep working as before.
 On macOS `stop` unloads the daemon until the next `start` or reboot; on Linux and Windows the
 service's start type is unchanged, so it starts again at boot. On Windows and macOS the tray /
 menu bar icon (`blue-onyx-prism-tray`) does the same from a menu.
+
+**Stopping.** A stop (Ctrl-C, SIGTERM, `service stop`, an OS shutdown) tells everything at once:
+a running training, auto-label or model export ends its processes and keeps its checkpoint
+(retry it later), a benchmark is cancelled, and Blue Iris requests in flight get up to 10 s to
+finish before their connections are closed. The process then ends within 60 s even when a model
+is still compiling on the GPU: past that it ends its own child processes, writes the last log
+lines and exits with code 1 (the log says what was still running). A second Ctrl-C exits at once
+the same way. The service managers wait 75 s before they kill it (systemd `TimeoutStopSec`,
+launchd `ExitTimeOut`, Docker `stop_grace_period`, the Windows preshutdown timeout), so its own
+end always runs; keep that if you edit the unit, plist or compose file.
 
 **Windows** (elevated PowerShell, from the extracted archive):
 
@@ -1417,7 +1427,9 @@ unrestricted`, so the grants above apply under any account) and only `SeChangeNo
 (`sc.exe privs`: every other privilege is removed, LocalSystem included). The script raises the
 machine-wide `ServicesPipeTimeout` to 600000 ms (applies after a reboot; a larger value is kept) so
 the first start can compile models; it records the previous value and `uninstall_service.ps1`
-restores it. A reinstall fails with a clear message, instead of half-registering the service,
+restores it. It also sets the service's preshutdown timeout to 75 s
+(`blue-onyx-prism-service.exe --set-preshutdown-timeout`, elevated), so an OS restart waits for
+the service's stop instead of Windows' default 10 s. A reinstall fails with a clear message, instead of half-registering the service,
 when services.msc or Event Viewer keeps the old one open. Logs go to the Application event log (source
 `BlueOnyxPrism`) and, with `log_path`, to files.
 
@@ -1511,6 +1523,10 @@ and open `https://127.0.0.1:32169/setup` on the host. The accounts, the API toke
   the published binding is the gate; passwords and the lockout still apply.
 
 The container's health check polls `/v1/status` (`docker ps` shows `healthy` once a model is ready).
+The image starts the service under `tini`, which reaps the processes a cancelled export or
+training leaves, and the compose file gives a stop 75 s (`stop_grace_period`); with plain
+`docker run` / `docker stop`, pass `--stop-timeout 75` / `-t 75`, since Docker's default 10 s cuts
+the service's own stop short.
 
 ## HTTP API
 

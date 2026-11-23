@@ -1,7 +1,17 @@
 //! Seams of the export stage machine: [`CommandRunner`] (child processes, the real
 //! [`SystemRunner`] with process-tree kill, pause / resume and bounded output; [`PausableRunner`]
 //! binds a pause flag to any runner) and [`Fetcher`] (verified downloads through the download
-//! manager). Tests swap both for the fake in `super::fake`.
+//! manager, a cancel stopping the download itself). Tests swap both for the fake in
+//! `super::fake`.
+//!
+//! [`SystemRunner`] is the one spawn path of every long-running child (export, training, import,
+//! auto-label, refine): its `Tree` ties the child's whole process tree to the service (own
+//! process group + Linux parent-death signal, a Windows Job joined before the child runs, a
+//! stdin pipe the scripts watch for EOF, an entry in `<data root>/.children.json`, a kill on
+//! drop), and [`kill_live_trees`] ends every running tree on a forced exit. The runner waits on
+//! the child in the thread that spawned it (required by `PR_SET_PDEATHSIG`, see
+//! [`crate::backend::process`]); after the child exits, its output is drained for a bounded
+//! time only.
 
 use super::*;
 
@@ -177,16 +187,106 @@ impl std::error::Error for ChildFailed {}
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemRunner;
 
-/// A running child and the handle that kills (and suspends) its whole process tree: the process
-/// group on Unix (the child is its leader), a Job Object with kill-on-close on Windows
-/// ([`crate::backend::job`]).
+/// Set to `1` in every child's environment: the child's stdin is the parent-watch pipe (a pipe
+/// the service never writes), so the Python scripts may watch it for EOF. A script run by hand (stdin a
+/// terminal) does not have it and does not watch.
+pub const PARENT_PIPE_ENV: &str = "BOP_PARENT_PIPE";
+
+/// After a child exited, how long its helpers may keep the output pipes open before the rest
+/// of the tree is killed.
+const ORPHAN_GRACE: Duration = Duration::from_secs(2);
+/// After that kill, how much longer the output is drained before the runner stops waiting for
+/// the pipes (RA resources-8: a helper outside the group or job holds them; the reader threads
+/// are left to end with it).
+const DRAIN_AFTER_KILL: Duration = Duration::from_secs(5);
+/// Between SIGTERM and SIGKILL when a tree is stopped (Unix): uv drops its temp files.
+#[cfg(unix)]
+const TERM_GRACE: Duration = Duration::from_millis(1500);
+
+/// Process groups of the trees running now (Unix; empty on Windows, where each tree's Job
+/// Object dies with the process): [`kill_live_trees`] ends them on the way out of a forced exit.
+static LIVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// SIGKILL every process tree a [`SystemRunner`] of this process is running now (each after a
+/// SIGCONT, so paused trees die too), for exits that skip the runners' own cleanup: the second
+/// Ctrl-C of a CLI command, the service's forced exit. Returns how many groups were signalled.
+/// Windows: nothing to do, the trees' Job Objects kill them when the process exits.
+pub fn kill_live_trees() -> usize {
+    let groups: Vec<u32> = LIVE.lock_recover().clone();
+    for &g in &groups {
+        if let Err(e) = crate::backend::process::kill_group(g) {
+            tracing::warn!("could not end process group {g}: {e}");
+        }
+    }
+    groups.len()
+}
+
+/// Keeps a tree's group in [`LIVE`] while it runs.
+struct Live(u32);
+
+impl Live {
+    fn add(pgid: u32) -> Self {
+        if cfg!(unix) {
+            LIVE.lock_recover().push(pgid);
+        }
+        Self(pgid)
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        let mut live = LIVE.lock_recover();
+        if let Some(i) = live.iter().position(|&g| g == self.0) {
+            live.swap_remove(i);
+        }
+    }
+}
+
+/// The data root a command's children are recorded in ([`crate::children`]): the parent of
+/// the `tools` folder its program lives in (uv and the Python environments are all under
+/// `<data root>/tools/`, see [`Paths`]). None (not recorded) for a program elsewhere.
+pub(crate) fn record_root(program: &Path) -> Option<PathBuf> {
+    program
+        .ancestors()
+        .skip(1)
+        .find(|a| a.file_name().is_some_and(|n| n == TOOLS_DIR))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
+/// A running child and what ties its whole process tree to it (audit 2026-11, RA resources-1,
+/// -8, -9, backend-8):
+/// - the tree: the process group the child leads on Unix ([`crate::backend::process::prepare`],
+///   which on Linux also asks for SIGKILL when the spawning thread dies), a kill-on-close Job
+///   Object on Windows ([`crate::backend::job`]) that the child joins before its first
+///   instruction (spawned suspended, assigned, then resumed; a job that cannot be made or
+///   joined fails the spawn rather than run a tree that would survive a cancel);
+/// - the parent watch: the child's stdin is a pipe whose write end only this struct holds and
+///   never writes, so when the service dies every descendant that inherited stdin reads EOF
+///   (the scripts exit on it, [`PARENT_PIPE_ENV`]);
+/// - its entry in `<data root>/.children.json` ([`crate::children`], for a program under
+///   `tools/`) so the next start ends it after a crash;
+/// - dropped before the child was reaped (an early `?`, a panic in a line handler), the tree is
+///   killed (SIGCONT + SIGKILL to the group; Windows: the job).
+///
+/// Signals go through `killpg(2)` ([`crate::backend::process::signal_group`]), never an
+/// external `kill` program.
 struct Tree {
     child: std::process::Child,
+    /// The child has been waited for.
+    reaped: bool,
+    /// Write end of the child's stdin, never written: closed when the tree is dropped.
+    parent_pipe: Option<std::process::ChildStdin>,
     #[cfg(windows)]
-    job: Option<crate::backend::job::Job>,
+    job: crate::backend::job::Job,
     /// The tree's threads while it is paused (resumed on drop).
     #[cfg(windows)]
     suspended: Option<crate::backend::job::Suspended>,
+    /// The tree is paused (Unix: SIGSTOP sent).
+    #[cfg(unix)]
+    stopped: bool,
+    _record: Option<crate::children::Recorded>,
+    _live: Live,
 }
 
 impl Tree {
@@ -195,7 +295,7 @@ impl Tree {
         let mut c = Command::new(&cmd.program);
         c.args(&cmd.args)
             .current_dir(&cmd.cwd)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear();
@@ -212,137 +312,225 @@ impl Tree {
         for (k, v) in &cmd.env {
             c.env(k, v);
         }
+        c.env(PARENT_PIPE_ENV, "1");
+        // Own process group (pgid = pid) so the tree can be signalled as one; Linux: SIGKILL
+        // when this (spawning and waiting) thread dies.
+        crate::backend::process::prepare(&mut c);
         #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // Own process group (pgid = pid) so `kill_tree` reaches every descendant.
-            c.process_group(0);
-            if cmd.low_priority {
-                crate::backend::priority::lower_child(&mut c);
-            }
+        if cmd.low_priority {
+            crate::backend::priority::lower_child(&mut c);
         }
         #[cfg(windows)]
         let job = {
             use std::os::windows::process::CommandExt;
+            /// CREATE_SUSPENDED: the child runs nothing before it is in the job.
+            const CREATE_SUSPENDED: u32 = 0x0000_0004;
             // CREATE_NO_WINDOW: no console window when the service runs it; below normal
             // priority for a low-priority command (inherited by the processes it starts).
             c.creation_flags(crate::backend::priority::child_creation_flags(
-                0x0800_0000,
+                crate::command::CREATE_NO_WINDOW | CREATE_SUSPENDED,
                 cmd.low_priority,
             ));
-            match crate::backend::job::Job::new() {
-                Ok(j) => Some(j),
-                Err(e) => {
-                    tracing::warn!("no job object for the export process tree: {e:#}");
-                    None
-                }
-            }
+            crate::backend::job::Job::new().with_context(|| {
+                format!(
+                    "could not create a job object for {}; without it its helper processes \
+                     would survive a cancel. Restart the service; if it persists, the service \
+                     may be running inside a job that forbids nested jobs",
+                    cmd.program.display()
+                )
+            })?
         };
         let child = c
             .spawn()
             .with_context(|| format!("starting {}", cmd.program.display()))?;
         #[cfg(windows)]
-        if let Some(j) = &job
-            && let Err(e) = j.assign(&child)
+        let mut child = child;
+        #[cfg(windows)]
+        if let Err(e) = job
+            .assign(&child)
+            .and_then(|()| crate::backend::job::resume_process(child.id()).map(|_| ()))
         {
-            tracing::warn!("export child not assigned to its job object: {e:#}");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e.context(format!(
+                "could not put {} in a job object (its helpers would survive a cancel), so it \
+                 was not run",
+                cmd.program.display()
+            )));
         }
-        Ok(Tree {
-            child,
+        let mut tree = Tree {
+            reaped: false,
+            parent_pipe: None,
             #[cfg(windows)]
             job,
             #[cfg(windows)]
             suspended: None,
-        })
+            #[cfg(unix)]
+            stopped: false,
+            _record: None,
+            _live: Live::add(child.id()),
+            child,
+        };
+        tree.parent_pipe = tree.child.stdin.take();
+        tree._record = record_root(&cmd.program).and_then(|root| {
+            let kind = cmd
+                .program
+                .file_stem()
+                .map_or_else(|| "child".to_string(), |n| n.to_string_lossy().into_owned());
+            crate::children::Registry::new(root)
+                .record(&kind, tree.child.id())
+                .map_err(|e| {
+                    tracing::warn!(
+                        "{} is not listed for the startup clean-up: {e:#}; if the service is \
+                         killed while it runs, it may keep running",
+                        cmd.program.display()
+                    );
+                })
+                .ok()
+        });
+        Ok(tree)
+    }
+
+    /// Process group of the tree (Unix: the child leads it).
+    #[cfg(unix)]
+    fn pgid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Send `sig` to the group, logging a failure (a group that is gone is not one).
+    #[cfg(unix)]
+    fn signal(&self, sig: crate::backend::process::Signal) -> bool {
+        match crate::backend::process::signal_group(self.pgid(), sig) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    "could not send {sig:?} to process group {}: {e}",
+                    self.pgid()
+                );
+                false
+            }
+        }
     }
 
     /// Pause the child and every process it spawned (Unix: STOP to the group; Windows: every
-    /// thread of the job suspended).
+    /// thread of the job suspended). A failure is logged: the tree keeps running.
     fn suspend(&mut self) {
         #[cfg(unix)]
-        signal_group(self.child.id(), "STOP");
+        if self.signal(crate::backend::process::Signal::Stop) {
+            self.stopped = true;
+        } else {
+            tracing::warn!("the process tree was not paused and keeps running");
+        }
         #[cfg(windows)]
-        match &self.job {
-            Some(j) if self.suspended.is_none() => match j.suspend() {
+        if self.suspended.is_none() {
+            match self.job.suspend() {
                 Ok(s) => {
                     tracing::debug!("paused {} threads of the process tree", s.len());
                     self.suspended = Some(s);
                 }
                 Err(e) => tracing::warn!("the process tree was not paused: {e:#}"),
-            },
-            Some(_) => {}
-            None => tracing::warn!(
-                "the process tree cannot be paused: it has no job object (see the earlier warning)"
-            ),
+            }
         }
     }
 
     /// Continue a tree paused by [`Self::suspend`].
     fn resume(&mut self) {
         #[cfg(unix)]
-        signal_group(self.child.id(), "CONT");
+        if self.stopped {
+            self.signal(crate::backend::process::Signal::Cont);
+            self.stopped = false;
+        }
         #[cfg(windows)]
         if let Some(s) = self.suspended.take() {
             s.resume();
         }
     }
 
-    /// Kill the child and every process it spawned, then reap the child.
+    /// Kill the child and every process it spawned, then reap the child. Unix: SIGTERM and
+    /// SIGCONT to the group (a paused tree acts on the TERM only once it runs), up to
+    /// [`TERM_GRACE`] for the leader, then SIGCONT + SIGKILL to the group. The group must be
+    /// signalled before `wait` reaps the leader (the pgid lives on with the leader's zombie).
     fn kill_tree(&mut self) {
+        if self.reaped {
+            return;
+        }
         #[cfg(unix)]
         {
-            // The group must be signalled before `wait` reaps the leader (the pgid lives on
-            // with the leader's zombie). TERM first, so uv can drop its temp files, KILL after
-            // a grace period.
-            let pgid = self.child.id();
-            signal_group(pgid, "TERM");
-            // A paused (stopped) tree only acts on the TERM once it runs again.
-            signal_group(pgid, "CONT");
-            let until = Instant::now() + Duration::from_millis(1500);
+            use crate::backend::process::Signal;
+            self.signal(Signal::Term);
+            self.signal(Signal::Cont);
+            let until = Instant::now() + TERM_GRACE;
             while Instant::now() < until {
                 if matches!(self.child.try_wait(), Ok(Some(_))) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            signal_group(pgid, "KILL");
+        }
+        self.kill_now();
+    }
+
+    /// End the tree at once (no grace) and reap the child.
+    fn kill_now(&mut self) {
+        if self.reaped {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            // kill_group sends SIGCONT first: a paused tree dies too.
+            if let Err(e) = crate::backend::process::kill_group(self.pgid()) {
+                tracing::warn!("could not end process group {}: {e}", self.pgid());
+            }
+            self.stopped = false;
         }
         #[cfg(windows)]
-        if let Some(j) = &self.job {
-            let _ = j.kill();
+        if let Err(e) = self.job.kill() {
+            tracing::warn!("could not end the process tree's job: {e:#}");
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.reaped = true;
         // Windows: close the (now terminated) threads' handles.
         self.resume();
     }
-}
 
-impl Tree {
+    /// The child exited (`try_wait` returned its status): it is reaped.
+    fn exited(&mut self) {
+        self.reaped = true;
+        #[cfg(unix)]
+        {
+            self.stopped = false;
+        }
+    }
+
     /// Kill what is left of the tree after the child itself exited (helpers still holding the
-    /// output pipes).
+    /// output pipes; the group outlives its reaped leader while a member lives).
     fn kill_orphans(&self) {
         #[cfg(unix)]
-        signal_group(self.child.id(), "KILL");
-        #[cfg(windows)]
-        if let Some(j) = &self.job {
-            let _ = j.kill();
+        if let Err(e) = crate::backend::process::kill_group(self.pgid()) {
+            tracing::warn!("could not end process group {}: {e}", self.pgid());
         }
+        #[cfg(windows)]
+        let _ = self.job.kill();
+    }
+
+    /// Close the parent-watch pipe now, as the service's death would (tests).
+    #[cfg(all(test, unix))]
+    fn close_parent_pipe(&mut self) {
+        self.parent_pipe = None;
     }
 }
 
-/// `kill -<signal> -- -<pgid>` through the `kill` binary (no libc binding needed here).
-#[cfg(unix)]
-fn signal_group(pgid: u32, signal: &str) {
-    use std::process::{Command, Stdio};
-    let _ = Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pgid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+impl Drop for Tree {
+    fn drop(&mut self) {
+        if !self.reaped {
+            tracing::warn!(
+                "process {} was still running when its runner returned; ending its tree",
+                self.child.id()
+            );
+            self.kill_now();
+        }
+    }
 }
 
 /// How often the runner looks at its pause / cancel flags and the child.
@@ -431,24 +619,40 @@ impl CommandRunner for SystemRunner {
                     cmd.timeout.as_secs() / 60
                 );
             }
+            // An error here drops the tree unreaped: its Drop kills it.
             if let Some(status) = tree.child.try_wait()? {
+                tree.exited();
                 break status;
             }
         };
         // Drain until both readers hang up (a bounded channel: the readers may still be
         // blocked on `send`), then join them. A helper the child left behind still holding
-        // the pipes would keep them open forever: after a grace period the rest of the tree
-        // is killed (the group only gets a signal while it has members, so the pgid cannot
-        // have been reused).
-        let grace = Instant::now() + Duration::from_secs(2);
+        // the pipes would keep them open forever: after ORPHAN_GRACE the rest of the tree is
+        // killed (the group only gets a signal while it has members, so the pgid cannot have
+        // been reused), and DRAIN_AFTER_KILL later (a helper outside the group or job) the
+        // runner stops waiting and leaves the reader threads to end with the pipe. A cancel
+        // stops the drain too.
+        let grace = Instant::now() + ORPHAN_GRACE;
+        let give_up = grace + DRAIN_AFTER_KILL;
         let mut orphans_killed = false;
+        let mut drained = false;
+        let mut cancelled = false;
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(line) => keep(line, on_line),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    drained = true;
+                    break;
+                }
             }
-            if !orphans_killed && Instant::now() >= grace {
+            if cancel.load(Ordering::Relaxed) {
+                tree.kill_orphans();
+                cancelled = true;
+                break;
+            }
+            let now = Instant::now();
+            if !orphans_killed && now >= grace {
                 tracing::warn!(
                     "{} left helper processes behind; stopping them",
                     cmd.display()
@@ -456,9 +660,28 @@ impl CommandRunner for SystemRunner {
                 tree.kill_orphans();
                 orphans_killed = true;
             }
+            if now >= give_up {
+                tracing::warn!(
+                    "{} exited {} s ago, but a process outside its tree still holds its \
+                     output; no longer waiting for it (process group {})",
+                    cmd.display(),
+                    (ORPHAN_GRACE + DRAIN_AFTER_KILL).as_secs(),
+                    tree.child.id()
+                );
+                break;
+            }
         }
-        for r in readers {
-            let _ = r.join();
+        if drained {
+            for r in readers {
+                let _ = r.join();
+            }
+        } else {
+            // The readers end when the pipe closes or their next send fails.
+            drop(rx);
+            drop(readers);
+        }
+        if cancelled {
+            return Err(anyhow!(Cancelled));
         }
         if !status.success() {
             return Err(anyhow::Error::new(ChildFailed {
@@ -556,6 +779,12 @@ pub(super) fn strip_ansi(text: &str) -> String {
 
 /// Verified downloads through the shared [`Manager`] (same queue, lock, resume and SHA-256 checks
 /// as every other download).
+///
+/// A cancel stops the download, not just the wait (RA resources-4): the job is queued as one
+/// waiter's ([`Manager::enqueue_waiting`]) and [`manager::Waiter::give_up`] cancels it unless a
+/// Download button, the service's provisioning or another fetch still wants it. A failed attempt
+/// that the manager retries (`Failed { retry_at: Some(..) }`, the service) is waited out, still
+/// honouring the cancel; only a final failure fails the fetch.
 #[derive(Debug)]
 pub struct ManagerFetcher {
     manager: Arc<Manager>,
@@ -579,15 +808,41 @@ impl Fetcher for ManagerFetcher {
         let key = job.key();
         // A remembered "installed" from before a removal would make enqueue a no-op.
         self.manager.forget(&key);
-        self.manager.enqueue(job);
+        let waiter = self.manager.enqueue_waiting(job);
+        let mut told_retry: Option<u32> = None;
         loop {
             if cancel.load(Ordering::Relaxed) {
+                if waiter.give_up() {
+                    tracing::info!("stopped the download of {}", res.title);
+                }
                 return Err(anyhow!(Cancelled));
             }
             match self.manager.status(&key).map(|s| s.state) {
                 Some(DownloadState::Installed) => return Ok(()),
-                Some(DownloadState::Failed { error, .. }) => {
+                Some(DownloadState::Failed {
+                    error,
+                    retry_at: None,
+                    ..
+                }) => {
                     bail!("download of {} failed: {error}", res.title)
+                }
+                Some(DownloadState::Failed {
+                    error,
+                    retry_at: Some(at),
+                    attempts,
+                }) => {
+                    if told_retry != Some(attempts) {
+                        told_retry = Some(attempts);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        tracing::info!(
+                            "download of {} failed ({error}); the download manager retries in \
+                             {} s (cancel to stop it)",
+                            res.title,
+                            at.saturating_sub(now)
+                        );
+                    }
                 }
                 Some(DownloadState::Downloading { bytes, total }) => progress(bytes, total),
                 _ if !self.manager.is_alive() => bail!(
@@ -875,5 +1130,279 @@ mod tree_tests {
         let run = Running::start(cmd);
         run.finish().unwrap();
         t.assert_stops("a helper left behind");
+    }
+
+    #[test]
+    fn record_root_is_the_parent_of_the_tools_folder() {
+        let root = Path::new("/data/root");
+        assert_eq!(
+            record_root(&root.join("tools/uv/uv")),
+            Some(root.to_path_buf())
+        );
+        assert_eq!(
+            record_root(&root.join("tools/export-env/bin/python")),
+            Some(root.to_path_buf())
+        );
+        // The nearest `tools` above the program counts, not one in the data root's own path.
+        assert_eq!(
+            record_root(Path::new("/home/u/tools/bop/tools/train-env/bin/python")),
+            Some(PathBuf::from("/home/u/tools/bop"))
+        );
+        assert_eq!(record_root(Path::new("/bin/sh")), None);
+        assert_eq!(record_root(Path::new("tools")), None);
+    }
+
+    /// A shell command as a [`Cmd`] in `dir`.
+    #[cfg(unix)]
+    fn sh_cmd(dir: &Path, script: &str) -> Cmd {
+        Cmd {
+            stage: Stage::Export,
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: vec![],
+            cwd: dir.to_path_buf(),
+            timeout: Duration::from_secs(120),
+            low_priority: false,
+        }
+    }
+
+    /// Whether `pid` is gone (or a zombie) within 15 s.
+    #[cfg(unix)]
+    fn gone(pid: u32) -> bool {
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if stat.is_empty() || stat.starts_with('Z') {
+                return true;
+            }
+            if Instant::now() > until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The first line of the tree's stdout (a pid the script echoes).
+    #[cfg(unix)]
+    fn first_line(tree: &mut Tree) -> String {
+        use std::io::BufRead as _;
+        let out = tree.child.stdout.take().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(out).read_line(&mut line).unwrap();
+        line.trim().to_string()
+    }
+
+    /// The parent watch (RA resources-1): the child's stdin is a pipe nothing writes to, it is
+    /// told so by `BOP_PARENT_PIPE=1`, and a child waiting on it (the scripts' watcher; here a
+    /// shell `cat`) sees EOF exactly when the write end closes, as it does when the service dies.
+    #[cfg(unix)]
+    #[test]
+    fn the_parent_pipe_ends_a_child_that_watches_it() {
+        let t = Ticker::new("pipe");
+        let mut tree = Tree::spawn(&sh_cmd(
+            &t.dir,
+            "[ \"$BOP_PARENT_PIPE\" = 1 ] || exit 9; cat >/dev/null; exit 7",
+        ))
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            tree.child.try_wait().unwrap().is_none(),
+            "the child did not wait on its stdin"
+        );
+        tree.close_parent_pipe();
+        let until = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(s) = tree.child.try_wait().unwrap() {
+                tree.exited();
+                break s;
+            }
+            assert!(Instant::now() < until, "EOF never reached the child");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(7), "{status}");
+    }
+
+    /// The same through the real script watcher: `watch_parent()` of each script, started with
+    /// `BOP_PARENT_PIPE=1`, ends the process (and its group) once the pipe closes.
+    #[cfg(unix)]
+    #[test]
+    fn the_scripts_exit_when_the_parent_pipe_closes() {
+        let Some(python) = crate::training::progress::test_python::python3(
+            "the_scripts_exit_when_the_parent_pipe_closes",
+        ) else {
+            return;
+        };
+        let t = Ticker::new("py-pipe");
+        let scripts = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts");
+        for name in ["export_model", "train_model", "autolabel", "import_footage"] {
+            // A grandchild in the script's group: it must die with it.
+            let code = format!(
+                "import importlib.util, subprocess, sys, time\n\
+                 spec = importlib.util.spec_from_file_location('m', '{scripts}/{name}.py')\n\
+                 m = importlib.util.module_from_spec(spec)\n\
+                 spec.loader.exec_module(m)\n\
+                 kid = subprocess.Popen(['sleep', '60'], stdin=subprocess.DEVNULL)\n\
+                 print(kid.pid, flush=True)\n\
+                 m.watch_parent()\n\
+                 time.sleep(60)\n"
+            );
+            let cmd = Cmd {
+                program: python.into(),
+                args: vec!["-I".into(), "-c".into(), code.into()],
+                ..sh_cmd(&t.dir, "")
+            };
+            let mut tree = Tree::spawn(&cmd).unwrap();
+            let kid: u32 = first_line(&mut tree)
+                .parse()
+                .unwrap_or_else(|e| panic!("{name}: no pid line ({e})"));
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(
+                tree.child.try_wait().unwrap().is_none(),
+                "{name} exited early"
+            );
+            let t0 = Instant::now();
+            tree.close_parent_pipe();
+            let until = Instant::now() + Duration::from_secs(20);
+            while tree.child.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < until, "{name} kept running");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            tree.exited();
+            // The pipe, not the 2 s parent poll (the parent never changed here).
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "{name}: {:?}",
+                t0.elapsed()
+            );
+            assert!(gone(kid), "{name}: its child {kid} survived");
+        }
+    }
+
+    /// RA resources-1 (+extra): a tree dropped before its child was reaped is killed with its
+    /// whole group, also when it is paused.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_a_running_or_paused_tree_kills_its_group() {
+        let t = Ticker::new("drop");
+        for paused in [false, true] {
+            let mut tree = Tree::spawn(&sh_cmd(&t.dir, "sleep 60 & echo $!; wait")).unwrap();
+            let leader = tree.child.id();
+            let kid: u32 = first_line(&mut tree).parse().unwrap();
+            assert!(LIVE.lock_recover().contains(&leader));
+            if paused {
+                tree.suspend();
+                assert!(tree.stopped);
+            }
+            drop(tree);
+            assert!(
+                gone(kid),
+                "paused={paused}: grandchild {kid} survived the drop"
+            );
+            assert!(
+                gone(leader),
+                "paused={paused}: leader {leader} survived the drop"
+            );
+            assert!(!LIVE.lock_recover().contains(&leader));
+        }
+    }
+
+    /// A child under `<root>/tools/` is in `<root>/.children.json` while it runs and gone after.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_child_is_recorded_until_it_is_reaped() {
+        let t = Ticker::new("record");
+        let tools = t.dir.join(TOOLS_DIR);
+        std::fs::create_dir_all(&tools).unwrap();
+        let sh = tools.join("sh");
+        std::os::unix::fs::symlink("/bin/sh", &sh).unwrap();
+        let reg = crate::children::Registry::new(&t.dir);
+        let cmd = Cmd {
+            program: sh,
+            ..sh_cmd(&t.dir, "sleep 2")
+        };
+        let run = std::thread::spawn(move || {
+            SystemRunner.run(&cmd, &mut |_| {}, &AtomicBool::new(false))
+        });
+        let until = Instant::now() + Duration::from_secs(20);
+        let entry = loop {
+            if let Some(e) = reg.entries().unwrap().into_iter().next() {
+                break e;
+            }
+            assert!(Instant::now() < until, "never recorded");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(entry.kind, "sh");
+        assert_eq!(entry.owner_pid, std::process::id());
+        run.join().unwrap().unwrap();
+        assert!(
+            reg.entries().unwrap().is_empty(),
+            "still listed after the reap"
+        );
+    }
+
+    /// RA resources-8: a helper that left the tree's process group and holds the output pipes
+    /// does not hang the runner: it stops waiting after the bounded drain.
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_outside_the_group_does_not_hang_the_runner() {
+        let t = Ticker::new("escaped");
+        // `set -m` in bash: the background job gets a process group of its own (dash, Ubuntu's
+        // `/bin/sh`, only warns without a terminal and keeps the job in the group).
+        let cmd = sh_cmd(&t.dir, "bash -c 'set -m; sleep 60 & echo $!; exit 0'");
+        let mut lines = Vec::new();
+        let t0 = Instant::now();
+        SystemRunner
+            .run(
+                &cmd,
+                &mut |l| lines.push(l.to_string()),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let took = t0.elapsed();
+        let helper: u32 = lines
+            .iter()
+            .find_map(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no helper pid in {lines:?}"));
+        let _ = crate::backend::process::kill_pid(helper);
+        assert!(took < Duration::from_secs(30), "{took:?}");
+        assert!(took >= ORPHAN_GRACE + DRAIN_AFTER_KILL, "{took:?}");
+    }
+
+    /// The drain after the exit honours a cancel too: set once the child has exited, while the
+    /// escaped helper still holds the pipes, it ends the run before the orphan grace.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_ends_the_drain() {
+        let t = Ticker::new("drain-cancel");
+        let cmd = sh_cmd(&t.dir, "bash -c 'set -m; sleep 60 & echo $!; exit 0'");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(800));
+                cancel.store(true, Ordering::Relaxed);
+            })
+        };
+        let mut lines = Vec::new();
+        let t0 = Instant::now();
+        let e = SystemRunner
+            .run(&cmd, &mut |l| lines.push(l.to_string()), &cancel)
+            .unwrap_err();
+        setter.join().unwrap();
+        let helper: u32 = lines
+            .iter()
+            .find_map(|l| l.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no helper pid in {lines:?}"));
+        let _ = crate::backend::process::kill_pid(helper);
+        assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+        assert!(
+            t0.elapsed() < ORPHAN_GRACE + Duration::from_millis(500),
+            "{:?}",
+            t0.elapsed()
+        );
     }
 }

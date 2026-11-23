@@ -19,6 +19,14 @@
 //! - **TLS**: the handshake runs in the connection's own task under [`HANDSHAKE_TIMEOUT`], so a
 //!   client that connects and never handshakes holds only its own slot. Then the same hyper
 //!   builder as HTTP takes over ([`HEADER_READ_TIMEOUT`], keep-alive, graceful shutdown).
+//! - **Stop** (audit 2026-11, RA-023): every connection task is tracked per accept loop
+//!   ([`TaskTracker`]). On shutdown the loop stops accepting, lets hyper finish in-flight requests
+//!   and close idle keep-alive connections for at most [`GRACEFUL_SHUTDOWN_TIMEOUT`], then cancels
+//!   a hard-stop token every connection task selects on, so the connections still open are dropped
+//!   with their router clones (and through them the last `AppState`), and waits for the tasks for
+//!   at most [`HARD_CLOSE_WAIT`]. [`serve_on`] therefore returns within about 11 s of the stop
+//!   request. A request whose handler runs on the blocking pool loses its answer, but the blocking
+//!   closure itself runs on (it cannot be interrupted from here).
 //!
 //! # The per-address cap and Blue Iris
 //!
@@ -41,6 +49,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 /// Longest a client may take to send a request head. With hyper 1.x HTTP/1 this timer also
@@ -52,6 +61,15 @@ pub(crate) const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a shutdown waits for in-flight requests to finish before closing their
 /// connections anyway.
 pub(crate) const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// After [`GRACEFUL_SHUTDOWN_TIMEOUT`], how long the accept loop waits for the connection tasks
+/// it just told to close (dropping a connection's future takes microseconds; the bound only
+/// keeps a task stuck in a synchronous call from holding the stop).
+pub(crate) const HARD_CLOSE_WAIT: Duration = Duration::from_secs(1);
+
+/// The longest [`serve_on`] takes to return after its stop token is cancelled (the runner's
+/// stop timeline budgets the HTTP step with it).
+pub const SERVER_STOP_BOUND: Duration = GRACEFUL_SHUTDOWN_TIMEOUT.saturating_add(HARD_CLOSE_WAIT);
 
 /// Pause after an accept error that is not about one connection (e.g. out of file
 /// descriptors), so the loop does not spin.
@@ -83,6 +101,10 @@ pub(crate) struct Limits {
     pub(crate) per_peer: usize,
     pub(crate) handshake_timeout: Duration,
     pub(crate) https_retry: Duration,
+    /// [`GRACEFUL_SHUTDOWN_TIMEOUT`].
+    pub(crate) graceful: Duration,
+    /// [`HARD_CLOSE_WAIT`].
+    pub(crate) hard_close: Duration,
 }
 
 impl Default for Limits {
@@ -92,6 +114,8 @@ impl Default for Limits {
             per_peer: MAX_CONNECTIONS_PER_PEER,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             https_retry: HTTPS_RETRY,
+            graceful: GRACEFUL_SHUTDOWN_TIMEOUT,
+            hard_close: HARD_CLOSE_WAIT,
         }
     }
 }
@@ -216,7 +240,8 @@ pub async fn bind(address: IpAddr, port: u16) -> anyhow::Result<Listeners> {
 }
 
 /// Serve `shared` on `listeners` until `shutdown` is cancelled (in-flight requests finish,
-/// for at most [`GRACEFUL_SHUTDOWN_TIMEOUT`]). Runs for the whole process: generation restarts
+/// for at most [`GRACEFUL_SHUTDOWN_TIMEOUT`]; then the connections still open are closed, so it
+/// returns within [`SERVER_STOP_BOUND`]). Runs for the whole process: generation restarts
 /// swap `shared` instead of stopping it. Connections are HTTP/1.1 served by hyper with a
 /// timer, so [`HEADER_READ_TIMEOUT`] applies to request heads and idle keep-alive waits.
 pub async fn serve_on(
@@ -404,12 +429,16 @@ fn connection_builder() -> hyper_util::server::conn::auto::Builder<hyper_util::r
 }
 
 /// Accept connections on `listener` until `l.shutdown`, then let the open ones finish their
-/// requests (graceful shutdown, at most [`GRACEFUL_SHUTDOWN_TIMEOUT`]). A peer outside the
+/// requests (graceful shutdown, at most `l.limits.graceful`), close the ones still open and wait
+/// for their tasks (at most `l.limits.hard_close`; see the module docs). A peer outside the
 /// network rule (read from the current config at each accept, [`guard::admit`]) or over a
 /// connection cap is closed at once: nothing is read from it or written to it.
 async fn accept_loop(listener: tokio::net::TcpListener, l: Loop) {
     let builder = connection_builder();
     let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    // Every connection task, and the token that drops the ones still open after the grace.
+    let tracker = TaskTracker::new();
+    let hard_stop = CancellationToken::new();
     let transport = match l.accept {
         Accept::Plain => Transport::Plain,
         Accept::Tls(_) => Transport::Tls,
@@ -459,10 +488,16 @@ async fn accept_loop(listener: tokio::net::TcpListener, l: Loop) {
                     .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
                     .into_owned();
                 let conn = graceful.watch(conn);
-                tokio::spawn(async move {
+                let hard_stop = hard_stop.clone();
+                tracker.spawn(async move {
                     let _slot = slot;
-                    if let Err(e) = conn.await {
-                        debug!(%peer, "HTTP connection ended: {e}");
+                    tokio::select! {
+                        ended = conn => if let Err(e) = ended {
+                            debug!(%peer, "HTTP connection ended: {e}");
+                        },
+                        () = hard_stop.cancelled() => {
+                            debug!(%peer, "HTTP connection closed by the shutdown");
+                        }
                     }
                 });
             }
@@ -471,8 +506,9 @@ async fn accept_loop(listener: tokio::net::TcpListener, l: Loop) {
                 let builder = builder.clone();
                 let watcher = graceful.watcher();
                 let shutdown = l.shutdown.clone();
+                let hard_stop = hard_stop.clone();
                 let timeout = l.limits.handshake_timeout;
-                tokio::spawn(async move {
+                tracker.spawn(async move {
                     let _slot = slot;
                     let handshake = tokio::time::timeout(timeout, acceptor.accept(stream));
                     let tls = tokio::select! {
@@ -492,21 +528,48 @@ async fn accept_loop(listener: tokio::net::TcpListener, l: Loop) {
                     let conn = builder
                         .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
                         .into_owned();
-                    if let Err(e) = watcher.watch(conn).await {
-                        debug!(%peer, "HTTPS connection ended: {e}");
+                    tokio::select! {
+                        ended = watcher.watch(conn) => if let Err(e) = ended {
+                            debug!(%peer, "HTTPS connection ended: {e}");
+                        },
+                        () = hard_stop.cancelled() => {
+                            debug!(%peer, "HTTPS connection closed by the shutdown");
+                        }
                     }
                 });
             }
         }
     }
     drop(listener);
-    if tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, graceful.shutdown())
+    tracker.close();
+    let label = match transport {
+        Transport::Plain => "HTTP",
+        Transport::Tls => "HTTPS",
+    };
+    let grace = l.limits.graceful;
+    if tokio::time::timeout(grace, graceful.shutdown())
         .await
         .is_err()
     {
         warn!(
-            "HTTP connections still busy {} s after shutdown; closing them",
-            GRACEFUL_SHUTDOWN_TIMEOUT.as_secs()
+            open = tracker.len(),
+            "{label} connections still busy {:.1} s after the shutdown request (a slow \
+             client or a long request); closing them, their requests get no answer",
+            grace.as_secs_f32()
+        );
+    }
+    // Drops every connection still open (idle ones hyper already closed) and, with it, its
+    // router clone.
+    hard_stop.cancel();
+    if tokio::time::timeout(l.limits.hard_close, tracker.wait())
+        .await
+        .is_err()
+    {
+        warn!(
+            open = tracker.len(),
+            "{label} connection tasks did not end {:.1} s after they were closed (one is \
+             inside a call that does not yield); the server stops without them",
+            l.limits.hard_close.as_secs_f32()
         );
     }
 }

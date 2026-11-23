@@ -19,6 +19,31 @@
 //! finished (at most `DRAIN`). So requests do not see "initializing" for a restart, except a
 //! model whose new copy had no memory beside the old one: the old copy goes first
 //! (`ModelRegistry::yield_model`).
+//!
+//! # Stopping
+//!
+//! One timeline ([`stop`], audit 2026-11 RA-009) starts at the first stop request, t0 (Ctrl-C,
+//! SIGTERM, the service's Stop / Preshutdown, a 131 restart of the service, or the run ending on
+//! an error). Every step is measured from t0, never from the end of the step before it, so the
+//! waits overlap instead of adding up:
+//!
+//! | Step | What | Bound (from t0) |
+//! |---|---|---|
+//! | 0 | `shutdown` cancelled: accept loops stop, graceful HTTP close starts, workers, watcher, supervisor, sweeper and session flusher see it | at once |
+//! | 1 | benchmark cancelled (no wait); training queue, model export + downloads, collector told to stop for exit, each on its own thread | signalled at once, done by [`JOBS_STOP`] (15 s) |
+//! | 2 | HTTP stop: in-flight requests finish, then open connections are closed ([`server::SERVER_STOP_BOUND`], 11 s) | [`SERVER_STOP_TIMEOUT`] (12 s) |
+//! | 3 | benchmark thread idle, else abandoned (warned, breadcrumb kept) | [`BENCHMARK_STOP`] (15 s) |
+//! | 4 | step-1 threads joined, else abandoned (warned) | [`JOBS_STOP`] + [`JOIN_SLACK`] (16 s) |
+//! | 5 | forced sessions flush | ms |
+//! | 6 | last generation retired: linger ([`SHUTDOWN_LINGER`], 1 s), its helper threads (about 3 s), `ModelRegistry::shutdown` (bounded by the registry, budgeted [`REGISTRY_STOP`], 20 s) | about 40 s |
+//! | 7 | run's threads (retention sweeper, session flusher) and the provisioner dropped | bounded by their owners |
+//! | 8 | binary: `Runtime::shutdown_timeout` ([`RUNTIME_SHUTDOWN_GRACE`], 5 s), then the file log flushed (`cli::flush_logs`, about 1 s) | about 47 s |
+//! | - | hard bound: [`SHUTDOWN_DEADLINE`] (60 s); the CLI exits 1, the service reports Stopped; both first kill this process's recorded child trees and flush the log ([`stop::before_forced_exit`]) | 60 s |
+//!
+//! Service managers wait longer than the hard bound, so the app's own end always runs:
+//! [`SERVICE_MANAGER_STOP`] (75 s) is systemd's `TimeoutStopSec`, launchd's `ExitTimeOut`, Docker
+//! compose's `stop_grace_period` and the Windows preshutdown timeout; `service stop|restart`
+//! waits [`SERVICE_CTL_STOP_WAIT`] (85 s). A test reads the deploy files and checks them.
 
 use crate::cli::LogReloadHandle;
 use crate::config::Config;
@@ -50,9 +75,28 @@ pub fn ensure_models(config: &Config, config_path: &std::path::Path) -> Result<(
     Ok(())
 }
 
-/// How long the HTTP server may take to close its connections after a shutdown request
-/// (a slow client holding a request); then its task is aborted (CO-12).
-pub const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+mod stop;
+pub use stop::{before_forced_exit, kill_own_children};
+
+/// How long after the stop request (t0) the runner waits for the HTTP server task: the server
+/// closes its connections within [`server::SERVER_STOP_BOUND`] of t0 (requests finish, then the
+/// connections still open are dropped), plus a second of margin; past it the task is aborted.
+pub const SERVER_STOP_TIMEOUT: Duration =
+    server::SERVER_STOP_BOUND.saturating_add(Duration::from_secs(1));
+
+/// The deadline (from t0) of the step-1 stops: the training queue, model export and downloads,
+/// and the collector (see the module docs).
+pub const JOBS_STOP: Duration = Duration::from_secs(15);
+
+/// How long (from t0) a cancelled benchmark may take to end before its thread is abandoned (a
+/// model compile cannot be interrupted).
+pub const BENCHMARK_STOP: Duration = Duration::from_secs(15);
+
+/// How long past [`JOBS_STOP`] the runner waits for a step-1 thread before going on without it.
+pub const JOIN_SLACK: Duration = Duration::from_secs(1);
+
+/// What the stop budgets for `ModelRegistry::shutdown` (the registry bounds its own joins).
+pub const REGISTRY_STOP: Duration = Duration::from_secs(20);
 
 /// How long `Runtime::shutdown_timeout` waits for blocking tasks when a binary exits.
 pub const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -60,6 +104,44 @@ pub const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Upper bound of a whole shutdown (CLI hard deadline; the Windows service stops waiting and
 /// reports Stopped after it).
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a service manager lets the process stop before it kills it: systemd
+/// `TimeoutStopSec`, launchd `ExitTimeOut`, compose `stop_grace_period`, the Windows service's
+/// preshutdown timeout. Above [`SHUTDOWN_DEADLINE`], so the app's own bounded end (and its log
+/// line naming what was stuck) always runs first.
+pub const SERVICE_MANAGER_STOP: Duration = Duration::from_secs(75);
+
+/// How long `service stop|restart` waits for the service to stop: above
+/// [`SERVICE_MANAGER_STOP`] (launchd's `bootout` returns before the process exits).
+pub const SERVICE_CTL_STOP_WAIT: Duration = Duration::from_secs(85);
+
+/// How long `service start|restart` waits for the service to run: the Windows service stays
+/// StartPending until its port is bound, at most [`BIND_GIVE_UP`].
+pub const SERVICE_CTL_START_WAIT: Duration = Duration::from_secs(75);
+
+// The table in the module docs: the normal stop ends well inside the hard bound, and every
+// service-manager wait is longer than it.
+const _: () = {
+    let steps = JOBS_STOP.as_secs()
+        + JOIN_SLACK.as_secs()
+        + SHUTDOWN_LINGER.as_secs()
+        + 3
+        + REGISTRY_STOP.as_secs()
+        + RUNTIME_SHUTDOWN_GRACE.as_secs()
+        + 1;
+    assert!(steps < SHUTDOWN_DEADLINE.as_secs());
+    assert!(SERVER_STOP_TIMEOUT.as_secs() <= JOBS_STOP.as_secs());
+    assert!(BENCHMARK_STOP.as_secs() <= JOBS_STOP.as_secs() + JOIN_SLACK.as_secs());
+    assert!(SERVICE_MANAGER_STOP.as_secs() >= SHUTDOWN_DEADLINE.as_secs() + 15);
+    assert!(SERVICE_CTL_STOP_WAIT.as_secs() >= SERVICE_MANAGER_STOP.as_secs() + 10);
+    assert!(SERVICE_CTL_START_WAIT.as_secs() >= BIND_GIVE_UP.as_secs() + 15);
+    // The registry bounds its own shutdown by one join deadline; the budget must cover it.
+    assert!(crate::registry::RETIRE_JOIN.as_secs() <= REGISTRY_STOP.as_secs());
+};
+
+/// How long dropping the retention sweeper waits for its thread: the storage sweep stops
+/// between two items, so only the item in hand is left to finish.
+const SWEEPER_JOIN: Duration = Duration::from_secs(2);
 
 /// Build the tokio runtime the server runs on: two worker threads (handlers are short; the point
 /// is that one slow handler cannot stall the detection routes) plus the blocking pool that
@@ -102,6 +184,9 @@ pub fn run_server_on(
 /// How long a retired generation's in-flight requests may take before its workers are stopped.
 const DRAIN: Duration = Duration::from_secs(5);
 
+/// How long a restart waits for the benchmark it cancelled (a compile cannot be interrupted).
+const RESTART_BENCHMARK_WAIT: Duration = Duration::from_secs(30);
+
 /// How long a new generation may load while the old one serves before it takes over anyway (the
 /// time after which a compile counts as slow: a model that never finishes must not hold config
 /// changes off the running service for ever).
@@ -119,12 +204,10 @@ fn takeover_ready(serving: &[String], loading: &[String]) -> bool {
 }
 
 /// How long shutdown waits for the HTTP side to let go of the last generation's state after
-/// the server task has returned. The server task can return a moment before every connection
-/// task has dropped its copy of the router (axum 0.8 releases a connection's "still open" guard
-/// before dropping the connection and the service it owns), so the state, and through it the
-/// registry, can be shared for a few more microseconds; without this wait `finish` would skip
-/// `ModelRegistry::shutdown` (no worker join) whenever it lost that race. Normally the wait
-/// ends at once.
+/// the server task has returned. The server's accept loops wait for their connection tasks
+/// (closing the ones still open after the grace), so normally nothing holds the state any more
+/// and the wait ends at once; a request whose handler runs on the blocking pool keeps its own
+/// copy until that closure returns, which the linger bounds.
 const SHUTDOWN_LINGER: Duration = Duration::from_secs(1);
 
 /// A restart: let `old` serve until `next` has loaded the models `old` serves, at most `limit`.
@@ -345,10 +428,9 @@ impl Sweeper {
 impl Drop for Sweeper {
     fn drop(&mut self) {
         self.stop.cancel();
-        if let Some(j) = self.join.take()
-            && j.join().is_err()
-        {
-            warn!("retention sweeper panicked");
+        if let Some(j) = self.join.take() {
+            // Past the deadline the thread is left to finish its item (logged by join_within).
+            let _ = crate::retention::join_within(j, Instant::now() + SWEEPER_JOIN, "retention");
         }
     }
 }
@@ -402,11 +484,21 @@ impl Process {
         )
     }
 
-    /// A benchmark still running uses the runtimes of the generation that is ending: stop it.
+    /// A restart: a benchmark still running uses the runtimes of the generation that is ending,
+    /// so stop it and wait (up to `RESTART_BENCHMARK_WAIT`). A stop of the run does not come
+    /// here: its timeline cancels the benchmark at t0 and waits later ([`stop`]).
     fn stop_benchmark(&self) {
         if self.benchmark.cancel() {
             info!("benchmark cancelled by the restart");
-            self.benchmark.wait_idle(Duration::from_secs(30));
+            if !self.benchmark.wait_idle(RESTART_BENCHMARK_WAIT) {
+                warn!(
+                    "{}",
+                    stop::abandoned_benchmark(
+                        self.benchmark.running().as_ref(),
+                        RESTART_BENCHMARK_WAIT
+                    )
+                );
+            }
         }
     }
 
@@ -417,6 +509,7 @@ impl Process {
         registry: &Arc<ModelRegistry>,
         provision: &Arc<Provision>,
         generation: &CancellationToken,
+        shutdown: &CancellationToken,
         loaded_ort: Option<crate::resources::catalog::Flavor>,
     ) -> Arc<AppState> {
         Arc::new(AppState {
@@ -439,6 +532,7 @@ impl Process {
             config_path: self.config_path.clone(),
             log_reload: Some(self.log.clone()),
             restart: generation.clone(),
+            shutdown: shutdown.clone(),
             resources: Some(crate::resources::status::ResourcesCtx {
                 provisioner: self.provisioner.clone(),
                 provision: provision.clone(),
@@ -540,6 +634,9 @@ struct Run<'r> {
     /// The generation being replaced (still current until the next one is swapped in), or, on
     /// the way out, the last one.
     old: Option<Generation>,
+    /// A next generation the stop request came in while it loaded: it never served, and is
+    /// retired beside `old` on the way out.
+    abandoned: Option<Generation>,
 }
 
 impl Run<'_> {
@@ -597,30 +694,54 @@ impl Run<'_> {
         ended
     }
 
-    /// Stop the server and the last generation, and return `result`.
-    fn finish(self, result: Result<()>) -> Result<()> {
+    /// Stop the run along `stop`'s timeline (started now unless the stop request started it):
+    /// the HTTP server, then the last generation. Returns `result` (and a failure of the server
+    /// task).
+    fn finish(self, result: Result<()>, stop: &stop::Timeline) -> Result<()> {
         let Run {
             rt,
             server_stop,
             server_task,
             shared,
             old,
+            abandoned,
             ..
         } = self;
+        stop.begin();
         server_stop.cancel();
-        let served = server_task.map(|t| stop_server(rt, t, SERVER_STOP_TIMEOUT));
-        // The server (and its router) is gone; this was the last long-lived other holder of the
-        // state (connection tasks may still be dropping theirs, see `SHUTDOWN_LINGER`).
-        drop(shared);
-        if let Some(g) = old {
-            g.retire(SHUTDOWN_LINGER);
-        }
+        let mut served = None;
+        let report = stop.finish(
+            |deadline| {
+                served = server_task.map(|t| {
+                    stop_server(rt, t, deadline.saturating_duration_since(Instant::now()))
+                });
+                // The server (and its router) is gone, its connections closed: this was the last
+                // long-lived other holder of the state.
+                drop(shared);
+            },
+            || {
+                // Side by side: each registry bounds its own shutdown.
+                std::thread::scope(|s| {
+                    if let Some(a) = abandoned {
+                        s.spawn(move || a.retire(Duration::ZERO));
+                    }
+                    if let Some(g) = old {
+                        g.retire(SHUTDOWN_LINGER);
+                    }
+                });
+            },
+        );
+        info!(
+            took_ms = report.took.as_millis(),
+            "stopped the server and the models"
+        );
         result.and(served.unwrap_or(Ok(())))
     }
 }
 
 /// Wait for the stopped server task, at most `timeout` (CO-12: a slow client must not hold
-/// the shutdown); on timeout the task is aborted and its connections dropped.
+/// the shutdown). The server closes its own connections within [`server::SERVER_STOP_BOUND`];
+/// a task still running after `timeout` is aborted (what it still holds is dropped).
 fn stop_server(
     rt: &tokio::runtime::Runtime,
     mut task: tokio::task::JoinHandle<Result<()>>,
@@ -631,9 +752,8 @@ fn stop_server(
             Ok(r) => r.unwrap_or_else(|e| Err(anyhow::anyhow!("HTTP server task: {e}"))),
             Err(_) => {
                 warn!(
-                    "open HTTP connections did not close within {} s of the shutdown; dropping \
-                     them",
-                    timeout.as_secs()
+                    "the HTTP server did not stop within {:.1} s; aborting it",
+                    timeout.as_secs_f32()
                 );
                 task.abort();
                 Ok(())
@@ -769,6 +889,11 @@ fn run_server_inner(
     let provisioner = Arc::new(provisioner);
     ensure_models(&config, &config_path)?;
     let started = Instant::now();
+    // Children an earlier, dead process left (`.children.json`): ended before anything here
+    // trusts a job's lock or busy marker, in particular before the retention sweeper below
+    // starts its storage sweep.
+    stop::remember_data_root(&config.data_root());
+    stop::sweep_orphans_once(&config.data_root());
     // The listener is bound once and survives generation restarts (a port change in the config
     // applies when the process restarts).
     // HTTPS starts with the server (`serve_on`) and never holds HTTP up: a port it cannot
@@ -842,6 +967,14 @@ fn run_server_inner(
     };
     // A benchmark the machine died in names its last device at start, not at the next page view.
     process.benchmark.claim_breadcrumb(&config.data_root());
+    // The one stop timeline of this run: started by the stop request itself, wherever the loop
+    // below is then, and finished by `Run::finish`.
+    let timeline = stop::Timeline::new(Arc::new(stop::ProcessTargets {
+        provisioner: process.provisioner.clone(),
+        benchmark: process.benchmark.clone(),
+        auth: process.auth.clone(),
+    }));
+    stop::arm(rt, &timeline, &shutdown);
     // Disk retention (saved images, free-space warning): one sweeper per process, reading the
     // current settings on every tick; stopped and joined when this function returns.
     let _sweeper = Sweeper::spawn(process.store.clone(), &shutdown);
@@ -856,6 +989,7 @@ fn run_server_inner(
         server_task: None,
         shared: None,
         old: None,
+        abandoned: None,
     };
     // Config to fall back to when a restart with the edited config fails to start.
     let mut previous: Option<Config> = None;
@@ -877,6 +1011,7 @@ fn run_server_inner(
         // The decode ceiling follows the generation's config (and every later config change,
         // see `ConfigStore`).
         crate::image::set_max_pixels(config.max_image_pixels);
+        stop::remember_data_root(&config.data_root());
         let generation = shutdown.child_token();
         let workers = shutdown.child_token();
         let provision = Arc::new(process.provisioner.prepare(&config, loaded_ort));
@@ -893,14 +1028,21 @@ fn run_server_inner(
                     adopt = Some("restart failed: previous config restored");
                     continue;
                 }
-                None => return run.finish(Err(e)),
+                None => return run.finish(Err(e), &timeline),
             },
         };
         info!(models = ?registry.names(), "models registered (compiling in the background)");
         if loaded_ort.is_none() {
             loaded_ort = registry.loaded_runtimes().ort;
         }
-        let state = process.state_for(&config, &registry, &provision, &generation, loaded_ort);
+        let state = process.state_for(
+            &config,
+            &registry,
+            &provision,
+            &generation,
+            &shutdown,
+            loaded_ort,
+        );
         process.note_data_root(&config);
         // The token of the data root the process started with: the one the service checks.
         crate::admin_token::ensure_for(&Config {
@@ -923,6 +1065,20 @@ fn run_server_inner(
             // wait reaches this one through the apply below, a disabled model included.
             if let Some(old) = &run.old {
                 wait_for_takeover(&old.registry, &registry, &generation, TAKEOVER_WAIT);
+            }
+            if shutdown.is_cancelled() {
+                // The stop came while this generation loaded: it never serves.
+                run.abandoned = Some(Generation {
+                    state,
+                    registry,
+                    workers,
+                    watcher,
+                    supervisor,
+                    disk_watch: None,
+                });
+                let r = run.finish(Ok(()), &timeline);
+                info!("bye");
+                return r;
             }
             // One started during the wait runs on the generation that is leaving.
             process.stop_benchmark();
@@ -963,7 +1119,7 @@ fn run_server_inner(
                 supervisor,
                 disk_watch,
             });
-            return run.finish(Err(e));
+            return run.finish(Err(e), &timeline);
         }
         run.retire_old();
         if restarted {
@@ -987,21 +1143,22 @@ fn run_server_inner(
         run.old = Some(current);
         if let Some(r) = server_ended {
             if shutdown.is_cancelled() {
-                let r = run.finish(r);
+                let r = run.finish(r, &timeline);
                 info!("bye");
                 return r;
             }
             // The listener is gone: nothing left to serve on.
             let r = r.and(Err(anyhow::anyhow!("HTTP server stopped unexpectedly")));
-            return run.finish(r);
+            return run.finish(r, &timeline);
         }
-        process.stop_benchmark();
-
+        // A stop: the timeline cancelled the benchmark at t0 and waits for it later, after the
+        // HTTP stop (never the restart's long wait first).
         if shutdown.is_cancelled() {
-            let r = run.finish(Ok(()));
+            let r = run.finish(Ok(()), &timeline);
             info!("bye");
             return r;
         }
+        process.stop_benchmark();
 
         if resources_restart.load(Ordering::SeqCst) {
             info!("restarting the registry to load downloaded resources");
