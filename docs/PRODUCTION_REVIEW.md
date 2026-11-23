@@ -4735,7 +4735,10 @@ Tests: each shape has a crash simulation (leftover made, sweep run, gone) and a 
 fix was shown to fail its test with the fix reverted in a private copy with its own target folder. A test that drops a lock and then
 expects a try-lock to win now retries: on macOS a child that another test forks shares the lock file's open
 description until it execs, so the dropped flock stays held for that moment (shown with a standalone program: 20 of
-20 tries blocked). The service only skips one sweep in that case.
+20 tries blocked). The service only skips one sweep in that case. On the PR, macOS CI failed `burst::open_loop_latency_includes_the_queue_wait_from_the_intended_time`
+(untouched here): its numbers fit a constant 103-125 ms per-request cost on the loaded VM, which compounds through the
+FIFO queue past a flat slack. The upper bounds now scale with the cost measured on the first answer; the lower bounds
+are unchanged. Injecting 105 ms per request failed the old test 10/10 and the new one 0/10.
 
 Measured after this phase (release build on the development Mac, short smoke run): unchanged from phase 1. After
 kill -9 and after a graceful stop, no process survives; the data root holds only its own files, now including

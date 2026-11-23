@@ -193,24 +193,30 @@ fn open_loop_latency_includes_the_queue_wait_from_the_intended_time() {
     assert_eq!(hand, vec![150.0, 300.0, 350.0, 500.0, 550.0, 700.0]);
     // Nearest rank over the six: p50 = the 3rd, p95 = p99 = max = the 6th.
     let l = &br.latency_ms;
-    for (got, want) in [
-        (l.min, 150.0),
-        (l.p50, 350.0),
-        (l.p95, 700.0),
-        (l.max, 700.0),
+    // What a request costs beyond the fake's 150 ms (sleep overshoot, thread wake-ups): the first
+    // answer never queues, so its latency is one service. On one slot that cost adds up in FIFO
+    // order, once per request served before an answer: the hand's k-th latency becomes
+    // `hand + k * extra` (a loaded 3-core macOS CI VM measured min 275, p50 669, max 1318 ms:
+    // 103-125 ms per request, past a flat slack at the 6th). The lower bounds stay the hand's.
+    let extra = (l.min - 150.0).max(0.0);
+    for (got, want, served) in [
+        (l.min, 150.0, 1.0),
+        (l.p50, 350.0, 3.0),
+        (l.p95, 700.0, 6.0),
+        (l.max, 700.0, 6.0),
     ] {
         assert!(
-            got >= want - 5.0 && got <= want + SLACK_MS,
-            "latency {got} ms, hand {want} ms ({l:?})"
+            got >= want - 5.0 && got <= want + served * extra + SLACK_MS,
+            "latency {got} ms, hand {want} ms, {extra} ms per request ({l:?})"
         );
     }
     let t = &br.trigger_ms;
     assert!(
-        t.min >= 745.0 && t.min <= 750.0 + SLACK_MS,
+        t.min >= 745.0 && t.min <= 750.0 + 5.0 * extra + SLACK_MS,
         "first trigger {t:?}"
     );
     assert!(
-        t.max >= 895.0 && t.max <= 900.0 + SLACK_MS,
+        t.max >= 895.0 && t.max <= 900.0 + 6.0 * extra + SLACK_MS,
         "last trigger {t:?}"
     );
     assert!(
