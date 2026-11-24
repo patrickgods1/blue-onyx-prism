@@ -12,6 +12,7 @@
 //!   (YOLO + COCO) and a held-out benchmark `dir:` set.
 //! - [`job`]: one run's stage machine over the model export's seams (`CommandRunner`, `Fetcher`;
 //!   the environment is `tools/train-env`, [`crate::resources::export::train`]).
+//! - [`oom`]: a helper's out-of-memory failure, host or GPU, from its log lines.
 //! - [`preflight`]: the report shown before a run, the refusals and the disk check.
 //! - [`commit`]: the memory commit check before a job starts a Python model process (Windows).
 //! - [`retry`]: a failed run's kept checkpoints: Retry export, disk use, deleting run files.
@@ -48,6 +49,7 @@ pub mod file_id;
 pub mod finish;
 pub mod import;
 pub mod job;
+pub mod oom;
 pub mod overlaps;
 pub mod preflight;
 pub mod progress;
@@ -469,9 +471,9 @@ pub fn frozen_heldout(config: &Config) -> Result<std::collections::BTreeSet<Stri
 }
 
 /// The camera days (`camera`, `date`) any training run trained or validated on: the frames of
-/// every `<training dir>/<run>/data/train.txt` and `valid.txt` (names as the run's dataset writes
-/// them, `s<N>-<scene>.<camera>.<date>.<stem>.jpg`; public images name no day). A run folder
-/// without a list (a run that never wrote its dataset) adds nothing. None when the training folder
+/// every `<training dir>/<run>/data/train.txt` and `valid.txt`, each image as the frame it was made
+/// from ([`dataset::seen_sources`]; public images name no day). A run folder without `train.txt`
+/// (a run that never wrote its dataset) adds nothing. None when the training folder
 /// or a list does not read: a day may then have been trained on unseen
 /// ([`crate::collect::labels::heldout::HeldoutPolicy::seen`]).
 pub fn seen_days(config: &Config) -> Option<std::collections::BTreeSet<(String, String)>> {
@@ -499,23 +501,27 @@ fn seen_days_in(dir: &Path) -> Option<std::collections::BTreeSet<(String, String
         if !data.is_dir() {
             continue;
         }
-        for list in ["train.txt", "valid.txt"] {
-            let path = data.join(list);
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    tracing::warn!("{}: {e}", path.display());
-                    return None;
-                }
-            };
-            for line in text.lines() {
-                let Some(rel) = autolabel::trained_frame(line)
-                    .and_then(|f| crate::collect::layout::parse_rel(&f))
-                else {
-                    continue;
-                };
-                days.insert((rel.camera, rel.date));
+        // A prepared dataset writes both lists, `train.txt` first; a folder without it trained on
+        // nothing.
+        match data.join("train.txt").try_exists() {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!("{}: {e}", data.display());
+                return None;
+            }
+        }
+        // QA-104: each image as the frame it was made from (`image_sources.json`).
+        let seen = match dataset::seen_sources(&data) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("{e:#}");
+                return None;
+            }
+        };
+        for f in seen.train.iter().chain(&seen.valid) {
+            if let Some(r) = crate::collect::labels::export::parse_flat_name(f) {
+                days.insert((r.camera, r.date));
             }
         }
     }
@@ -744,7 +750,7 @@ pub fn plan_job(
     if config
         .models
         .iter()
-        .any(|m| m.effective_name().eq_ignore_ascii_case(&name))
+        .any(|m| crate::model::name::same_model_name(&m.effective_name(), &name))
     {
         bail!("the config already has a model named {name}; choose another name");
     }
@@ -1433,6 +1439,23 @@ mod tests {
                 ]
                 .into()
             )
+        );
+        // QA-104: a name the dataset cut (here the whole name, extension included, as datasets
+        // before QA-040 did) names its day through the run's image_sources.json.
+        let porch = format!("porch-{}", "p".repeat(54));
+        let long = format!("day.{porch}.2026-11-02.{}.jpg", "x".repeat(60));
+        let cut = dataset::names::legacy_spelling(0, &long);
+        assert!(!cut.ends_with(".jpg"), "{cut}");
+        write("20261105-1", "train.txt", &format!("./images/{cut}\n"));
+        write(
+            "20261105-1",
+            dataset::IMAGE_SOURCES_FILE,
+            &serde_json::json!({ cut.clone(): format!("/exports/e/images/train/{long}") })
+                .to_string(),
+        );
+        assert!(
+            seen_days(&c).unwrap().contains(&day(&porch, "2026-11-02")),
+            "{cut}"
         );
         // A list that does not read: nothing can be called unseen.
         let bad = dir.join("20261104-1").join("data");

@@ -91,7 +91,8 @@ SMALL_AREA = 32 * 32
 NIGHT_LUMA = 50.0  # mean Pillow "L" (0..255) below this => night / low-light
 GRAY_SPREAD = 3.0  # chroma spread (0..255) below this => monochrome / IR (see the module docs)
 GRAY_GRID = 64
-GRAY_RULE = "v2-fit"  # bump when the rule changes: nir-night's pixel-check cache is keyed by it
+GRAY_RULE = "v3-flat"  # bump when the rule changes: nir-night's pixel-check cache is keyed by it
+FLAT_LUMA_VAR = 1e-6  # image_stats.rs FLAT_LUMA_VAR
 EMPTY_FRACTION = 0.07
 CCTV_FOCUS = ["person", "bicycle", "car", "motorbike", "bus", "truck", "bird", "cat", "dog", "horse"]
 
@@ -211,6 +212,11 @@ def chroma_spread(im: "Image.Image") -> tuple[float, float]:
             d2.append(float(g - b))
     n = len(d1)
     raw = sum(abs(a) + abs(b) for a, b in zip(d1, d2)) / (2 * n)
+    ml = sum(lum) / n
+    if sum((x - ml) ** 2 for x in lum) / n < FLAT_LUMA_VAR:
+        # Exactly flat luma: the tint fit is exact and says nothing (a solid "no video" screen);
+        # image_stats.rs uses chroma_spread there too (QA-045).
+        return raw, raw
     return raw, (fit_residual(lum, d1) + fit_residual(lum, d2)) / 2
 
 

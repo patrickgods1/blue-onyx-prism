@@ -1403,6 +1403,9 @@ pub(super) struct MessageTemplate {
     /// Config-store generation when the restart was requested; the page waits until
     /// `/v1/config` reports another one (the listener stays up across a restart).
     pub(super) generation: u64,
+    /// The process's start (`ConfigStore::epoch`): a process that restarts answers generation 1
+    /// again, so the page waits for another generation or another epoch (QA-113).
+    pub(super) epoch: u64,
 }
 
 /// Ends this generation: the run loop (`runner`) reloads the config file, starts the next
@@ -1461,6 +1464,7 @@ fn restart_response_to(state: &AppState, message: String, url: String) -> Respon
         refresh_url: url,
         restarting: true,
         generation: state.config.generation(),
+        epoch: state.config.epoch(),
     })
 }
 
@@ -1486,11 +1490,23 @@ pub(super) async fn config_loglevel(
                 )
             })?;
             let level: LogLevel = raw.trim().parse()?;
+            // Applied first, so nothing is saved when live control is unavailable; a failed save
+            // puts the running level back, so "not changed" is true (QA-093).
+            let before = state.config_read().log_level;
             apply_log_level(&state, level)?;
-            state.config.update("log level", |c| {
+            let saved = state.config.update("log level", |c| {
                 c.log_level = level;
                 Ok(())
-            })?;
+            });
+            if let Err(e) = saved {
+                if let Err(back) = apply_log_level(&state, before) {
+                    tracing::warn!(
+                        "the log level could not be put back to {} after a failed save: {back:#}",
+                        before.as_str()
+                    );
+                }
+                return Err(e);
+            }
             Ok(level)
         })();
         let html = wants_html(&headers);
@@ -2098,6 +2114,22 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), state.restart.cancelled())
             .await
             .expect("restart token cancelled");
+    }
+
+    /// QA-093: a save that is refused (the file on disk is a later config format) leaves the
+    /// running log level where it was, so the answer "not changed" is true.
+    #[tokio::test]
+    async fn a_failed_log_level_save_puts_the_running_level_back() {
+        let mut st = Arc::try_unwrap(test_state()).ok().unwrap();
+        let handle = crate::cli::LogReloadHandle::detached(crate::config::LogLevel::Info);
+        st.log_reload = Some(handle.clone());
+        let state = Arc::new(st);
+        std::fs::write(&state.config_path, "{\"format\": 999}").unwrap();
+        let (s, _, b) = call(&state, post_form("/config/loglevel", "level=debug", false)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8(b).unwrap().contains("not changed"));
+        assert_eq!(handle.level(), crate::config::LogLevel::Info);
+        assert_eq!(state.config_read().log_level, crate::config::LogLevel::Info);
     }
 
     #[tokio::test]

@@ -78,12 +78,16 @@ impl Shell {
     }
 }
 
-/// `GET /benchmark`: the step that has something to show (see the module docs).
+/// `GET /benchmark`: the step that has something to show (see the module docs). The results
+/// file is looked at in [`super::super::blocking`], like every page here (QA-061).
 pub(in crate::server) async fn index(
     State(state): State<Arc<AppState>>,
     RawQuery(query): RawQuery,
 ) -> Response {
-    let has = super::file_stamp(&results_path(&state.config_path)).is_some();
+    let has = super::super::blocking(move || {
+        super::file_stamp(&results_path(&state.config_path)).is_some()
+    })
+    .await;
     let to = if has {
         "/benchmark/compare"
     } else {
@@ -519,16 +523,7 @@ pub(in crate::server) async fn run_page(State(state): State<Arc<AppState>>) -> R
             models: model_options(&cfg, &timing),
             devices: device_rows(&snap, &cfg, &devices_in_use(&state, &snap, &cfg)),
             datasets: dataset_rows(&state, &cfg),
-            reference_models: cfg
-                .models
-                .iter()
-                .filter(|m| cfg.data_path(&m.path).is_file())
-                .map(|m| {
-                    let n = m.effective_name();
-                    let sel = b.reference_model.as_deref() == Some(n.as_str());
-                    (n, sel)
-                })
-                .collect(),
+            reference_models: reference_rows(&cfg),
             repeat: b.repeat_per_image.max(1),
             warmup: b.warmup,
             low_priority: b.low_priority,
@@ -543,6 +538,28 @@ pub(in crate::server) async fn run_page(State(state): State<Arc<AppState>>) -> R
     .await
 }
 
+/// The Run form's reference model options: each configured model whose file is there, and
+/// whether it is `benchmark.reference_model`. The name is resolved as the run resolves it
+/// ([`crate::benchmark::find_model`], case and spacing ignored), so a hand-edited `RT-DETRv2-X`
+/// for model `rt-detrv2-x` stays selected rather than posting "Automatic" back (QA-062).
+fn reference_rows(cfg: &Config) -> Vec<(String, bool)> {
+    let want = cfg
+        .benchmark
+        .reference_model
+        .as_deref()
+        .and_then(|r| crate::benchmark::find_model(cfg, r))
+        .map(|m| m.effective_name());
+    cfg.models
+        .iter()
+        .filter(|m| cfg.data_path(&m.path).is_file())
+        .map(|m| {
+            let n = m.effective_name();
+            let sel = want.as_ref() == Some(&n);
+            (n, sel)
+        })
+        .collect()
+}
+
 /// The ranges of the burst test's cameras, images and interval (ms), for the form's inputs.
 fn burst_ranges() -> [(u64, u64); 3] {
     use crate::config::{BURST_CAMERAS, BURST_IMAGES, BURST_INTERVAL_MS};
@@ -553,4 +570,44 @@ fn burst_ranges() -> [(u64, u64); 3] {
         )
     };
     [u(BURST_CAMERAS), u(BURST_IMAGES), BURST_INTERVAL_MS]
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::config::ModelConfig;
+
+    /// QA-062: a reference model named with another case or spacing than the model is still the
+    /// selected option (the form posted "Automatic" and Save defaults cleared it).
+    #[test]
+    fn a_reference_model_differing_in_case_is_selected() {
+        let dir = crate::test_dirs::TempDir::new("bench_ref_rows");
+        let models = ["rt-detrv2-x", "yolo26s"]
+            .iter()
+            .map(|n| {
+                let path = dir.join(format!("{n}.onnx"));
+                std::fs::write(&path, b"x").unwrap();
+                ModelConfig {
+                    name: Some((*n).to_string()),
+                    path,
+                    ..Default::default()
+                }
+            })
+            .collect();
+        let mut cfg = Config {
+            models,
+            ..Default::default()
+        };
+        cfg.benchmark.reference_model = Some("RT-DETRv2-X".into());
+        assert_eq!(
+            reference_rows(&cfg),
+            [
+                ("rt-detrv2-x".to_string(), true),
+                ("yolo26s".to_string(), false)
+            ]
+        );
+        cfg.benchmark.reference_model = None;
+        assert!(reference_rows(&cfg).iter().all(|(_, sel)| !sel));
+    }
 }

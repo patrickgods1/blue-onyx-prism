@@ -4,7 +4,9 @@
 //! - fewer than [`DELAY_AFTER`] (10) failures in a row: every attempt is allowed;
 //! - from 10 on: an attempt is refused without hashing until `last_failure + delay`, the delay
 //!   1 s at 10 failures and doubling with each further one, capped at [`MAX_DELAY_SECS`]
-//!   (15 min; reached at 20 failures);
+//!   (15 min; reached at 20 failures); a `last_failure` more than the delay ahead of `now` (stamped
+//!   while the clock ran ahead) is not waited for, so a corrected clock never refuses an account
+//!   until the wall clock catches up;
 //! - at [`DISABLE_AT`] (100) in a row the account is disabled until `user unlock` or
 //!   `user reset-password` (which clear it), whatever the time;
 //! - a success resets the count.
@@ -70,6 +72,15 @@ pub fn decide(state: &State, now: u64) -> Decision {
         return Decision::Allow;
     }
     let last = state.last_failure.unwrap_or(0);
+    // A failure stamped more than the delay ahead of `now` was stamped while the clock ran
+    // ahead (a bad NTP step, a VM resumed with a skewed clock): waiting for it would refuse the
+    // account until the wall clock catches up, months maybe, and a refusal stamps nothing new.
+    // Allow the attempt instead; its failure, if any, is stamped with the corrected clock, so
+    // the count and the delays carry on from there (QA-085). A smaller step back still waits
+    // for the stamp, at most twice the delay.
+    if last > now.saturating_add(wait) {
+        return Decision::Allow;
+    }
     let until = last.saturating_add(wait);
     if now < until {
         Decision::Wait(until - now)
@@ -207,8 +218,31 @@ mod tests {
         assert_eq!(decide(&many, t), Decision::Wait(900));
         assert_eq!(decide(&many, t + 899), Decision::Wait(1));
         assert_eq!(decide(&many, t + 900), Decision::Allow);
-        // A clock that went back still waits at most the delay from the failure.
+        // A clock that went back a little still waits for the stamp (at most twice the delay).
         assert_eq!(decide(&many, t - 5), Decision::Wait(905));
+        assert_eq!(decide(&many, t - 900), Decision::Wait(1800));
+    }
+
+    // QA-085
+    #[test]
+    fn a_failure_stamped_by_a_clock_that_ran_ahead_does_not_lock_until_it_catches_up() {
+        let now = 1_700_000_000;
+        let ahead = after(15, now + 365 * 86_400);
+        assert_eq!(decide(&ahead, now), Decision::Allow);
+        // The next failure is stamped with the corrected clock and waits as usual.
+        let again = on_failure(&ahead, now);
+        assert_eq!(again.failures, 16);
+        assert_eq!(decide(&again, now), Decision::Wait(delay(16)));
+        // Just past the delay ahead: allowed; within it: still waits for the stamp.
+        let near = after(40, now + MAX_DELAY_SECS + 1);
+        assert_eq!(decide(&near, now), Decision::Allow);
+        let near = after(40, now + MAX_DELAY_SECS);
+        assert_eq!(decide(&near, now), Decision::Wait(2 * MAX_DELAY_SECS));
+        // Disabled stays disabled whatever the stamp.
+        assert_eq!(
+            decide(&after(100, now + 365 * 86_400), now),
+            Decision::Disabled
+        );
     }
 
     #[test]

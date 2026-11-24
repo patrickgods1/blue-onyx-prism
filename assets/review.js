@@ -637,7 +637,9 @@
   function fmtScore(s) { return (typeof s === 'number') ? s.toFixed(2) : ''; }
 
   // The classes Review offers: the list minus the hidden ones.
-  function visible() { return classes.filter(function (c) { return hiddenClasses.indexOf(c) < 0; }); }
+  // Hidden names compare as R.isHiddenClass does (case-insensitive), everywhere: a class the
+  // canvas hides must not stay on a picker or a 1-0 key.
+  function visible() { return classes.filter(function (c) { return !isHiddenClass(c); }); }
 
   // A "don't want" class (collect.hidden_classes; case-insensitive).
   function isHiddenClass(label) { return R.isHiddenClass(label, hiddenClasses); }
@@ -2030,7 +2032,7 @@
     var names = visible();
     if (names.indexOf(b.label) < 0) names.unshift(b.label);
     names.forEach(function (c) {
-      var o = el('option', null, c + (classes.indexOf(c) < 0 ? ' (not a class)' : (hiddenClasses.indexOf(c) >= 0 ? ' (hidden)' : '')));
+      var o = el('option', null, c + (classes.indexOf(c) < 0 ? ' (not a class)' : (isHiddenClass(c) ? ' (hidden)' : '')));
       o.value = c;
       if (c === b.label) o.selected = true;
       sel.appendChild(o);
@@ -4367,7 +4369,7 @@
     var out = CU.mergeEntries(base, classes.concat(seenLabels));
     out.forEach(function (e) {
       if (classes.indexOf(e.name) >= 0) e.in_list = true;
-      e.hidden = hiddenClasses.indexOf(e.name) >= 0;
+      e.hidden = isHiddenClass(e.name);
     });
     return out;
   }
@@ -5378,12 +5380,11 @@
 
   // Task records: task `id` (a list of one, none when the server has no such task), else every
   // queued, running or paused one. From GET /v1/train/jobs (task=<id> / tasks=busy: the records
-  // without log or result); a server whose answer lacks the field is asked on GET /v1/training
-  // from then on.
-  var jobsHasTasks = true;
-  function taskRecords(id, asPoll) {
-    // Asked from a poll (here, or a fallback chained after one's answer): a poll throughout.
-    var poll = asPoll || (window.PrismPoll && window.PrismPoll.inPoll && window.PrismPoll.inPoll());
+  // without log or result). The server always sends the field (null for an unknown task); an
+  // answer without it is an error, never a reason to ask another route.
+  function taskRecords(id) {
+    // Asked from a poll: a poll throughout.
+    var poll = window.PrismPoll && window.PrismPoll.inPoll && window.PrismPoll.inPoll();
     var get = poll && window.PrismPoll.fetch ? window.PrismPoll.fetch : fetch;
     var json = function (url) {
       return get(url, { headers: { Accept: 'application/json' }, cache: 'no-store' }).then(function (r) {
@@ -5391,14 +5392,9 @@
         return r.json();
       });
     };
-    if (!jobsHasTasks) {
-      return json('/v1/training').then(function (data) {
-        return (data.tasks || []).filter(function (t) { return id ? t.id === id : true; });
-      });
-    }
     var key = id ? 'task' : 'tasks';
     return json('/v1/train/jobs?' + (id ? 'task=' + encodeURIComponent(id) : 'tasks=busy')).then(function (j) {
-      if (!j || !(key in j)) { jobsHasTasks = false; return taskRecords(id, poll); }
+      if (!j || typeof j !== 'object' || !(key in j)) throw new Error('the jobs answer has no ' + key + ' field');
       return id ? (j.task ? [j.task] : []) : (j.tasks || []);
     });
   }

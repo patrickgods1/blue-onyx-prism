@@ -183,6 +183,9 @@ fn format_uptime(d: Duration) -> String {
 
 struct ModelRow {
     name: String,
+    /// `registry::normalize_name(name)`, the key `/v1/config` lists the model under; the page's
+    /// restart badge matches by it (QA-116: no second normalizer in `welcome.js`).
+    key: String,
     is_default: bool,
     /// Short state text ("Ready", "Loading", "Waiting for download", "Failed:", "Lazy").
     state: String,
@@ -266,6 +269,7 @@ pub(super) async fn welcome(State(state): State<Arc<AppState>>) -> Response {
                         .get(&crate::registry::normalize_name(&w.name))
                         .copied(),
                     pending: pending.for_model(&w.name).join("; "),
+                    key: crate::registry::normalize_name(&w.name),
                     name: w.name.clone(),
                     is_default: w.name == default,
                     state,
@@ -1083,7 +1087,7 @@ mod tests {
         assert!(home.contains("<tr class=\"st-fail\" data-model=\"ipcam-general\">"));
         // A restart badge's reasons open on a tap (live.js PrismTip), not only as a title.
         assert!(
-            home.contains("<button type=\"button\" class=\"term tag restart pending-badge\" data-model=\"ipcam-general\" data-tip=\""),
+            home.contains("<button type=\"button\" class=\"term tag restart pending-badge\" data-model=\"ipcam-general\" data-key=\"ipcam-general\" data-tip=\""), // QA-116
             "{home}"
         );
         assert!(home.contains("Running on") && home.contains("nothing loaded yet"));
@@ -1579,11 +1583,13 @@ mod tests {
             refresh_url: "/config\"></p><script>alert(1)</script>".into(),
             restarting: true,
             generation: 7,
+            epoch: 42,
         }
         .render()
         .unwrap();
         assert_csp_clean("message", &html);
         assert!(html.contains("data-generation=\"7\""), "{html}");
+        assert!(html.contains("data-epoch=\"42\""), "{html}"); // QA-113
         assert!(
             html.contains("data-target=\"/config&#34;&#62;&#60;/p&#62;&#60;script&#62;alert(1)&#60;/script&#62;\""),
             "{html}"
@@ -1666,6 +1672,77 @@ mod tests {
         assert_eq!(
             super::no_objects_line("0.001", 0.5, None),
             ("No objects at or above 0.01.".into(), "")
+        );
+    }
+
+    /// QA-114: `assets/test.js` `PrismTestPage.noneLine` / `effective` print what
+    /// `no_objects_line` / `worker::effective_threshold` do, over a grid of Min confidence texts,
+    /// model thresholds and night thresholds. Needs `node` (skipped without it, unless
+    /// `BOP_REQUIRE_NODE=1`).
+    #[test]
+    fn test_js_none_line_matches_the_rust_sentence() {
+        let have_node = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !have_node {
+            assert!(
+                std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
+                "BOP_REQUIRE_NODE=1 but `node` does not run"
+            );
+            return;
+        }
+        let mut cases = Vec::new();
+        for text in [
+            "", " ", "abc", "0", "-1", "0.005", "0.01", "0.3", "0.5", "1", "45", "50", "100",
+            "101", "150",
+        ] {
+            for model in [0.5_f32, 0.375, 0.01] {
+                for night in [None, Some(0.3_f32), Some(0.5), Some(0.01)] {
+                    let (line, hint) = super::no_objects_line(text, model, night);
+                    cases.push(serde_json::json!({
+                        "text": text, "model": model, "night": night,
+                        "line": line, "hint": hint,
+                        "effective": crate::worker::effective_threshold(
+                            text.trim().parse::<f32>().unwrap_or(0.0), model),
+                    }));
+                }
+            }
+        }
+        let dir = crate::test_dirs::TempDir::new("test-js");
+        let driver = dir.join("driver.js");
+        std::fs::write(
+            &driver,
+            r#"
+const assert = require('assert'), fs = require('fs'), vm = require('vm');
+const ctx = vm.createContext({});
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const P = vm.runInContext('PrismTestPage', ctx);
+for (const c of JSON.parse(process.argv[3])) {
+  const m = {t: c.model, night: c.night};
+  const [line, hint] = P.noneLine(c.text, m);
+  assert.strictEqual(line, c.line, JSON.stringify(c));
+  assert.strictEqual(hint, c.hint, JSON.stringify(c));
+  const asked = parseFloat(c.text);
+  assert.ok(Math.abs(P.effective(asked, c.model) - c.effective) < 1e-6, JSON.stringify(c));
+}
+assert.strictEqual(P.noneLine('', undefined)[0], 'No objects found.');
+console.log('ok');
+"#,
+        )
+        .unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&driver)
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/test.js"))
+            .arg(serde_json::to_string(&cases).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "node failed ({}): {}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 

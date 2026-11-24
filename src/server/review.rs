@@ -242,10 +242,28 @@ fn context(state: &AppState) -> (PathBuf, Vec<String>, PathBuf) {
     )
 }
 
-/// `collect.hidden_classes` of the current config: with `collect.classes`, what the reviewer
-/// wants ([`bulk::Wanted`]).
+/// `collect.hidden_classes` of the current config in the class list's spelling ([`in_list_spelling`]):
+/// with `collect.classes`, what the reviewer wants ([`bulk::Wanted`]).
 fn hidden(state: &AppState) -> Vec<String> {
-    state.config_read().collect.hidden_classes.clone()
+    let cfg = state.config_read();
+    in_list_spelling(&cfg.collect.hidden_classes, &cfg.collect.classes)
+}
+
+/// `hidden` with each name in the spelling of the class of `classes` it names (compared as
+/// `validate_hidden` does, ASCII case aside), a name of none as it is: a hand-edited config's
+/// `BIRD` against class `bird` is served as `bird`, so a page comparing names exactly hides the
+/// class from its pickers as it hides its boxes (QA-112).
+fn in_list_spelling(hidden: &[String], classes: &[String]) -> Vec<String> {
+    hidden
+        .iter()
+        .map(|h| {
+            classes
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(h.trim()))
+                .unwrap_or(h)
+                .clone()
+        })
+        .collect()
 }
 
 fn now() -> String {
@@ -509,30 +527,110 @@ impl SentLists {
         serde_json::from_slice(body).unwrap_or_default()
     }
 
-    /// `file` with the stored file's lists and `review_pick` in place of those the body left out.
-    fn keep_stored(&self, file: &mut LabelFile, path: &std::path::Path) {
-        if self.refine.is_some() && self.overlap_suggestions.is_some() && self.review_pick {
+    /// `file` with the `stored` file's lists and `review_pick` in place of those the body left
+    /// out (None: there is no stored file, or it did not read).
+    fn keep_from(&self, stored: Option<&LabelFile>, file: &mut LabelFile) {
+        let Some(stored) = stored else {
             return;
+        };
+        if self.refine.is_none() {
+            file.refine.clone_from(&stored.refine);
         }
-        let stored = match labels::read(path) {
-            Ok(Some(s)) => s,
-            Ok(None) => return,
+        if self.overlap_suggestions.is_none() {
+            file.overlap_suggestions
+                .clone_from(&stored.overlap_suggestions);
+        }
+        if !self.review_pick {
+            file.review_pick.clone_from(&stored.review_pick);
+        }
+    }
+}
+
+/// What [`save`] did.
+#[derive(Debug)]
+enum Saved {
+    /// Written as this file; whether the save can change the open count
+    /// ([`super::refine::save_changes_open`]).
+    Written(Box<LabelFile>, bool),
+    /// Refused: the revision is no longer the one sent (the current one).
+    Conflict(String),
+    /// Refused: the file sent does not pass [`labels::normalize`].
+    Invalid(anyhow::Error),
+    /// The read or write failed.
+    Failed(anyhow::Error),
+}
+
+/// A review save of the frame whose label file is `path` (`rel` its image): `file` as sent,
+/// completed from the stored file ([`SentLists::keep_from`], [`drop_foreign_pick`]) and checked
+/// ([`labels::normalize`] for a `width` x `height` frame at `now`). With `expected` (the revision
+/// the client read), the file is read once and written only when its revision is still that one
+/// ([`labels::write_checked`]). Without, everything happens under the write lock
+/// ([`labels::update_with_read`]): a job's suggestions written since the client read the frame
+/// are kept, never replaced by an older copy (QA-090). `before_write` runs just before the write
+/// lock is taken (tests: a job writing meanwhile).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one save's inputs, called from one route"
+)]
+fn save(
+    path: &std::path::Path,
+    rel: &str,
+    file: LabelFile,
+    sent: &SentLists,
+    expected: Option<&str>,
+    classes: &[String],
+    (width, height): (u32, u32),
+    now: &str,
+    before_write: impl FnOnce(),
+) -> Saved {
+    let check = |mut file: LabelFile, stored: Option<&LabelFile>| {
+        sent.keep_from(stored, &mut file);
+        drop_foreign_pick(&mut file, rel);
+        labels::normalize(file, classes, width, height, now)
+    };
+    if let Some(rev) = expected {
+        // Read once, outside the lock: the write is refused when the file changed since.
+        let stored = labels::read(path).ok().flatten();
+        let f = match check(file, stored.as_ref()) {
+            Ok(f) => f,
+            Err(e) => return Saved::Invalid(e),
+        };
+        let open_changes = super::refine::save_changes_open(stored.as_ref(), &f);
+        before_write();
+        return match labels::write_checked(path, &f, rev) {
+            Ok(Ok(())) => Saved::Written(Box::new(f), open_changes),
+            Ok(Err(current)) => Saved::Conflict(current),
+            Err(e) => Saved::Failed(e),
+        };
+    }
+    before_write();
+    let mut outcome = None;
+    let written = labels::update_with_read(path, |current| {
+        let stored = match current {
+            Ok(s) => s,
             Err(e) => {
                 tracing::debug!(
                     "review save: the stored label file did not read ({e:#}); its suggestions are not kept"
                 );
-                return;
+                None
             }
         };
-        if self.refine.is_none() {
-            file.refine = stored.refine;
+        match check(file, stored.as_ref()) {
+            Ok(f) => {
+                let open_changes = super::refine::save_changes_open(stored.as_ref(), &f);
+                outcome = Some(Saved::Written(Box::new(f.clone()), open_changes));
+                Ok(Some(f))
+            }
+            Err(e) => {
+                outcome = Some(Saved::Invalid(e));
+                Ok(None)
+            }
         }
-        if self.overlap_suggestions.is_none() {
-            file.overlap_suggestions = stored.overlap_suggestions;
-        }
-        if !self.review_pick {
-            file.review_pick = stored.review_pick;
-        }
+    });
+    match (written, outcome) {
+        (Err(e), _) => Saved::Failed(e),
+        (Ok(_), Some(o)) => o,
+        (Ok(_), None) => Saved::Failed(anyhow::anyhow!("the save did not run")),
     }
 }
 
@@ -541,7 +639,7 @@ impl SentLists {
 /// the GET answered; empty = not saved then) the save is refused with 409 and `conflict: true`
 /// when the file changed meanwhile; without it, it always overwrites (X-AnyLabeling and other
 /// clients). A body without a `refine` or `overlap_suggestions` key keeps the stored file's list
-/// ([`SentLists`]): the suggestions and their answers are the jobs' and the reviewer's, not the
+/// ([`SentLists`], read under the write lock when there is no revision: [`save`]): the suggestions and their answers are the jobs' and the reviewer's, not the
 /// client's to drop by leaving them out. So does one without `review_pick`; `random` on a frame
 /// out of the random-pick pool is dropped ([`drop_foreign_pick`]). A save around an unanswered
 /// suggestion drops the kept open counts ([`super::refine::save_changes_open`]).
@@ -557,7 +655,7 @@ pub(super) async fn labels_post(
     let sent = body
         .as_ref()
         .map_or_else(|_| SentLists::default(), |b| SentLists::of(b));
-    let mut file: LabelFile = json_body(&headers, body)?;
+    let file: LabelFile = json_body(&headers, body)?;
     Ok(blocking(move || {
         let (dir, classes, _) = context(&state);
         let hidden = hidden(&state);
@@ -569,23 +667,20 @@ pub(super) async fn labels_post(
             Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         };
         let status = file.status;
-        // Read before the write, outside its lock: with a revision the write is refused when the
-        // file changed since; without one the save overwrites whatever came between, as always.
-        let stored = labels::read(&frame.labels).ok().flatten();
-        sent.keep_stored(&mut file, &frame.labels);
-        drop_foreign_pick(&mut file, &frame.rel.jpg());
-        let f = match labels::normalize(file, &classes, rec.width, rec.height, &now()) {
-            Ok(f) => f,
-            Err(e) => return fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not saved: {e:#}")),
-        };
-        let open_changes = super::refine::save_changes_open(stored.as_ref(), &f);
-        let written = match &expected {
-            Some(rev) => labels::write_checked(&frame.labels, &f, rev),
-            None => labels::write(&frame.labels, &f).map(Ok),
-        };
-        match written {
-            Ok(Ok(())) => {}
-            Ok(Err(current)) => {
+        let saved = save(
+            &frame.labels,
+            &frame.rel.jpg(),
+            file,
+            &sent,
+            expected.as_deref(),
+            &classes,
+            (rec.width, rec.height),
+            &now(),
+            || {},
+        );
+        let (f, open_changes) = match saved {
+            Saved::Written(f, open_changes) => (f, open_changes),
+            Saved::Conflict(current) => {
                 tracing::debug!(frame = %rel, current = %current, "review save refused: stale revision");
                 return (
                     StatusCode::CONFLICT,
@@ -597,8 +692,13 @@ pub(super) async fn labels_post(
                 )
                     .into_response();
             }
-            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("Not saved: {e:#}")),
-        }
+            Saved::Invalid(e) => {
+                return fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not saved: {e:#}"));
+            }
+            Saved::Failed(e) => {
+                return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("Not saved: {e:#}"));
+            }
+        };
         // The dataset check's open count may have changed (an answer, a box moved under a
         // suggestion): the Train strip shows none until the next walk.
         if open_changes {
@@ -1800,6 +1900,183 @@ mod tests {
         assert_eq!(
             super::super::refine::kept_open(&d.dir, &classes, &hidden),
             None
+        );
+    }
+
+    /// QA-090: each key a body leaves out takes the stored value; one present, `[]` included (and
+    /// `null` for `review_pick`), is the client's.
+    #[test]
+    fn keep_from_takes_the_stored_value_of_each_key_left_out() {
+        use crate::collect::labels::overlaps::{Suggestion as Overlap, Verdict};
+        use crate::collect::labels::refine::{Kind, Suggestion};
+        let stored = LabelFile {
+            refine: vec![Suggestion {
+                kind: Kind::Add,
+                target: None,
+                target_label: None,
+                bbox: Some([1.0, 1.0, 9.0, 9.0]),
+                label: Some("car".into()),
+                score: Some(0.5),
+                why: "w".into(),
+                spot: None,
+                answer: None,
+                run: "refine-1".into(),
+            }],
+            overlap_suggestions: vec![Overlap {
+                a: [0.0, 0.0, 40.0, 40.0],
+                b: [5.0, 5.0, 25.0, 25.0],
+                verdict: Verdict::Unclear,
+                why: String::new(),
+                kept_score: None,
+                other_score: None,
+                low_confidence: false,
+                weak: false,
+            }],
+            review_pick: Some(labels::ReviewPick::Random),
+            ..LabelFile::default()
+        };
+        let client = LabelFile::default();
+        let kept = |body: &str| {
+            let mut f = client.clone();
+            SentLists::of(body.as_bytes()).keep_from(Some(&stored), &mut f);
+            (
+                f.refine == stored.refine,
+                f.overlap_suggestions == stored.overlap_suggestions,
+                f.review_pick == stored.review_pick,
+            )
+        };
+        assert_eq!(kept("{}"), (true, true, true));
+        assert_eq!(kept(r#"{"refine": []}"#), (false, true, true));
+        assert_eq!(kept(r#"{"overlap_suggestions": []}"#), (true, false, true));
+        assert_eq!(kept(r#"{"review_pick": null}"#), (true, true, false));
+        assert_eq!(
+            kept(r#"{"refine": [], "overlap_suggestions": [], "review_pick": null}"#),
+            (false, false, false)
+        );
+        // No stored file (or one that does not read): nothing to keep.
+        let mut f = client.clone();
+        SentLists::of(b"{}").keep_from(None, &mut f);
+        assert_eq!(f, client);
+    }
+
+    /// QA-090: a save without a revision and without a `refine` key keeps the suggestions a job
+    /// wrote after the client read the frame: the stored lists are read under the write lock.
+    #[test]
+    fn a_save_without_a_revision_keeps_suggestions_written_meanwhile() {
+        use crate::collect::labels::refine::Answer;
+        let d = ds_with(refine_classes);
+        let (rel, path, f) = refine_frame(&d);
+        let frame = Frame::resolve(&d.dir, &rel).unwrap();
+        let rec = frame.record().unwrap();
+        let classes = d.state.config_read().collect.classes.clone();
+        // The client's copy: the boxes, no lists (X-AnyLabeling, a script).
+        let body = LabelFile {
+            refine: Vec::new(),
+            ..f.clone()
+        };
+        let sent = SentLists::of(br#"{"status": "reviewed", "boxes": []}"#);
+        // Meanwhile a dataset check answers one suggestion of the stored file.
+        let mut meanwhile = f.refine.clone();
+        meanwhile[3].answer = Some(Answer::Dismissed);
+        let job = meanwhile.clone();
+        let saved = save(
+            &path,
+            &rel,
+            body,
+            &sent,
+            None,
+            &classes,
+            (rec.width, rec.height),
+            "2026-10-23T00:00:00Z",
+            || {
+                labels::update(&path, |cur| {
+                    let mut c = cur.unwrap();
+                    c.refine = job;
+                    Ok(Some(c))
+                })
+                .unwrap();
+            },
+        );
+        assert!(matches!(saved, Saved::Written(..)), "{saved:?}");
+        assert_eq!(labels::read(&path).unwrap().unwrap().refine, meanwhile);
+    }
+
+    /// QA-091: a bulk write that changed a frame drops the Refine tab's kept counts, as a review
+    /// save answering a suggestion does.
+    #[tokio::test]
+    async fn a_bulk_write_drops_the_kept_open_count() {
+        use crate::collect::labels::bulk::test_support::{auto_box, labels_of, put_frame_at};
+        use labels::{BoxState, Status, Triage};
+        let d = ds_with(refine_classes);
+        refine_frame(&d);
+        let car = |bbox: [f32; 4], score: f32| labels::LabelBox {
+            bbox,
+            state: BoxState::Accepted,
+            ..auto_box("car", score, Triage::Accept)
+        };
+        let rel = put_frame_at(
+            &d.dir,
+            "yard",
+            "o",
+            (64, 48),
+            None,
+            vec![
+                car([0.0, 0.0, 40.0, 40.0], 0.9),
+                car([0.0, 0.0, 40.0, 38.0], 0.4),
+            ],
+        );
+        let mut f = labels_of(&d.dir, &rel);
+        f.status = Status::Reviewed;
+        f.reviewed_at = Some("2026-10-01T00:00:00Z".into());
+        labels::write(&Frame::resolve(&d.dir, &rel).unwrap().labels, &f).unwrap();
+        let classes = d.state.config_read().collect.classes.clone();
+        let hidden = d.state.config_read().collect.hidden_classes.clone();
+        let uri = "/v1/review/reject-stacked";
+        // A dry run writes nothing and keeps the count.
+        let kept = (0..50).any(|_| super::super::refine::keep_open_now(&d.dir, &classes, &hidden));
+        assert!(kept, "no count kept");
+        let (s, v) = json(&d.state, post_json(uri, r#"{"dry_run": true}"#)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (s, v) = json(&d.state, post_json(uri, "{}")).await;
+        assert_eq!(
+            (s, v["rejected"].as_u64()),
+            (StatusCode::OK, Some(1)),
+            "{v}"
+        );
+        assert_eq!(
+            super::super::refine::kept_open(&d.dir, &classes, &hidden),
+            None
+        );
+    }
+
+    /// QA-112: an explicit hidden list is checked as sent and stored and answered in the class
+    /// list's spelling; a hand-edited one is served in it too.
+    #[tokio::test]
+    async fn a_hidden_list_is_stored_in_the_class_lists_spelling() {
+        let d = ds();
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/classes",
+                r#"{"classes": ["person", "bird"], "hidden": ["BIRD"]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["hidden"], serde_json::json!(["bird"]));
+        assert_eq!(d.state.config_read().collect.hidden_classes, ["bird"]);
+        let (s, v) = json(
+            &d.state,
+            post_json(
+                "/v1/review/classes",
+                r#"{"classes": ["person", "bird"], "hidden": ["bird", "Bird"]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "listed twice: {v}");
+        assert_eq!(
+            in_list_spelling(&["BIRD".into(), "fox".into()], &["bird".into()]),
+            ["bird", "fox"]
         );
     }
 

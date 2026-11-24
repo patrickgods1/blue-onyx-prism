@@ -144,11 +144,36 @@ def log(msg: str) -> None:
     print(f"[train_model] {msg}", flush=True)
 
 
+def jsonable(v):
+    """`v` as plain JSON for an event: a NaN or an infinity as None (JSON has neither, and the
+    service drops a whole line holding the bare token), a numpy / torch scalar or array as its
+    Python value (`tolist`), dicts, lists and tuples item by item, anything else as its text (a
+    Path)."""
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, dict):
+        return {str(k): jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [jsonable(x) for x in v]
+    tolist = getattr(v, "tolist", None)
+    if callable(tolist):
+        try:
+            return jsonable(tolist())
+        except Exception:
+            pass
+    return str(v)
+
+
 def event(kind: str, **fields) -> None:
-    """One progress event for the service (`@train {json}`)."""
+    """One progress event for the service (`@train {json}`): every field through `jsonable`, so
+    a NaN loss is `null` and never loses the whole event; `allow_nan=False` makes one that slips
+    past it an error here rather than a line the service cannot read."""
     fields["event"] = kind
+    text = json.dumps(jsonable(fields), separators=(",", ":"), allow_nan=False)
     # A leading newline: progress bars (Ultralytics, Lightning) leave the cursor mid-line.
-    print("\n@train " + json.dumps(fields, separators=(",", ":"), default=str), flush=True)
+    print("\n@train " + text, flush=True)
 
 
 def finite_lr(v):
@@ -2552,25 +2577,37 @@ def export_rfdetr_best(a, ckpt: Path, device: str, names: list[str], em) -> dict
     with torch.no_grad():
         ref = net(torch.from_numpy(x))
     ref_logits = ref["pred_logits"].numpy()
+    ref_boxes = ref["pred_boxes"].numpy()
     del native, net, ref
     free_memory(device)
     slice_logits(a.name, out["onnx"], len(names))
     em.stamp_coreml_cache_key(out["onnx"])
-    got = em.compare_with_onnxruntime(a.name, out["onnx"], {"pixel_values": x}, {})
+    # The boxes too: their shape and finiteness here, their values below (QA-074).
+    got = em.compare_with_onnxruntime(a.name, out["onnx"], {"pixel_values": x}, {"pred_boxes": ref_boxes})
     if got["logits"].shape[-1] != len(names):
         fail(f"{a.name}: logits have {got['logits'].shape[-1]} classes after the cut, expected {len(names)}")
     sig = lambda v: 1 / (1 + np.exp(-v))
     ref_named = ref_logits[..., : len(names)]
     diff = float(np.abs(np.sort(sig(ref_named).ravel())[-20:] - np.sort(sig(got["logits"]).ravel())[-20:]).max())
     log(f"{a.name}: top-20 score difference rfdetr PyTorch vs ONNX Runtime: {diff:.2e}")
-    if diff > 1e-2:
+    if export_disagrees(diff, 1e-2):
         fail(f"{a.name}: the ONNX export and rfdetr's PyTorch model disagree (top scores differ by {diff:.3f})")
+    box_diff = query_box_difference(sig(ref_named[0]), ref_boxes[0], sig(got["logits"][0]), got["pred_boxes"][0]) * a.imgsz
+    log(f"{a.name}: box difference of the top 20 queries, rfdetr PyTorch vs ONNX Runtime: {box_diff:.3f} px")
+    if export_disagrees(box_diff, 0.5):
+        fail(f"{a.name}: the ONNX export's boxes and rfdetr's PyTorch model's disagree by {box_diff:.2f} px")
     return {"family": "rfdetr", **out}
 
 
 # ---------------------------------------------------------------------------------------------
 # transformers (RT-DETRv2, D-FINE)
 # ---------------------------------------------------------------------------------------------
+
+
+def export_disagrees(diff: float, tolerance: float) -> bool:
+    """Whether an export check's difference fails it: above `tolerance`, or not a number at all
+    (a NaN compares False with everything, so `diff > tolerance` alone lets it pass)."""
+    return not math.isfinite(diff) or diff > tolerance
 
 
 def query_box_difference(ref_scores, ref_boxes, got_scores, got_boxes, k: int = 20) -> float:
@@ -2957,11 +2994,11 @@ def export_transformers_model(a, model, device: str, names: list[str], em) -> di
     sig = lambda v: 1 / (1 + np.exp(-v))
     diff = float(np.abs(np.sort(sig(got["logits"]).ravel())[-20:] - np.sort(sig(logits.numpy()).ravel())[-20:]).max())
     log(f"{a.name}: top-20 score difference PyTorch vs ONNX Runtime: {diff:.2e}")
-    if diff > 1e-2:
+    if export_disagrees(diff, 1e-2):
         fail(f"{a.name}: ONNX Runtime and PyTorch disagree (top scores differ by {diff:.3f})")
     box_diff = query_box_difference(sig(logits.numpy()[0]), boxes.numpy()[0], sig(got["logits"][0]), got["pred_boxes"][0]) * a.imgsz
     log(f"{a.name}: box difference of the top 20 queries: {box_diff:.3f} px")
-    if box_diff > 0.5:
+    if export_disagrees(box_diff, 0.5):
         fail(f"{a.name}: ONNX Runtime and PyTorch boxes disagree by {box_diff:.2f} px")
     out = em.finish_hf(a.name, onnx, argparse.Namespace(out=a.out_dir, no_onnx=False, no_openvino=True, fp32=False), {}, a.imgsz, names)
     return {"family": "detr", **out}

@@ -9,7 +9,7 @@ Every request gets a scene from a 64x64 sample of the decoded frame (`src/image_
 
 | Scene | Rule |
 |---|---|
-| `ir` | Monochrome: colour spread or tint-fit residual below 3/255. This catches gray IR frames and green- or white-balance-tinted ones, even when IR lighting makes them bright. |
+| `ir` | Monochrome: colour spread or tint-fit residual below 3/255. This catches gray IR frames and green- or white-balance-tinted ones, even when IR lighting makes them bright. A frame of exactly flat brightness (e.g. a solid "no video" screen) is IR only when it is gray. |
 | `night` | Colour frame with mean BT.601 luma below 50. |
 | `day` | Everything else. |
 

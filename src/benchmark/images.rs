@@ -687,7 +687,8 @@ fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
 /// directory of YOLO txt labels) or found automatically (`_annotations.coco.json`,
 /// `annotations.json`, `instances*.json`; `labels/` or `<stem>.txt` beside the images).
 /// Returns the set and warnings (images left out because the ground truth does not cover
-/// them or their size is unknown, duplicate COCO file names). A missing YOLO label file is an
+/// them or their size is unknown, duplicate COCO file names, YOLO label files with no image of
+/// their name: files without a .jpg/.jpeg/.png extension are not images here). A missing YOLO label file is an
 /// image without objects; one that does not read (permissions, not UTF-8) fails the folder,
 /// naming the file; a UTF-8 byte-order mark is skipped.
 pub fn load_dir(
@@ -1100,6 +1101,12 @@ pub fn parse_yolo(text: &str, names: &[String], w: u32, h: u32) -> Result<Vec<Gt
 /// warnings.
 fn apply_yolo(images: &mut Vec<SetImage>, labels: &Path, dir: &Path) -> Result<Vec<String>> {
     let names = yolo_class_names(&[labels, dir])?;
+    let stems: std::collections::HashSet<String> = images
+        .iter()
+        .filter_map(|i| Path::new(&i.file).file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    let orphans = orphan_labels(labels, &stems);
     let mut unreadable = Vec::new();
     images.retain(|img| {
         let ok = img.width > 0 && img.height > 0;
@@ -1156,7 +1163,60 @@ fn apply_yolo(images: &mut Vec<SetImage>, labels: &Path, dir: &Path) -> Result<V
             examples(&unreadable)
         ));
     }
+    if !orphans.is_empty() {
+        warnings.push(format!(
+            "{} YOLO label file(s) in {} have no .jpg/.jpeg/.png image of the same name in the \
+             folder (e.g. {}): those frames are not part of the set. An image whose name lost \
+             its extension is not read; give it back its .jpg/.jpeg/.png extension, or remove \
+             the label file.",
+            orphans.len(),
+            labels.display(),
+            examples(&orphans)
+        ));
+    }
     Ok(warnings)
+}
+
+/// The YOLO label files in `labels` whose stem names none of `stems` (the folder's images),
+/// sorted (QA-063: a frame whose name lost its extension is otherwise left out without a word).
+/// A label file is a `.txt` that is empty (a frame with no objects) or whose lines all hold five
+/// numbers; `classes.txt`, hidden files and other text (notes beside the images) are not.
+fn orphan_labels(labels: &Path, stems: &std::collections::HashSet<String>) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(labels) else {
+        return Vec::new();
+    };
+    let looks_like_yolo = |p: &Path| {
+        std::fs::read_to_string(p).is_ok_and(|t| {
+            t.trim_start_matches('\u{feff}')
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .all(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    f.len() >= 5 && f.iter().all(|x| x.parse::<f64>().is_ok())
+                })
+        })
+    };
+    let mut out: Vec<String> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let Some(name) = p.file_name().map(|n| n.to_string_lossy()) else {
+                return false;
+            };
+            !name.starts_with('.')
+                && !name.eq_ignore_ascii_case("classes.txt")
+                && p.extension()
+                    .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("txt"))
+                && p.file_stem()
+                    .is_some_and(|s| !stems.contains(s.to_string_lossy().as_ref()))
+                && p.is_file()
+                && looks_like_yolo(p)
+        })
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    out.sort();
+    out
 }
 
 /// Datasets resolved for a run.
@@ -1702,6 +1762,33 @@ mod tests {
         std::fs::write(dir.join("labels/a.txt"), "0 0.5 0.5 0.5 0.5\n0 nan 0 0 0\n").unwrap();
         let e = format!("{:#}", load_dir(&dir, None, None).unwrap_err());
         assert!(e.contains("a.txt") && e.contains("line 2"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// QA-063: a YOLO label whose image is not in the folder as a .jpg/.jpeg/.png (a frame whose
+    /// name lost its extension) is named in a warning; classes.txt and notes are not labels.
+    #[test]
+    fn a_yolo_label_without_its_image_is_warned_about() {
+        let dir = temp_set(&[("a.jpg", None), ("long-name-without-ext", None)]);
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        std::fs::write(dir.join("labels/a.txt"), "0 0.5 0.5 0.5 0.5\n").unwrap();
+        std::fs::write(dir.join("labels/classes.txt"), "person\n").unwrap();
+        std::fs::write(dir.join("labels/notes.txt"), "camera moved on day 2\n").unwrap();
+        let (set, warnings) = load_dir(&dir, None, None).unwrap();
+        assert_eq!(set.images.len(), 1);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        std::fs::write(
+            dir.join("labels/long-name-without-ext.txt"),
+            "0 0.5 0.5 0.5 0.5\n",
+        )
+        .unwrap();
+        let (set, warnings) = load_dir(&dir, None, None).unwrap();
+        assert_eq!(set.images.len(), 1);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("long-name-without-ext.txt") && !warnings[0].contains("notes"),
+            "{warnings:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

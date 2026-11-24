@@ -318,7 +318,7 @@ it; every key can also be set in the file.
 | `https_port` | `32169` | HTTPS listen port (the web UI and the admin API, behind [sign-in](#signing-in); the open routes answer here too). Must differ from `port`. Integer 1-65535. Applies: process restart. UI: yes. See [HTTPS](#https) |
 | `tls_cert_path` | not set | Your own HTTPS certificate (PEM, the chain allowed, leaf first) instead of the generated self-signed one; set together with `tls_key_path`. A relative path is under the data root. Used as given, never written. Applies: process restart. UI: read-only; set it in the config file, see [HTTPS](#https) |
 | `tls_key_path` | not set | The private key of `tls_cert_path` (PEM: PKCS#8, PKCS#1 or SEC1). Both or neither. Applies: process restart. UI: no; set it in the config file |
-| `bind_address` | `0.0.0.0` | Address the HTTP and HTTPS listeners bind; `127.0.0.1` = this machine only. IP address. Applies: process restart. UI: yes. See [Signing in](#signing-in) |
+| `bind_address` | `0.0.0.0` | Address the HTTP and HTTPS listeners bind; `127.0.0.1` = this machine only; `::` serves IPv6 and IPv4 on every OS (on Windows a second socket on `0.0.0.0` carries IPv4). IP address. Applies: process restart. UI: yes. See [Signing in](#signing-in) |
 | `allow_remote_admin` | retired | No longer used: every browser, this machine's included, signs in with an account over HTTPS. Read from old files only (a warning at start; the first start with it `true` rotates the API token once, since it travelled over plain HTTP) and dropped from the file at the next save. UI: no |
 | `allowed_hosts` | `[]` | Host names the admin pages answer under, besides IP addresses and `localhost` (the defence against DNS rebinding). List of up to 32 bare names, lower-cased: no scheme, port, path or wildcard. Applies: at once. UI: yes. See [Signing in](#signing-in) |
 | `allowed_networks` | `[]` | Networks served besides the local network (loopback, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fc00::/7`, `fe80::/10`), e.g. a VPN: `["100.64.0.0/10"]` for Tailscale. Every other client is refused on every route. List of up to 32 CIDRs (a bare address = one address), stored in network form; `/0` is refused. Applies: at once. UI: read-only; set it in the config file, see [Local network only](#local-network-only) |
@@ -342,7 +342,7 @@ it; every key can also be set in the file.
 | `night_label_thresholds` | `{}` | Minimum confidence per label on night / IR frames. Numbers 0-1. Applies: at once. UI: yes for `person` (Night / IR) |
 | `person_aspect` | `null` | Allowed width / height of a `person` box, `[min, max]` (suggested `[0.2, 0.9]`); `null` = off. Applies: at once. UI: yes (Night / IR) |
 | `min_box_area_frac` | `null` | Drop boxes smaller than this share of the image area; `null` = off. Number 0-1. Applies: at once. UI: config file |
-| `suppress_overlaps` | `[]` | Drop a box that overlaps another label's box: `[{"drop": "person", "if_overlaps": "potted plant", "iou": 0.5, "night_only": false}]`; fires at IoU >= `iou` or when the other box covers 80% of it. Applies: at once. UI: yes for person / potted plant (Night / IR) |
+| `suppress_overlaps` | `[]` | Drop a box that overlaps another label's box: `[{"drop": "person", "if_overlaps": "potted plant", "iou": 0.5, "night_only": false}]`; fires at IoU >= `iou` or when the other box covers 80% of it; a rule whose `drop` and `if_overlaps` name the same label has no effect (warned at load). Applies: at once. UI: yes for person / potted plant (Night / IR) |
 | `static_suppression` | off | Suppress a box seen at the same place in many requests of one camera (a rock or plant read as a person): `{"enabled": false, "iou": 0.85, "hits": 5, "window_minutes": 30, "labels": ["person"]}`; a request without the box releases it. The camera is the image file name without its timestamp, else the model and frame size. A person standing perfectly still is suppressed too. Applies: at once. UI: yes (on/off, Night / IR) |
 | `preprocess` | `null` | Image enhancement before the model's resize (after the night / IR test, which always sees the original frame): `"none"`, `"grayscale"` (BT.601 luma in all channels), `"gamma:<g>"` (`255 (v/255)^g`; below 1 brightens shadows, e.g. `"gamma:0.6"`), `"clahe"` / `"clahe:<clip>,<tiles>"` (CLAHE on luma, default clip 2 and 8 x 8 tiles; colour frames keep their hue). Off by default: enhancement helps some models and hurts others, so compare with `benchmark --variants none,pre:clahe,pre:gamma:0.6` first. Costs a few ms per frame on the preprocess pool. Applies: at once. UI: Models JSON / config file |
 | `night_preprocess` | `null` | Enhancement on night / IR frames only (same values as `preprocess`), replacing `preprocess` there; `null` = `preprocess`. Compare with `benchmark --variants night-pre:<mode>`. Applies: at once. UI: Models JSON / config file |
@@ -391,9 +391,9 @@ it; every key can also be set in the file.
 | `save_image_max_mb` | `2048` | Keep the saved-image folder under this many MB, deleting the oldest first, 0 = unlimited. Integer 0-1000000. Applies: at once. UI: yes |
 | `max_image_pixels` | `50000000` | Largest image (width x height) accepted for decoding; checked from the header before allocating. Integer 1000-1000000000. Applies: at once. UI: no |
 | `intra_threads` | `0` | CPU inference threads: 0 = all physical cores but one on machines with at least 4 cores (the OS, the HTTP threads and the desktop keep a core), every core on smaller ones; set it to use every core. Server and benchmark alike. Integer 0-256. Applies: restart. UI: yes |
-| `preprocess_threads` | `0` | Decode + preprocess threads shared by every model; 0 = from the hardware profile (half the cores, 1-8; at most 2 when every model runs on the CPU). Integer 0-256. Applies: restart. UI: no |
-| `inflight` | `0` | Concurrent inferences per model; 0 = from the hardware profile and the model's device. A model's own `inflight` wins. Integer 0-64. Applies: restart. UI: no |
-| `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model (on `ort:cpu` the sessions share the CPU thread budget, so more sessions do not add threads); 0 = from the hardware profile (2 with a discrete GPU of at least 4 GB and 8 GB of memory, so the GPU overlaps one request's compute with the other's copy and NMS; else 1). Integer 0-16. Applies: restart. UI: no |
+| `preprocess_threads` | `0` | Decode + preprocess threads shared by every model; 0 = from the hardware profile (half the cores, 1-8; at most 2 when every model runs on the CPU). Integer 0-256; values above 32 run at 32 (warned once). Applies: restart. UI: no |
+| `inflight` | `0` | Concurrent inferences per model; 0 = from the hardware profile and the model's device. A model's own `inflight` wins. Integer 0-64; values above 8 run at 8 (warned once). Applies: restart. UI: no |
+| `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model (on `ort:cpu` the sessions share the CPU thread budget, so more sessions do not add threads); 0 = from the hardware profile (2 with a discrete GPU of at least 4 GB and 8 GB of memory, so the GPU overlaps one request's compute with the other's copy and NMS; else 1). Integer 0-16; values above 8 run at 8 (warned once). Applies: restart. UI: no |
 | `ort_gpu_mem_limit_mb` | unset (no cap) | Cap in MB of the GPU memory arena of each ONNX Runtime CUDA session (ONNX Runtime's `gpu_mem_limit`), for a card shared with training or auto-label jobs; also caps the CUDA provider behind `ort:tensorrt` (TensorRT's own memory is not counted). Per session: a model with two `ort_sessions` can use twice it, and the CUDA context and libraries' own memory lie outside it. A run that needs more than the cap fails with an inference error instead of growing the arena. Unset = no cap (the arena grows by what a run asks for). No effect on DirectML, CoreML or OpenVINO. Integer 64-1048576. Applies: restart. UI: no |
 | `hardware_profile` | `"auto"` | Hardware class the `0` defaults above come from: `auto` (classified from cores, RAM and GPUs) or forced `low`, `mid`, `high`. Applies: restart. UI: no |
 | `performance_hint` | unset (`latency` on an integrated GPU) | OpenVINO compile hint for models on an OpenVINO GPU (`openvino:gpu[.N]`): `latency` (one stream, 2 requests in flight so the host prepares the next frame while the GPU runs one) or `throughput` (OpenVINO's THROUGHPUT hint, several streams; requests in flight = the compiled model's `OPTIMAL_NUMBER_OF_INFER_REQUESTS`, two per stream, at most 4: 2 streams and 4 requests on a UHD 630. The OpenVINO runtime `setup-openvino` installs has no auto-batching plugin, so a request never waits for a batch to fill). Unset = the hardware profile's choice: `latency` on an integrated GPU, THROUGHPUT with up to 4 in flight (clamped to its streams) on a discrete Intel GPU. An explicit `inflight` still sets the count. CPU, NPU and ONNX Runtime devices ignore it. On a UHD 630 `throughput` measured the same as `latency` below saturation and about 5% more frames per second only when overloaded (docs/PRODUCTION_REVIEW.md), so the default stays; a model's own `performance_hint` wins. Applies: restart (shown on every model it moves). UI: no |
@@ -611,7 +611,7 @@ and the default model; every key is in the *Models JSON* under it):
 | `lazy` | `false` | Compile on first request instead of at startup; requests are answered "initializing" at once until it is ready. Boolean. Applies: model reload. UI: Models JSON |
 | `gpu_precision` | `null` | Inference precision on an OpenVINO GPU: `f16` (default) or `f32` (slower; for models that overflow f16). Applies: model reload. UI: Models JSON |
 | `enabled` | `true` | Load and serve this model; disabled models stay in the config but are not loaded. Boolean. Applies: model reload (start or stop). UI: yes (Models card *Load*) |
-| `inflight` | `null` | Concurrent inferences of this model; `null` or `0` = the global `inflight`. Integer 0-64. Applies: restart. UI: no |
+| `inflight` | `null` | Concurrent inferences of this model; `null` or `0` = the global `inflight`. Integer 0-64; values above 8 run at 8 (warned once). Applies: restart. UI: no |
 | `performance_hint` | `null` | OpenVINO GPU compile hint of this model, `latency` or `throughput` (see the global key); `null` = the global `performance_hint`. No effect on CPU, NPU or ONNX Runtime devices. Applies: model reload. UI: Models JSON |
 | `night_confidence_threshold`, `person_aspect`, `min_box_area_frac`, `suppress_overlaps`, `static_suppression` | absent | Per-model night / IR rules (see the global keys); absent = the global value, a set value replaces it. Applies: at once. UI: Models JSON |
 | `label_thresholds`, `night_label_thresholds` | absent | Per-model label thresholds, merged over the global ones (this model's entries win; `0` turns a global entry off). Applies: at once. UI: Models JSON |
@@ -720,11 +720,11 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   `{"dir": "...", "gt": "...", "name": "..."}`, CLI `--images <dir> [--gt <file|dir>]`) with optional
   ground truth as COCO instances JSON or YOLO txt labels and tags in `manifest.json` (a YOLO label
   file that cannot be read, e.g. UTF-16 or no permission, skips that folder with a warning naming the
-  file; a UTF-8 byte-order mark is fine). Without ground
+  file; a UTF-8 byte-order mark is fine; a YOLO label file with no .jpg/.jpeg/.png of the same name gives a warning naming it). Without ground
   truth a dataset is scored against a reference model (the most accurate installed one, or
   `benchmark.reference_model`); such scores are marked *relative*, and the reference model, its As
   served result and its `--variants` results are never scored on it (they would grade their own
-  detections). A results, history or predictions file that cannot be read is never saved over; a
+  detections). A results, history or predictions file, or the Your cameras labels snapshot `benchmark-gt.json`, that cannot be read is never saved over; a
   damaged one is moved aside as `<name>.bad-<time>`, and a file with entries this version cannot read
   is copied aside the same way before a save drops them.
 - **What is timed**: each model runs as it serves. It is compiled with its worker's settings on that
@@ -1549,7 +1549,8 @@ and open `https://127.0.0.1:32169/setup` on the host. The accounts, the API toke
   Docker's proxy hides the client's address (see [Local network only](#local-network-only)), so
   the published binding is the gate; passwords and the lockout still apply.
 
-The container's health check polls `/v1/status` (`docker ps` shows `healthy` once a model is ready).
+The container's health check polls `/v1/status` (`docker ps` shows `healthy` once a model can serve; a
+second model still downloading or compiling does not make it unhealthy).
 The image starts the service under `tini`, which reaps the processes a cancelled export or
 training leaves, and the compose file gives a stop 75 s (`stop_grace_period`); with plain
 `docker run` / `docker stop`, pass `--stop-timeout 75` / `-t 75`, since Docker's default 10 s cuts
@@ -1564,7 +1565,7 @@ the service's own stop short.
 | POST, GET | `/v1/vision/custom/list` | configured model names |
 | POST | `/v1/models/add` | add a custom model by file or directory path to the config (`path`, `name`, `family`, `classes`) |
 | GET | `/v1/fs/browse` | read-only file browser behind the Config page's *Browse...* buttons and the Train tab's footage import: `?path=<dir>&kind=model`, `classes` or `video`; lists only folders and `.onnx`/`.xml` (or `.yaml`/`.yml`, or `.mp4`/`.mkv`/`.avi`/`.mov`) files of the machine running the service |
-| GET | `/v1/status` | readiness for Blue Iris, Docker `HEALTHCHECK` or systemd: `{ready, status: ready/degraded/initializing/failed, models[{name,state,device,detail}], uptimeSecs, generation, version, fileLogCapped}` (`fileLogCapped`: today's log file reached its cap); HTTP 200 when ready or degraded (a failed model next to a usable one), 503 while a non-lazy model is still loading or nothing is usable |
+| GET | `/v1/status` | readiness for Blue Iris, Docker `HEALTHCHECK` or systemd: `{ready, status: ready/degraded/initializing/failed, models[{name,state,device,detail}], loading, uptimeSecs, generation, version, fileLogCapped}` (`loading`: the models still downloading or compiling; `fileLogCapped`: today's log file reached its cap); HTTP 200 when ready or degraded (a usable model next to one that failed or is still loading), 503 while no model is usable yet (`initializing`) or none can load (`failed`) |
 | GET | `/v1/status/updateavailable` | GitHub release check |
 | GET | `/`, `/stats`, `/stats.json`, `/prometheus` | UI and metrics (sign-in or the API token) |
 | GET | `/logs`, `/logs.json?after=<seq>&level=<min>` | log page; recent log events newer than `after` at `level` (`trace`..`error`) or more severe, with `last` as the next cursor |
@@ -1645,7 +1646,7 @@ recommendation, `benchmark.json`). Flags: `--model`, `--family`, `--device`, `--
 `--report <file.html|.md>`, `--no-save`, `--force-cpu`, `--image` (one file), `--dataset` (repeatable),
 `--images <dir>`, `--gt`, `--max-images`, `--no-image-cap`, `--list-datasets`, `--reference-model`, `--accuracy-weight`,
 `--repeat` (timed runs per image; 100 for a single image), `--warmup`, `--compare-cpu` (also runs on CPU
-and diffs detections), `--cache-dir` (`""` disables), `--threads`, `--classes`, `--min-confidence`,
+and diffs detections image by image at one threshold, so saved device profiles are not counted as differences), `--cache-dir` (`""` disables), `--threads`, `--classes`, `--min-confidence`,
 `--config` (enabled models from the config when no `--model`), `--json`, `-v`.
 If GPU latency is not clearly below CPU latency, the GPU was probably not used (check the log) or
 the FP32 path is active.

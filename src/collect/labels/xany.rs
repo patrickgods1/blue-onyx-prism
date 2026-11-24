@@ -197,7 +197,9 @@ pub fn rects(x: &XFile) -> (Vec<Rect>, Vec<String>) {
 /// - any other rectangle is a new human box (`added`);
 /// - every box of `base` no rectangle matched is rejected (a model or auto box: hard-negative
 ///   evidence) or dropped (a human box);
-/// - `empty_confirmed` = no rectangle.
+/// - `empty_confirmed` = no rectangle;
+/// - what the jobs and the page keep on the frame (`overlaps_checked`, the overlap and refine
+///   suggestions, `review_pick`, the `auto_run` marker) carried over from `base`.
 pub fn apply_import(base: LabelFile, rects: &[Rect]) -> LabelFile {
     let mut boxes = base.boxes;
     let mut matched = vec![false; boxes.len()];
@@ -269,6 +271,8 @@ pub fn apply_import(base: LabelFile, rects: &[Rect]) -> LabelFile {
         overlap_suggestions: base.overlap_suggestions,
         refine: base.refine,
         review_pick: base.review_pick,
+        // QA-053: the last auto-label run's marker stays, so a skip-done run still skips it.
+        auto_run: base.auto_run,
         ..LabelFile::default()
     }
 }
@@ -524,6 +528,31 @@ mod tests {
         assert_eq!(r.len(), 2);
         assert_eq!(w.len(), 2, "{w:?}");
         assert!(!x.checked);
+    }
+
+    /// QA-053: an import keeps the last auto-label run's marker, through the save's checks too,
+    /// so a skip-done run does not label the corrected frame again.
+    #[test]
+    fn apply_import_keeps_the_auto_run_marker() {
+        let base = LabelFile {
+            boxes: vec![model_box(
+                "person",
+                [10.0, 10.0, 50.0, 90.0],
+                BoxState::Pending,
+            )],
+            auto_run: Some(super::super::AutoRun {
+                at: "2026-10-22T00:00:00Z".into(),
+                labeler: "mm-gdino-tiny + rfdetr-large".into(),
+                classes: vec!["person".into()],
+            }),
+            ..LabelFile::default()
+        };
+        let rects = [("person".to_string(), [11.0, 10.0, 50.0, 90.0], None, false)];
+        let merged = apply_import(base.clone(), &rects);
+        assert_eq!(merged.auto_run, base.auto_run);
+        let classes = vec!["person".to_string()];
+        let saved = normalize(merged, &classes, 640, 480, "2026-10-23T00:00:00Z").unwrap();
+        assert_eq!(saved.auto_run, base.auto_run);
     }
 
     #[test]

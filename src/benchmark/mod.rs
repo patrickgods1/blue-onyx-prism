@@ -934,7 +934,8 @@ pub fn configured_device(config: &Config, m: &ModelConfig, sel: &Selection) -> O
 }
 
 /// Reference models for pseudo ground truth, most accurate first (matched as name prefixes,
-/// case-insensitive).
+/// case-insensitive; the longest matching prefix decides, so `rt-detrv2-ms` ranks as itself and
+/// not as `rt-detrv2-m`).
 pub(crate) const REFERENCE_PREFERENCE: [&str; 16] = [
     "rt-detrv2-x",
     "dfine-x",
@@ -976,10 +977,13 @@ pub(crate) fn pick_reference<'a>(
     let candidates: Vec<&ModelConfig> = config.models.iter().filter(present).collect();
     let rank = |m: &ModelConfig| {
         let n = m.effective_name().to_ascii_lowercase();
+        // QA-048: the longest matching prefix, not the first one.
         REFERENCE_PREFERENCE
             .iter()
-            .position(|p| n.starts_with(p))
-            .unwrap_or(usize::MAX)
+            .enumerate()
+            .filter(|(_, p)| n.starts_with(**p))
+            .max_by_key(|(_, p)| p.len())
+            .map_or(usize::MAX, |(i, _)| i)
     };
     if let Some(m) = candidates
         .iter()
@@ -1254,6 +1258,29 @@ mod tests {
         };
         assert!(pick_reference(&only, None).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// QA-048: `rt-detrv2-ms` starts with `rt-detrv2-m`; it ranks as itself (below dfine-m), not
+    /// as the larger model whose name is its prefix.
+    #[test]
+    fn reference_rank_uses_the_longest_prefix() {
+        let dir = crate::test_dirs::TempDir::new("ref-prefix");
+        for f in ["rt-detrv2-ms.onnx", "dfine-m.onnx"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let m = |n: &str| ModelConfig {
+            name: Some(n.into()),
+            path: dir.join(format!("{n}.onnx")),
+            ..Default::default()
+        };
+        let c = Config {
+            models: vec![m("rt-detrv2-ms"), m("dfine-m")],
+            ..Default::default()
+        };
+        assert_eq!(
+            pick_reference(&c, None).unwrap().effective_name(),
+            "dfine-m"
+        );
     }
 
     /// Camera-trap wildlife a model cannot score (raccoon, opossum for a COCO model) is not a

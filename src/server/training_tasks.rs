@@ -9,6 +9,7 @@
 //! auto-label form answers JSON (`{success, message, id}`) to a client that accepts
 //! `application/json`, else the Auto-label tab.
 
+use super::form::checked;
 use super::train_area::{AUTOLABEL, IMPORT};
 use super::training::{all, field, num, service, view};
 use super::{Shared, blocking, render};
@@ -154,12 +155,12 @@ pub(crate) fn import_from_form(f: &[(String, String)]) -> anyhow::Result<ImportR
     if let Some(n) = num(f, "max_candidates", "max candidates per video")? {
         r.max_candidates = n;
     }
-    r.balance = field(f, "no_balance").is_none();
+    r.balance = !checked(f, "no_balance");
     r.license = field(f, "license").map(str::to_string);
-    r.license_confirmed = field(f, "confirm_license").is_some();
-    r.allow_large = field(f, "confirm_large").is_some();
+    r.license_confirmed = checked(f, "confirm_license");
+    r.allow_large = checked(f, "confirm_large");
     r.out_dir = field(f, "out_dir").map(PathBuf::from);
-    r.ignore_memory_check = field(f, "ignore_memory_check").is_some();
+    r.ignore_memory_check = checked(f, "ignore_memory_check");
     r.validate()?;
     Ok(r)
 }
@@ -205,7 +206,7 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
             }
         }
     }
-    if field(f, "again").is_some() && !named.iter().any(|n| n == "again") {
+    if checked(f, "again") && !named.iter().any(|n| n == "again") {
         parts.push("again=1".into());
     }
     Ok(parts.join(","))
@@ -223,7 +224,8 @@ pub(crate) fn frame_filter_text(f: &[(String, String)]) -> anyhow::Result<String
 /// the default); `confirm_large`, `confirm_license` (ticked = confirmed). The run options `keep_on_cancel`,
 /// `vlm_batch`, `prefetch`, `night_enhance`, `missing_unreviewed` and `vlm_min_on` (ticked = on; then
 /// `vlm_min_score` applies) count only when the form posts `run_options` (the Train tab's card);
-/// without it (the Review page, older forms) they keep the request's defaults.
+/// without it (the Review page, older forms) they keep the request's defaults. "Ticked" is
+/// [`super::form::checked`]: present and not `0`, `no`, `false`, `off` or empty, on every form here.
 pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<AutolabelRequest> {
     let with_model = match field(f, "mode") {
         Some("labelers") => None,
@@ -253,17 +255,16 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
         "off" => None,
         v => Some(VlmSize::parse(v).ok_or_else(|| anyhow::anyhow!("VLM: '{v}' is not a size"))?),
     };
-    r.rfdetr = field(f, "rfdetr").is_some();
-    r.siglip = field(f, "siglip").is_some();
+    r.rfdetr = checked(f, "rfdetr");
+    r.siglip = checked(f, "siglip");
     if field(f, "run_options").is_some() {
-        r.keep_on_cancel = field(f, "keep_on_cancel").is_some();
-        r.vlm_batch = field(f, "vlm_batch").is_some();
-        r.prefetch = field(f, "prefetch").is_some();
-        r.night_enhance = field(f, "night_enhance")
-            .is_some()
+        r.keep_on_cancel = checked(f, "keep_on_cancel");
+        r.vlm_batch = checked(f, "vlm_batch");
+        r.prefetch = checked(f, "prefetch");
+        r.night_enhance = checked(f, "night_enhance")
             .then_some(crate::training::autolabel::night::DEFAULT_NIGHT_ENHANCE);
-        r.missing_unreviewed = field(f, "missing_unreviewed").is_some();
-        r.vlm_min_score = if field(f, "vlm_min_on").is_some() {
+        r.missing_unreviewed = checked(f, "missing_unreviewed");
+        r.vlm_min_score = if checked(f, "vlm_min_on") {
             Some(
                 num(f, "vlm_min_score", "VLM minimum score")?
                     .unwrap_or(crate::training::autolabel::SUGGESTED_VLM_MIN_SCORE),
@@ -276,10 +277,10 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
         // A model run's fields; the labelers' are ignored.
         r.device = field(f, "device").map(str::to_string);
         r.model_accept_score = num(f, "model_accept_score", "model accept score")?;
-        r.missing_only = field(f, "missing_only").is_some();
+        r.missing_only = checked(f, "missing_only");
     } else {
         r.gpu = field(f, "gpu").map(str::to_string);
-        r.mdv6 = field(f, "mdv6").is_some();
+        r.mdv6 = checked(f, "mdv6");
         if r.mdv6
             && let Some(t) = num(f, "mdv6_threshold", "MegaDetector threshold")?
         {
@@ -295,10 +296,10 @@ pub(crate) fn autolabel_from_form(f: &[(String, String)]) -> anyhow::Result<Auto
     if let Some(t) = num(f, "threshold", "threshold")? {
         r.threshold = t;
     }
-    r.allow_large = field(f, "confirm_large").is_some();
-    r.confirm_license = field(f, "confirm_license").is_some();
+    r.allow_large = checked(f, "confirm_large");
+    r.confirm_license = checked(f, "confirm_license");
     // The preview's "Start anyway" checkbox (shown only with a memory refusal).
-    r.ignore_memory_check = field(f, "ignore_memory_check").is_some();
+    r.ignore_memory_check = checked(f, "ignore_memory_check");
     let classes: Vec<String> = all(f, "classes")
         .iter()
         .flat_map(|c| c.split(','))
@@ -337,9 +338,9 @@ fn finish_from_form(
     out_dir: Option<&std::path::Path>,
     dataset_dir: &std::path::Path,
 ) -> anyhow::Result<Option<Finish>> {
-    let reject = field(f, "after_reject").is_some();
-    let accept = field(f, "after_accept").is_some();
-    let folder = field(f, "after_review_folder").is_some();
+    let reject = checked(f, "after_reject");
+    let accept = checked(f, "after_accept");
+    let folder = checked(f, "after_review_folder");
     if !chained && reject {
         anyhow::bail!(
             "reject auto boxes scoring below: needs Auto-label after import; tick \"Auto-label the \
@@ -402,7 +403,7 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
                     .map_err(|(_, m)| anyhow::anyhow!("save frames to: {m}"))?;
                 req.out_dir = Some(allowed);
             }
-            let chained = field(&f, "autolabel").is_some();
+            let chained = checked(&f, "autolabel");
             let has_out_dir = req.out_dir.is_some();
             let cap = crate::training::capability_now();
             let mut job = crate::training::import::plan_import(&config, req, &cap)?;
@@ -753,7 +754,7 @@ mod tests {
             .collect()
     }
 
-    /// "Start anyway" posts `ignore_memory_check` (a checkbox: present = on); absent = refused as
+    /// "Start anyway" posts `ignore_memory_check` (a checkbox: present and truthy = on); absent = refused as
     /// usual.
     #[test]
     fn the_forms_carry_start_anyway() {
@@ -771,6 +772,36 @@ mod tests {
         let mut on = al.to_vec();
         on.push(("ignore_memory_check", "1"));
         assert!(autolabel_from_form(&form(&on)).unwrap().ignore_memory_check);
+    }
+
+    /// QA-094: the import and auto-label forms read a false-like confirmation as unticked
+    /// (`confirm_large=0` allowed a multi-GB download before).
+    #[test]
+    fn false_like_confirmations_are_unticked() {
+        for v in crate::server::form::FALSE_LIKE {
+            let import = form(&[
+                ("path", "clips"),
+                ("confirm_large", v),
+                ("confirm_license", v),
+                ("ignore_memory_check", v),
+                ("no_balance", v),
+            ]);
+            let r = import_from_form(&import).unwrap();
+            assert!(!r.allow_large && !r.license_confirmed, "{v:?}");
+            assert!(!r.ignore_memory_check && r.balance, "{v:?}");
+            let al = form(&[
+                ("mode", "labelers"),
+                ("confirm_large", v),
+                ("confirm_license", v),
+                ("ignore_memory_check", v),
+                ("mdv6", v),
+            ]);
+            let r = autolabel_from_form(&al).unwrap();
+            assert!(!r.allow_large && !r.confirm_license, "{v:?}");
+            assert!(!r.ignore_memory_check && !r.mdv6, "{v:?}");
+        }
+        let r = import_from_form(&form(&[("path", "clips"), ("confirm_large", "on")])).unwrap();
+        assert!(r.allow_large);
     }
 
     #[test]

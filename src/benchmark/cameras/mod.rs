@@ -450,6 +450,12 @@ pub fn nothing_left(left: Option<&super::report::LeftOut>) -> String {
 /// ([`snapshot::GtSnapshot::merged_with`]); returns its identity, which the results saved next
 /// record ([`snapshot::stamp`]). Called under the results lock before the run's first save of
 /// `benchmark.json`, whose copy of the set has no labels. None when the run has no such set.
+///
+/// The snapshot there follows the results' rule
+/// (`report::load_or_move_aside`, QA-051): one that does not parse or is of a later
+/// format (a newer build's) is moved aside to `benchmark-gt.json.bad-<time>` with a warning, and
+/// the new one keeps none of its frames; one that cannot be read, or cannot be set aside, is an
+/// error and nothing is written over it.
 pub fn write_snapshot(
     results_path: &Path,
     sets: &[ImageSet],
@@ -460,10 +466,13 @@ pub fn write_snapshot(
         return Ok(None);
     };
     let path = snapshot::path_beside(results_path);
-    let old = snapshot::GtSnapshot::load(&path).unwrap_or_else(|e| {
-        tracing::warn!("{e:#}; the new snapshot keeps none of its frames");
-        None
-    });
+    let (old, _warned) = super::report::load_or_move_aside(&path, |p| {
+        Ok(super::report::Load {
+            value: snapshot::GtSnapshot::load(p)?,
+            warnings: Vec::new(),
+            dropped: 0,
+        })
+    })?;
     let snap =
         snapshot::GtSnapshot::of(&l.source, set, &l.reviewed).merged_with(old.as_ref(), prev);
     snap.save(&path).map(Some)

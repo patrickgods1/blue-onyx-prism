@@ -28,6 +28,9 @@ use std::sync::OnceLock;
 pub const MAX_INFLIGHT: usize = 8;
 /// Upper bound of the decode + preprocess pool.
 pub const MAX_PREPROCESS_THREADS: usize = 8;
+/// Largest explicit `preprocess_threads` applied ([`crate::registry::preprocess_threads`]); the
+/// config accepts up to 256, a larger value runs at this one, with a warning.
+pub const MAX_PREPROCESS_THREADS_SETTING: usize = MAX_PREPROCESS_THREADS * 4;
 /// Pool size when every model runs on the CPU (CPU inference already uses all cores but one).
 pub const CPU_ONLY_PREPROCESS_THREADS: usize = 2;
 /// Logical cores from which CPU inference is compiled for throughput (several streams).
@@ -388,6 +391,57 @@ pub struct Overrides {
     pub default_model: bool,
     /// `performance_hint` (model, else global; None = the profile's hint for the device).
     pub hint: Option<PerformanceHint>,
+}
+
+impl Overrides {
+    /// Explicit values above what [`Profile::tuning_with`] applies, as `(key, set, applied)`:
+    /// `inflight` and `ort_sessions` run at [`MAX_INFLIGHT`] at most (the config accepts up to 64
+    /// and 16).
+    pub fn capped(&self) -> Vec<(&'static str, usize, usize)> {
+        [
+            ("inflight", self.inflight),
+            ("ort_sessions", self.ort_sessions),
+        ]
+        .into_iter()
+        .filter(|&(_, n)| n > MAX_INFLIGHT)
+        .map(|(key, n)| (key, n, MAX_INFLIGHT))
+        .collect()
+    }
+
+    /// [`warn_capped`] for each of [`Self::capped`]: `inflight` under `model` (it can be the
+    /// model's own), the global `ort_sessions` once for all models.
+    pub fn warn_if_capped(&self, model: &str) {
+        for (key, set, applied) in self.capped() {
+            let scope = if key == "inflight" { model } else { "" };
+            warn_capped(scope, key, set, applied);
+        }
+    }
+}
+
+/// Warn that `key` = `set` of `scope` (a model name; "" for a global key) runs at `applied`, the
+/// first time this process sees that scope, key and value (QA-120: the cap used to apply
+/// silently). The scopes and keys come from the config file, so the set stays small. True when
+/// it logged.
+pub fn warn_capped(scope: &str, key: &str, set: usize, applied: usize) -> bool {
+    use crate::sync::LockExt as _;
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    if !SEEN
+        .lock_recover()
+        .insert(format!("{scope}\u{0}{key}\u{0}{set}"))
+    {
+        return false;
+    }
+    let whose = if scope.is_empty() {
+        String::new()
+    } else {
+        format!(" for model '{scope}'")
+    };
+    tracing::warn!(
+        "{key} {set}{whose} is above the maximum {applied}; {applied} is applied (set {key} to \
+         {applied} or less to silence this)"
+    );
+    true
 }
 
 /// The profile of this machine.
@@ -957,6 +1011,44 @@ mod tests {
         assert!("ultra".parse::<HardwareProfile>().is_err());
         let v: HardwareProfile = serde_json::from_str(r#""mid""#).unwrap();
         assert_eq!(v, HardwareProfile::Mid);
+    }
+
+    // QA-120: values the config accepts above the caps ran at the caps without a word.
+    #[test]
+    fn capped_settings_are_named_and_warned_once() {
+        let p = classify(&facts(16, 64.0, "x86_64", vec![]));
+        let o = Overrides {
+            inflight: 16,
+            ort_sessions: 12,
+            ..Overrides::default()
+        };
+        assert_eq!(p.tuning_with(DeviceClass::Cpu, o).inflight, MAX_INFLIGHT);
+        let ort = p.tuning_with(
+            DeviceClass::Ort { gpu: true },
+            Overrides { inflight: 0, ..o },
+        );
+        assert_eq!(ort.ort_sessions, MAX_INFLIGHT);
+        assert_eq!(
+            o.capped(),
+            [
+                ("inflight", 16, MAX_INFLIGHT),
+                ("ort_sessions", 12, MAX_INFLIGHT)
+            ]
+        );
+        let fits = Overrides {
+            inflight: MAX_INFLIGHT,
+            ort_sessions: 1,
+            ..Overrides::default()
+        };
+        assert!(fits.capped().is_empty());
+        assert!(Overrides::default().capped().is_empty());
+        assert!(warn_capped("capped-test", "inflight", 16, 8));
+        assert!(!warn_capped("capped-test", "inflight", 16, 8), "once");
+        assert!(warn_capped("capped-test", "inflight", 32, 8), "a new value");
+        assert!(
+            warn_capped("capped-test-2", "inflight", 16, 8),
+            "another model"
+        );
     }
 
     #[test]

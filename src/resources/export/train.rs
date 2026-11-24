@@ -211,8 +211,13 @@ pub fn env_job(paths: &TrainPaths, resource: &'static Resource, platform: Platfo
         platform,
         timeouts: Timeouts::default(),
         system_dir: vc_runtime::system_dir(),
+        task: SETUP_TASK,
     }
 }
+
+/// [`ExportJob::task`] of [`env_job`]: its failures say "then try again" and name the training
+/// environment.
+pub(crate) const SETUP_TASK: &str = "training environment setup";
 
 /// Set up `tools/train-env` for `lane` (uv, Python, packages, Visual C++ runtime) under the export
 /// lock. Reports the export's [`Stage`]s. Returns System32's `msvcp140.dll` version once probed.
@@ -261,30 +266,8 @@ pub(crate) fn prepare_train_env(
             &mut current,
         )
     })();
-    result.map_err(|e| {
-        let cancelled = e.downcast_ref::<Cancelled>().is_some() || cancel.load(Ordering::Relaxed);
-        ExportError {
-            stage: current,
-            message: if cancelled {
-                "cancelled".to_string()
-            } else {
-                format!(
-                    "{:#}",
-                    failure::explain(
-                        e,
-                        &failure::FailureContext {
-                            windows: os == "windows",
-                            system_msvcp140: None,
-                            tools: &job.paths.tools,
-                            python_script: false,
-                            task: "training environment setup",
-                        },
-                    )
-                )
-            },
-            cancelled,
-        }
-    })
+    // The child failures are explained inside `prepare_env`, with `job.task` (QA-084).
+    result.map_err(|e| ExportError::from_run(&e, current, cancel))
 }
 
 /// How long [`TrainLock::try_acquire`] retries a lock that looks held.
@@ -646,6 +629,34 @@ mod train_env_tests {
         let n = fake.runs.load(Ordering::SeqCst);
         prepare_train_env(&job, TrainLane::Cu126, &fake, &fake, &mut |_| {}, &cancel).unwrap();
         assert_eq!(fake.runs.load(Ordering::SeqCst), n);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// QA-084: a full disk while the training environment's packages install is worded for the
+    /// setup ("then try again"), never for an export.
+    #[test]
+    fn a_failed_env_setup_is_not_worded_for_an_export() {
+        let root = tmp("setup-disk");
+        let p = TrainPaths::new(&root, root.join("models"));
+        let fake = Fake {
+            fail_on: Some(" pip install "),
+            fail_lines: vec!["error: failed to write: No space left on device (os error 28)"],
+            ..Fake::new()
+        };
+        let res = catalog::export_model("yolo26n").unwrap();
+        let job = env_job(&p, res, Platform::LINUX_X64);
+        let cancel = AtomicBool::new(false);
+        let e = prepare_train_env(&job, TrainLane::Cu126, &fake, &fake, &mut |_| {}, &cancel)
+            .unwrap_err();
+        assert_eq!(e.stage, Some(Stage::Packages));
+        assert!(!e.cancelled);
+        let first = e.message.split(" [").next().unwrap_or_default();
+        assert!(
+            first.starts_with("the disk holding") && first.ends_with("then try again"),
+            "{}",
+            e.message
+        );
+        assert!(!e.message.contains("export again"), "{}", e.message);
         let _ = std::fs::remove_dir_all(&root);
     }
 

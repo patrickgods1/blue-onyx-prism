@@ -21,10 +21,10 @@
 
   // ---- pure helpers -------------------------------------------------------------------------
 
-  // A class name as typed: trimmed, 1-64 characters, no control characters. null when invalid.
+  // A class name as typed: trimmed, 1-64 characters (code points, as the server counts `chars()`), no control characters. null when invalid.
   function validName(s) {
     var t = String(s == null ? '' : s).trim();
-    if (!t || t.length > NAME_MAX) return null;
+    if (!t || Array.from(t).length > NAME_MAX) return null;
     if (/[\u0000-\u001f\u007f-\u009f]/.test(t)) return null;
     return t;
   }
@@ -33,7 +33,7 @@
   function nameProblem(s) {
     var t = String(s == null ? '' : s).trim();
     if (!t) return 'Type a class name first.';
-    if (t.length > NAME_MAX) return 'A class name has at most ' + NAME_MAX + ' characters.';
+    if (Array.from(t).length > NAME_MAX) return 'A class name has at most ' + NAME_MAX + ' characters.';
     if (validName(t) == null) return 'A class name cannot contain control characters.';
     return '';
   }

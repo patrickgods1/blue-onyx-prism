@@ -194,6 +194,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | crc32fast | 1.5.2 | MIT OR Apache-2.0 | https://github.com/srijs/rust-crc32fast |
 | crossbeam-channel | 0.5.17 | MIT OR Apache-2.0 | https://github.com/crossbeam-rs/crossbeam |
 | crossbeam-utils | 0.8.23 | MIT OR Apache-2.0 | https://github.com/crossbeam-rs/crossbeam |
+| crunchy | 0.2.4 | MIT | https://github.com/eira-fransham/crunchy |
 | crypto-common | 0.2.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
 | ctutils | 0.4.4 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |
 | data-encoding | 2.11.1 | MIT | https://github.com/ia0/data-encoding |
@@ -258,6 +259,7 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | gtk-sys | 0.18.2 | MIT | https://github.com/gtk-rs/gtk3-rs |
 | gtk3-macros | 0.18.2 | MIT | https://github.com/gtk-rs/gtk3-rs |
 | h2 | 0.4.20 | MIT | https://github.com/hyperium/h2 |
+| half | 2.7.1 | MIT OR Apache-2.0 | https://github.com/VoidStarKat/half-rs |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown |
 | heck | 0.4.1 | MIT OR Apache-2.0 | https://github.com/withoutboats/heck |
 | heck | 0.5.0 | MIT OR Apache-2.0 | https://github.com/withoutboats/heck |
@@ -590,6 +592,8 @@ it with `--check` and fails on a difference. Check the licenses themselves with
 | yasna | 0.6.0 | MIT OR Apache-2.0 | https://github.com/qnighy/yasna.rs |
 | yoke | 0.8.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | yoke-derive | 0.8.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
+| zerocopy | 0.8.65 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy |
+| zerocopy-derive | 0.8.65 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy |
 | zerofrom | 0.1.8 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerofrom-derive | 0.1.8 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zeroize | 1.9.1 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils |

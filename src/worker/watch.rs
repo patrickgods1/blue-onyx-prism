@@ -68,12 +68,14 @@ impl StuckWatch {
         self.state.set(ModelState::Failed(msg));
     }
 
-    /// The stuck inference finished after all: serve again.
+    /// The stuck inference finished after all: serve again. Only a stuck mark is undone; a
+    /// model marked broken since keeps its flag and its `Failed` text.
     fn clear(&self, waited: Duration) {
-        self.stuck.store(false, Ordering::Release);
-        if matches!(self.state.get(), ModelState::Failed(m) if m.starts_with(STUCK_PREFIX)) {
-            self.state.set(ModelState::Ready);
+        if !matches!(self.state.get(), ModelState::Failed(m) if m.starts_with(STUCK_PREFIX)) {
+            return;
         }
+        self.stuck.store(false, Ordering::Release);
+        self.state.set(ModelState::Ready);
         info!(
             model = %self.name,
             device = %self.device,
@@ -99,20 +101,23 @@ pub(super) fn collect_watched<T>(
         let watcher = std::thread::Builder::new()
             .name(format!("stuck-{}", watch.name))
             .spawn_scoped(s, || {
-                if rx.recv_timeout(limit) == Err(crossbeam_channel::RecvTimeoutError::Timeout) {
+                let late =
+                    rx.recv_timeout(limit) == Err(crossbeam_channel::RecvTimeoutError::Timeout);
+                if late {
                     // The inference started a request timeout before this wait.
                     watch.mark(started.elapsed() + limit, None);
                 }
+                late
             });
         if let Err(e) = &watcher {
             warn!(model = %watch.name, "could not start the stuck-inference watchdog: {e}");
         }
         let r = collect();
         drop(tx);
-        if let Ok(w) = watcher {
-            let _ = w.join();
-        }
-        if watch.stuck.load(Ordering::Acquire) && r.is_ok() {
+        // Only this watchdog's own mark is undone (QA-118): a model marked broken or dead by
+        // something else stays `Failed` and flagged, for the supervisor to reload.
+        let marked = watcher.ok().and_then(|w| w.join().ok()).unwrap_or(false);
+        if marked && r.is_ok() {
             watch.clear(started.elapsed() + limit);
         }
         r
@@ -259,6 +264,36 @@ mod tests {
         };
         assert!(msg.contains("session thread exited"), "{msg}");
         assert!(!session_dead(&anyhow::anyhow!("x")));
+    }
+
+    // QA-118: a collect that outlasted the limit and then succeeded cleared the stuck flag
+    // even when this watchdog had not set it (a broken model stayed Failed but unflagged, so
+    // the supervisor never reloaded it).
+    #[test]
+    fn a_late_success_does_not_clear_a_mark_it_did_not_make() {
+        let w = watch();
+        w.mark_broken("x");
+        let r = collect_watched(&w, Duration::from_millis(20), || Ok(1));
+        assert_eq!(r.unwrap(), 1);
+        assert!(w.stuck.load(Ordering::Acquire), "the broken mark stays");
+        let ModelState::Failed(msg) = w.state.get() else {
+            panic!("expected Failed");
+        };
+        assert!(msg.starts_with(BROKEN_PREFIX), "{msg}");
+        // Marked broken while overdue: the watchdog's own stuck mark was replaced, so the flag
+        // and the broken text stay (clear undoes a stuck mark only).
+        let w = watch();
+        let r = collect_watched(&w, Duration::from_millis(20), || {
+            let t = Instant::now();
+            while !w.stuck.load(Ordering::Acquire) && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            w.mark_broken("y");
+            Ok(2)
+        });
+        assert_eq!(r.unwrap(), 2);
+        assert!(w.stuck.load(Ordering::Acquire));
+        assert!(matches!(w.state.get(), ModelState::Failed(m) if m.starts_with(BROKEN_PREFIX)));
     }
 
     #[test]

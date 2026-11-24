@@ -183,6 +183,9 @@ async fn spot_route(
             dry_run,
             &|r| r != skip,
         );
+        if !dry_run {
+            super::bulk_routes::wrote(o.done_count);
+        }
         let verb = if accept { "Accepted" } else { "Rejected" };
         let mut message = format!(
             "{verb} {} {} box(es) at that spot on {} unreviewed {} frame(s) (the frames stay \

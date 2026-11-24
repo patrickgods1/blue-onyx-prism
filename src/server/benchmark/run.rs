@@ -5,11 +5,12 @@
 //! (`/v1/benchmark/image`, only files listed in the saved results, through a cached index keyed
 //! by the results file stamp). File I/O runs in `server::blocking`.
 
-use super::{file_stamp, json_error, loaded_devices, truthy};
+use super::{file_stamp, json_error, loaded_devices};
 use crate::benchmark::images;
 use crate::benchmark::service::{RunContext, RunRequest, SEVERAL_GPUS_WARNING, parse_devices};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::DatasetRef;
+use crate::server::form::truthy;
 use crate::server::{AppState, save_config};
 use crate::training::service::RunRecord;
 use crate::training::task::{TaskKind, TaskRecord};
@@ -219,7 +220,14 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
             })),
         )
             .into_response(),
-        Err(e) => json_error(StatusCode::CONFLICT, e.to_string()),
+        // A run in progress is a conflict; a thread that could not start is the server's fault
+        // (QA-047).
+        Err(e @ crate::benchmark::service::StartError::Busy) => {
+            json_error(StatusCode::CONFLICT, e.to_string())
+        }
+        Err(e @ crate::benchmark::service::StartError::Spawn(_)) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
     }
 }
 

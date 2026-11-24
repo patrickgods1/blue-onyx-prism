@@ -1058,7 +1058,7 @@ impl WorkerCtx {
                 WaitStatus::Pending(msg) | WaitStatus::AwaitingRestart(msg) => {
                     if msg != last {
                         debug!(model = %name, "{msg}");
-                        self.state.set_initializing(msg.clone());
+                        self.state.set_waiting_for_download(msg.clone());
                         last = msg;
                     }
                 }

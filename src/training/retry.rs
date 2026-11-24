@@ -119,7 +119,7 @@ pub fn plan_retry(config: &Config, r: &RunRecord, cap: &Capability) -> Result<Tr
     if config
         .models
         .iter()
-        .any(|m| m.effective_name().eq_ignore_ascii_case(&r.name))
+        .any(|m| crate::model::name::same_model_name(&m.effective_name(), &r.name))
     {
         bail!(
             "the config already has a model named {}: remove that model first, or train again \

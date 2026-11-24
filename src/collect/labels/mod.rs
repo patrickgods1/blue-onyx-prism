@@ -1005,8 +1005,8 @@ fn label_ok(l: &str) -> bool {
 /// - a dismissal ([`bulk::is_dismissal`], the size floor's too) cleared unless the box is rejected
 ///   with no reason of a reviewer's; [`spots::PARKED_REASON`] and its mark cleared unless the box is
 ///   accepted;
-/// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `auto_run` kept
-///   (bounded), `overlaps_checked`, `overlap_suggestions` (bounded, [`overlaps::check`]) and
+/// - `orig_bbox` checked and clamped like `bbox`, dropped when equal to it; `model_label` dropped
+///   when blank or equal to the label, else bounded like a label; `auto_run` kept (bounded), `overlaps_checked`, `overlap_suggestions` (bounded, [`overlaps::check`]) and
 ///   `refine` (bounded, [`refine::check`]) kept, `bulk_accepted` and `checked_before_reopen`
 ///   cleared;
 /// - a `review_pick` this build does not know ([`ReviewPick::Other`]) kept, checked like an
@@ -1088,8 +1088,20 @@ pub fn normalize(
         } else if b.state == BoxState::Added {
             b.state = BoxState::Accepted;
         }
-        if b.model_label.as_deref() == Some(b.label.as_str()) {
+        // QA-071: a blank model label is none (the page's `dupGroups` reads "" as none, the
+        // server's `stacks::rank` as one), and one is bounded like the label it once was.
+        if b.model_label
+            .as_deref()
+            .is_some_and(|m| m.trim().is_empty() || m == b.label)
+        {
             b.model_label = None;
+        }
+        if let Some(m) = &b.model_label
+            && (m.chars().count() > MAX_LABEL_LEN || m.chars().any(char::is_control))
+        {
+            bail!(
+                "box {n}: the model label is longer than {MAX_LABEL_LEN} characters or holds control characters"
+            );
         }
         boxes.push(b);
     }
@@ -1648,8 +1660,18 @@ pub fn update(
     path: &Path,
     f: impl FnOnce(Option<LabelFile>) -> Result<Option<LabelFile>>,
 ) -> Result<bool> {
+    update_with_read(path, |current| f(current?))
+}
+
+/// [`update`] that also hands `f` a file that does not read (damaged, or of a newer version) as
+/// the error, for a writer that replaces the whole file anyway (a review save without a revision)
+/// and only takes a few fields of the current one when it reads.
+pub fn update_with_read(
+    path: &Path,
+    f: impl FnOnce(Result<Option<LabelFile>>) -> Result<Option<LabelFile>>,
+) -> Result<bool> {
     let _held = write_lock(path);
-    match f(read(path)?)? {
+    match f(read(path))? {
         Some(new) => write_locked(path, &new).map(|()| true),
         None => Ok(false),
     }
@@ -2776,6 +2798,34 @@ mod tests {
         f.disagreement = None;
         f.status = Status::Skipped;
         assert!(!auto_accept_eligible(&f));
+    }
+
+    /// QA-071: a blank model label is none on save (as the page's `dupGroups` reads it, so
+    /// `stacks::rank` and the page pick the same keeper), and one is bounded like a label.
+    #[test]
+    fn a_blank_or_unbounded_model_label_is_dropped_or_refused_on_save() {
+        let with = |m: &str| LabelFile {
+            boxes: vec![LabelBox {
+                model_label: Some(m.into()),
+                ..tests_support::auto_box("car")
+            }],
+            ..LabelFile::default()
+        };
+        let model_label = |m: &str| {
+            normalize(with(m), &classes(), 640, 480, "t").map(|n| n.boxes[0].model_label.clone())
+        };
+        assert_eq!(model_label("").unwrap(), None);
+        assert_eq!(model_label("  ").unwrap(), None);
+        assert_eq!(model_label("car").unwrap(), None, "equal to the label");
+        assert_eq!(model_label("truck").unwrap(), Some("truck".into()));
+        assert_eq!(
+            model_label(&"t".repeat(MAX_LABEL_LEN)).unwrap(),
+            Some("t".repeat(MAX_LABEL_LEN))
+        );
+        for bad in ["t".repeat(MAX_LABEL_LEN + 1), "tr\nuck".into()] {
+            let e = model_label(&bad).unwrap_err();
+            assert!(e.to_string().contains("model label"), "{e}");
+        }
     }
 
     #[test]

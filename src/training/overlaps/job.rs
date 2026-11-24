@@ -189,10 +189,20 @@ impl OverlapsJob {
             &format!("{} pairs on {} frames", s.pairs, s.frame_count),
         );
         if s.pairs == 0 {
+            // Pairs a full frame has no room for wait for a reviewer (QA-070); say so.
+            let full = if s.no_room > 0 {
+                format!(
+                    "; {} more wait until a reviewer settles some (their frames already hold the \
+                     most suggestions a frame keeps)",
+                    s.no_room
+                )
+            } else {
+                String::new()
+            };
             let summary = format!(
                 "nothing to check: no open overlap without an answer on these frames ({} pairs \
-                 answered before, {} frames skipped or checked by a reviewer); add again=1 to look \
-                 at answered pairs afresh",
+                 answered before, {} frames skipped or checked by a reviewer){full}; add again=1 \
+                 to look at answered pairs afresh",
                 s.answered, s.passed_over
             );
             return Ok(TaskOutcome {

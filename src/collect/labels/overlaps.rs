@@ -582,7 +582,8 @@ impl Applied {
 /// crop did not finish), as is one that stopped being open. A skipped frame and one a reviewer
 /// checked are left alone. A pair already answered stays unless `again`.
 /// When something new is written, stale suggestions go too and the list is sorted strongest first,
-/// at most [`MAX_SUGGESTIONS`].
+/// at most [`MAX_SUGGESTIONS`]; the counts are of the new suggestions that made it into the list,
+/// and a run none of whose new suggestions fit leaves `f` as it was.
 pub fn apply<'z>(
     f: &mut LabelFile,
     wanted: &Wanted<'_>,
@@ -617,7 +618,16 @@ pub fn apply<'z>(
     if fresh.is_empty() {
         return done;
     }
-    for s in &fresh {
+    list.retain(|s| !fresh.iter().any(|n| n.a == s.a && n.b == s.b));
+    list.extend(fresh.iter().cloned());
+    list.sort_by_key(|s| std::cmp::Reverse(strength(s)));
+    list.truncate(MAX_SUGGESTIONS);
+    // QA-070: only what reaches the file counts. When no new suggestion survived the bound (each
+    // one weaker than every kept one), the file stays as it is: rewriting the same list, or one
+    // only short of stale entries, is no answer.
+    let mut kept = 0;
+    for s in list.iter().filter(|s| fresh.contains(s)) {
+        kept += 1;
         match s.verdict {
             Verdict::DropA | Verdict::DropB => {
                 done.drops += 1;
@@ -628,10 +638,12 @@ pub fn apply<'z>(
             Verdict::Unclear | Verdict::Unknown => done.unclear += 1,
         }
     }
-    list.retain(|s| !fresh.iter().any(|n| n.a == s.a && n.b == s.b));
-    list.extend(fresh);
-    list.sort_by_key(|s| std::cmp::Reverse(strength(s)));
-    list.truncate(MAX_SUGGESTIONS);
+    if kept == 0 || list == f.overlap_suggestions {
+        return Applied {
+            no_result: done.no_result,
+            ..Applied::default()
+        };
+    }
     f.overlap_suggestions = list;
     done
 }
@@ -1142,6 +1154,32 @@ mod tests {
         check(&f.overlap_suggestions).unwrap();
         let s: Vec<u32> = f.overlap_suggestions.iter().map(strength).collect();
         assert!(s.windows(2).all(|p| p[0] >= p[1]), "{s:?}");
+        // QA-070: a rerun whose new suggestions all fall off the bound changes nothing and
+        // reports nothing written (the frame is not rewritten).
+        let before = f.clone();
+        let a = write(&mut f, &c, &[]);
+        assert!(!a.changed(), "{a:?}");
+        assert_eq!(f, before);
+    }
+
+    /// QA-070: the counts are of the new suggestions that reached the list, not of all judged.
+    #[test]
+    fn counts_are_of_the_suggestions_that_fit_the_bound() {
+        let c = classes();
+        let boxes: Vec<LabelBox> = (0..13)
+            .map(|i| {
+                let side = 30.0 * 1.4_f32.powi(i);
+                let mut b = at("car", [0.0, 0.0, side, side]);
+                b.auto.labelers.insert(format!("d{i}"), 0.5);
+                b
+            })
+            .collect();
+        let mut f = file(boxes, vec![]);
+        let a = write(&mut f, &c, &[]);
+        assert_eq!(
+            a.drops + a.two_objects + a.unclear,
+            f.overlap_suggestions.len()
+        );
     }
 
     #[test]

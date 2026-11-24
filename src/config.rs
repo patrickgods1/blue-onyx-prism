@@ -1836,11 +1836,32 @@ pub fn validate_filter_rules(prefix: &str, f: &FilterFields<'_>) -> Result<()> {
         if r.iou <= 0.0 {
             bail!("{field}.iou: must be above 0 (0 would match boxes that do not touch), got 0");
         }
+        // QA-044: accepted (a file that loaded before must still load) but skipped by
+        // `filters::apply`; said once per field and label, not on every save or disk check.
+        if r.is_self_overlap() && first_self_overlap(&format!("{field}:{}", r.drop)) {
+            tracing::warn!(
+                "{field}: `drop` and `if_overlaps` both name \"{}\", so the rule has no effect \
+                 (it would remove both of two overlapping \"{}\" boxes); name another label in \
+                 `if_overlaps`, such as \"potted plant\", or remove the rule",
+                r.drop,
+                r.drop
+            );
+        }
     }
     if let Some(s) = f.static_suppression {
         s.validate(&format!("{prefix}static_suppression"))?;
     }
     Ok(())
+}
+
+/// True the first time this process sees `key` (a `suppress_overlaps[i]:<label>` of a
+/// same-label overlap rule), so its warning is logged once, not on every validation. The keys
+/// come from the config file, never from a client, so the set stays small.
+fn first_self_overlap(key: &str) -> bool {
+    use crate::sync::LockExt as _;
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    SEEN.lock_recover().insert(key.to_string())
 }
 
 /// The models list on its own: at least one entry, and [`validate_model_entries`].
@@ -4636,6 +4657,14 @@ mod tests {
             e.contains("suppress_overlaps[0].iou: must be above 0"),
             "{e}"
         );
+        // QA-044: a same-label rule still loads (it is skipped and warned about once).
+        c.suppress_overlaps = vec![OverlapRule {
+            if_overlaps: "Person".into(),
+            ..rule("person", 0.5)
+        }];
+        c.validate().unwrap();
+        assert!(first_self_overlap("test-only:suppress_overlaps[0]:x"));
+        assert!(!first_self_overlap("test-only:suppress_overlaps[0]:x"));
         let e = night(|c| c.static_suppression.hits = 0).unwrap_err();
         assert!(e.contains("static_suppression.hits"), "{e}");
         // Per model: the error names the model.

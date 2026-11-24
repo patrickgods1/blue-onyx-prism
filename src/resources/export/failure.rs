@@ -27,21 +27,57 @@ pub(crate) struct FailureContext<'a> {
 impl FailureContext<'_> {
     /// The verb of "then <verb> again".
     fn verb(&self) -> &'static str {
-        match self.task {
-            "training" => "train",
-            "auto-label" => "auto-label",
-            "import" => "import",
-            "export" => "export",
-            _ => "try",
-        }
+        again(self.task)
     }
+}
+
+/// The verb of "then <verb> again" for `task` ([`FailureContext::task`]): "export", "train",
+/// "auto-label", "import", else "try" (the training environment setup).
+pub(crate) fn again(task: &str) -> &'static str {
+    match task {
+        "training" => "train",
+        "auto-label" => "auto-label",
+        "import" => "import",
+        "export" => "export",
+        _ => "try",
+    }
+}
+
+/// Which Python environment `task` runs in: "export" for the export, else "training" (training,
+/// auto-label, import and the training environment setup use `tools/train-env`).
+pub(crate) fn env_of(task: &str) -> &'static str {
+    if task == "export" {
+        "export"
+    } else {
+        "training"
+    }
+}
+
+/// The next action for an incomplete environment of `task`: the button that deletes it (the
+/// export's toolchain on the Config page, the training environment on the Train area's Train
+/// tab), then the task again (QA-084: a training setup was told to export again).
+pub(crate) fn remove_env(task: &str) -> String {
+    if task == "export" {
+        remove_toolchain(task)
+    } else {
+        format!(
+            "click \"Remove training environment\" on the Train area's Train tab and {} again",
+            again(task)
+        )
+    }
+}
+
+/// The next action for a broken shared toolchain part (uv, the base Python, the private Visual
+/// C++ runtime: what "Remove export toolchain" deletes), then `task` again.
+pub(crate) fn remove_toolchain(task: &str) -> String {
+    format!(
+        "click \"Remove export toolchain\" on the Config page and {} again",
+        again(task)
+    )
 }
 
 /// Prefix of the export script's own log lines.
 const OWN_PREFIX: &str = "[export_model]";
-
-const REMOVE_TOOLCHAIN: &str =
-    "click \"Remove export toolchain\" on the Config page and export again";
 
 /// The first line containing any of `needles` (ASCII case-insensitive).
 fn find<'a>(lines: &'a [String], needles: &[&str]) -> Option<&'a str> {
@@ -170,11 +206,13 @@ pub(crate) fn classify(lines: &[String], ctx: &FailureContext<'_>) -> Option<Str
             return Some(format!(
                 "Python could not load PyTorch's native libraries{lib} ({}): the Microsoft Visual \
                  C++ runtime on this machine is too old or broken for PyTorch ({found}, needs {} \
-                 or newer). Blue Onyx Prism installs a private copy for the export; if this still \
+                 or newer). Blue Onyx Prism installs a private copy for the {}; if this still \
                  fails, install the current runtime system-wide as administrator from \
-                 {VC_REDIST_URL} and export again",
+                 {VC_REDIST_URL} and {} again",
                 quote(l),
-                torch_min()
+                torch_min(),
+                ctx.task,
+                ctx.verb()
             ));
         }
     }
@@ -184,11 +222,12 @@ pub(crate) fn classify(lines: &[String], ctx: &FailureContext<'_>) -> Option<Str
             .or_else(|| error_loading(l).map(|d| d.to_string()))
             .unwrap_or_else(|| "a Python module".to_string());
         return Some(format!(
-            "a library needed by {what} could not be loaded ({}): the export environment is \
-             incomplete or a system library is missing; {REMOVE_TOOLCHAIN}. If it still fails, \
-             install the current Microsoft Visual C++ runtime as administrator from \
-             {VC_REDIST_URL}",
-            quote(l)
+            "a library needed by {what} could not be loaded ({}): the {} environment is \
+             incomplete or a system library is missing; {}. If it still fails, install the \
+             current Microsoft Visual C++ runtime as administrator from {VC_REDIST_URL}",
+            quote(l),
+            env_of(ctx.task),
+            remove_env(ctx.task)
         ));
     }
     if let Some(l) = find(lines, &["ModuleNotFoundError", "ImportError"]) {
@@ -196,17 +235,21 @@ pub(crate) fn classify(lines: &[String], ctx: &FailureContext<'_>) -> Option<Str
             .map(|m| format!(" (module {m})"))
             .unwrap_or_default();
         return Some(format!(
-            "the export environment is incomplete{module} ({}); {REMOVE_TOOLCHAIN} (the pinned \
-             packages are installed again)",
-            quote(l)
+            "the {} environment is incomplete{module} ({}); {} (the pinned packages are \
+             installed again)",
+            env_of(ctx.task),
+            quote(l),
+            remove_env(ctx.task)
         ));
     }
     if ctx.python_script {
         if let Some(l) = find(lines, &["Fatal Python error", "Windows fatal exception"]) {
             return Some(format!(
                 "Python crashed in native code ({}); the log above has its faulthandler stack. \
-                 Export again; if it keeps crashing, {REMOVE_TOOLCHAIN}",
-                quote(l)
+                 {} again; if it keeps crashing, {}",
+                quote(l),
+                capitalized(ctx.verb()),
+                remove_env(ctx.task)
             ));
         }
         let own_only = lines.iter().all(|l| l.trim_start().starts_with(OWN_PREFIX));
@@ -217,12 +260,22 @@ pub(crate) fn classify(lines: &[String], ctx: &FailureContext<'_>) -> Option<Str
                 .unwrap_or_default();
             return Some(format!(
                 "Python exited without an error message{after} (likely a native crash in a \
-                 library); the log above has a faulthandler stack if any. Export again; if it \
-                 keeps failing, {REMOVE_TOOLCHAIN}"
+                 library); the log above has a faulthandler stack if any. {} again; if it keeps \
+                 failing, {}",
+                capitalized(ctx.verb()),
+                remove_env(ctx.task)
             ));
         }
     }
     None
+}
+
+/// `verb` with its first letter in upper case ("Export again").
+fn capitalized(verb: &str) -> String {
+    let mut c = verb.chars();
+    c.next().map_or_else(String::new, |f| {
+        f.to_uppercase().chain(c).collect::<String>()
+    })
 }
 
 /// `e` with the classified cause in front when it is a [`ChildFailed`] that [`classify`]

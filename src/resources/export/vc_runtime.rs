@@ -282,26 +282,35 @@ pub fn pyvenv_home(text: &str) -> Option<PathBuf> {
 /// The directory of the environment's base `python.exe` (from its `pyvenv.cfg`), which must be
 /// inside our own `tools/python` (uv's install; checked on the resolved paths, links followed): the
 /// only place DLLs are ever copied to. Returned as written in `pyvenv.cfg`.
-pub fn base_python_dir(paths: &Paths) -> Result<PathBuf> {
+/// `task` ([`ExportJob::task`]) words the next action.
+pub fn base_python_dir(paths: &Paths, task: &str) -> Result<PathBuf> {
     let cfg = paths.env.join("pyvenv.cfg");
-    let incomplete = "the export environment is incomplete: click \"Remove export toolchain\" \
-                      on the Config page and export again";
+    let env = failure::env_of(task);
+    let incomplete = format!(
+        "the {env} environment is incomplete: {}",
+        failure::remove_env(task)
+    );
     let text = std::fs::read_to_string(&cfg)
         .with_context(|| format!("reading {} ({incomplete})", cfg.display()))?;
     let home = pyvenv_home(&text)
         .ok_or_else(|| anyhow!("{} has no `home` line; {incomplete}", cfg.display()))?;
+    // The base Python is the shared toolchain's (`tools/python`).
+    let broken = format!(
+        "the shared Python is damaged: {}",
+        failure::remove_toolchain(task)
+    );
     let (Ok(real_home), Ok(real_installs)) = (
         std::fs::canonicalize(&home),
         std::fs::canonicalize(&paths.python_installs),
     ) else {
         bail!(
-            "the export environment's base Python {} does not exist; {incomplete}",
+            "the {env} environment's base Python {} does not exist; {broken}",
             home.display()
         );
     };
     if !real_home.starts_with(&real_installs) {
         bail!(
-            "the export environment's base Python {} is not in {}; {incomplete}",
+            "the {env} environment's base Python {} is not in {}; {broken}",
             home.display(),
             paths.python_installs.display()
         );
@@ -311,19 +320,26 @@ pub fn base_python_dir(paths: &Paths) -> Result<PathBuf> {
 
 /// Copy `names` from `src` (the verified `tool:vc-runtime` install) into `dst`, each through a
 /// temporary file and a rename. Every source must carry the pinned version. Returns
-/// "msvcp140.dll (was 14.26.28720.3)" / "(was missing)" lines.
-pub fn place(src: &Path, dst: &Path, names: &[&str], found: &[Found]) -> Result<Vec<String>> {
+/// "msvcp140.dll (was 14.26.28720.3)" / "(was missing)" lines. `task` ([`ExportJob::task`])
+/// words the next action.
+pub fn place(
+    src: &Path,
+    dst: &Path,
+    names: &[&str],
+    found: &[Found],
+    task: &str,
+) -> Result<Vec<String>> {
     let mut placed = Vec::new();
     for name in names {
         let from = src.join(name);
         match file_version(&from) {
             Some(v) if v == FileVersion::PIN => {}
             other => bail!(
-                "{} is version {}, not the pinned {}; click \"Remove export toolchain\" on the \
-                 Config page and export again",
+                "{} is version {}, not the pinned {}; {}",
                 from.display(),
                 other.map_or_else(|| "unknown".to_string(), |v| v.to_string()),
-                FileVersion::PIN
+                FileVersion::PIN,
+                failure::remove_toolchain(task)
             ),
         }
         let to = dst.join(name);
@@ -335,9 +351,10 @@ pub fn place(src: &Path, dst: &Path, names: &[&str], found: &[Found]) -> Result<
             let _ = std::fs::remove_file(&tmp);
             return Err(e).with_context(|| {
                 format!(
-                    "replacing {} (is another Python of the export still running? stop it, then \
-                     export again)",
-                    to.display()
+                    "replacing {} (is another Python of an export or a training still running? \
+                     stop it, then {} again)",
+                    to.display(),
+                    failure::again(task)
                 )
             });
         }
@@ -366,6 +383,7 @@ pub(super) fn ensure(
     cancel: &AtomicBool,
 ) -> Result<Vec<Found>> {
     let p = &job.paths;
+    let again = failure::again(job.task);
     let (os, arch) = (job.platform.os, job.platform.arch);
     let stage = |report: &mut dyn FnMut(Progress<'_>), pct: u8, detail: &str| {
         report(Progress::Stage {
@@ -381,7 +399,7 @@ pub(super) fn ensure(
             line: l,
         });
     };
-    let python = base_python_dir(p)?;
+    let python = base_python_dir(p, job.task)?;
     let found = probe(job.system_dir.as_deref(), &python);
     let plan = decide(&found, FileVersion::PIN, forced());
     let system = system_runtime(&found);
@@ -435,15 +453,15 @@ pub(super) fn ensure(
             bail!(
                 "downloading the private Visual C++ runtime ({}) failed: {e:#}. This machine's \
                  Visual C++ runtime is too old for PyTorch ({system}; PyTorch needs {} or \
-                 newer). Check the network and proxy settings and export again, or install the \
-                 current runtime system-wide as administrator from {VC_REDIST_URL} and export \
-                 again",
+                 newer). Check the network and proxy settings and {again} again, or install \
+                 the current runtime system-wide as administrator from {VC_REDIST_URL} and \
+                 {again} again",
                 res.id,
                 torch_min()
             );
         }
     }
-    let placed = place(&p.vc_runtime, &python, &plan.place, &found)?;
+    let placed = place(&p.vc_runtime, &python, &plan.place, &found, job.task)?;
     line(
         report,
         &format!(
@@ -459,7 +477,7 @@ pub(super) fn ensure(
         bail!(
             "the private Visual C++ runtime was copied into {} but is still not effective ({}); \
              install the current runtime system-wide as administrator from {VC_REDIST_URL} and \
-             export again",
+             {again} again",
             python.display(),
             still.reasons.join("; ")
         );
@@ -724,7 +742,19 @@ mod tests {
     fn base_python_dir_must_be_ours_and_place_copies() {
         let root = std::env::temp_dir().join(format!("bop-vcrt-{}", uuid::Uuid::new_v4()));
         let paths = Paths::new(&root, root.join("models"));
-        assert!(base_python_dir(&paths).is_err(), "no pyvenv.cfg");
+        assert!(base_python_dir(&paths, "export").is_err(), "no pyvenv.cfg");
+        // QA-084: a training environment setup is told about the training environment.
+        let e = format!(
+            "{:#}",
+            base_python_dir(&paths, "training environment setup").unwrap_err()
+        );
+        assert!(
+            e.contains("the training environment is incomplete")
+                && e.contains("Remove training environment")
+                && e.contains("and try again)")
+                && !e.contains("export again"),
+            "{e}"
+        );
         let base = paths.python_installs.join("cpython-3.11.16-x");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::create_dir_all(&paths.env).unwrap();
@@ -735,7 +765,7 @@ mod tests {
             format!("home = {}\n", outside.display()),
         )
         .unwrap();
-        let e = base_python_dir(&paths).unwrap_err();
+        let e = base_python_dir(&paths, "export").unwrap_err();
         assert!(
             format!("{e:#}").contains("Remove export toolchain"),
             "{e:#}"
@@ -745,7 +775,7 @@ mod tests {
             format!("home = {}\n", base.display()),
         )
         .unwrap();
-        let dir = base_python_dir(&paths).unwrap();
+        let dir = base_python_dir(&paths, "export").unwrap();
         assert_eq!(dir, base);
 
         // place: only pinned-version sources, through a temp file, reporting what was there.
@@ -758,13 +788,13 @@ mod tests {
         std::fs::write(paths.vc_runtime.join("vcomp140.dll"), synthetic_dll(OLD)).unwrap();
         std::fs::write(dir.join("msvcp140.dll"), synthetic_dll(OLD)).unwrap();
         let found = probe(None, &dir);
-        let placed = place(&paths.vc_runtime, &dir, &["msvcp140.dll"], &found).unwrap();
+        let placed = place(&paths.vc_runtime, &dir, &["msvcp140.dll"], &found, "export").unwrap();
         assert_eq!(placed, ["msvcp140.dll (was 14.26.28720.3)"]);
         assert_eq!(
             file_version(&dir.join("msvcp140.dll")),
             Some(FileVersion::PIN)
         );
-        let e = place(&paths.vc_runtime, &dir, &["vcomp140.dll"], &found).unwrap_err();
+        let e = place(&paths.vc_runtime, &dir, &["vcomp140.dll"], &found, "export").unwrap_err();
         assert!(format!("{e:#}").contains("not the pinned"), "{e:#}");
         assert!(!dir.join("vcomp140.dll").exists());
         let leftovers: Vec<_> = std::fs::read_dir(&dir)

@@ -60,8 +60,9 @@ ENV MALLOC_ARENA_MAX=2 \
 # 32168: plain HTTP (Blue Iris, detection API); 32169: HTTPS (web UI, self-signed certificate in
 # the data volume, `tls-fingerprint` prints its fingerprint).
 EXPOSE 32168 32169
-# GET /v1/status answers 200 when a model is ready (or degraded) and 503 while models download or
-# compile or when none loaded, so `docker ps` shows "starting" until the service can detect. The
+# GET /v1/status answers 200 while a model can serve (ready, or degraded: another one failed or is
+# still loading) and 503 while no model can serve yet (downloading or compiling) or none loaded, so
+# `docker ps` shows "starting" until the service can detect. The
 # start period covers the first model download + compile (--start-period only suppresses
 # failures; a healthy answer ends it early). curl is installed above.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \

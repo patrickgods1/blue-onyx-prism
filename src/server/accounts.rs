@@ -21,14 +21,19 @@
 //!   generation and ends every session of the account, this one included.
 //!
 //! Every change is logged with who made it and from where; never a password, hash, session or
-//! device id. Everything is written to the data root the process started with
-//! ([`crate::accounts::Auth::data_root`]).
+//! device id. A refusal that costs no hashing (the API token, the address limit, the account's
+//! wait or disabled state, every hashing slot busy) logs at most one line a minute per kind
+//! ([`WARN_EVERY`], with the `dropped` count), as a sign-in's do: a client that keeps posting
+//! could log thousands a second. A checked wrong password logs one line per attempt (hashing and
+//! the limits pace them), and says when the account now waits or is disabled. Everything is
+//! written to the data root the process started with ([`crate::accounts::Auth::data_root`]).
 
 use super::auth::{self, SignedIn, Via};
 use super::{AppState, blocking, wants_html};
 use crate::accounts::lockout::{self, Decision};
 use crate::accounts::sessions::{ABSOLUTE_SECS, SessionId};
 use crate::accounts::{self, Refused, Snapshot, Store, cookies, password};
+use crate::logthrottle::Throttle;
 use axum::Json;
 use axum::extract::rejection::{ExtensionRejection, FormRejection};
 use axum::extract::{ConnectInfo, Extension, Form, State};
@@ -37,7 +42,21 @@ use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tracing::{error, info, warn};
+
+/// At most one line per this per kind of refusal that costs no hashing (see the module doc).
+const WARN_EVERY: Duration = Duration::from_secs(60);
+/// "an account change with the API token was refused".
+static TOKEN_WARNS: Throttle = Throttle::new(WARN_EVERY);
+/// "current password not checked: too many wrong attempts from this address".
+static ADDRESS_WARNS: Throttle = Throttle::new(WARN_EVERY);
+/// "current password not checked: the account waits after failures in a row".
+static WAIT_WARNS: Throttle = Throttle::new(WARN_EVERY);
+/// "current password not checked: the account is disabled ...".
+static DISABLED_WARNS: Throttle = Throttle::new(WARN_EVERY);
+/// "current password not checked: every password-hashing slot stayed busy".
+static BUSY_WARNS: Throttle = Throttle::new(WARN_EVERY);
 
 /// What a wrong current password (or a disabled account) reads.
 const WRONG_CURRENT: &str = "Wrong password: type the password you sign in with as your current \
@@ -210,7 +229,9 @@ impl Ctx {
             html,
         };
         if ctx.signed.via == Via::Token {
-            warn!(peer = %ctx.who(), "an account change with the API token was refused");
+            if let Some(dropped) = TOKEN_WARNS.allow_now() {
+                warn!(peer = %ctx.who(), dropped, "an account change with the API token was refused");
+            }
             return Err(Box::new(super::guard::forbidden(
                 &ctx.headers,
                 TOKEN_REFUSED.to_string(),
@@ -405,7 +426,9 @@ async fn reauth<T: Send + 'static>(
     let reserved = match auth::reserve(state, ctx.peer) {
         Ok(r) => r,
         Err(wait) => {
-            warn!(peer = %who, user = %me, wait, "current password not checked: too many wrong attempts from this address");
+            if let Some(dropped) = ADDRESS_WARNS.allow_now() {
+                warn!(peer = %who, user = %me, wait, dropped, "current password not checked: too many wrong attempts from this address");
+            }
             return Err(Denied::Wait(wait));
         }
     };
@@ -430,11 +453,15 @@ async fn reauth<T: Send + 'static>(
     let slot = match slot {
         Ok(slot) => slot,
         Err(Decision::Wait(secs)) => {
-            warn!(peer = %who, user = %me, wait = secs, "current password not checked: the account waits after failures in a row");
+            if let Some(dropped) = WAIT_WARNS.allow_now() {
+                warn!(peer = %who, user = %me, wait = secs, dropped, "current password not checked: the account waits after failures in a row");
+            }
             return Err(Denied::Wait(secs));
         }
         Err(_) => {
-            warn!(peer = %who, user = %me, "current password not checked: the account is disabled after too many wrong passwords");
+            if let Some(dropped) = DISABLED_WARNS.allow_now() {
+                warn!(peer = %who, user = %me, dropped, "current password not checked: the account is disabled after too many wrong passwords; `blue-onyx-prism user unlock <name>` on the server enables it");
+            }
             return Err(Denied::Wrong);
         }
     };
@@ -449,7 +476,9 @@ async fn reauth<T: Send + 'static>(
         let Some(permit) = st.login.hashing.acquire(st.login.hash_wait) else {
             auth::refund(&st, reserved);
             drop(slot);
-            warn!(peer = %who, user = %user.name, "current password not checked: every password-hashing slot stayed busy; answered 503");
+            if let Some(dropped) = BUSY_WARNS.allow_now() {
+                warn!(peer = %who, user = %user.name, dropped, "current password not checked: every password-hashing slot stayed busy; answered 503");
+            }
             return Err(Denied::Busy);
         };
         st.login.hashed.fetch_add(1, Ordering::Relaxed);
@@ -477,11 +506,9 @@ async fn reauth<T: Send + 'static>(
             st.auth.devices.record_failure(d, &user.name, user.created, now);
         }
         match store.record_failure(&user.name, now) {
-            Ok(Some(s)) if s.disabled => {
-                warn!(peer = %who, user = %user.name, failures = s.failures, "wrong current password for an account change; the account is now disabled until `blue-onyx-prism user unlock <name>` on the server")
-            }
-            Ok(_) => {
-                warn!(peer = %who, user = %user.name, "wrong current password for an account change")
+            Ok(s) => {
+                let failures = s.map_or(0, |s| s.failures);
+                warn!(peer = %who, user = %user.name, failures, "wrong current password for an account change{}", after_wrong(s.as_ref()))
             }
             Err(e) => {
                 warn!(peer = %who, user = %user.name, "wrong current password for an account change; the failure could not be saved: {e:#}")
@@ -492,6 +519,22 @@ async fn reauth<T: Send + 'static>(
         Err(Denied::Wrong)
     })
     .await
+}
+
+/// What the log line of a wrong current password adds about the account once that failure is
+/// counted (`state`, None when the account is gone): disabled, or now waiting before each
+/// attempt (extra [14]: an operator who sees it knows `user unlock` is the way out), else nothing.
+fn after_wrong(state: Option<&lockout::State>) -> &'static str {
+    match state {
+        Some(s) if s.disabled => {
+            "; the account is now disabled until `blue-onyx-prism user unlock <name>` on the server"
+        }
+        Some(s) if s.failures >= lockout::DELAY_AFTER => {
+            "; the account now waits before each attempt (`blue-onyx-prism user unlock <name>` on \
+             the server clears it)"
+        }
+        _ => "",
+    }
 }
 
 /// The accounts as last read, when they can be used.

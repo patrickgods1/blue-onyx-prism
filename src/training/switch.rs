@@ -12,6 +12,7 @@
 use crate::benchmark::report::ModelResult;
 use crate::config::{Config, ModelConfig, PreviousDefault, ThresholdSource};
 use crate::config_merge::field_label;
+use crate::model::name::same_model_name as same_name;
 use crate::registry::normalize_name;
 use crate::training::autolabel::catalog::same_class;
 use anyhow::{Result, anyhow, bail};
@@ -72,10 +73,6 @@ fn entry_mut<'a>(models: &'a mut [ModelConfig], name: &str) -> Option<&'a mut Mo
     models
         .iter_mut()
         .find(|m| normalize_name(&m.effective_name()) == key)
-}
-
-fn same_name(a: &str, b: &str) -> bool {
-    normalize_name(a) == normalize_name(b)
 }
 
 /// The model serving `/v1/vision/detection` now (the name of the entry), if any.

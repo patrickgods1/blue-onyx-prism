@@ -29,6 +29,7 @@ mod js_sort;
 mod js_time;
 mod js_train_metrics;
 mod js_viewport;
+mod js_web_low;
 mod live_config;
 mod multi_model_http;
 mod postprocess;

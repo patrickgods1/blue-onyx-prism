@@ -321,21 +321,10 @@ fn task_name(tag: &str) -> &'static str {
 
 /// The likely cause of a failed helper script when it ran out of GPU memory (not when the host
 /// ran out too: on Windows a CUDA allocation also fails when the system commit is exhausted;
-/// [`super::job::host_out_of_memory_line`], left to the generic memory message). `sam3`: a run with
-/// SAM 3, which `--gdino` is refused on.
+/// left to the generic memory message). The rule training uses, [`super::oom::out_of_memory_line`].
+/// `sam3`: a run with SAM 3, which `--gdino` is refused on.
 fn gpu_failure(lines: &[String], tag: &str, sam3: bool) -> Option<String> {
-    if super::job::host_out_of_memory_line(lines).is_some() {
-        return None;
-    }
-    let l = lines.iter().rev().find(|l| {
-        [
-            "CUDA out of memory",
-            "MPS backend out of memory",
-            "torch.OutOfMemoryError",
-        ]
-        .iter()
-        .any(|p| l.contains(p))
-    })?;
+    let l = super::oom::out_of_memory_line(lines)?;
     let fix = if tag == "overlaps" {
         "close other programs that use the GPU (the check needs about 500 MB of it) and run it \
          again; it keeps the finished pairs"
@@ -372,6 +361,19 @@ mod tests {
             )
             .unwrap()
             .contains("--gdino tiny")
+        );
+        // QA-102: cuBLAS's allocation failure is a GPU out of memory here as in training.
+        assert!(
+            gpu_failure(
+                &[
+                    "RuntimeError: CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling \
+                   `cublasCreate(handle)`"
+                        .into()
+                ],
+                "autolabel",
+                false
+            )
+            .is_some_and(|m| m.contains("--gdino tiny"))
         );
         // A SAM 3 run refuses --gdino, so the hint must not offer it.
         let sam3 = gpu_failure(&["CUDA out of memory".into()], "autolabel", true).unwrap();

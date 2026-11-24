@@ -430,12 +430,13 @@ impl ImportJob {
         Ok(ex)
     }
 
-    /// Queue the written frames `rels` (of `frames`) for review and list the import in
-    /// `imports.jsonl`; returns the frames per scene and the cameras.
+    /// Queue the written frames `rels` for review and list the import in `imports.jsonl`;
+    /// returns the frames per scene and the cameras ([`written_tally`] of `frames` at `written`,
+    /// the indices [`write::Step::Written`] reported).
     fn record_written(
         &self,
-        zone: crate::clock::Zone,
         frames: &[write::Frame],
+        written: &[usize],
         rels: &[String],
         license: &str,
         kind: &str,
@@ -443,19 +444,7 @@ impl ImportJob {
     ) -> Result<(BTreeMap<String, usize>, Vec<String>)> {
         crate::collect::layout::append_review(&self.dataset_dir, rels)
             .context("queueing the imported frames for review")?;
-        let mut scenes: BTreeMap<String, usize> = BTreeMap::new();
-        let mut cameras: Vec<String> = Vec::new();
-        for f in frames.iter().filter(|f| {
-            rels.iter()
-                .any(|r| r.contains(&write::stamp(zone, f.time)) && r.contains(&f.camera))
-        }) {
-            *scenes
-                .entry(f.stats.scene().as_str().to_string())
-                .or_default() += 1;
-            if !cameras.contains(&f.camera) {
-                cameras.push(f.camera.clone());
-            }
-        }
+        let (scenes, cameras) = written_tally(frames, written);
         write::append_import(
             &self.dataset_dir,
             &ImportLine {
@@ -947,13 +936,7 @@ impl ImportJob {
             if !file.starts_with(&dl) || !file.is_file() {
                 bail!("yt-dlp wrote no video into {}", dl.display());
             }
-            let host = u
-                .split("://")
-                .nth(1)
-                .and_then(|x| x.split(['/', '?', '#', ':']).next())
-                .unwrap_or("web")
-                .trim_start_matches("www.")
-                .to_string();
+            let host = source::site_of(u);
             let camera = source::camera_of(&file, r.camera.as_deref().or(Some(&host)));
             let mut site = ev.clone();
             if let Some(o) = site.as_object_mut() {
@@ -1472,6 +1455,8 @@ impl ImportJob {
         let n_write = frames.len();
         self.step(report, 7, 60, &format!("writing {n_write} frames"));
         let full_dir = self.work.join("full");
+        // The frames written (`Step::Written`), in order: what imports.jsonl counts (QA-108).
+        let mut written_at: Vec<usize> = Vec::new();
         let written = write::write_frames_with(
             &self.dataset_dir,
             zone,
@@ -1493,6 +1478,7 @@ impl ImportJob {
                     check(cancel)
                 }
                 write::Step::Written(k) => {
+                    written_at.push(k);
                     if let Some(f) = frames.get(k)
                         && !r.keep_work
                         && f.file.starts_with(&full_dir)
@@ -1514,8 +1500,8 @@ impl ImportJob {
             Err(p) => {
                 if !p.rels.is_empty() {
                     let queued = self.record_written(
-                        zone,
                         &frames,
+                        &written_at,
                         &p.rels,
                         &license,
                         kind,
@@ -1543,7 +1529,7 @@ impl ImportJob {
             ));
         }
         let (scenes, cameras) =
-            self.record_written(zone, &frames, &rels, &license, kind, attribution)?;
+            self.record_written(&frames, &written_at, &rels, &license, kind, attribution)?;
         crate::collect::global().rescan_if_running(&self.dataset_dir);
         // The work folder goes in `run_guarded`, with the hold on it.
         self.step(report, 7, 100, &format!("{} frames", rels.len()));
@@ -1753,6 +1739,26 @@ impl Task for ImportJob {
         }
         Ok(out)
     }
+}
+
+/// The frames per scene and the cameras (in first-written order) of the frames of `frames` at
+/// the indices `written`. Exact (QA-108): never matched by the text of the written paths, where a
+/// skipped `cam1` frame looked written beside a `cam10` frame of the same time.
+fn written_tally(
+    frames: &[write::Frame],
+    written: &[usize],
+) -> (BTreeMap<String, usize>, Vec<String>) {
+    let mut scenes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut cameras: Vec<String> = Vec::new();
+    for f in written.iter().filter_map(|&k| frames.get(k)) {
+        *scenes
+            .entry(f.stats.scene().as_str().to_string())
+            .or_default() += 1;
+        if !cameras.contains(&f.camera) {
+            cameras.push(f.camera.clone());
+        }
+    }
+    (scenes, cameras)
 }
 
 #[cfg(test)]

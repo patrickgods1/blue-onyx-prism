@@ -355,6 +355,10 @@ fn live_settings_reach_a_replacement_still_loading() {
 fn no_memory_beside_the_old_worker_retires_it_and_tries_again() {
     let f = Fixture::start(&["a"], |_| {});
     let old = f.ready("a");
+    // The stats are the model's (shared by both workers); the old worker's show until the take
+    // over, then the replacement's load from scratch (QA-119).
+    old.metrics.begin_load("the device before");
+    old.metrics.set_loaded("openvino:gpu", "OpenVINO GPU");
     let weak = Arc::downgrade(&old);
     drop(old);
     let before = f.loads.tried().len();
@@ -369,6 +373,12 @@ fn no_memory_beside_the_old_worker_retires_it_and_tries_again() {
     assert!(weak.upgrade().is_none(), "the old worker was not retired");
     let w = f.handle("a");
     assert_eq!(w.state.get(), ModelState::Initializing);
+    assert_ne!(w.metrics.requested_device(), "the device before");
+    assert_eq!(
+        w.metrics.execution_provider(),
+        "",
+        "no provider while it loads"
+    );
     assert!(!f.reg.is_replacing("a"));
     assert_eq!(f.reg.reloads("a"), 1);
 
@@ -377,6 +387,76 @@ fn no_memory_beside_the_old_worker_retires_it_and_tries_again() {
     assert_eq!(w.loaded_device().as_deref(), Some("openvino:gpu"));
     assert!(w.better().is_none());
     assert!(detect(&w).success);
+    f.stop();
+}
+
+// QA-122: `replace_at_once` was told the model did not serve (the caller looked before a
+// background replacement took over, Ready); it retired the worker it found with no drain, so
+// that worker's queued requests got "shutting down" and the new one waited for it.
+#[test]
+fn a_replace_at_once_drains_a_worker_that_serves_after_all() {
+    let f = Fixture::start(&["a"], |_| {});
+    let old = f.ready("a");
+    // One inference in flight (held), one queued behind it.
+    f.script.push([Step::Hang]);
+    let send = || {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let req = VisionDetectionRequest {
+            image_data: jpeg().into(),
+            image_name: "x.jpg".into(),
+            ..VisionDetectionRequest::default()
+        };
+        old.sender
+            .try_send(WorkItem::Detect(req, tx, Instant::now()))
+            .unwrap();
+        rx
+    };
+    let mut first = send();
+    wait_until("the inference to start", || f.script.submits() == 1);
+    let mut queued = send();
+    let sp = f.reg.spawner.as_ref().unwrap();
+    let m = f.config.models[0].clone();
+    let plan = plan_model(
+        &f.config,
+        &m,
+        &plan::LockedRuntimes(&sp.runtimes),
+        None,
+        sp.best_cpu,
+    );
+    let at = ModelAt {
+        sp,
+        config: &f.config,
+        key: "a",
+    };
+    f.reg
+        .replace_at_once(at, plan, SpawnOptions::default(), false);
+    assert!(!Arc::ptr_eq(&f.handle("a"), &old));
+    // The new worker did not wait for the old one: it loads while the old one still holds its
+    // inference.
+    let new = f.ready("a");
+    f.script
+        .release(Ok(vec![crate::backend::fake::yolo26_output(&[])]));
+    let reply = |rx: &mut tokio::sync::oneshot::Receiver<VisionDetectionResponse>| {
+        let t = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(r) => return r,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    assert!(t.elapsed() < SOON, "no reply");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("the worker dropped the reply: {e}"),
+            }
+        }
+    };
+    let (a, b) = (reply(&mut first), reply(&mut queued));
+    assert!(a.success, "{a:?}");
+    assert!(
+        b.success,
+        "the queued request was answered by the draining worker: {b:?}"
+    );
+    assert!(detect(&new).success);
+    drop(old);
     f.stop();
 }
 

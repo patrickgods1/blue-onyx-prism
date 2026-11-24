@@ -206,6 +206,12 @@ pub(super) fn forget() {
     CACHE.forget();
 }
 
+/// How many times [`forget`] dropped the answers (tests of other modules).
+#[cfg(test)]
+pub(super) fn forgotten() -> u64 {
+    CACHE.generation.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 impl Cache {
     const fn new() -> Self {
         Self {

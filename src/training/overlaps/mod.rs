@@ -58,12 +58,9 @@ pub struct OverlapsRequest {
 impl OverlapsRequest {
     /// A request for the frames of `filter` (`scene=ir,camera=patio,limit=50,again=1`).
     pub fn parse(filter: &str) -> Result<Self> {
-        let mut frames = FrameFilter::parse(filter, "any")?;
+        let mut frames = FrameFilter::parse_with_default(filter, "any", MAX_LIMIT)?;
         frames.query.insert("status".into(), "any".into());
         frames.query.insert("source".into(), "all".into());
-        if !filter.contains("limit=") {
-            frames.limit = MAX_LIMIT;
-        }
         Ok(Self {
             frames,
             gpu: None,
@@ -145,5 +142,23 @@ mod tests {
         assert_eq!(r.frames.query["source"], "all");
         assert!(r.frames.again());
         assert!(OverlapsRequest::parse("scene=dusk").is_err());
+    }
+
+    /// QA-106: a limit written with spaces or capitals is the limit, not the 20,000 default.
+    #[test]
+    fn a_spaced_or_capitalized_limit_is_kept() {
+        for (text, want) in [
+            ("limit = 7", 7),
+            ("LIMIT=7", 7),
+            ("camera=patio, Limit =7", 7),
+            ("", MAX_LIMIT),
+            ("scene=ir", MAX_LIMIT),
+        ] {
+            assert_eq!(
+                OverlapsRequest::parse(text).unwrap().frames.limit,
+                want,
+                "{text}"
+            );
+        }
     }
 }

@@ -5,13 +5,14 @@
 //! config write goes through one `save_config` call; file I/O and search run in
 //! `server::blocking`.
 
-use super::{ApiError, form_field, form_models, json_error, truthy};
+use super::{ApiError, form_field, form_models, json_error};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::Config;
 use crate::config_form::{
     DeviceChange, ProfileChange, ThresholdChange, apply_device_thresholds, apply_model_devices,
     apply_model_thresholds,
 };
+use crate::server::form::truthy;
 use crate::server::{AppState, save_config, schedule_restart};
 use axum::Json;
 use axum::extract::rejection::FormRejection;

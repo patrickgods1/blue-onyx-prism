@@ -21,7 +21,7 @@
 //!   training run keeps of those showing nothing else (0 = off), saved through the one config
 //!   writer like the other settings routes.
 
-use super::refine::{fail, forget_counts, json_body, queue_stamp};
+use super::refine::{fail, json_body, label_files_changed, queue_stamp};
 use super::review::{push_failed, push_past_limit};
 use super::{AppState, blocking, save_config, training};
 use crate::collect::labels::bulk::{LISTED, Wanted};
@@ -172,6 +172,12 @@ static CACHE: Cache = Cache::new();
 /// Drop every kept answer of the process (a label write changed what a walk finds).
 pub(super) fn forget() {
     CACHE.forget();
+}
+
+/// How many times [`forget`] dropped the answers (tests of other modules).
+#[cfg(test)]
+pub(super) fn forgotten() -> u64 {
+    CACHE.generation.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// [`Cache::computed`] of the process.
@@ -632,11 +638,9 @@ pub(super) async fn accept_spot_route(
             }
         };
         if !dry_run {
-            // Label writes tell the Review index and the repeats cache themselves; the tab's own
-            // answers are dropped here.
-            forget_counts();
-            forget();
-            super::refine_coverage::forget();
+            // Label writes tell the Review index and the repeats cache themselves; the Refine
+            // caches are dropped here, all of them (QA-091).
+            label_files_changed();
         }
         let weak = score_text(min);
         let mut message = if dry_run {

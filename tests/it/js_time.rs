@@ -37,6 +37,7 @@ fn prism_time_formats_in_the_zone() {
     let out = Command::new("node")
         .arg(&driver)
         .arg(&time_js)
+        .arg(parity_cases())
         .output()
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -47,6 +48,39 @@ fn prism_time_formats_in_the_zone() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// QA-111: the server's `Zone::display` and the abbreviation map it writes on the page, for
+/// zones whose en-US `Intl` name has no letters (`GMT+1`). The driver must print the same text.
+/// Instants are relative to now (the map covers the next year), a half year apart, so both
+/// daylight saving states are met; no text of the process-wide zone is used.
+fn parity_cases() -> String {
+    use blue_onyx_prism::clock::Zone;
+    let now = chrono::Utc::now();
+    let mut cases = Vec::new();
+    for name in [
+        "Europe/Berlin",
+        "Europe/London",
+        "Asia/Kolkata",
+        "Australia/Sydney",
+        "America/Sao_Paulo",
+        "America/Los_Angeles",
+        "Asia/Dubai",
+        "UTC",
+        "+05:30",
+    ] {
+        let zone: Zone = name.parse().unwrap();
+        for days in [0, 91, 182, 273] {
+            let t = now + chrono::TimeDelta::days(days);
+            cases.push(serde_json::json!({
+                "tz": zone.browser_name(),
+                "abbr": zone.abbreviation_map(now),
+                "ms": t.timestamp_millis(),
+                "expected": zone.display(t),
+            }));
+        }
+    }
+    serde_json::to_string(&cases).unwrap()
 }
 
 const DRIVER: &str = r#"
@@ -68,7 +102,7 @@ assert.strictEqual(T.clock(Date.parse(winter), LA), '14:02:11');
 assert.strictEqual(T.stamp(Date.parse(winter), LA), '20261116-140211');
 // Midnight is 00, never 24.
 assert.strictEqual(T.clock(Date.parse('2026-11-16T08:00:05Z'), LA), '00:00:05');
-assert.strictEqual(T.when('2026-11-16T22:02:11Z', 'Europe/Berlin').slice(0, 16), '2026-11-16 23:02');
+assert.strictEqual(T.when('2026-11-16T22:02:11Z', 'Europe/Berlin'), '2026-11-16 23:02 +01:00'); // no map: the numeric offset
 assert.strictEqual(T.date('2026-11-16T23:30:00Z', 'Europe/Berlin'), '2026-11-17');
 assert.strictEqual(T.when(winter, 'UTC'), '2026-11-16 22:02 UTC');
 assert.strictEqual(T.when(winter, '+05:30'), '2026-11-17 03:32 +05:30');
@@ -99,5 +133,13 @@ assert.strictEqual(T.doneAt(21 * 3600, Date.parse('2026-11-17T07:00:00Z'), 'UTC'
 globalThis.document = { documentElement: { dataset: { tz: LA } } };
 assert.strictEqual(T.zone(), LA);
 assert.strictEqual(T.when(winter), '2026-11-16 14:02 PST');
+// QA-111: with the server's map, the letters the server prints.
+assert.strictEqual(T.when('2026-11-16T22:02:11Z', 'Europe/Berlin', '60:CET,120:CEST'), '2026-11-16 23:02 CET');
+assert.strictEqual(T.when('2026-07-16T22:02:11Z', 'Europe/Berlin', '60:CET,120:CEST'), '2026-07-17 00:02 CEST');
+// Every zone of the Rust side prints the same text (`Zone::display`).
+for (const c of JSON.parse(process.argv[3])) {
+  const got = T.when(c.ms, c.tz, c.abbr);
+  assert.strictEqual(got, c.expected, JSON.stringify(c));
+}
 console.log('ok');
 "#;

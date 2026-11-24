@@ -14,9 +14,23 @@ pub fn normalize_name(name: &str) -> String {
     lower
 }
 
+/// Whether two model names name the same model: equal after [`normalize_name`]. The one rule for
+/// "already in the config / queue" checks, so a check never passes a name registration refuses
+/// (QA-101: `Raccoon` vs `raccoon`, `foo` vs `foo.onnx`).
+pub fn same_model_name(a: &str, b: &str) -> bool {
+    normalize_name(a) == normalize_name(b)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_name;
+    use super::{normalize_name, same_model_name};
+
+    #[test]
+    fn same_model_name_ignores_case_space_and_one_extension() {
+        assert!(same_model_name("Raccoon", "raccoon"));
+        assert!(same_model_name("foo.onnx", " FOO "));
+        assert!(!same_model_name("foo", "foo2"));
+    }
 
     #[test]
     fn lowercases_trims_and_strips_one_model_extension() {

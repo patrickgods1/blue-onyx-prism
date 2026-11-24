@@ -43,6 +43,7 @@ mod deadline;
 mod detect;
 mod devices;
 mod diagnostics;
+mod form;
 #[cfg(test)]
 mod gate_tests;
 mod guard;
@@ -1037,11 +1038,11 @@ pub(super) fn state_view(w: &WorkerHandle) -> (String, &'static str, Option<Stri
         ModelState::Initializing if w.accepts_while_initializing() => {
             ("Lazy".into(), "lazy", Some("loads on first request".into()))
         }
-        ModelState::Initializing => match w.state.detail() {
-            Some(d) if d.starts_with(crate::worker::COMPILING_ON) => {
-                ("Loading".into(), "loading", Some(d))
-            }
-            Some(d) => ("Waiting for download".into(), "wait", Some(d)),
+        // Only a download wait's detail is tagged one; a compile, a hand-over or any other
+        // detail is "Loading" (QA-121).
+        ModelState::Initializing => match w.state.detail_kind() {
+            Some((d, true)) => ("Waiting for download".into(), "wait", Some(d)),
+            Some((d, false)) => ("Loading".into(), "loading", Some(d)),
             None => ("Loading".into(), "loading", None),
         },
     }
@@ -1072,6 +1073,41 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::Request;
+
+    // QA-121: the generation hand-over's placeholder was badged "Waiting for download" (every
+    // detail but a compile's was); only a download wait's detail is that now.
+    #[test]
+    fn state_view_labels_only_download_waits_as_waiting() {
+        let mm = Arc::new(ModelMetrics::new("m", "CPU", ""));
+        let hand_over =
+            WorkerHandle::placeholder("m", "the new generation is taking over", mm.clone());
+        assert_eq!(
+            state_view(&hand_over),
+            (
+                "Loading".into(),
+                "loading",
+                Some("the new generation is taking over".into())
+            )
+        );
+        let w = WorkerHandle::placeholder("m", "x", mm);
+        w.state
+            .set_initializing("compiling on openvino:gpu for 7 min");
+        assert_eq!(state_view(&w).0, "Loading");
+        w.state
+            .set_waiting_for_download("downloading OpenVINO runtime 42% (18/44 MB)");
+        assert_eq!(
+            state_view(&w),
+            (
+                "Waiting for download".into(),
+                "wait",
+                Some("downloading OpenVINO runtime 42% (18/44 MB)".into())
+            )
+        );
+        w.state.set(ModelState::Initializing);
+        assert_eq!(state_view(&w), ("Loading".into(), "loading", None));
+        w.state.set(ModelState::Ready);
+        assert_eq!(state_view(&w).1, "ok");
+    }
 
     /// Sessions belong to the process: the next generation's `AppState` gets the same
     /// [`crate::accounts::Auth`] (as `runner`'s `state_for` hands it over), so a session made

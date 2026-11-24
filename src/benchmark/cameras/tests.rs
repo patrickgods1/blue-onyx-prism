@@ -877,6 +877,69 @@ fn a_rescore_keeps_frames_it_could_not_read() {
     );
 }
 
+/// QA-050: a re-score whose stored predictions do not load fails before it writes anything:
+/// the snapshot and the results stay as they were (a new snapshot beside old results would mark
+/// the set stale on every load, and every retry would repeat it).
+#[test]
+fn a_rescore_with_damaged_preds_writes_nothing() {
+    let t = Tmp::new();
+    let (results_path, preds_path, dir, cfg) = saved_run(&t, &["m"]);
+    labels::update(&labels_path(&dir, "day/front/2026-11-02/b"), |f| {
+        let mut f = f.unwrap();
+        f.boxes
+            .push(lb("person", [40.0, 4.0, 60.0, 40.0], BoxState::Accepted));
+        Ok(Some(f))
+    })
+    .unwrap();
+    std::fs::write(&preds_path, b"{ not json").unwrap();
+    let gt_path = snapshot::path_beside(&results_path);
+    let (gt_before, results_before) = (
+        std::fs::read(&gt_path).unwrap(),
+        std::fs::read(&results_path).unwrap(),
+    );
+    assert!(rescore::rescore(&cfg, &results_path, &preds_path).is_err());
+    assert_eq!(std::fs::read(&gt_path).unwrap(), gt_before);
+    assert_eq!(std::fs::read(&results_path).unwrap(), results_before);
+}
+
+/// QA-051: a run's snapshot save sets a snapshot this build does not read (a newer build's)
+/// aside with its bytes, as `benchmark.json` is, instead of writing over it.
+#[test]
+fn a_run_sets_a_newer_snapshot_aside_before_writing_its_own() {
+    let t = Tmp::new();
+    let (results_path, _preds, _dir, cfg) = saved_run(&t, &["m"]);
+    let gt_path = snapshot::path_beside(&results_path);
+    let newer = br#"{"version": 99, "set": "cameras"}"#;
+    std::fs::write(&gt_path, newer).unwrap();
+    let src = Source::of(&cfg);
+    let l = ready(load(&src));
+    let loaded = CamerasLoaded {
+        source: src.clone(),
+        reviewed: l.reviewed.clone(),
+    };
+    let id = write_snapshot(
+        &results_path,
+        std::slice::from_ref(&l.set),
+        Some(&loaded),
+        None,
+    )
+    .unwrap();
+    assert!(id.is_some());
+    let asides: Vec<PathBuf> = std::fs::read_dir(&t.0)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{}.bad-", snapshot::FILE))
+        })
+        .map(|e| e.path())
+        .collect();
+    assert_eq!(asides.len(), 1, "{asides:?}");
+    assert_eq!(std::fs::read(&asides[0]).unwrap(), newer);
+    assert_eq!(GtSnapshot::load(&gt_path).unwrap().unwrap().frames.len(), 3);
+}
+
 /// D1: a re-score against another folder or another class list is refused: the snapshot is of
 /// another set.
 #[test]

@@ -492,9 +492,15 @@ impl HistoryEntry {
         e
     }
 
-    /// The device row `spec`.
+    /// The device row `spec`: the one spelled the same, else one naming the same device in
+    /// another spelling ([`crate::config::same_device`]: `openvino:gpu` is `openvino:gpu.0`;
+    /// QA-064).
     pub fn device(&self, spec: &str) -> Option<&DeviceSnap> {
-        self.devices.iter().find(|d| d.device == spec)
+        self.devices.iter().find(|d| d.device == spec).or_else(|| {
+            self.devices
+                .iter()
+                .find(|d| crate::config::same_device(&d.device, spec))
+        })
     }
 
     /// The recommended device row, else the first that ran.

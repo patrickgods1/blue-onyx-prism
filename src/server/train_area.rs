@@ -709,6 +709,27 @@ pub(super) fn tally_of(dir: &Path, wait: Duration) -> Option<Arc<Tally>> {
 
 /// [`tally_of`] with the [`AutoGap`] of the same walk.
 pub(super) fn walked_of(dir: &Path, wait: Duration) -> Option<Walked> {
+    walked_with(dir, wait, spawn_walk)
+}
+
+/// Starts a walk's thread (the seam [`walked_with`] takes, so a test can make it fail).
+type SpawnWalk = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
+
+/// The real [`SpawnWalk`]: a named thread; the OS refusing one is an error, not a panic.
+fn spawn_walk(walk: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("train-tally".into())
+        .spawn(walk)
+        .map(drop)
+}
+
+/// A walk's thread that could not start, logged at most once a minute (the strip polls).
+static SPAWN_WARNS: crate::logthrottle::Throttle =
+    crate::logthrottle::Throttle::new(Duration::from_secs(60));
+
+/// [`walked_of`] with the thread start passed in. A walk whose thread does not start leaves the
+/// folder not walking (QA-092: it stayed "counting" until a restart), so the next ask tries again.
+fn walked_with(dir: &Path, wait: Duration, spawn: SpawnWalk) -> Option<Walked> {
     let mut kept = KEPT.lock_recover();
     if !kept.contains_key(dir) {
         kept.insert(dir.to_path_buf(), Kept::default());
@@ -725,17 +746,31 @@ pub(super) fn walked_of(dir: &Path, wait: Duration) -> Option<Walked> {
         k.walking = true;
         // Under the lock and before the walk reads a file: a drop after this redoes it again.
         k.redo = false;
-        let dir = dir.to_path_buf();
-        std::thread::spawn(move || {
+        let owned = dir.to_path_buf();
+        let started = spawn(Box::new(move || {
             crate::backend::priority::lower_this_thread(
                 crate::backend::priority::ThreadRole::Background,
             );
-            let mut done = WalkDone(&dir, None);
+            let mut done = WalkDone(&owned, None);
             let start = Instant::now();
-            let t = queue::tally(&dir);
-            let g = auto_gap(&dir);
+            let t = queue::tally(&owned);
+            let g = auto_gap(&owned);
             done.1 = Some((t, g, start.elapsed()));
-        });
+        }));
+        if let Err(e) = started {
+            // Still under the lock: no `WalkDone` will clear it, so clear it here.
+            k.walking = false;
+            WALKED.notify_all();
+            if let Some(held) = SPAWN_WARNS.allow_now() {
+                tracing::warn!(
+                    similar_since_last_warning = held,
+                    "could not start counting the frames of {}: {e}. The system refused a new \
+                     thread (too many threads or too little memory); the Train strip says \
+                     \"counting\" and tries again on its next refresh.",
+                    dir.display()
+                );
+            }
+        }
     }
     let until = Instant::now() + wait;
     loop {
@@ -2255,6 +2290,18 @@ mod tests {
         }
         let stale = tally_of(&dir, Duration::ZERO).unwrap();
         assert!(Arc::ptr_eq(&first, &stale));
+    }
+
+    /// QA-092: a walk whose thread the OS refuses leaves the folder not walking, so the next ask
+    /// starts one (it stayed "counting" until a restart, and the handler panicked).
+    #[test]
+    fn a_walk_whose_thread_fails_to_start_is_tried_again() {
+        let dir = scratch();
+        let refused: SpawnWalk = |_| Err(std::io::Error::other("no threads left"));
+        assert!(walked_with(&dir, Duration::from_secs(1), refused).is_none());
+        assert!(!KEPT.lock_recover().get(&dir).unwrap().walking);
+        let w = walked_with(&dir, Duration::from_secs(60), spawn_walk).expect("walked");
+        assert_eq!(w.0.frames, 0);
     }
 
     /// A rescan: the kept answer still serves at once, a new walk starts; one running at the

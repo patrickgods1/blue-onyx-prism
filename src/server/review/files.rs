@@ -383,6 +383,8 @@ pub(in crate::server) async fn import(
             &|| shutdown.is_cancelled(),
         );
         drop(job);
+        // Frames were written, also by an import that stopped part way (QA-091).
+        crate::server::refine::label_files_changed();
         match result {
             Ok(r) => success(serde_json::json!({ "report": r })),
             Err(e) if export::is_stopped(&e) => {
@@ -515,10 +517,7 @@ pub(in crate::server) async fn rescan(
         labels::repeats::invalidate(&dir);
         super::steer::forget_spots(&dir);
         crate::server::train_area::forget_tally(&dir);
-        crate::server::refine::forget_counts();
-        crate::server::refine_coverage::forget();
-        crate::server::refine_floor::forget();
-        crate::server::refine_spots::forget();
+        crate::server::refine::label_files_changed();
         let strays = labels::strays::find(&dir);
         tracing::info!(
             "review: rescan of {} asked ({}); {} image(s) no frame of the layout names, {} \
@@ -601,6 +600,9 @@ pub(in crate::server) async fn classes(
                 None => c.collect.prune_hidden(),
             }
             c.collect.validate(&c.data_root())?;
+            // QA-112: checked as sent (a name not listed, or listed twice, is refused), stored in
+            // the list's spelling, so the page's pickers and its drawing agree on what is hidden.
+            c.collect.prune_hidden();
             hidden = c.collect.hidden_classes.clone();
             dir = c.collect.resolved_review_dir(&c.data_root());
             Ok(())
@@ -631,6 +633,9 @@ pub(in crate::server) async fn classes(
                 usize::MAX,
                 false,
             );
+            if o.done_count > 0 {
+                crate::server::refine::label_files_changed();
+            }
             tracing::info!(
                 classes = %gone.join(", "),
                 boxes = o.boxes,

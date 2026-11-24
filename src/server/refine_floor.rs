@@ -29,7 +29,7 @@
 //!   pending. A dry run counts what an apply on the unchanged folder does; at most `limit` frames
 //!   (500) are written per call.
 
-use super::refine::{fail, forget_counts, json_body, recall_report};
+use super::refine::{fail, json_body, label_files_changed, recall_report};
 use super::review::{push_failed, push_past_limit};
 use super::{AppState, blocking, save_config, training};
 use crate::collect::labels::SizeFloor;
@@ -158,6 +158,12 @@ static CACHE: Cache = Cache::new();
 /// Drop every kept answer of the process (a floor was saved or the rule wrote).
 pub(super) fn forget() {
     CACHE.forget();
+}
+
+/// How many times [`forget`] dropped the answers (tests of other modules).
+#[cfg(test)]
+pub(super) fn forgotten() -> u64 {
+    CACHE.generation.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 impl Cache {
@@ -530,11 +536,9 @@ pub(super) async fn resolve_small(
         };
         let frames = if dry_run { o.eligible } else { o.done_count };
         if !dry_run {
-            // Label writes tell the Review index and the repeats cache themselves; the tab's own
-            // answers are dropped here.
-            forget_counts();
-            forget();
-            super::refine_coverage::forget();
+            // Label writes tell the Review index and the repeats cache themselves; the Refine
+            // caches are dropped here, all of them (QA-091).
+            label_files_changed();
         }
         let mut message = match (restore, o.boxes == 0, dry_run) {
             (false, true, _) => {

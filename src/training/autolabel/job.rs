@@ -249,7 +249,8 @@ pub struct AutolabelReport {
     pub review: usize,
     /// Pending boxes added to label files that were written.
     pub added: usize,
-    /// Proposals an existing box already covered.
+    /// Proposals an existing box already covered, or that found the file full
+    /// ([`crate::collect::labels::MAX_BOXES`]).
     pub dropped: usize,
     /// Existing boxes that got the auto-labeler's evidence.
     pub annotated: usize,
@@ -450,8 +451,11 @@ impl AutolabelReport {
             .added
             .saturating_sub(a.dismissed + a.spot_dismissed + a.parked_new)
             + a.missing.candidates();
-        self.dropped +=
-            a.apply.merge.dropped + a.missing.covered + a.missing.judged + a.missing.full;
+        self.dropped += a.apply.merge.dropped
+            + a.apply.full
+            + a.missing.covered
+            + a.missing.judged
+            + a.missing.full;
         self.dropped_judged += a.missing.judged;
         self.annotated += a.apply.annotated;
         self.class_suggestions += a.apply.class_suggestions;
@@ -493,7 +497,7 @@ impl AutolabelReport {
     /// Add what one frame of a run with a model did.
     fn count_relabel(&mut self, t: &triage::RelabelReport) {
         self.added += t.apply.merge.added;
-        self.dropped += t.apply.merge.dropped;
+        self.dropped += t.apply.merge.dropped + t.apply.full;
         self.annotated += t.apply.annotated;
         self.class_suggestions += t.apply.class_suggestions;
         self.votes += t.votes;
@@ -1091,7 +1095,7 @@ impl AutolabelJob {
             tracing::warn!("{w}");
         }
         if let Some(a) = &self.accelerator {
-            for w in super::gpu_notes(r, a) {
+            for w in super::gpu_notes(r, &self.classes, a) {
                 tracing::warn!("auto-label: {w}");
                 rep.warnings.push(w);
             }

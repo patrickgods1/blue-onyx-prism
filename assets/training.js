@@ -27,6 +27,11 @@
 // and the confirm that names a verifier about to be replaced.
 (function () {
   "use strict";
+  // An answer's JSON body (an error answer keeps the server's own words); a body that is not
+  // JSON (a proxy's HTML 502) rejects with "HTTP <status>" instead of the parser's message.
+  function asJson(res) {
+    return res.json().catch(function () { throw new Error("HTTP " + res.status); });
+  }
 
   // Set by the auto-label classes block: the picker's selection, whether some are outside the
   // class list, and the confirm that appends them (null without the picker).
@@ -215,14 +220,16 @@
       if (cam && cam.value.trim()) q += "&camera=" + encodeURIComponent(cam.value.trim());
       show("Checking\u2026", false);
       fetch("/v1/training/import/preview?" + q, { headers: { Accept: "application/json" } })
-        .then(function (res) { return res.json(); })
+        .then(asJson)
         .then(function (j) {
           if (mine !== seq) return;
           if (!j.success) { show(j.message || "Cannot read this path.", true); return; }
           var w = (j.warnings || []).filter(function (x) { return x.indexOf(".bvr") < 0; });
           show(j.summary + (w.length ? ". " + w.join(". ") : ""), false);
         })
-        .catch(function () { if (mine === seq) show("", false); });
+        .catch(function (e) {
+          if (mine === seq) show("The path could not be checked (" + e.message + "). Import still works.", true);
+        });
     };
     var later = function () {
       if (timer) clearTimeout(timer);
@@ -397,7 +404,7 @@
     var act = function (path, button) {
       button.disabled = true;
       fetch(API + path, { method: "POST", headers: { Accept: "application/json" } })
-        .then(function (res) { return res.json(); })
+        .then(asJson)
         .then(function (s) {
           button.disabled = false;
           if (s.state) {
@@ -1220,7 +1227,7 @@
       Promise.all([
         cat,
         fetch("/v1/training/dataset-classes?" + q, { headers: { Accept: "application/json" } })
-          .then(function (res) { return res.json(); })
+          .then(asJson)
       ]).then(function (r) {
         if (mine !== seq) return;
         catalog = r[0] || {};

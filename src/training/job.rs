@@ -497,6 +497,13 @@ pub trait Hooks: Send + Sync {
     ) -> Result<Option<Baseline>> {
         Ok(None)
     }
+    /// Whether the config now has a model named `name` ([`crate::model::name::same_model_name`]).
+    /// Checked when a run starts, before any GPU time (QA-101): the config can gain the name
+    /// between the enqueue check and the start, and registration would then refuse the trained
+    /// model. The default (tests, fold runs) knows no config.
+    fn config_has_model(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 /// Hooks that do nothing (tests, `--no-register`).
@@ -881,6 +888,13 @@ fn stages(
         bail!(
             "{} already exists; choose another model name",
             models.join(format!("{}.onnx", job.name)).display()
+        );
+    }
+    if hooks.config_has_model(&job.name) {
+        bail!(
+            "the config already has a model named {} (added after this run was queued); remove \
+             that model first, or train again under another name",
+            job.name
         );
     }
     if let Some(r) = &job.export_only {
@@ -1453,6 +1467,14 @@ fn stages(
     let mut retries = 0;
     let mut host_retries = 0;
     let mut note: Option<String> = None;
+    // A finish request of an earlier run does not end this one at its first epoch. Removed once:
+    // one made during an attempt that is retried carries over to the retry (QA-103).
+    let stop = stop_file(&job.run_dir);
+    if let Err(e) = std::fs::remove_file(&stop)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        bail!("cannot remove the old stop request {}: {e}", stop.display());
+    }
     let (res, done, usage, attempt) = loop {
         let mut cmd = env::train_python_cmd(
             paths,
@@ -1469,13 +1491,6 @@ fn stages(
                     cmd.env.push((k.to_string(), v.into()));
                 }
             }
-        }
-        // A finish request of an earlier attempt (or run) does not end this one at its first epoch.
-        let stop = stop_file(&job.run_dir);
-        if let Err(e) = std::fs::remove_file(&stop)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            bail!("cannot remove the old stop request {}: {e}", stop.display());
         }
         let started = Instant::now();
         let mut tp = TrainProgress {
@@ -1594,10 +1609,23 @@ fn stages(
                 percent: 0,
                 detail: &msg,
             });
+            // The stop file lives under `work`, which the retry starts without.
+            let finish = std::fs::read(&stop).ok();
             let _ = manager::remove_any(&work);
             manager::remove_any(&staging)?;
             std::fs::create_dir_all(&staging)
                 .with_context(|| format!("creating {}", staging.display()))?;
+            if let Some(request) = finish {
+                // QA-103: the user's Finish now holds for the retry, which stops after its first
+                // epoch and exports it, rather than training to the end.
+                stop.parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| std::fs::write(&stop, request))
+                    .with_context(|| format!("keeping the stop request {}", stop.display()))?;
+                let line = "finish requested: the retry stops after its first epoch";
+                log.line(&format!("# {line}"));
+                report(TrainReport::Line(line));
+            }
             note = Some(msg);
             continue;
         }
@@ -1887,58 +1915,7 @@ fn enter(
 /// What the failure messages call a training run ([`env::explain_train_failure`]).
 const TRAINING_TASK: &str = "training";
 
-/// A line of `lines` that reports the host out of memory (RAM + paging file, the Windows
-/// commit), if any: of the most telling kind present (a paging file too small, then a failed CPU
-/// allocation, ...), the last such line.
-pub fn host_out_of_memory_line(lines: &[String]) -> Option<&String> {
-    const KINDS: [&[&str]; 4] = [
-        &["[WinError 1455]", "paging file is too small"],
-        &["DefaultCPUAllocator: not enough memory", "[WinError 1450]"],
-        &[
-            "can't start new thread",
-            "Cannot allocate memory",
-            "[Errno 12]",
-        ],
-        &["is killed by signal: Killed"],
-    ];
-    KINDS
-        .iter()
-        .find_map(|pats| {
-            lines
-                .iter()
-                .rev()
-                .find(|l| pats.iter().any(|p| l.contains(p)))
-        })
-        // Python's own `MemoryError` only at the start of a line: `torch.OutOfMemoryError` (GPU)
-        // contains it too.
-        .or_else(|| {
-            lines
-                .iter()
-                .rev()
-                .find(|l| l.trim_start().starts_with("MemoryError"))
-        })
-}
-
-/// The last line of `lines` that reports the GPU out of memory, if any. None when the host ran
-/// out of memory too ([`host_out_of_memory_line`]): on Windows (WDDM) a CUDA allocation also
-/// fails when the system commit is exhausted, with GPU memory free ("CUDA out of memory ...
-/// 6.17 GiB is free"), and a smaller batch does not help there.
-pub fn out_of_memory_line(lines: &[String]) -> Option<&String> {
-    const PATTERNS: [&str; 5] = [
-        "CUDA out of memory",
-        "MPS backend out of memory",
-        "torch.OutOfMemoryError",
-        "CUBLAS_STATUS_ALLOC_FAILED",
-        "cudaErrorMemoryAllocation",
-    ];
-    if host_out_of_memory_line(lines).is_some() {
-        return None;
-    }
-    lines
-        .iter()
-        .rev()
-        .find(|l| PATTERNS.iter().any(|p| l.contains(p)))
-}
+pub use super::oom::{host_out_of_memory_line, out_of_memory_line};
 
 /// What [`classify_train_failure`] says about the host's memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

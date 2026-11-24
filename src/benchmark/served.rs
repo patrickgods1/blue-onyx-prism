@@ -390,9 +390,16 @@ mod tests {
             rules.min_box_area_frac = Some(0.005);
         }
         for _ in 0..r.pick(3) {
+            // Two different labels: a rule naming one label on both sides is skipped by the
+            // service (`OverlapRule::is_self_overlap`, QA-044) and would make no window.
+            let drop = ["person", "car", "dog"][r.pick(3)];
+            let evidence: Vec<&str> = ["potted plant", "car", "person"]
+                .into_iter()
+                .filter(|l| *l != drop)
+                .collect();
             rules.suppress_overlaps.push(OverlapRule {
-                drop: ["person", "car", "dog"][r.pick(3)].into(),
-                if_overlaps: ["potted plant", "car", "person"][r.pick(3)].into(),
+                drop: drop.into(),
+                if_overlaps: evidence[r.pick(evidence.len())].into(),
                 iou: 0.2 + r.f() * 0.5,
                 night_only: some(r, 0.3),
             });

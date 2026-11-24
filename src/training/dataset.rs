@@ -3339,6 +3339,87 @@ pub fn read_image_sources(dir: &Path) -> Result<BTreeMap<String, PathBuf>> {
     serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", p.display()))
 }
 
+/// The source file names of the images a prepared dataset (`<run>/data`) lists in `train.txt` and
+/// `valid.txt` ([`seen_sources`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeenSources {
+    /// One per line of `train.txt` (balancing's repeats kept): the file name of the image's source
+    /// (for a review export's frame, its flat name `<scene>.<camera>.<date>.<stem>.jpg`).
+    pub train: Vec<String>,
+    /// The same for `valid.txt` (a dataset without the list has none).
+    pub valid: Vec<String>,
+    /// Why [`IMAGE_SOURCES_FILE`] was not used for some or all names (it does not read, or does
+    /// not list a name), for the caller's warnings; the names there were taken as they are.
+    pub notes: Vec<String>,
+}
+
+/// [`SeenSources`] of the prepared dataset in `data` (QA-104): each listed image as its source's
+/// file name from [`IMAGE_SOURCES_FILE`], which is exact whatever the dataset named the image (a
+/// stem cut to 120 bytes, a `-2` for a name taken twice). A dataset written without that record,
+/// a record that does not read, or a name it does not list falls back to the name itself without
+/// its `s<N>-` prefix ([`names::split_source`]), which is the source's file name unless
+/// [`names`] cut or numbered it (such a name then reads as no frame). The one rule of the readers
+/// that tell which frames a run saw and only warn about the rest (auto-label's `--missing-only`,
+/// the benchmark's fair frames, the camera days trained on); the dataset check refuses instead
+/// (`refine::quick::seen_of`). An error: `train.txt` does not read, or `valid.txt` does not read
+/// for another reason than being absent.
+pub fn seen_sources(data: &Path) -> Result<SeenSources> {
+    fn list(path: &Path, missing_ok: bool) -> Result<Vec<String>> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if missing_ok && e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.rsplit('/').next().unwrap_or(l).to_string())
+            .collect())
+    }
+    let train = list(&data.join("train.txt"), false)?;
+    let valid = list(&data.join("valid.txt"), true)?;
+    let mut notes = Vec::new();
+    let record = data.join(IMAGE_SOURCES_FILE);
+    let sources = if record.is_file() {
+        match read_image_sources(data) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                notes.push(format!("{e:#}; its images are told by their names"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut unlisted = 0usize;
+    let mut source_of = |n: String| -> String {
+        if let Some(sources) = &sources {
+            match sources.get(&n).and_then(|p| p.file_name()) {
+                Some(f) => return f.to_string_lossy().into_owned(),
+                None => unlisted += 1,
+            }
+        }
+        match names::split_source(&n) {
+            Some((_, rest)) => rest.to_string(),
+            None => n,
+        }
+    };
+    let train: Vec<String> = train.into_iter().map(&mut source_of).collect();
+    let valid: Vec<String> = valid.into_iter().map(&mut source_of).collect();
+    if unlisted > 0 {
+        notes.push(format!(
+            "{unlisted} listed images are not in {}; they are told by their names",
+            record.display()
+        ));
+    }
+    Ok(SeenSources {
+        train,
+        valid,
+        notes,
+    })
+}
+
 /// Read `dataset.json` sources of a prepared dataset (provenance).
 pub fn read_summary_sources(dir: &Path) -> Vec<SourceSummary> {
     #[derive(Deserialize)]

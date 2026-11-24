@@ -198,10 +198,13 @@ pub fn run(
         };
         match svc.start_run(c, req.clone()) {
             Ok(id) => break id,
-            Err(_) if started.elapsed() < BUSY_WAIT => {
+            // Only a busy service is worth waiting for; a thread that could not start fails
+            // now (QA-047).
+            Err(e @ crate::benchmark::service::StartError::Spawn(_)) => return Err(anyhow!(e)),
+            Err(crate::benchmark::service::StartError::Busy) if started.elapsed() < BUSY_WAIT => {
                 std::thread::sleep(Duration::from_secs(2));
             }
-            Err(_) => bail!(
+            Err(crate::benchmark::service::StartError::Busy) => bail!(
                 "another benchmark kept running for {} min; benchmark the model from the \
                  Benchmark page",
                 BUSY_WAIT.as_secs() / 60
@@ -251,7 +254,7 @@ pub fn baseline_skip(
     let Some(default) = default else {
         return Some("no model is enabled as the default".to_string());
     };
-    if crate::registry::normalize_name(default) == crate::registry::normalize_name(new) {
+    if crate::model::name::same_model_name(default, new) {
         return Some(format!(
             "{new} is the default model itself, so there is nothing to compare it with"
         ));

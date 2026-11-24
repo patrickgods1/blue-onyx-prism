@@ -1333,6 +1333,20 @@ mod tests {
         assert!(text.contains("blue_onyx_prism_inflight_requests 1"));
     }
 
+    /// The rejection counter's HELP text explains every reason it is exported with (extra [9]:
+    /// it once missed `upload_budget`).
+    #[test]
+    fn the_rejected_help_names_every_reason() {
+        let text = render_prometheus(&Arc::new(Metrics::new("0")), &[]);
+        let help = text
+            .lines()
+            .find(|l| l.starts_with("# HELP blue_onyx_prism_requests_rejected_total "))
+            .unwrap();
+        for r in RejectReason::ALL {
+            assert!(help.contains(&format!("{}: ", r.as_str())), "{help}");
+        }
+    }
+
     #[test]
     fn prometheus_reject_reasons_build_info_and_downloads() {
         let m = Arc::new(Metrics::new("9.8.7"));

@@ -833,3 +833,36 @@ fn a_lasting_accept_failure_logs_once_a_minute() {
     ));
     assert_eq!(throttle.held_back(), 0);
 }
+
+/// QA-089: `bind_address` `::` serves IPv4 clients too. Windows binds `::` IPv6-only, so the
+/// companion `0.0.0.0` socket carries them there; a dual-stack system serves them on `::` itself
+/// (the companion then fails with `AddrInUse`, and this still passes).
+#[tokio::test]
+async fn an_ipv6_wildcard_bind_also_serves_ipv4() {
+    let any6: IpAddr = std::net::Ipv6Addr::UNSPECIFIED.into();
+    let (main, companion, port) = match bind_pair(any6, 0).await {
+        Ok(bound) => bound,
+        Err(e) => {
+            eprintln!("skipped: this host cannot bind [::] ({e})");
+            return;
+        }
+    };
+    let accept = async {
+        match &companion {
+            Some(c) => tokio::select! {
+                a = main.accept() => a,
+                a = c.accept() => a,
+            },
+            None => main.accept().await,
+        }
+    };
+    let connect = tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)));
+    let (accepted, connected) = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(accept, connect)
+    })
+    .await
+    .expect("the IPv4 connection was accepted");
+    let connected = connected.expect("127.0.0.1 reaches a `::` bind");
+    let (_, peer) = accepted.expect("accepted");
+    assert_eq!(peer.port(), connected.local_addr().unwrap().port());
+}
