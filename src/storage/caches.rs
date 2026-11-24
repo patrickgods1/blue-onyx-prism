@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     fn the_model_key_follows_path_size_and_time() {
-        let t = UNIX_EPOCH + Duration::from_nanos(1_700_000_000_123_456_789);
+        let t = UNIX_EPOCH + Duration::from_nanos(1_700_000_000_123_456_700);
         let p = Path::new("/m/a.onnx");
         let k = model_key(p, 100, t);
         assert_eq!(k.len(), 16);
@@ -921,10 +921,11 @@ mod tests {
         );
         assert_eq!(model_key(p, 100, t), k, "deterministic");
         assert_ne!(model_key(p, 101, t), k, "size");
+        // 1 µs, not 1 ns: Windows' SystemTime counts 100 ns ticks, so `t + 1 ns` is `t` there.
         assert_ne!(
-            model_key(p, 100, t + Duration::from_nanos(1)),
+            model_key(p, 100, t + Duration::from_micros(1)),
             k,
-            "mtime nanos"
+            "sub-second mtime"
         );
         assert_ne!(model_key(Path::new("/m/b.onnx"), 100, t), k, "path");
         // Before 1970 counts as 0, never a panic.
