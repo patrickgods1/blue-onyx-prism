@@ -1542,7 +1542,9 @@ mod tests {
     /// manifest per file (RA-114): 30000 x 30000 string compares would show here.
     #[test]
     fn a_large_manifest_resolves_every_file() {
-        const N: usize = 30000;
+        // Correctness through the folder walk; the lookup's cost is checked without I/O below
+        // (a wall-clock bound around 30 000 file reads failed on a slow Windows runner).
+        const N: usize = 3000;
         let names: Vec<String> = (0..N).map(|i| format!("f{i:05}.jpg")).collect();
         let owned: Vec<(&str, Option<&[u8]>)> = names
             .iter()
@@ -1558,16 +1560,54 @@ mod tests {
             format!(r#"{{"images":[{}]}}"#, entries.join(",")),
         )
         .unwrap();
-        let t0 = std::time::Instant::now();
         let (set, _) = load_dir(&dir, None, Some("big")).unwrap();
-        let took = t0.elapsed();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(set.images.len(), N);
         for i in &set.images {
             assert_eq!((i.width, i.height), (640, 480), "{}", i.file);
             assert!(i.tags.contains(&format!("t-{}", i.file)), "{}", i.file);
         }
-        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    /// `load_dir`'s manifest lookup (RA-114): 200 000 names resolve in one pass with no file I/O
+    /// (a scan per name would be 2e10 comparisons, minutes even optimized), and a name listed
+    /// twice keeps its first entry as the old linear `find` did.
+    #[test]
+    fn the_manifest_lookup_is_one_map_built_once() {
+        const N: usize = 200_000;
+        let image = |file: String, width: u32| ManifestImage {
+            file,
+            url: None,
+            sha256: None,
+            size: None,
+            width: Some(width),
+            height: None,
+            tags: Vec::new(),
+            objects: None,
+        };
+        let mut images: Vec<ManifestImage> =
+            (0..N).map(|i| image(format!("f{i:06}.jpg"), 1)).collect();
+        images.push(image("f000007.jpg".into(), 2));
+        let manifest = Manifest {
+            images,
+            ..Manifest::default()
+        };
+        let t0 = std::time::Instant::now();
+        let by_file = manifest_by_file(Some(&manifest));
+        let found = (0..N)
+            .filter(|i| by_file.contains_key(format!("f{i:06}.jpg").as_str()))
+            .count();
+        let took = t0.elapsed();
+        assert_eq!(found, N);
+        assert_eq!(by_file.len(), N);
+        assert_eq!(
+            by_file["f000007.jpg"].width,
+            Some(1),
+            "the first entry wins"
+        );
+        assert!(manifest_by_file(None).is_empty());
+        // Linear: well under a second even in a debug build on a slow runner; quadratic: minutes.
+        assert!(took < std::time::Duration::from_secs(20), "{took:?}");
     }
 
     /// A COCO JSON is matched by file name: unlisted images are left out with a warning,
