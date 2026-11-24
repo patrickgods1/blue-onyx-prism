@@ -381,7 +381,7 @@ it; every key can also be set in the file.
 | `log_level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error`. Applies: at once. UI: yes (also the Logs page) |
 | `timezone` | `"local"` | The time zone of log timestamps (files, console and the Logs page), file and folder names (dataset day folders and frame names, runs, reports, diagnostics), and every time shown on pages, in the command line and in reports: `"local"` (this computer's zone), `"utc"`, an IANA name such as `"America/Los_Angeles"`, or a fixed offset such as `"+08:00"`. Log lines print RFC 3339 with the offset (`2026-10-15T17:54:59.580-07:00`; `...580Z` for `"utc"`). Timestamps stored inside records (JSON / JSONL fields such as `created` or `reviewed_at`) stay UTC and are converted when shown; the Blue Iris API's `timestampUTC` stays UTC. A config without it takes the retired `log_timezone` (below). Applies: at once. UI: yes (Server tab, General: a dropdown of local, UTC and common zones; other values set here show as "Custom") |
 | `log_timezone` | retired | Replaced by `timezone`. Read from old files only: when `timezone` is absent, its value becomes `timezone`, except `"utc"` (the old default, which every save wrote), which means `"local"`. Dropped from the file at the next save. UI: no |
-| `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept (default: stdout only). Path. Applies: process restart. UI: yes |
+| `log_path` | `null` | Directory for daily rolling log files `blue_onyx_prism.log.<date>`; the newest 14 are kept, 500 MB in all (the oldest go first, except the day a fault that still fills today's file began), and one day's file stops at 200 MB except for errors (10 MB more), with the count of dropped lines at its end; `GET /v1/status` `fileLogCapped` and the Logs page say when today's file is full (default: stdout only). Path. Applies: process restart. UI: yes |
 | `log_format` | `"text"` | Format of the log files under `log_path`: `"text"` or `"json"` (one JSON object per line, for log shippers); the console stays text. Applies: process restart. UI: no |
 | `save_image_path` | `null` | Save annotated detections here (`<name>_od.jpg`, written after the answer went out; when images arrive faster than they are written, a few are skipped with a warning). Path. Applies: at once. UI: yes |
 | `save_ref_image` | `false` | Also save the unannotated image (`<name>.jpg`: the uploaded JPEG as it came, other formats as a JPEG). Boolean. Applies: at once. UI: yes |
@@ -391,7 +391,7 @@ it; every key can also be set in the file.
 | `intra_threads` | `0` | CPU inference threads: 0 = all physical cores but one on machines with at least 4 cores (the OS, the HTTP threads and the desktop keep a core), every core on smaller ones; set it to use every core. Server and benchmark alike. Integer 0-256. Applies: restart. UI: yes |
 | `preprocess_threads` | `0` | Decode + preprocess threads shared by every model; 0 = from the hardware profile (half the cores, 1-8; at most 2 when every model runs on the CPU). Integer 0-256. Applies: restart. UI: no |
 | `inflight` | `0` | Concurrent inferences per model; 0 = from the hardware profile and the model's device. A model's own `inflight` wins. Integer 0-64. Applies: restart. UI: no |
-| `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model; 0 = from the hardware profile (2 with a discrete GPU of at least 4 GB and 8 GB of memory, so the GPU overlaps one request's compute with the other's copy and NMS; else 1). Integer 0-16. Applies: restart. UI: no |
+| `ort_sessions` | `0` | ONNX Runtime sessions per model, one inference in flight each, each holding its own copy of the model (on `ort:cpu` the sessions share the CPU thread budget, so more sessions do not add threads); 0 = from the hardware profile (2 with a discrete GPU of at least 4 GB and 8 GB of memory, so the GPU overlaps one request's compute with the other's copy and NMS; else 1). Integer 0-16. Applies: restart. UI: no |
 | `ort_gpu_mem_limit_mb` | unset (no cap) | Cap in MB of the GPU memory arena of each ONNX Runtime CUDA session (ONNX Runtime's `gpu_mem_limit`), for a card shared with training or auto-label jobs; also caps the CUDA provider behind `ort:tensorrt` (TensorRT's own memory is not counted). Per session: a model with two `ort_sessions` can use twice it, and the CUDA context and libraries' own memory lie outside it. A run that needs more than the cap fails with an inference error instead of growing the arena. Unset = no cap (the arena grows by what a run asks for). No effect on DirectML, CoreML or OpenVINO. Integer 64-1048576. Applies: restart. UI: no |
 | `hardware_profile` | `"auto"` | Hardware class the `0` defaults above come from: `auto` (classified from cores, RAM and GPUs) or forced `low`, `mid`, `high`. Applies: restart. UI: no |
 | `performance_hint` | unset (`latency` on an integrated GPU) | OpenVINO compile hint for models on an OpenVINO GPU (`openvino:gpu[.N]`): `latency` (one stream, 2 requests in flight so the host prepares the next frame while the GPU runs one) or `throughput` (OpenVINO's THROUGHPUT hint, several streams; requests in flight = the compiled model's `OPTIMAL_NUMBER_OF_INFER_REQUESTS`, two per stream, at most 4: 2 streams and 4 requests on a UHD 630. The OpenVINO runtime `setup-openvino` installs has no auto-batching plugin, so a request never waits for a batch to fill). Unset = the hardware profile's choice: `latency` on an integrated GPU, THROUGHPUT with up to 4 in flight (clamped to its streams) on a discrete Intel GPU. An explicit `inflight` still sets the count. CPU, NPU and ONNX Runtime devices ignore it. On a UHD 630 `throughput` measured the same as `latency` below saturation and about 5% more frames per second only when overloaded (docs/PRODUCTION_REVIEW.md), so the default stays; a model's own `performance_hint` wins. Applies: restart (shown on every model it moves). UI: no |
@@ -1101,7 +1101,9 @@ dashboards; the `_avg`/`_min`/`_max` gauges are still exported. Process level:
 can hold plus 16; `stats.json` shows the same as `rejectedOverloaded` and `inflightRequests`).
 Other `requests_rejected_total` reasons count detection requests refused before they reach a
 model (`body_too_large`, `decode_error`, `bad_request`, `peer_body_reads`: one address already has
-the most uploads allowed in progress, `body_timeout`: an upload took over 10 s to arrive). Gauges: `model_info`, `model_ready`,
+the most uploads allowed in progress, `body_timeout`: an upload took over 10 s to arrive,
+`upload_budget`: the shared upload byte budget was full, `unknown_model`: the request named no loaded
+model). Gauges: `model_info`, `model_ready`,
 `queue_length`, `queue_capacity`, `inflight_requests`. (`rejected_initializing_total` is now
 `dropped_total{reason="initializing"}`.) Process and build:
 
@@ -1152,6 +1154,8 @@ The start-up log names the address and the certificate's fingerprint:
 - Each port keeps at most 256 connections open, and 32 per address on HTTPS (an IPv6 client counts
   by its /64); on HTTP the per-address cap is at least the detection in-flight cap, so a busy Blue
   Iris gets the detection API's own 503 rather than a closed connection. A TLS handshake has 10 s.
+  A client that takes no data for 30 s while an answer is being sent is disconnected, and a web UI
+  request body that sends nothing for 30 s is ended (the detection API keeps its 10 s upload deadline).
 
 ### Local network only
 
@@ -1438,8 +1442,9 @@ the first start can compile models; it records the previous value and `uninstall
 restores it. It also sets the service's preshutdown timeout to 75 s
 (`blue-onyx-prism-service.exe --set-preshutdown-timeout`, elevated), so an OS restart waits for
 the service's stop instead of Windows' default 10 s. A reinstall fails with a clear message, instead of half-registering the service,
-when services.msc or Event Viewer keeps the old one open. Logs go to the Application event log (source
-`BlueOnyxPrism`) and, with `log_path`, to files.
+when services.msc or Event Viewer keeps the old one open. INFO and above go to the Application event log (source
+`BlueOnyxPrism`): at most one INFO or WARN line per log statement per 10 s, every ERROR, never a model
+export's child-process output. With `log_path` every line goes to files.
 
 **Linux** (systemd):
 
@@ -1548,7 +1553,7 @@ the service's own stop short.
 | POST, GET | `/v1/vision/custom/list` | configured model names |
 | POST | `/v1/models/add` | add a custom model by file or directory path to the config (`path`, `name`, `family`, `classes`) |
 | GET | `/v1/fs/browse` | read-only file browser behind the Config page's *Browse...* buttons and the Train tab's footage import: `?path=<dir>&kind=model`, `classes` or `video`; lists only folders and `.onnx`/`.xml` (or `.yaml`/`.yml`, or `.mp4`/`.mkv`/`.avi`/`.mov`) files of the machine running the service |
-| GET | `/v1/status` | readiness for Blue Iris, Docker `HEALTHCHECK` or systemd: `{ready, status: ready/degraded/initializing/failed, models[{name,state,device,detail}], uptimeSecs, generation, version}`; HTTP 200 when ready or degraded (a failed model next to a usable one), 503 while a non-lazy model is still loading or nothing is usable |
+| GET | `/v1/status` | readiness for Blue Iris, Docker `HEALTHCHECK` or systemd: `{ready, status: ready/degraded/initializing/failed, models[{name,state,device,detail}], uptimeSecs, generation, version, fileLogCapped}` (`fileLogCapped`: today's log file reached its cap); HTTP 200 when ready or degraded (a failed model next to a usable one), 503 while a non-lazy model is still loading or nothing is usable |
 | GET | `/v1/status/updateavailable` | GitHub release check |
 | GET | `/`, `/stats`, `/stats.json`, `/prometheus` | UI and metrics (sign-in or the API token) |
 | GET | `/logs`, `/logs.json?after=<seq>&level=<min>` | log page; recent log events newer than `after` at `level` (`trace`..`error`) or more severe, with `last` as the next cursor |

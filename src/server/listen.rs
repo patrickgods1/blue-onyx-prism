@@ -19,6 +19,15 @@
 //! - **TLS**: the handshake runs in the connection's own task under [`HANDSHAKE_TIMEOUT`], so a
 //!   client that connects and never handshakes holds only its own slot. Then the same hyper
 //!   builder as HTTP takes over ([`HEADER_READ_TIMEOUT`], keep-alive, graceful shutdown).
+//! - **A peer that stops reading** (audit 2026-11, RA-032): every accepted socket is wrapped,
+//!   below TLS, in [`super::deadline::WriteStall`], so a write that waits on the peer for
+//!   [`super::deadline::WRITE_STALL_TIMEOUT`] closes the connection and gives its slot back. A
+//!   request body that stops arriving is ended by the router ([`super::deadline::IdleBody`]).
+//! - **Repeated failures stay cheap** (audit 2026-11, phase 6): while the HTTPS port stays taken,
+//!   what holds it is looked up ([`crate::port_holder`], which runs `netstat` + `tasklist` on
+//!   Windows) only when the bind error changes or the last lookup is [`HOLDER_REFRESH`] old
+//!   ([`HolderCache`]); the attempt itself stays every [`HTTPS_RETRY`]. A lasting accept failure
+//!   logs at most one ERROR per [`ACCEPT_ERROR_LOG_EVERY`], with the number held back.
 //! - **Stop** (audit 2026-11, RA-023): every connection task is tracked per accept loop
 //!   ([`TaskTracker`]). On shutdown the loop stops accepting, lets hyper finish in-flight requests
 //!   and close idle keep-alive connections for at most [`GRACEFUL_SHUTDOWN_TIMEOUT`], then cancels
@@ -41,6 +50,7 @@
 //! (a handful of connections each), so 32 applies as is.
 
 use super::{Shared, Transport, guard};
+use crate::logthrottle::Throttle;
 use crate::sync::LockExt;
 use axum::Router;
 use std::collections::HashMap;
@@ -75,6 +85,23 @@ pub const SERVER_STOP_BOUND: Duration = GRACEFUL_SHUTDOWN_TIMEOUT.saturating_add
 /// descriptors), so the loop does not spin.
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_secs(1);
 
+/// At most one ERROR line per this long about failed accepts (audit 2026-11, RA-119). A lasting
+/// failure (out of file descriptors or handles) fails every [`ACCEPT_ERROR_PAUSE`] on up to four
+/// sockets (IPv4 and IPv6, HTTP and HTTPS); unthrottled that is some 345 000 lines a day, and on
+/// Windows each is an Error record in the Event Log that rolls the Application log over and buries
+/// the first line, the one that shows the cause. A minute keeps the fault visible.
+const ACCEPT_ERROR_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// Failed accepts logged by this process (every listener: one kind of line).
+static ACCEPT_ERRORS: Throttle = Throttle::new(ACCEPT_ERROR_LOG_EVERY);
+
+/// How long a port-holder lookup is reused while the HTTPS bind keeps failing the same way
+/// (audit 2026-11, RA-033). The lookup spawns `netstat -ano` and `tasklist` on Windows (`lsof` /
+/// `ss` elsewhere) and its result only feeds a message that repeats at debug level, so doing it
+/// on every [`HTTPS_RETRY`] attempt cost some 2 900 lookups a day on an idle service. Ten minutes
+/// still notices a different program taking the port the same day.
+pub(crate) const HOLDER_REFRESH: Duration = Duration::from_secs(10 * 60);
+
 /// Longest a TLS handshake may take before its connection is closed.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -92,7 +119,7 @@ pub(crate) const MAX_CONNECTIONS_PER_PEER: usize = 32;
 const CAP_WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// Connections closed by a cap, logged by this process.
-static CAP_WARNS: Mutex<guard::WarnThrottle> = Mutex::new(guard::WarnThrottle::new());
+static CAP_WARNS: Throttle = Throttle::new(CAP_WARN_EVERY);
 
 /// The timings and caps of the listeners (shorter ones in tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +132,8 @@ pub(crate) struct Limits {
     pub(crate) graceful: Duration,
     /// [`HARD_CLOSE_WAIT`].
     pub(crate) hard_close: Duration,
+    /// [`super::deadline::WRITE_STALL_TIMEOUT`].
+    pub(crate) write_stall: Duration,
 }
 
 impl Default for Limits {
@@ -116,6 +145,7 @@ impl Default for Limits {
             https_retry: HTTPS_RETRY,
             graceful: GRACEFUL_SHUTDOWN_TIMEOUT,
             hard_close: HARD_CLOSE_WAIT,
+            write_stall: super::deadline::WRITE_STALL_TIMEOUT,
         }
     }
 }
@@ -296,11 +326,19 @@ async fn run_pair(v4: tokio::net::TcpListener, v6: Option<tokio::net::TcpListene
 async fn serve_https(plan: HttpsPlan, l: Loop, http_port: u16) {
     let mut resolver: Option<crate::tls::Resolver> = None;
     let mut last: Option<String> = None;
+    let mut holder = HolderCache::default();
     loop {
         if l.shutdown.is_cancelled() {
             return;
         }
-        match start_https(&plan, &mut resolver, http_port, l.limits.https_retry).await {
+        let attempt = start_https(
+            &plan,
+            &mut resolver,
+            &mut holder,
+            http_port,
+            l.limits.https_retry,
+        );
+        match attempt.await {
             Ok((config, v4, v6, port, fingerprint)) => {
                 l.shared.https_port().set(Some(port));
                 info!("HTTPS on https://localhost:{port}/ (certificate SHA-256 {fingerprint})");
@@ -338,10 +376,11 @@ type Started = (
 );
 
 /// One attempt: the certificate (loaded once; own files that fail are read again next time),
-/// then the bind. `Err`: the message to log.
+/// then the bind (what holds a taken port through `holder`). `Err`: the message to log.
 async fn start_https(
     plan: &HttpsPlan,
     resolver: &mut Option<crate::tls::Resolver>,
+    holder: &mut HolderCache,
     http_port: u16,
     retry: Duration,
 ) -> Result<Started, String> {
@@ -375,10 +414,9 @@ async fn start_https(
             let held = if port == 0 {
                 String::new()
             } else {
-                tokio::task::spawn_blocking(move || crate::port_holder::lookup(port))
+                holder
+                    .text(port, &e, Instant::now(), crate::port_holder::lookup)
                     .await
-                    .map(|h| format!("; {}", h.describe(port)))
-                    .unwrap_or_default()
             };
             Err(format!(
                 "HTTPS listener (web UI) not started: binding {addr}: {e}{held}. Stop the program \
@@ -386,6 +424,58 @@ async fn start_https(
                  the service; {after}"
             ))
         }
+    }
+}
+
+/// How a bind failed, as far as the cached port-holder text depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BindFailure {
+    kind: std::io::ErrorKind,
+    os: Option<i32>,
+}
+
+impl BindFailure {
+    fn of(e: &std::io::Error) -> Self {
+        Self {
+            kind: e.kind(),
+            os: e.raw_os_error(),
+        }
+    }
+}
+
+/// The last port-holder lookup of the HTTPS retry loop (see the module docs).
+#[derive(Debug, Default)]
+struct HolderCache {
+    last: Option<(BindFailure, Instant, String)>,
+}
+
+impl HolderCache {
+    /// The `; port N is held by ...` part of the message for a bind of `port` that failed with
+    /// `error` at `now`: the cached text while the failure is the same and the lookup younger
+    /// than [`HOLDER_REFRESH`], else a new `lookup` (on the blocking pool).
+    async fn text<F>(
+        &mut self,
+        port: u16,
+        error: &std::io::Error,
+        now: Instant,
+        lookup: F,
+    ) -> String
+    where
+        F: FnOnce(u16) -> crate::port_holder::Lookup + Send + 'static,
+    {
+        let failure = BindFailure::of(error);
+        if let Some((seen, at, held)) = &self.last
+            && *seen == failure
+            && now.saturating_duration_since(*at) < HOLDER_REFRESH
+        {
+            return held.clone();
+        }
+        let held = tokio::task::spawn_blocking(move || lookup(port))
+            .await
+            .map(|h| format!("; {}", h.describe(port)))
+            .unwrap_or_default();
+        self.last = Some((failure, now, held.clone()));
+        held
     }
 }
 
@@ -450,7 +540,7 @@ async fn accept_loop(listener: tokio::net::TcpListener, l: Loop) {
                 Ok(c) => c,
                 Err(e) if is_connection_error(&e) => continue,
                 Err(e) => {
-                    error!("accepting an HTTP connection: {e}");
+                    note_accept_error(&e, transport, &ACCEPT_ERRORS, crate::logthrottle::process_ms());
                     tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
                     continue;
                 }
@@ -472,6 +562,8 @@ async fn accept_loop(listener: tokio::net::TcpListener, l: Loop) {
                 continue;
             }
         };
+        // Below TLS, so the handshake and every TLS write are covered too.
+        let stream = super::deadline::WriteStall::new(stream, l.limits.write_stall);
         let router = l.app.clone();
         // The peer address feeds the network rule and the admin-route check (`admin_only`).
         let service =
@@ -574,12 +666,35 @@ async fn accept_loop(listener: tokio::net::TcpListener, l: Loop) {
     }
 }
 
+/// Log an accept that failed for a reason not about one connection, through `throttle` (the
+/// process's [`ACCEPT_ERRORS`]) at `now_ms` on its clock; whether the line was written.
+fn note_accept_error(
+    e: &std::io::Error,
+    transport: Transport,
+    throttle: &Throttle,
+    now_ms: u64,
+) -> bool {
+    let Some(dropped) = throttle.allow(now_ms) else {
+        return false;
+    };
+    let listener = match transport {
+        Transport::Plain => "HTTP",
+        Transport::Tls => "HTTPS",
+    };
+    error!(
+        dropped,
+        "accepting a {listener} connection failed: {e}. The likely cause is that the service or \
+         the machine ran out of file handles or sockets (too many open files or connections, or \
+         a leak); the listener tries again every {} s. If this repeats, check the service's open \
+         handles and restart it",
+        ACCEPT_ERROR_PAUSE.as_secs()
+    );
+    true
+}
+
 /// Log a connection closed by a cap (throttled).
 fn note_cap(hit: CapHit, peer: SocketAddr, transport: Transport, total: usize, per_peer: usize) {
-    let Some(dropped) = CAP_WARNS
-        .lock_recover()
-        .allow_at(Instant::now(), CAP_WARN_EVERY)
-    else {
+    let Some(dropped) = CAP_WARNS.allow_now() else {
         return;
     };
     let listener = match transport {

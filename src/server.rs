@@ -39,6 +39,7 @@ mod body_budget;
 mod browse;
 mod config_page;
 mod dataset;
+mod deadline;
 mod detect;
 mod devices;
 mod diagnostics;
@@ -556,7 +557,10 @@ pub(crate) fn router(state: impl Into<Shared>) -> Router {
     for (path, method) in admin_routes() {
         admin = admin.route(path, method);
     }
+    // RA-032: a request body that stops arriving ends after `deadline::BODY_IDLE_TIMEOUT` (the
+    // detection routes, open ones, keep their own total read deadline instead).
     let admin = admin
+        .route_layer(axum::middleware::map_request(deadline::idle_body))
         .route_layer(axum::middleware::from_fn(guard::csrf))
         .route_layer(axum::middleware::from_fn_with_state(
             shared.clone(),
@@ -567,6 +571,7 @@ pub(crate) fn router(state: impl Into<Shared>) -> Router {
         login = login.route(path, method);
     }
     let login = login
+        .route_layer(axum::middleware::map_request(deadline::idle_body))
         .route_layer(axum::middleware::from_fn(guard::csrf))
         .route_layer(axum::middleware::from_fn_with_state(
             shared.clone(),

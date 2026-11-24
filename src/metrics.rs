@@ -135,10 +135,13 @@ pub enum RejectReason {
     /// The uploads in flight across all requests would pass their byte budget (503,
     /// `server::body_budget`): many large frames at once, not one slow sender.
     UploadBudget,
+    /// `/v1/vision/custom/<model>` named no enabled model (a camera still calling a model that
+    /// was removed, renamed or disabled).
+    UnknownModel,
 }
 
 impl RejectReason {
-    pub const ALL: [RejectReason; 7] = [
+    pub const ALL: [RejectReason; 8] = [
         RejectReason::Overloaded,
         RejectReason::BodyTooLarge,
         RejectReason::DecodeError,
@@ -146,6 +149,7 @@ impl RejectReason {
         RejectReason::PeerBodyReads,
         RejectReason::BodyTimeout,
         RejectReason::UploadBudget,
+        RejectReason::UnknownModel,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -157,6 +161,7 @@ impl RejectReason {
             RejectReason::PeerBodyReads => "peer_body_reads",
             RejectReason::BodyTimeout => "body_timeout",
             RejectReason::UploadBudget => "upload_budget",
+            RejectReason::UnknownModel => "unknown_model",
         }
     }
 }
@@ -259,6 +264,16 @@ pub struct ModelMetrics {
     /// [`LOG_THROTTLE_INTERVAL`] instead of one per rejected request; the service writes
     /// warnings to the Windows event log).
     pub queue_full_log: LogThrottle,
+    /// Throttle of the "dropping request that waited longer than the request timeout" warning
+    /// on the worker thread (a slowed device drops at the camera rate; `dropped_total{reason=
+    /// "timeout"}` keeps the exact count).
+    pub timeout_log: LogThrottle,
+    /// Throttle of the "worker dropped the request" / "timed out waiting for the worker"
+    /// warnings of the HTTP side (`server::detect`).
+    pub worker_gone_log: LogThrottle,
+    /// Throttle of the bad or oversized image warning (one camera sending broken frames would
+    /// otherwise log one line per frame; `decode_error` rejections keep the exact count).
+    pub decode_error_log: LogThrottle,
     /// Clock of [`Self::now_ms`].
     started: Instant,
 }
@@ -288,6 +303,9 @@ impl ModelMetrics {
             process_ms: Histogram::new(),
             round_trip_ms: Histogram::new(),
             queue_full_log: LogThrottle::default(),
+            timeout_log: LogThrottle::default(),
+            worker_gone_log: LogThrottle::default(),
+            decode_error_log: LogThrottle::default(),
             started: Instant::now(),
         }
     }
@@ -486,6 +504,8 @@ pub struct Metrics {
     pub rejected_body_timeout: AtomicU64,
     /// Detection uploads refused by the upload byte budget ([`RejectReason::UploadBudget`]).
     pub rejected_upload_budget: AtomicU64,
+    /// `/v1/vision/custom/<model>` requests for no enabled model ([`RejectReason::UnknownModel`]).
+    pub rejected_unknown_model: AtomicU64,
     /// Fixed server-wide in-flight cap for detection requests; 0 (the default) derives it from
     /// the models' queue capacities on every request (see `server::detect::max_inflight`).
     pub inflight_limit: AtomicUsize,
@@ -493,6 +513,9 @@ pub struct Metrics {
     pub overload_log: LogThrottle,
     /// Rate limit of the "one client holds too many uploads" warning.
     pub peer_reads_log: LogThrottle,
+    /// Rate limit of the "request for unknown model" warning: one for every name, since the
+    /// names are the client's text (a map keyed by them would grow without bound).
+    pub unknown_model_log: LogThrottle,
     /// Detection requests being handled now, process-wide (every generation counts: an
     /// in-flight request of an old generation still holds its upload in memory).
     inflight: AtomicUsize,
@@ -536,47 +559,13 @@ impl Drop for InflightPermit {
 }
 
 /// Smallest gap between two warnings of the same rate-limited kind.
-pub const LOG_THROTTLE_INTERVAL: Duration = Duration::from_secs(10);
+pub const LOG_THROTTLE_INTERVAL: Duration = crate::logthrottle::DEFAULT_EVERY;
 
-/// Lets a repeated warning through at most once per [`LOG_THROTTLE_INTERVAL`] and counts the
-/// ones it held back, so a flood (e.g. every rejected request under overload) logs one line per
-/// interval instead of one per event.
-#[derive(Debug)]
-pub struct LogThrottle {
-    /// Time of the last warning let through, in ms since `Metrics::started` (`u64::MAX`: never).
-    last_ms: AtomicU64,
-    suppressed: AtomicU64,
-}
-
-impl Default for LogThrottle {
-    fn default() -> Self {
-        Self {
-            last_ms: AtomicU64::new(u64::MAX),
-            suppressed: AtomicU64::new(0),
-        }
-    }
-}
-
-impl LogThrottle {
-    /// At `now_ms` (any monotonic millisecond clock): `Some(n)` when the warning should be
-    /// logged now, `n` being how many were held back since the last one; `None` to skip it.
-    pub fn allow(&self, now_ms: u64) -> Option<u64> {
-        let interval = u64::try_from(LOG_THROTTLE_INTERVAL.as_millis()).unwrap_or(u64::MAX);
-        let last = self.last_ms.load(Ordering::Acquire);
-        let due = last == u64::MAX || now_ms.saturating_sub(last) >= interval;
-        if due
-            && self
-                .last_ms
-                .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            Some(self.suppressed.swap(0, Ordering::AcqRel))
-        } else {
-            self.suppressed.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    }
-}
+/// Lets a repeated warning through at most once per [`LOG_THROTTLE_INTERVAL`] (its `Default`)
+/// and counts the ones it held back, so a flood (e.g. every rejected request under overload)
+/// logs one line per interval instead of one per event. The crate's one throttle,
+/// [`crate::logthrottle::Throttle`].
+pub type LogThrottle = crate::logthrottle::Throttle;
 
 impl Metrics {
     pub fn new(version: impl Into<String>) -> Self {
@@ -591,9 +580,11 @@ impl Metrics {
             rejected_peer_body_reads: AtomicU64::new(0),
             rejected_body_timeout: AtomicU64::new(0),
             rejected_upload_budget: AtomicU64::new(0),
+            rejected_unknown_model: AtomicU64::new(0),
             inflight_limit: AtomicUsize::new(0),
             overload_log: LogThrottle::default(),
             peer_reads_log: LogThrottle::default(),
+            unknown_model_log: LogThrottle::default(),
             inflight: AtomicUsize::new(0),
             body_reads: Mutex::new(HashMap::new()),
         }
@@ -654,6 +645,7 @@ impl Metrics {
             RejectReason::PeerBodyReads => &self.rejected_peer_body_reads,
             RejectReason::BodyTimeout => &self.rejected_body_timeout,
             RejectReason::UploadBudget => &self.rejected_upload_budget,
+            RejectReason::UnknownModel => &self.rejected_unknown_model,
             RejectReason::DecodeError => return,
         };
         c.fetch_add(1, Ordering::Relaxed);
@@ -668,6 +660,7 @@ impl Metrics {
             RejectReason::PeerBodyReads => self.rejected_peer_body_reads.load(Ordering::Relaxed),
             RejectReason::BodyTimeout => self.rejected_body_timeout.load(Ordering::Relaxed),
             RejectReason::UploadBudget => self.rejected_upload_budget.load(Ordering::Relaxed),
+            RejectReason::UnknownModel => self.rejected_unknown_model.load(Ordering::Relaxed),
             RejectReason::DecodeError => self
                 .models
                 .read_recover()
@@ -895,7 +888,7 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
 
     let _ = writeln!(
         out,
-        "# HELP {PREFIX}requests_rejected_total Detection requests rejected before inference, by reason (overloaded: the server-wide in-flight cap was reached; body_too_large: the upload exceeded the body limit; decode_error: the image could not be decoded; bad_request: no usable multipart image upload; peer_body_reads: one client had too many uploads still being read, a stalled or very slow sender; body_timeout: the upload was not received in time)."
+        "# HELP {PREFIX}requests_rejected_total Detection requests rejected before inference, by reason (overloaded: the server-wide in-flight cap was reached; body_too_large: the upload exceeded the body limit; decode_error: the image could not be decoded; bad_request: no usable multipart image upload; peer_body_reads: one client had too many uploads still being read, a stalled or very slow sender; body_timeout: the upload was not received in time; upload_budget: the uploads in flight held the most memory allowed; unknown_model: the request named no enabled model)."
     );
     let _ = writeln!(out, "# TYPE {PREFIX}requests_rejected_total counter");
     for reason in RejectReason::ALL {
@@ -1350,6 +1343,7 @@ mod tests {
         m.record_rejected(RejectReason::PeerBodyReads);
         m.record_rejected(RejectReason::BodyTimeout);
         m.record_rejected(RejectReason::BodyTimeout);
+        m.record_rejected(RejectReason::UnknownModel);
         m.model("a").record_decode_error();
         m.model("b").record_decode_error();
         m.model("b").record_decode_error();
@@ -1367,6 +1361,7 @@ mod tests {
         has("blue_onyx_prism_requests_rejected_total{reason=\"peer_body_reads\"} 1");
         has("blue_onyx_prism_requests_rejected_total{reason=\"body_timeout\"} 2");
         has("blue_onyx_prism_requests_rejected_total{reason=\"bad_request\"} 2");
+        has("blue_onyx_prism_requests_rejected_total{reason=\"unknown_model\"} 1");
         has("blue_onyx_prism_info{version=\"9.8.7\"} 1");
         has("# TYPE blue_onyx_prism_build_info gauge");
         has(&format!(

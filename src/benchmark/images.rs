@@ -39,6 +39,7 @@ use crate::config::DatasetRef;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Built-in set ids the project curates (`assets/bench/<id>.json`). An id listed here whose
@@ -624,6 +625,16 @@ pub fn safe_file_name(f: &str) -> bool {
     )
 }
 
+/// The manifest's entries by file name, built once so a folder of N files costs N lookups, not
+/// N scans. A name listed twice keeps its first entry, as a linear `find` did.
+fn manifest_by_file(manifest: Option<&Manifest>) -> HashMap<&str, &ManifestImage> {
+    let mut map = HashMap::new();
+    for i in manifest.map(|m| m.images.as_slice()).unwrap_or_default() {
+        map.entry(i.file.as_str()).or_insert(i);
+    }
+    map
+}
+
 pub(crate) fn manifest_image(i: &ManifestImage, path: PathBuf) -> SetImage {
     let (w, h) = match (i.width, i.height) {
         (Some(w), Some(h)) => (w, h),
@@ -704,15 +715,14 @@ pub fn load_dir(
         ),
         _ => None,
     };
+    let by_file = manifest_by_file(manifest.as_ref());
     let mut images = Vec::new();
     for path in files {
         let file = path
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let entry = manifest
-            .as_ref()
-            .and_then(|m| m.images.iter().find(|i| i.file == file));
+        let entry = by_file.get(file.as_str()).copied();
         images.push(match entry {
             Some(e) => manifest_image(e, path),
             None => {
@@ -1526,6 +1536,38 @@ mod tests {
             std::fs::write(dir.join(name), bytes.unwrap_or(&jpg)).unwrap();
         }
         dir
+    }
+
+    /// A manifest of tens of thousands of entries resolves each file by lookup, not by a scan of the
+    /// manifest per file (RA-114): 30000 x 30000 string compares would show here.
+    #[test]
+    fn a_large_manifest_resolves_every_file() {
+        const N: usize = 30000;
+        let names: Vec<String> = (0..N).map(|i| format!("f{i:05}.jpg")).collect();
+        let owned: Vec<(&str, Option<&[u8]>)> = names
+            .iter()
+            .map(|n| (n.as_str(), Some(&b"x"[..])))
+            .collect();
+        let dir = temp_set(&owned);
+        let entries: Vec<String> = names
+            .iter()
+            .map(|n| format!(r#"{{"file":"{n}","width":640,"height":480,"tags":["t-{n}"]}}"#))
+            .collect();
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(r#"{{"images":[{}]}}"#, entries.join(",")),
+        )
+        .unwrap();
+        let t0 = std::time::Instant::now();
+        let (set, _) = load_dir(&dir, None, Some("big")).unwrap();
+        let took = t0.elapsed();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(set.images.len(), N);
+        for i in &set.images {
+            assert_eq!((i.width, i.height), (640, 480), "{}", i.file);
+            assert!(i.tags.contains(&format!("t-{}", i.file)), "{}", i.file);
+        }
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     /// A COCO JSON is matched by file name: unlisted images are left out with a warning,

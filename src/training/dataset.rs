@@ -74,6 +74,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod balance;
 pub mod reuse;
@@ -2870,9 +2871,19 @@ pub fn heldout_tags(
 }
 
 /// Write `plan` into `out` (created; must not exist or be empty). The frames as the plan read them
-/// ([`at_run_input`]: size floor regions a run at `opts.imgsz` can learn are boxes).
+/// ([`at_run_input`]: size floor regions a run at `opts.imgsz` can learn are boxes). Not
+/// cancellable (`train prepare`; a training run uses [`write_reusing`] with its cancel flag).
 pub fn write(sources: &[Source], plan: &Plan, opts: &Options, out: &Path) -> Result<Prepared> {
-    write_reusing(sources, plan, opts, out, &[]).map(|(p, _)| p)
+    write_reusing(sources, plan, opts, out, &[], &AtomicBool::new(false)).map(|(p, _)| p)
+}
+
+/// `Err(Cancelled)` once `cancel` is set: [`write_reusing`] asks before every frame.
+fn check_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(anyhow::anyhow!(crate::resources::export::Cancelled))
+    } else {
+        Ok(())
+    }
 }
 
 /// What [`write_reusing`] took from a donor.
@@ -2903,12 +2914,17 @@ impl Reused {
 /// whose plan is the same instead of writing them again, where that is safe ([`reuse`]); every
 /// image it cannot link is written from its source as by [`write`]. Records its own images
 /// ([`reuse::PREPARED_FILES_FILE`]) for a later run.
+///
+/// `cancel` is checked before every frame (also on the image writers' threads, so a cancel
+/// stops within a frame per thread): then `Err(Cancelled)` with `out` half written, which the
+/// caller removes (the run's own `data`; nothing else is written here).
 pub fn write_reusing(
     sources: &[Source],
     plan: &Plan,
     opts: &Options,
     out: &Path,
     donors: &[PathBuf],
+    cancel: &AtomicBool,
 ) -> Result<(Prepared, Reused)> {
     let at_input = at_run_input(sources, plan, opts);
     let sources: &[Source] = &at_input;
@@ -3004,6 +3020,7 @@ pub fn write_reusing(
     let mut written: BTreeSet<FrameRef> = BTreeSet::new();
     let mut to_write: Vec<(FrameRef, String)> = Vec::new();
     let mut put = |r: FrameRef, f: &Frame, n: &str| -> Result<()> {
+        check_cancel(cancel)?;
         if written.insert(r) {
             to_write.push((r, n.to_string()));
             let txt = out
@@ -3084,6 +3101,7 @@ pub fn write_reusing(
         opts.prepared_short_side,
         &out.join("images"),
         donor.as_ref(),
+        cancel,
     )?;
     let mut resized: BTreeMap<FrameRef, (u32, u32)> = BTreeMap::new();
     for (&(r, src, n), w) in jobs.iter().zip(&written) {
@@ -3159,6 +3177,7 @@ pub fn write_reusing(
             ..Manifest::default()
         };
         for &r in &plan.heldout {
+            check_cancel(cancel)?;
             let f = frame(r)?;
             // Boxes cannot be placed without the size: left out, as the benchmark always did.
             let Some(size) = size_of(r, f).ok().filter(|s| s.0 > 0 && s.1 > 0) else {
@@ -3274,16 +3293,21 @@ struct WrittenImage {
 
 /// Write the images `jobs` (frame, source, file name in `dir`) of the train / valid splits: each
 /// hard-linked from `donor` when it may ([`reuse::Donor::link`]), else through [`prepare_image`] at
-/// `short`, or linked as it is when None. In parallel ([`crate::parallel::map_all`] on all
-/// physical cores but one); the first error is returned. Returns how each was written, in `jobs`
-/// order.
+/// `short`, or linked as it is when None. In parallel ([`crate::parallel::map_all_at`] on all
+/// physical cores but one; the threads it spawns run below normal priority
+/// ([`crate::parallel::Spawned::Background`]), so a downscale of thousands of frames never
+/// competes with detections; the calling (training) thread works too at its own priority); the
+/// first error is returned, `Cancelled` before any other once `cancel` is set (every image not
+/// started by then is skipped). Returns how each was written, in `jobs` order.
 fn write_images(
     jobs: &[(FrameRef, &Path, &str)],
     short: Option<u32>,
     dir: &Path,
     donor: Option<&reuse::Donor>,
+    cancel: &AtomicBool,
 ) -> Result<Vec<WrittenImage>> {
     let one = |i: usize| -> Result<Option<WrittenImage>> {
+        check_cancel(cancel)?;
         let Some(&(_, src, n)) = jobs.get(i) else {
             return Ok(None);
         };
@@ -3314,8 +3338,15 @@ fn write_images(
         Some(_) => crate::backend::cpu_threads::effective(0),
         None => crate::parallel::walk_threads_over(jobs.len()),
     };
+    let done = crate::parallel::map_all_at(
+        jobs.len(),
+        threads,
+        crate::parallel::Spawned::Background,
+        &one,
+    );
+    check_cancel(cancel)?;
     let mut out = Vec::with_capacity(jobs.len());
-    for d in crate::parallel::map_all(jobs.len(), threads, &one) {
+    for d in done {
         if let Some(w) = d? {
             out.push(w);
         }

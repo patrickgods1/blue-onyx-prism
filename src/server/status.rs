@@ -1,6 +1,8 @@
 //! `GET /v1/status`: machine-readable readiness for container orchestrators, systemd wrappers
 //! and Blue Iris watchdogs. Cheap (no file I/O) and open to every client; `curl -f` works
-//! because the HTTP status is 503 while the service cannot serve detections.
+//! because the HTTP status is 503 while the service cannot serve detections. `fileLogCapped`
+//! says today's log file reached its cap ([`crate::cli::file_log_capped`]): only errors still
+//! reach it until tomorrow, so something logs far more than usual.
 
 use super::{AppState, state_view};
 use crate::startup::ModelState;
@@ -102,6 +104,7 @@ pub(super) async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         "generation": state.config.generation(),
         "models": models,
         "version": crate::VERSION,
+        "fileLogCapped": crate::cli::file_log_capped(),
     });
     (overall.http(), Json(body)).into_response()
 }
@@ -195,6 +198,8 @@ mod tests {
         assert_eq!(v["status"], "ready");
         assert_eq!(v["ready"], true);
         assert_eq!(v["generation"], 1);
+        // Tests log to no file, so the file log is never capped here.
+        assert_eq!(v["fileLogCapped"], false);
 
         let (code, v) = get(&state_with(&[
             ("a", ModelState::Ready),

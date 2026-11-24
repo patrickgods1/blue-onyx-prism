@@ -57,15 +57,21 @@
 //! (no referrer to other sites) and `X-Frame-Options: DENY` to every answer, [`CSP`] to HTML pages (every script and style
 //! must come from `/static/`), `charset=utf-8` to HTML without one, and `Cache-Control:
 //! no-store` to JSON that sets no cache policy of its own.
+//!
+//! # Log lines
+//!
+//! Every refusal here can be sent by any LAN client at its own rate, so each kind logs at most
+//! one line per interval ([`crate::logthrottle::Throttle`], one per kind, the line carrying the
+//! `dropped` count), and the client's text in it is cut: a `Host`, `Origin` or `Referer` to
+//! [`MAX_HOST_SHOWN`] characters (also in the 403 answer), a path to [`MAX_PATH_LOGGED`].
 
 use super::{MessageTemplate, network, render, wants_html};
-use crate::sync::LockExt;
+use crate::logthrottle::Throttle;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, middleware::Next};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::warn;
 
 /// Content-Security-Policy of the HTML pages: everything from this origin, inline scripts
@@ -80,11 +86,12 @@ pub(crate) enum CrossSite {
     FetchSite,
     /// `Sec-Fetch-Site: same-site` over HTTPS (a plain-HTTP page of this host).
     SameSite,
-    /// `Origin`/`Referer` (the field) is not `https` on the HTTPS port.
+    /// `Origin`/`Referer` (the field, as shown: [`shown`]) is not `https` on the HTTPS port.
     Scheme(String),
     /// `Host` missing.
     NoHost,
-    /// `Origin`/`Referer` (first field) names another authority than `Host` (second field).
+    /// `Origin`/`Referer` (first field) names another authority than `Host` (second field),
+    /// both as shown ([`shown`]; the decision compared the full values).
     Mismatch(String, String),
 }
 
@@ -193,15 +200,15 @@ pub(crate) fn cross_site(headers: &HeaderMap, tls: bool) -> Result<(), CrossSite
         return Ok(());
     }
     let Some((scheme, auth)) = authority(source) else {
-        return Err(CrossSite::Mismatch(source.to_string(), host.to_string()));
+        return Err(CrossSite::Mismatch(shown(source), shown(host)));
     };
     if tls && scheme != "https" {
-        return Err(CrossSite::Scheme(format!("{scheme}://{auth}")));
+        return Err(CrossSite::Scheme(shown(&format!("{scheme}://{auth}"))));
     }
     if normalize_authority(&auth, scheme) == normalize_authority(host, scheme) {
         Ok(())
     } else {
-        Err(CrossSite::Mismatch(auth, host.to_string()))
+        Err(CrossSite::Mismatch(shown(&auth), shown(host)))
     }
 }
 
@@ -217,8 +224,19 @@ pub(super) fn proxy_header(headers: &HeaderMap) -> Option<&'static str> {
     PROXY_HEADERS.into_iter().find(|h| headers.contains_key(*h))
 }
 
-/// Most characters of a client's `Host` repeated in a refusal or in the log.
+/// Most characters of a client's `Host`, `Origin` or `Referer` repeated in a refusal or in the
+/// log: a request head may carry hundreds of KiB of it, and each refused request would format
+/// all of it (audit RA-106).
 const MAX_HOST_SHOWN: usize = 100;
+
+/// Client text as a refusal or a log line may repeat it: control characters dropped, at most
+/// [`MAX_HOST_SHOWN`] characters. Display only: decisions compare the full values.
+fn shown(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_HOST_SHOWN)
+        .collect()
+}
 
 /// Most characters of a request path written to the log by a refusal: a client may send a
 /// path of tens of KiB, and each refused request would format all of it (audit RA-079).
@@ -298,52 +316,26 @@ pub(super) fn host_allowed(host: &str, allowed: &[String]) -> bool {
 /// ([`host_allowed`]); None lets the request through. No host at all passes (module doc).
 pub(super) fn foreign_host(headers: &HeaderMap, uri: &Uri, allowed: &[String]) -> Option<String> {
     let host = request_host(headers, uri)?;
-    (!host_allowed(&host, allowed)).then(|| {
-        host.chars()
-            .filter(|c| !c.is_control())
-            .take(MAX_HOST_SHOWN)
-            .collect()
-    })
+    (!host_allowed(&host, allowed)).then(|| shown(&host))
 }
 
-/// What decides whether a repeated warning is logged now.
-#[derive(Debug)]
-pub(super) struct WarnThrottle {
-    last: Option<Instant>,
-    dropped: u64,
-}
-
-impl WarnThrottle {
-    pub(super) const fn new() -> Self {
-        Self {
-            last: None,
-            dropped: 0,
-        }
-    }
-
-    /// `Some(lines dropped since the last one)` when a line may be logged at `now`.
-    pub(super) fn allow_at(&mut self, now: Instant, every: Duration) -> Option<u64> {
-        if self.last.is_some_and(|t| now.duration_since(t) < every) {
-            self.dropped = self.dropped.saturating_add(1);
-            return None;
-        }
-        self.last = Some(now);
-        Some(std::mem::take(&mut self.dropped))
-    }
-}
+/// At most one log line per this long for each of [`NETWORK_WARNS`], [`ACCEPT_WARNS`] and
+/// [`CSRF_WARNS`]: a scanner or a hostile client would otherwise write one per connection or
+/// request.
+const NETWORK_WARN_EVERY: Duration = Duration::from_secs(60);
 
 /// The refused-`Host` warnings of this process.
-static HOST_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
+static HOST_WARNS: Throttle = Throttle::new(HOST_WARN_EVERY);
 
 /// Refusals of the network rule ([`network_rule`]) logged by this process.
-static NETWORK_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
+static NETWORK_WARNS: Throttle = Throttle::new(NETWORK_WARN_EVERY);
 
 /// Connections dropped at accept ([`admit`]) logged by this process.
-static ACCEPT_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
+static ACCEPT_WARNS: Throttle = Throttle::new(NETWORK_WARN_EVERY);
 
-/// At most one log line per this long for each of [`NETWORK_WARNS`] and [`ACCEPT_WARNS`]: a
-/// scanner would otherwise write one per connection.
-const NETWORK_WARN_EVERY: Duration = Duration::from_secs(60);
+/// Cross-site refusals ([`csrf`]) logged by this process: the login routes are behind it with
+/// no sign-in, so any LAN client can repeat one at its own rate.
+static CSRF_WARNS: Throttle = Throttle::new(NETWORK_WARN_EVERY);
 
 /// Whether the accept loop serves a connection from `peer`: [`network::allowed`] with the
 /// current config's `allowed_networks`. A refused one is logged (throttled) and the caller drops
@@ -353,10 +345,7 @@ pub(super) fn admit(peer: std::net::SocketAddr, shared: &super::Shared) -> bool 
     if network::allowed(peer.ip(), &extra) {
         return true;
     }
-    let dropped = ACCEPT_WARNS
-        .lock_recover()
-        .allow_at(Instant::now(), NETWORK_WARN_EVERY);
-    if let Some(dropped) = dropped {
+    if let Some(dropped) = ACCEPT_WARNS.allow_now() {
         warn!(
             peer = %peer.ip().to_canonical(),
             dropped,
@@ -384,10 +373,7 @@ pub(super) async fn network_rule(
     let Some(why) = network::refusal(peer, req.headers(), &extra) else {
         return next.run(req).await;
     };
-    let dropped = NETWORK_WARNS
-        .lock_recover()
-        .allow_at(Instant::now(), NETWORK_WARN_EVERY);
-    if let Some(dropped) = dropped {
+    if let Some(dropped) = NETWORK_WARNS.allow_now() {
         let who = peer.map_or_else(|| "unknown".to_string(), |ip| ip.to_canonical().to_string());
         let (header, problem) = match why {
             network::Refusal::Header {
@@ -416,10 +402,7 @@ pub(super) async fn network_rule(
 /// 403 for a `host` the admin routes do not answer under: an HTML page for browsers, else
 /// JSON. `host` comes from [`foreign_host`].
 pub(super) fn host_refused(headers: &HeaderMap, path: &str, host: &str) -> Response {
-    let dropped = HOST_WARNS
-        .lock_recover()
-        .allow_at(Instant::now(), HOST_WARN_EVERY);
-    if let Some(dropped) = dropped {
+    if let Some(dropped) = HOST_WARNS.allow_now() {
         let path = path_for_log(path);
         warn!(%host, %path, dropped, "admin route refused for an unknown host name (DNS rebinding?)");
     }
@@ -483,13 +466,28 @@ pub(super) async fn csrf(req: axum::extract::Request, next: Next) -> Response {
         Ok(()) => return next.run(req).await,
         Err(why) => why,
     };
-    warn!(path = %req.uri().path(), %why, "cross-site request to an admin route refused");
+    note_cross_site(
+        &CSRF_WARNS,
+        crate::logthrottle::process_ms(),
+        req.uri().path(),
+        &why,
+    );
     let msg = format!(
         "Cross-site request refused: {why}. Changes through the admin API must come from this \
          server's own pages (same scheme, host and port as the address in the browser) or from \
          a non-browser client."
     );
     forbidden(req.headers(), msg)
+}
+
+/// The warning of a [`csrf`] refusal at `now_ms` (on [`crate::logthrottle::process_ms`]),
+/// throttled by `warns`, with the path cut ([`path_for_log`]) and the reason as shown (its
+/// client text is cut by [`cross_site`]). `Some(dropped)` when it logged.
+fn note_cross_site(warns: &Throttle, now_ms: u64, path: &str, why: &CrossSite) -> Option<u64> {
+    let dropped = warns.allow(now_ms)?;
+    let path = path_for_log(path);
+    warn!(%path, %why, dropped, "cross-site request to an admin route refused");
+    Some(dropped)
 }
 
 /// Middleware of the whole router (outside the network rule): every answer on the plain port, and
@@ -862,19 +860,105 @@ mod tests {
 
     #[test]
     fn repeated_warnings_are_throttled() {
-        let t0 = Instant::now();
-        let every = Duration::from_secs(60);
-        let mut w = WarnThrottle {
-            last: None,
-            dropped: 0,
-        };
-        assert_eq!(w.allow_at(t0, every), Some(0));
+        // Start the process clock first: an `Instant` before its start reads as its start.
+        crate::logthrottle::process_ms();
+        let t0 = std::time::Instant::now();
+        let every = NETWORK_WARN_EVERY;
+        let w = Throttle::new(every);
+        assert_eq!(w.allow_at(t0), Some(0));
         for s in 0..59 {
-            assert_eq!(w.allow_at(t0 + Duration::from_secs(s), every), None);
+            assert_eq!(w.allow_at(t0 + Duration::from_secs(s)), None);
         }
-        assert_eq!(w.allow_at(t0 + every, every), Some(59));
-        assert_eq!(w.allow_at(t0 + every, every), None);
-        assert_eq!(w.allow_at(t0 + every * 2, every), Some(1));
+        assert_eq!(w.allow_at(t0 + every), Some(59));
+        assert_eq!(w.allow_at(t0 + every), None);
+        assert_eq!(w.allow_at(t0 + every * 2), Some(1));
+    }
+
+    /// RA-106: a flood of cross-site refusals logs one line per interval, with the path cut and
+    /// the count dropped.
+    #[test]
+    fn cross_site_refusals_log_once_per_interval() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let w = Throttle::new(NETWORK_WARN_EVERY);
+        let every = u64::try_from(NETWORK_WARN_EVERY.as_millis()).unwrap();
+        let why = CrossSite::FetchSite;
+        let long = format!("/login{}", "a".repeat(64 << 10));
+        let buf = crate::logbuf::LogBuffer::new(100);
+        let sub = tracing_subscriber::registry().with(buf.clone());
+        let got: Vec<Option<u64>> = tracing::subscriber::with_default(sub, || {
+            tracing::callsite::rebuild_interest_cache();
+            let mut got: Vec<_> = (0..30)
+                .map(|i| note_cross_site(&w, 5 + i, &long, &why))
+                .collect();
+            got.push(note_cross_site(&w, 5 + every, "/login", &why));
+            got
+        });
+        assert_eq!(got.first(), Some(&Some(0)));
+        assert_eq!(got.last(), Some(&Some(29)));
+        assert_eq!(got.iter().flatten().count(), 2, "{got:?}");
+        let lines: Vec<String> = buf
+            .since(0, None, 100)
+            .entries
+            .into_iter()
+            .map(|e| e.message)
+            .filter(|m| m.contains("cross-site"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].len() < 1000,
+            "the path is cut: {} bytes",
+            lines[0].len()
+        );
+        assert!(lines[1].contains("dropped=29"), "{}", lines[1]);
+    }
+
+    /// RA-106: a huge `Origin` is compared in full but shown cut, in the reason and so in the
+    /// 403 answer.
+    #[tokio::test]
+    async fn a_huge_origin_is_cut_in_the_answer() {
+        let host = ("host", "192.168.1.5:32169");
+        let huge = format!("https://{}.example", "o".repeat(10 << 10));
+        let why = cross_site(&headers(&[host, ("origin", &huge)]), true).unwrap_err();
+        let CrossSite::Mismatch(origin, shown_host) = &why else {
+            panic!("{why:?}");
+        };
+        assert_eq!(origin.chars().count(), MAX_HOST_SHOWN);
+        assert_eq!(shown_host, "192.168.1.5:32169");
+        let plain = format!("http://{}", "p".repeat(10 << 10));
+        let scheme = cross_site(&headers(&[host, ("origin", &plain)]), true).unwrap_err();
+        let CrossSite::Scheme(s) = &scheme else {
+            panic!("{scheme:?}");
+        };
+        assert_eq!(s.chars().count(), MAX_HOST_SHOWN);
+        // The comparison uses the full value: the same long name in Host and Origin passes,
+        // and two long names that differ only after the shown part do not.
+        let name = "n".repeat(10 << 10);
+        let same = cross_site(
+            &headers(&[("host", &name), ("origin", &format!("https://{name}"))]),
+            true,
+        );
+        assert_eq!(same, Ok(()));
+        let other = cross_site(
+            &headers(&[("host", &name), ("origin", &format!("https://{name}x"))]),
+            true,
+        );
+        assert!(matches!(other, Err(CrossSite::Mismatch(..))), "{other:?}");
+        // The answer repeats the cut text only.
+        let req = axum::http::Request::post("/login")
+            .header("host", "192.168.1.5:32169")
+            .header("origin", &huge)
+            .extension(super::super::Transport::Tls)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let app = axum::Router::new()
+            .route("/login", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(csrf));
+        let resp = tower::ServiceExt::oneshot(app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.len() < 2000, "{} bytes", body.len());
     }
 
     #[test]

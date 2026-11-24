@@ -3,8 +3,13 @@
 //!
 //! - [`map`]: long CPU-bound work with progress and a cancel flag (an import's analysis); the
 //!   calling thread polls a counter and reports.
-//! - [`map_all`]: a read walk over the dataset folder (`collect::labels`); the calling thread
-//!   works too and nothing polls, so a short walk pays no wake-up.
+//! - [`map_all`] / [`map_all_at`]: a read walk over the dataset folder (`collect::labels`) or a
+//!   training run's image downscale; the calling thread works too and nothing polls, so a short
+//!   walk pays no wake-up.
+//!
+//! Both take a [`Spawned`] priority for the threads they spawn (never the calling thread's):
+//! background jobs (import analysis, dataset downscale, review walks) pass
+//! [`Spawned::Background`], so they never compete with detections for the CPU.
 //!
 //! With one item or one thread both run on the calling thread: no spawn, no sleep. [`walk_threads`]
 //! is how many threads a walk may take.
@@ -39,6 +44,24 @@ pub fn walk_threads_over(frames: usize) -> usize {
         1
     } else {
         walk_threads()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether the calling worker thread lowered itself through [`enter`] (tests: the priority
+    /// helper is a no-op on macOS, so its effect cannot be read there).
+    static LOWERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// First thing in every spawned worker: lower it for [`Spawned::Background`].
+fn enter(spawned: Spawned) {
+    if spawned == Spawned::Background {
+        crate::backend::priority::lower_this_thread(
+            crate::backend::priority::ThreadRole::Background,
+        );
+        #[cfg(test)]
+        LOWERED.with(|l| l.set(true));
     }
 }
 
@@ -101,10 +124,12 @@ fn serial<T>(
 /// `f(i)` for `i` in `0..n` on `threads` threads (each takes the next index), results by index.
 /// `progress(done)` runs on the calling thread at the start, about every `poll` while the
 /// workers run, and once at the end. `None` when `cancel` was set before every item was done.
-/// One item or one thread runs on the calling thread, without a sleep.
+/// One item or one thread runs on the calling thread, without a sleep (and at its priority);
+/// otherwise every item runs on a spawned thread at `spawned` priority.
 pub fn map<T: Send>(
     n: usize,
     threads: usize,
+    spawned: Spawned,
     f: &(dyn Fn(usize) -> T + Sync),
     progress: &mut dyn FnMut(usize),
     poll: Duration,
@@ -119,7 +144,10 @@ pub fn map<T: Send>(
         let handles: Vec<_> = (0..threads.min(n))
             .map(|_| {
                 let (next, done) = (&next, &done);
-                s.spawn(move || steal(next, done, n, f, cancel))
+                s.spawn(move || {
+                    enter(spawned);
+                    steal(next, done, n, f, cancel)
+                })
             })
             .collect();
         // Wake often (the end is noticed within 10 ms), report every `poll`.
@@ -145,14 +173,16 @@ pub fn map<T: Send>(
     by_index(n, parts)
 }
 
-/// Priority of the threads [`map_all_at`] spawns. The calling thread never changes: it may be
-/// a pooled HTTP or blocking thread, which must keep its priority.
+/// Priority of the threads [`map`] and [`map_all_at`] spawn. The calling thread never changes:
+/// it may be a pooled HTTP or blocking thread, or a job thread that also runs benchmarks and
+/// timings, which must keep its priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spawned {
     /// As the calling process (detection-side callers).
     Normal,
-    /// Below normal ([`crate::backend::priority::lower_this_thread`]): UI and index walks, so a
-    /// long walk never competes with detections for the CPU.
+    /// Below normal ([`crate::backend::priority::lower_this_thread`]): UI and index walks, an
+    /// import's analysis, a training run's downscale, so long work never competes with
+    /// detections for the CPU.
     Background,
 }
 
@@ -179,11 +209,7 @@ pub fn map_all_at<T: Send>(
         let handles: Vec<_> = (1..threads.min(n))
             .map(|_| {
                 s.spawn(|| {
-                    if spawned == Spawned::Background {
-                        crate::backend::priority::lower_this_thread(
-                            crate::backend::priority::ThreadRole::Background,
-                        );
-                    }
+                    enter(spawned);
                     steal(&next, &done, n, f, &cancel)
                 })
             })
@@ -233,6 +259,61 @@ mod tests {
         }
     }
 
+    /// Audit 2026-11 (RA-112): every worker of a background [`map`] / [`map_all_at`] calls the
+    /// priority helper first (the [`LOWERED`] seam, which works on every OS); a normal one never
+    /// does, and neither does the calling thread (it may do other work afterwards).
+    #[test]
+    fn background_workers_call_the_priority_helper_and_the_caller_does_not() {
+        let me = std::thread::current().id();
+        let cancel = AtomicBool::new(false);
+        let item = |_: usize| {
+            // Long enough that several workers take items.
+            std::thread::sleep(Duration::from_millis(2));
+            (
+                std::thread::current().id() == me,
+                LOWERED.with(std::cell::Cell::get),
+            )
+        };
+        for spawned in [Spawned::Normal, Spawned::Background] {
+            let seen = map(
+                64,
+                4,
+                spawned,
+                &item,
+                &mut |_| {},
+                Duration::from_millis(1),
+                &cancel,
+            )
+            .unwrap();
+            assert!(seen.iter().all(|(caller, _)| !caller), "map's caller polls");
+            let all = map_all_at(64, 4, spawned, &item);
+            assert!(
+                all.iter().any(|(caller, _)| *caller),
+                "map_all's caller works"
+            );
+            assert!(all.iter().any(|(caller, _)| !caller), "and spawned threads");
+            for (caller, lowered) in seen.into_iter().chain(all) {
+                let want = spawned == Spawned::Background && !caller;
+                assert_eq!(lowered, want, "{spawned:?} caller={caller}");
+            }
+        }
+        assert!(
+            !LOWERED.with(std::cell::Cell::get),
+            "the caller is never lowered"
+        );
+        // One thread runs on the caller: nothing is lowered.
+        let here = map(
+            8,
+            1,
+            Spawned::Background,
+            &item,
+            &mut |_| {},
+            Duration::ZERO,
+            &cancel,
+        );
+        assert!(here.unwrap().iter().all(|(c, l)| *c && !*l));
+    }
+
     #[test]
     fn map_keeps_the_order_and_stops_on_cancel() {
         let cancel = AtomicBool::new(false);
@@ -240,6 +321,7 @@ mod tests {
         let out = map(
             500,
             4,
+            Spawned::Normal,
             &|i| i * i,
             &mut |d| seen.push(d),
             Duration::from_millis(1),
@@ -249,13 +331,22 @@ mod tests {
         assert_eq!(out, (0..500).map(|i| i * i).collect::<Vec<_>>());
         assert_eq!(*seen.last().unwrap(), 500);
         assert!(
-            map(0, 4, &|i| i, &mut |_| {}, Duration::from_millis(1), &cancel)
-                .unwrap()
-                .is_empty()
+            map(
+                0,
+                4,
+                Spawned::Normal,
+                &|i| i,
+                &mut |_| {},
+                Duration::from_millis(1),
+                &cancel
+            )
+            .unwrap()
+            .is_empty()
         );
         let r = map(
             10_000,
             3,
+            Spawned::Background,
             &|i| {
                 if i == 50 {
                     cancel.store(true, Ordering::SeqCst);
@@ -283,7 +374,16 @@ mod tests {
         for (n, threads) in [(0, 4), (1, 4), (40, 1), (40, 0)] {
             let start = Instant::now();
             let mut seen = Vec::new();
-            let out = map(n, threads, &here, &mut |d| seen.push(d), poll, &cancel).unwrap();
+            let out = map(
+                n,
+                threads,
+                Spawned::Background,
+                &here,
+                &mut |d| seen.push(d),
+                poll,
+                &cancel,
+            )
+            .unwrap();
             assert_eq!(out, (1..=n).collect::<Vec<_>>());
             assert_eq!((seen[0], *seen.last().unwrap()), (0, n), "start and end");
             assert!(start.elapsed() < Duration::from_secs(5));
@@ -294,6 +394,7 @@ mod tests {
         let out = map(
             3,
             1,
+            Spawned::Background,
             &here,
             &mut |d| seen.push(d),
             Duration::ZERO,
@@ -305,6 +406,7 @@ mod tests {
         let r = map(
             5,
             1,
+            Spawned::Background,
             &|i| {
                 if i == 1 {
                     stop.store(true, Ordering::SeqCst);

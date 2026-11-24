@@ -1,6 +1,7 @@
 //! Real-socket tests of the listeners: HTTPS serves the router with the `Tls` marker, a stalled
 //! handshake holds no one else up, HTTP serves while the HTTPS port is taken and HTTPS comes up
-//! once it is free, and the connection caps.
+//! once it is free, the connection caps, a peer that stops reading; and the port-holder cache and
+//! the accept-error throttle.
 
 use super::*;
 use crate::server::test_util::*;
@@ -497,20 +498,35 @@ async fn plain_loop(
     app: Router,
     limits: Limits,
 ) -> (u16, CancellationToken, tokio::task::JoinHandle<()>) {
+    let (port, shutdown, task, _) = plain_loop_with_caps(app, limits).await;
+    (port, shutdown, task)
+}
+
+/// [`plain_loop`] and the loop's connection caps.
+async fn plain_loop_with_caps(
+    app: Router,
+    limits: Limits,
+) -> (
+    u16,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+    Arc<ConnCaps>,
+) {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
     let port = listener.local_addr().unwrap().port();
     let shutdown = CancellationToken::new();
+    let caps = Arc::new(ConnCaps::default());
     let l = Loop {
         app,
         shared: Shared::from(test_state()),
         shutdown: shutdown.clone(),
-        caps: Arc::new(ConnCaps::default()),
+        caps: caps.clone(),
         limits,
         accept: Accept::Plain,
     };
-    (port, shutdown, tokio::spawn(accept_loop(listener, l)))
+    (port, shutdown, tokio::spawn(accept_loop(listener, l)), caps)
 }
 
 /// RA-023: a request that never finishes holds its connection only for the grace. After it the
@@ -614,4 +630,206 @@ async fn an_idle_keep_alive_connection_is_closed_at_once() {
         started.elapsed()
     );
     assert!(closed_within(&mut client, Duration::from_secs(1)).await);
+}
+
+/// A route whose answer never ends (64 KiB chunks for ever), so only the client's reading paces
+/// the server's writes.
+fn endless_app() -> Router {
+    Router::new().route(
+        "/endless",
+        axum::routing::get(|| async {
+            let chunk = axum::body::Bytes::from(vec![b'x'; 64 * 1024]);
+            axum::body::Body::from_stream(futures_util::stream::repeat_with(move || {
+                Ok::<_, std::io::Error>(chunk.clone())
+            }))
+        }),
+    )
+}
+
+/// A client that has asked for `/endless`, with a receive buffer of `recv_buffer` bytes when
+/// given (a small one fills at once; below the loopback MSS it also delays the window updates
+/// a reader's reads send, so a reading client must keep the default).
+async fn endless_client(port: u16, recv_buffer: Option<u32>) -> tokio::net::TcpStream {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    if let Some(size) = recv_buffer {
+        socket.set_recv_buffer_size(size).unwrap();
+    }
+    let mut s = socket
+        .connect(SocketAddr::from(([127, 0, 0, 1], port)))
+        .await
+        .unwrap();
+    s.write_all(b"GET /endless HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    s
+}
+
+const LOCAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+/// RA-032: a client that asks for an answer and never reads it holds its connection only for
+/// the write-stall timeout: then the server closes it and its slot under the caps goes back.
+#[tokio::test]
+async fn a_client_that_never_reads_is_closed_and_frees_its_slot() {
+    let limits = Limits {
+        write_stall: Duration::from_millis(400),
+        ..Limits::default()
+    };
+    let (port, stop, task, caps) = plain_loop_with_caps(endless_app(), limits).await;
+    let mut client = endless_client(port, Some(4096)).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while caps.open(LOCAL).0 == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the connection was never accepted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Once the buffers are full the writes wait on the client; within the timeout (plus the
+    // time to fill them) the connection is gone.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while caps.open(LOCAL).0 != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "a client that never reads still holds its connection"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // What was buffered can still be read, then the stream ends (or is reset).
+    let mut buf = vec![0u8; 64 * 1024];
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the stream did not end");
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// The control of the test above, what the server did before the write-stall deadline (an
+/// hour here stands for none): the client that never reads keeps its connection and its slot,
+/// so the test above fails without the deadline.
+#[tokio::test]
+async fn without_the_deadline_a_client_that_never_reads_holds_its_slot() {
+    let limits = Limits {
+        write_stall: Duration::from_secs(3600),
+        graceful: Duration::from_millis(200),
+        ..Limits::default()
+    };
+    let (port, stop, task, caps) = plain_loop_with_caps(endless_app(), limits).await;
+    let _client = endless_client(port, Some(4096)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(caps.open(LOCAL).0, 1, "the connection is still held");
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(caps.open(LOCAL).0, 0, "the shutdown closes it");
+}
+
+/// A client that reads slower than the server writes but keeps reading is never cut, though the
+/// transfer lasts four write-stall timeouts and the server's writes wait on it all along. (The
+/// kernel reports the socket writable again only after a large part of its send buffer drained,
+/// some 340 KB on macOS loopback, so the gaps the server sees are that over the read rate: about
+/// 0.1 s here.)
+#[tokio::test]
+async fn a_slow_reader_keeps_its_connection() {
+    let stall = Duration::from_secs(1);
+    let limits = Limits {
+        write_stall: stall,
+        ..Limits::default()
+    };
+    let (port, stop, task, caps) = plain_loop_with_caps(endless_app(), limits).await;
+    let mut client = endless_client(port, None).await;
+    let mut buf = vec![0u8; 64 * 1024];
+    let started = Instant::now();
+    while started.elapsed() < stall * 4 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("data keeps coming")
+            .unwrap();
+        assert!(n > 0, "the server closed a client that kept reading");
+    }
+    assert_eq!(caps.open(LOCAL).0, 1);
+    drop(client);
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// RA-033: the port holder is looked up again only when the bind error changes or the last
+/// lookup is [`HOLDER_REFRESH`] old; otherwise the 30 s retry reuses the text.
+#[tokio::test]
+async fn the_port_holder_is_looked_up_only_when_needed() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let lookup = |calls: &Arc<std::sync::atomic::AtomicUsize>| {
+        let calls = calls.clone();
+        move |_port: u16| {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            crate::port_holder::Lookup::Held(crate::port_holder::Holder {
+                pid: u32::try_from(n).unwrap(),
+                name: Some("other.exe".into()),
+            })
+        }
+    };
+    let in_use = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+    let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+    let mut cache = HolderCache::default();
+    let t0 = Instant::now();
+    let first = cache.text(9, &in_use, t0, lookup(&calls)).await;
+    assert_eq!(first, "; port 9 is held by other.exe (PID 1)");
+    // The same failure on the next attempts (every 30 s) for almost ten minutes: no lookup.
+    for step in 1..20u32 {
+        let now = t0 + HTTPS_RETRY * step;
+        assert_eq!(cache.text(9, &in_use, now, lookup(&calls)).await, first);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // Another kind of failure: looked up at once.
+    let other = cache
+        .text(9, &denied, t0 + HTTPS_RETRY * 20, lookup(&calls))
+        .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(other.contains("PID 2"), "{other}");
+    // The same one past the refresh age: looked up again.
+    let later = t0 + HTTPS_RETRY * 20 + HOLDER_REFRESH;
+    cache.text(9, &denied, later, lookup(&calls)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    // Back to "in use": a change again.
+    cache
+        .text(9, &in_use, later + Duration::from_secs(1), lookup(&calls))
+        .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+}
+
+/// RA-119: a lasting accept failure writes one ERROR line per minute, not one per second.
+#[test]
+fn a_lasting_accept_failure_logs_once_a_minute() {
+    let throttle = Throttle::new(ACCEPT_ERROR_LOG_EVERY);
+    let e = std::io::Error::other("Too many open files (os error 24)");
+    let pause = u64::try_from(ACCEPT_ERROR_PAUSE.as_millis()).unwrap();
+    let every = u64::try_from(ACCEPT_ERROR_LOG_EVERY.as_millis()).unwrap();
+    // One failure a second for a minute on one listener.
+    let logged = (0..60u64)
+        .filter(|s| note_accept_error(&e, Transport::Plain, &throttle, 5_000 + s * pause))
+        .count();
+    assert_eq!(logged, 1);
+    assert_eq!(throttle.held_back(), 59);
+    assert!(note_accept_error(
+        &e,
+        Transport::Tls,
+        &throttle,
+        5_000 + every
+    ));
+    assert_eq!(throttle.held_back(), 0);
 }

@@ -6,6 +6,9 @@
 //! (a GTX 1070 Ti + UHD 630 box hard-hung within seconds of that sweep starting, twice).
 //! A cancelled run waits for its own benchmark to stop (up to [`STOP_WAIT`]) before it returns,
 //! so the queue never starts its next GPU job beside a model compile that cannot be interrupted.
+//! Its own benchmark is told apart by the run id the service answers at the start: a benchmark
+//! started from the Benchmark page right after it ended is neither waited on, read as its result
+//! nor cancelled ([`wait_own`], [`own_status`]).
 //!
 //! Per-scene AP comes from the benchmark's per-tag breakdowns of the held-out manifest's own tags
 //! ([`dataset::heldout_tags`]: `heldout:day|night|ir|all|in-scope`), which are exact AP over
@@ -59,24 +62,22 @@ pub const STOP_WAIT: Duration = Duration::from_secs(10 * 60);
 /// How often that wait says it is still waiting.
 const STOP_LOG_EVERY: Duration = Duration::from_secs(30);
 
-/// Wait while the benchmark that started at `ours` runs (checked every `poll`). `cancel` cancels
-/// it, then waits for it to stop, up to `stop_wait` (logged every `log_every`), before answering
-/// [`Cancelled`]: the queue's next job must not start beside a benchmark that is still compiling.
+/// Wait while the benchmark run `ours` (its service run id) runs (checked every `poll`).
+/// `cancel` cancels it (only it: [`BenchmarkService::cancel_run`]), then waits for it to stop, up
+/// to `stop_wait` (logged every `log_every`), before answering [`Cancelled`]: the queue's next
+/// job must not start beside a benchmark that is still compiling.
 fn wait_own(
     svc: &BenchmarkService,
-    ours: Option<Instant>,
+    ours: u64,
     cancel: &AtomicBool,
     stop_wait: Duration,
     poll: Duration,
     log_every: Duration,
 ) -> Result<()> {
-    let running = || {
-        svc.running()
-            .is_some_and(|r| ours.is_some() && r.started == ours)
-    };
+    let running = || svc.is_run_running(ours);
     while running() {
         if cancel.load(Ordering::Relaxed) {
-            svc.cancel();
+            svc.cancel_run(ours);
             let started = Instant::now();
             let mut logged = Instant::now();
             while running() {
@@ -103,6 +104,18 @@ fn wait_own(
         std::thread::sleep(poll);
     }
     Ok(())
+}
+
+/// The status of this run's own benchmark `ours` once it ended; an error when another benchmark
+/// started since (the results are then in `benchmark.json` only, and the service holds the other
+/// run's): never another run's results read as this model's.
+fn own_status(svc: &BenchmarkService, ours: u64) -> Result<crate::benchmark::service::Status> {
+    svc.status_of(ours).ok_or_else(|| {
+        anyhow!(
+            "another benchmark started right after this run's own ended, so its results could \
+             not be read here; they are saved: see the Benchmark page"
+        )
+    })
 }
 
 /// The datasets of the run: the held-out set, then `extra` built-in ids.
@@ -174,7 +187,8 @@ pub fn run(
     req.validate()?;
     let started = Instant::now();
     let mut pending = Some(c);
-    loop {
+    // This run's benchmark, told from any later one by its id.
+    let ours = loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!(Cancelled));
         }
@@ -182,8 +196,8 @@ pub fn run(
             Some(c) => c,
             None => ctx(),
         };
-        match svc.start(c, req.clone()) {
-            Ok(()) => break,
+        match svc.start_run(c, req.clone()) {
+            Ok(id) => break id,
             Err(_) if started.elapsed() < BUSY_WAIT => {
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -193,9 +207,7 @@ pub fn run(
                 BUSY_WAIT.as_secs() / 60
             ),
         }
-    }
-    // This run's benchmark, told from any later one by its start.
-    let ours = svc.running().and_then(|r| r.started);
+    };
     wait_own(
         svc,
         ours,
@@ -204,7 +216,7 @@ pub fn run(
         Duration::from_millis(500),
         STOP_LOG_EVERY,
     )?;
-    let st = svc.status();
+    let st = own_status(svc, ours)?;
     if st.state == RunState::Failed {
         bail!(
             "the benchmark failed: {}",
@@ -730,24 +742,22 @@ mod tests {
     }
 
     /// A fake benchmark that ignores the cancel for a while (a model compile), then stops.
-    fn compiling(svc: &Arc<BenchmarkService>, busy: Duration) -> Option<Instant> {
+    fn compiling(svc: &Arc<BenchmarkService>, busy: Duration) -> u64 {
         let req = RunRequest::defaults(&crate::config::Config::default().benchmark);
-        svc.start_job(req, move |h| {
+        svc.start_job_run(req, move |h| {
             let t = Instant::now();
             while t.elapsed() < busy || !h.is_cancelled() {
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(anyhow!(Cancelled))
         })
-        .unwrap();
-        svc.running().and_then(|r| r.started)
+        .unwrap()
     }
 
     #[test]
     fn a_cancelled_benchmark_is_waited_for_until_it_stopped() {
         let svc = BenchmarkService::new();
         let ours = compiling(&svc, Duration::from_millis(300));
-        assert!(ours.is_some());
         let cancel = AtomicBool::new(true);
         let ms = Duration::from_millis;
         let t = Instant::now();
@@ -782,11 +792,10 @@ mod tests {
         let other = compiling(&svc, ms(0));
         let cancel = AtomicBool::new(false);
         let t = Instant::now();
-        wait_own(&svc, Some(Instant::now()), &cancel, ms(100), ms(5), ms(20)).unwrap();
-        wait_own(&svc, None, &cancel, ms(100), ms(5), ms(20)).unwrap();
+        wait_own(&svc, other + 1, &cancel, ms(100), ms(5), ms(20)).unwrap();
+        wait_own(&svc, other - 1, &cancel, ms(100), ms(5), ms(20)).unwrap();
         assert!(t.elapsed() < Duration::from_secs(1));
         assert!(svc.is_running(), "another run's benchmark is left alone");
-        assert!(other.is_some());
         svc.cancel();
         assert!(svc.wait_idle(Duration::from_secs(10)));
         // Ours, not cancelled: waited for until it ends.
@@ -801,6 +810,43 @@ mod tests {
         wait_own(&svc, ours, &cancel, ms(100), ms(5), ms(20)).unwrap();
         assert!(!svc.is_running());
         stopper.join().unwrap();
+    }
+
+    /// Audit 2026-11 (QA-099): our benchmark ended and another one (the Benchmark page) started
+    /// before the stage looked again. Our id neither waits on it, cancels it (also with the
+    /// run's cancel set) nor reads its results as ours.
+    #[test]
+    fn a_benchmark_started_after_ours_is_neither_read_nor_cancelled() {
+        let svc = BenchmarkService::new();
+        let ms = Duration::from_millis;
+        let req = RunRequest::defaults(&crate::config::Config::default().benchmark);
+        let ours = svc
+            .start_job_run(req.clone(), |_| Ok("ours".into()))
+            .unwrap();
+        assert!(svc.wait_idle(Duration::from_secs(10)));
+        // Ended, nothing after it: its own status.
+        assert_eq!(
+            own_status(&svc, ours).unwrap().message.as_deref(),
+            Some("ours")
+        );
+        let theirs = compiling(&svc, ms(0));
+        assert_ne!(theirs, ours);
+        let cancel = AtomicBool::new(true);
+        let t = Instant::now();
+        wait_own(&svc, ours, &cancel, ms(100), ms(5), ms(20)).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(1));
+        assert!(!svc.cancel_run(ours), "not ours to cancel");
+        std::thread::sleep(ms(50));
+        assert!(svc.is_running(), "the later benchmark keeps running");
+        assert!(svc.is_run_running(theirs) && !svc.is_run_running(ours));
+        let e = own_status(&svc, ours).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("another benchmark started"),
+            "{e:#}"
+        );
+        assert!(svc.status_of(theirs).is_some_and(|s| s.running));
+        assert!(svc.cancel_run(theirs));
+        assert!(svc.wait_idle(Duration::from_secs(10)));
     }
 
     #[test]

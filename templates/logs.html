@@ -3,6 +3,7 @@
 {% block content %}
 <h1>Logs</h1>
 {% if !available %}<p class="error">Log capture is not available in this process.</p>{% endif %}
+{% if file_capped %}<p class="error">Today's log file reached its size cap: until tomorrow only errors are written to it. Something logs far more than usual; the lines below show what.</p>{% endif %}
 <div class="card logbar">
   <form method="post" action="/config/loglevel" class="inline" id="level-form">
     <label class="inline-label">Server log level

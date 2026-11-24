@@ -4,7 +4,10 @@
 //! rename, so a stop or crash mid-write never leaves a truncated JPEG); the reply never waits for
 //! it, so `analysisRoundTripMs` holds no encode. The collector's pattern: a bounded queue fed by
 //! `try_send`; a full queue drops the save, counted, with a warning at most once per
-//! [`crate::metrics::LOG_THROTTLE_INTERVAL`].
+//! [`crate::metrics::LOG_THROTTLE_INTERVAL`]. A failed write (a folder the service cannot write,
+//! a full disk, a share that is gone) is warned at most once per that interval too, by the
+//! thread's own throttle, with the error of the save that gets through and the count held back:
+//! such a write fails at once, so the queue never fills and every frame would log.
 //!
 //! [`QUEUE`] bounds the memory: each queued save holds its decoded frame (12.3 MB for 2688x1520).
 //! The thread keeps the normal priority: a lowered one could starve under CPU inference and
@@ -146,8 +149,10 @@ impl Writer {
         let spawned = std::thread::Builder::new()
             .name("image-save".into())
             .spawn(move || {
+                let failures = LogThrottle::default();
+                let clock = Instant::now();
                 while let Ok(job) = rx.recv() {
-                    write(job);
+                    write_logged(job, &failures, clock);
                     queued.fetch_sub(1, Ordering::AcqRel);
                 }
             });
@@ -228,9 +233,19 @@ pub(crate) fn flush(deadline: Instant) -> Flushed {
     }
 }
 
-/// Draw, encode and write one save (a warning on failure). The file name: the request's image
-/// name, or a random one for an unnamed upload (`image.jpg`, Blue Iris' default).
+/// Draw, encode and write one save (a warning on every failure; the writer thread uses
+/// [`write_logged`]). Tests write what they took off a queue with it.
+#[cfg(test)]
 pub(super) fn write(job: SaveJob) {
+    write_logged(job, &LogThrottle::new(Duration::ZERO), Instant::now());
+}
+
+/// Draw, encode and write one save; a failure is warned when `failures` lets it through (on the
+/// millisecond clock that started at `clock`), with the count of failures held back since the
+/// last warning. `Some(held back)` when this save failed and warned. The file name: the
+/// request's image name, or a random one for an unnamed upload (`image.jpg`, Blue Iris'
+/// default).
+pub(super) fn write_logged(job: SaveJob, failures: &LogThrottle, clock: Instant) -> Option<u64> {
     let SaveJob {
         model,
         dir,
@@ -253,8 +268,17 @@ pub(super) fn write(job: SaveJob) {
         save_ref,
         upload.as_deref(),
     ) {
-        warn!(model = %model, "could not save annotated image: {e:#}");
+        let now = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let held_back = failures.allow(now)?;
+        warn!(
+            model = %model,
+            similar_since_last_warning = held_back,
+            "could not save annotated image: {e:#}; check that save_image_path exists, is \
+             writable by the service and has free space, or turn save_image_path off"
+        );
+        return Some(held_back);
     }
+    None
 }
 
 #[cfg(test)]
@@ -404,5 +428,31 @@ mod tests {
         assert_eq!(submit(None, again), Submitted::Queued, "a new writer");
         assert_eq!(flush(deadline()), Flushed::Drained);
         written(&["cam1_od.jpg", "cam2_od.jpg"]);
+    }
+
+    /// RA-110: a save that fails at once (here: its folder is a file) warns once per interval,
+    /// not per frame, and the next warning counts the ones held back.
+    #[test]
+    fn failed_writes_warn_once_per_interval() {
+        let root = crate::test_dirs::TempDir::new("save-fail");
+        let dir = root.join("blocker");
+        std::fs::write(&dir, b"not a folder").unwrap();
+        let throttle = LogThrottle::default();
+        let clock = Instant::now();
+        let warned: Vec<Option<u64>> = (0..10)
+            .map(|_| write_logged(job(&dir), &throttle, clock))
+            .collect();
+        assert_eq!(warned.first(), Some(&Some(0)), "{warned:?}");
+        assert!(warned.iter().skip(1).all(Option::is_none), "{warned:?}");
+        assert_eq!(throttle.held_back(), 9);
+        // A write that works logs nothing and holds nothing back.
+        let ok = crate::test_dirs::TempDir::unmade("save-ok");
+        assert_eq!(write_logged(job(&ok), &throttle, clock), None);
+        assert_eq!(throttle.held_back(), 9);
+        // Past the interval (a clock started that long ago), the next failure reports the 9.
+        let earlier = Instant::now()
+            .checked_sub(crate::metrics::LOG_THROTTLE_INTERVAL * 2)
+            .unwrap();
+        assert_eq!(write_logged(job(&dir), &throttle, earlier), Some(9));
     }
 }

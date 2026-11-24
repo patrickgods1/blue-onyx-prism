@@ -1,6 +1,8 @@
 //! The tray event loop (Windows and macOS): a tao event loop on the main thread owns the tray
-//! icon and its menu; a poll thread queries the service manager and `/v1/status` every 3 s (and
-//! at once after an action) and sends the result through an `EventLoopProxy`; start / stop /
+//! icon and its menu; a poll thread probes `/v1/status` and asks the service manager on the
+//! schedule of [`super::schedule`] (every 3 s after an action or a change, 15 s while nothing
+//! changes, the service manager only when the probe cannot tell; at once after an action) and
+//! sends the result through an `EventLoopProxy`; start / stop /
 //! restart run one at a time on a worker thread (the tray shows Busy meanwhile). The tray icon is
 //! created on `StartCause::Init`, as tray-icon requires on macOS; on macOS the app has no Dock
 //! icon (accessory activation policy).
@@ -10,6 +12,7 @@ use super::elevate::{self, Outcome};
 use super::icon::{ICON_SIZE, icon_rgba};
 use super::model::{self, Display, IconColor, Inputs};
 use super::probe::{self, HttpStatus, PROBE_TIMEOUT};
+use super::schedule::Schedule;
 use super::{TrayArgs, single_instance};
 use crate::service_ctl::{self, Action, ServiceState};
 use std::net::SocketAddr;
@@ -22,8 +25,6 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-/// Time between two polls.
-const POLL_EVERY: Duration = Duration::from_secs(3);
 /// How long a failed action's message stays in the tooltip.
 const ERROR_SHOWN_FOR: Duration = Duration::from_secs(30);
 
@@ -206,18 +207,31 @@ fn query_service() -> Option<ServiceState> {
 }
 
 fn poll_loop(addr: SocketAddr, proxy: EventLoopProxy<UserEvent>, poke: mpsc::Receiver<()>) {
+    let mut schedule = Schedule::default();
+    // The first round counts as poked: everything is asked.
+    let mut poked = true;
     loop {
+        let http = probe::probe(addr, PROBE_TIMEOUT);
+        if schedule.query_service(Instant::now(), poked, &http) {
+            let state = query_service();
+            schedule.queried(Instant::now(), state);
+        }
+        let wait = schedule.next_wait(Instant::now(), poked, &http);
         let poll = Poll {
-            service: query_service(),
-            http: probe::probe(addr, PROBE_TIMEOUT),
+            service: schedule.service(),
+            http,
         };
         if proxy.send_event(UserEvent::Status(poll)).is_err() {
             return;
         }
-        match poke.recv_timeout(POLL_EVERY) {
-            Ok(()) | Err(RecvTimeoutError::Timeout) => while poke.try_recv().is_ok() {},
+        poked = match poke.recv_timeout(wait) {
+            Ok(()) => {
+                while poke.try_recv().is_ok() {}
+                true
+            }
+            Err(RecvTimeoutError::Timeout) => false,
             Err(RecvTimeoutError::Disconnected) => return,
-        }
+        };
     }
 }
 

@@ -3248,3 +3248,47 @@ fn waiting_for_a_task_then_a_run_on_one_thread_is_fine() {
     );
     svc.shutdown();
 }
+
+/// Audit 2026-11 (RA-127): a cancel while the dataset is assembled stops the write (it no longer
+/// runs every frame to the end first), the run is cancelled in its Dataset stage, the
+/// half-written `<run>/data` is gone and the export it read from is untouched.
+#[test]
+fn a_cancel_during_the_dataset_stage_stops_it_and_removes_the_data() {
+    let t = tmp("cancel-dataset");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = TrainFake::new();
+    let cancel = AtomicBool::new(false);
+    let mut saw_data = false;
+    let data = j.run_dir.join("data");
+    let r = run_training(
+        &j,
+        &fake,
+        &fake,
+        &NoHooks,
+        &mut |p| match p {
+            // The stage's first report comes before anything is written.
+            TrainReport::Stage {
+                stage: TrainStage::Dataset,
+                percent: 0,
+                ..
+            } => cancel.store(true, Ordering::Relaxed),
+            TrainReport::Prepared(_) => saw_data = true,
+            _ => {}
+        },
+        &cancel,
+    );
+    let e = r.unwrap_err();
+    assert!(e.cancelled, "{e:?}");
+    assert_eq!(e.stage, Some(TrainStage::Dataset));
+    assert!(!saw_data, "the dataset was written to the end");
+    assert!(!data.exists(), "{} is left", data.display());
+    assert!(j.request.datasets[0].join("classes.txt").is_file());
+    assert!(
+        fake.train_cmds
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.display().contains("--self-check")),
+        "no training started"
+    );
+}

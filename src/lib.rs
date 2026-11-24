@@ -26,6 +26,7 @@
 //! - [`runner`]    server run loop (generations, restart) shared by the CLI and the service
 //! - [`metrics`]   request/latency counters and Prometheus rendering
 //! - [`logbuf`]    in-memory ring of recent log events for the web UI's Logs page
+//! - [`logthrottle`] the one rate limiter for log lines a lasting fault would repeat
 //! - [`panic`]     the panic hook every binary installs: panics go to the log
 //! - [`diagnostics`] the support bundle (`diagnostics` command, `GET /v1/diagnostics`)
 //! - [`port_holder`] which process listens on a port (for a bind failure's message)
@@ -41,6 +42,7 @@
 //! - [`children`]  registry of child processes the service started; the post-crash orphan sweep
 //! - [`command`]   the bounded runner for short helper programs (output drained and capped, stopped at the deadline)
 //! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
+//!   and [`sync::nap`], a sleep that a `CancellationToken` cuts short without polling
 
 //! # Lint policy
 //!
@@ -93,6 +95,7 @@ pub mod fsx;
 pub mod image;
 pub mod image_stats;
 pub mod logbuf;
+pub mod logthrottle;
 pub mod main_thread;
 pub mod metrics;
 pub mod model;

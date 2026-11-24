@@ -540,7 +540,8 @@ pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde
             })
         })
         .collect();
-    let process = crate::metrics::ProcessStats::read();
+    // QA-086: `/proc/self` reads (Linux) or the OS memory call, off the two runtime threads.
+    let process = blocking(crate::metrics::ProcessStats::read).await;
     Json(serde_json::json!({
         "version": crate::VERSION,
         "uptimeSecs": state.metrics.uptime().as_secs(),
@@ -555,13 +556,21 @@ pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde
     }))
 }
 
+/// The Prometheus scrape. Rendered on the blocking pool (QA-086): it reads the process stats and
+/// the GPU memory (`vram::readings`, NVML / DXGI / sysfs under a global lock when the cached
+/// reading is stale, which it always is at a 15 s scrape), which must not hold one of the two
+/// runtime threads Blue Iris's detections run on.
 pub(super) async fn prometheus(State(state): State<Arc<AppState>>) -> Response {
+    let text = blocking(move || {
+        crate::metrics::render_prometheus(&state.metrics, &state.registry.gauges())
+    })
+    .await;
     (
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        crate::metrics::render_prometheus(&state.metrics, &state.registry.gauges()),
+        text,
     )
         .into_response()
 }
@@ -797,6 +806,8 @@ struct LogsTemplate {
     /// Log capture is available (this process initialized logging).
     available: bool,
     capacity: usize,
+    /// Today's log file reached its cap ([`crate::cli::file_log_capped`]).
+    file_capped: bool,
 }
 
 pub(super) fn level_choices(current: &str) -> Vec<LevelChoice> {
@@ -823,6 +834,7 @@ pub(super) async fn logs_page(State(state): State<Arc<AppState>>) -> Response {
         log_levels: level_choices(&level),
         available: state.log_buffer().is_some(),
         capacity: crate::logbuf::DEFAULT_CAPACITY,
+        file_capped: crate::cli::file_log_capped(),
     })
 }
 
@@ -1719,6 +1731,20 @@ mod tests {
         let (s, page) = get_text(&state, "/logs").await;
         assert_eq!(s, StatusCode::OK);
         assert!(page.contains("id=\"logview\""));
+        // No log file in tests, so never capped; the notice shows only when it is.
+        assert!(!page.contains("reached its size cap"), "{page}");
+        let capped = render(&LogsTemplate {
+            nav: "logs",
+            version: crate::VERSION,
+            log_levels: level_choices("info"),
+            available: true,
+            capacity: 10,
+            file_capped: true,
+        });
+        let capped = axum::body::to_bytes(capped.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&capped).contains("reached its size cap"));
         assert!(page.contains("<option value=\"info\" selected>info</option>"));
         assert!(page.contains("class=\"active\" aria-current=\"page\">Logs</a>"));
 

@@ -751,12 +751,13 @@ impl WorkerCtx {
             return None;
         }
         self.metrics.record_drop(DropReason::Timeout);
-        warn!(
-            model = %self.cfg.name,
-            request_id = %meta.request_id,
-            waited_ms = millis_u64(waited),
-            timeout_ms = millis_u64(timeout),
-            "dropping request that waited longer than the request timeout (server overloaded)"
+        warn_timed_out(
+            &self.metrics,
+            self.metrics.now_ms(),
+            &self.cfg.name,
+            &meta.request_id,
+            waited,
+            timeout,
         );
         Some(VisionDetectionResponse {
             dropped: Some(DropReason::Timeout),
@@ -780,6 +781,33 @@ impl WorkerCtx {
             image = %meta.image_name,
             "detection failed: {e:#}"
         );
+        self.failure_answer(provider, e)
+    }
+
+    /// [`Self::failure`] for an image that could not be decoded or was refused by its size:
+    /// counted, and warned at most once per [`crate::metrics::LOG_THROTTLE_INTERVAL`] (bad input
+    /// never marks the model broken, so nothing else stops a camera that sends broken frames
+    /// from logging one line per frame). The line that gets through keeps the request id and the
+    /// image name, so the camera can still be found.
+    fn decode_failure(
+        &self,
+        meta: &Meta,
+        provider: &str,
+        e: &anyhow::Error,
+    ) -> VisionDetectionResponse {
+        self.metrics.record_decode_error();
+        warn_decode_failure(
+            &self.metrics,
+            self.metrics.now_ms(),
+            &self.cfg.name,
+            (&meta.request_id, &meta.image_name),
+            e,
+        );
+        self.failure_answer(provider, e)
+    }
+
+    /// The answer of [`Self::failure`] and [`Self::decode_failure`].
+    fn failure_answer(&self, provider: &str, e: &anyhow::Error) -> VisionDetectionResponse {
         let mut r = self.error_response(format!("{e:#}"), 0, 0);
         r.executionProvider = provider.to_string();
         r
@@ -794,10 +822,7 @@ impl WorkerCtx {
         let provider = loaded_provider(&self.device).unwrap_or_default();
         match r {
             Ok(Ok(prepared)) => Stage::Ready(prepared),
-            Ok(Err(e)) => {
-                self.metrics.record_decode_error();
-                Stage::Answer(self.failure(meta, &provider, &e))
-            }
+            Ok(Err(e)) => Stage::Answer(self.decode_failure(meta, &provider, &e)),
             Err(_) => Stage::Answer(self.failure(
                 meta,
                 &provider,
@@ -1687,18 +1712,28 @@ impl WorkerCtx {
     /// the lane cannot run, the request is answered here with its candidates unverified.
     fn hand_off(&self, pending: Box<Pending>) {
         let mut lane = self.verify_lane.borrow_mut();
-        if lane.is_none() {
+        let now = Instant::now();
+        if lane.is_none() && VERIFY_SPAWN.with_borrow_mut(|b| b.may_try(now)) {
             match Lane::spawn(LaneCtx {
                 name: self.cfg.name.clone(),
                 metrics: self.metrics.clone(),
                 peers: self.cfg.peers.clone(),
                 saver: self.saver(),
             }) {
-                Ok(l) => *lane = Some(l),
-                Err(e) => warn!(
-                    model = %self.cfg.name,
-                    "could not start the verifier thread ({e}); answering unverified"
-                ),
+                Ok(l) => {
+                    *lane = Some(l);
+                    VERIFY_SPAWN.with_borrow_mut(SpawnBackoff::started);
+                }
+                Err(e) => {
+                    let skipped = VERIFY_SPAWN.with_borrow_mut(|b| b.failed(now));
+                    warn!(
+                        model = %self.cfg.name,
+                        similar_since_last_warning = skipped,
+                        "could not start the verifier thread ({e}); answering unverified and \
+                         trying again in {} s; the system is out of threads or memory",
+                        VERIFY_SPAWN_BACKOFF.as_secs()
+                    );
+                }
             }
         }
         let pending = match lane.as_ref() {
@@ -1719,6 +1754,104 @@ impl WorkerCtx {
             super::verify::Failure::Stopped,
         );
     }
+}
+
+/// The queue-timeout drop warning of [`WorkerCtx::timed_out`] at `now_ms` (on
+/// [`ModelMetrics::now_ms`]), throttled by `metrics.timeout_log`: a slowed device drops at the
+/// camera rate, and each line costs the worker thread (the Event Log write in the service) while
+/// it is already behind. `Some(held back)` when it logged.
+fn warn_timed_out(
+    metrics: &ModelMetrics,
+    now_ms: u64,
+    model: &str,
+    request_id: &str,
+    waited: Duration,
+    timeout: Duration,
+) -> Option<u64> {
+    let held_back = metrics.timeout_log.allow(now_ms)?;
+    warn!(
+        model = %model,
+        request_id = %request_id,
+        waited_ms = millis_u64(waited),
+        timeout_ms = millis_u64(timeout),
+        similar_since_last_warning = held_back,
+        "dropping request that waited longer than the request timeout (server overloaded): the \
+         model serves slower than images arrive; lower the cameras' trigger rate or use a faster \
+         device or model"
+    );
+    Some(held_back)
+}
+
+/// The bad-image warning of [`WorkerCtx::decode_failure`] at `now_ms`, throttled by
+/// `metrics.decode_error_log`, with the request id and image name of the request that gets
+/// through (`(request id, image name)`). `Some(held back)` when it logged.
+fn warn_decode_failure(
+    metrics: &ModelMetrics,
+    now_ms: u64,
+    model: &str,
+    (request_id, image): (&str, &str),
+    e: &anyhow::Error,
+) -> Option<u64> {
+    let held_back = metrics.decode_error_log.allow(now_ms)?;
+    warn!(
+        model = %model,
+        request_id = %request_id,
+        image = %image,
+        similar_since_last_warning = held_back,
+        "detection failed: {e:#}"
+    );
+    Some(held_back)
+}
+
+/// Least time between two tries to start a worker's verify lane after one failed: a failed
+/// start means the system is out of threads or memory, and trying (and warning) on every
+/// verified request would only add load on the worker thread.
+const VERIFY_SPAWN_BACKOFF: Duration = Duration::from_secs(10);
+
+/// When a worker may try to start its verify lane again after a failed start, and how many
+/// requests went unverified without a try meanwhile (reported by the next failure's warning).
+#[derive(Debug, Default)]
+struct SpawnBackoff {
+    /// No try before this (None: try now).
+    next: Option<Instant>,
+    skipped: u64,
+}
+
+impl SpawnBackoff {
+    const fn new() -> Self {
+        Self {
+            next: None,
+            skipped: 0,
+        }
+    }
+
+    /// Whether a start may be tried at `now` (a refusal is counted).
+    fn may_try(&mut self, now: Instant) -> bool {
+        if self.next.is_some_and(|n| now < n) {
+            self.skipped = self.skipped.saturating_add(1);
+            return false;
+        }
+        true
+    }
+
+    /// The try at `now` failed: none again for [`VERIFY_SPAWN_BACKOFF`]. The requests skipped
+    /// since the last failure.
+    fn failed(&mut self, now: Instant) -> u64 {
+        self.next = now.checked_add(VERIFY_SPAWN_BACKOFF);
+        std::mem::take(&mut self.skipped)
+    }
+
+    /// A start succeeded: forget earlier failures.
+    fn started(&mut self) {
+        *self = Self::new();
+    }
+}
+
+thread_local! {
+    /// The verify lane's start backoff of the worker on this thread. Per thread because the lane
+    /// slot ([`WorkerCtx::verify_lane`]) is: one worker thread per model, and a reload starts a
+    /// new thread with a fresh backoff.
+    static VERIFY_SPAWN: RefCell<SpawnBackoff> = const { RefCell::new(SpawnBackoff::new()) };
 }
 
 /// The one debug line per detection ("detection done"), built in `finish` and written there or,
@@ -2152,5 +2285,49 @@ mod tests {
         let m = load_failure_message(&anyhow::anyhow!("every device failed"));
         assert!(m.starts_with("every device failed; "), "{m}");
         assert!(m.contains("check the log"), "{m}");
+    }
+
+    /// RA-109 / RA-110: queue timeouts and bad images log one line per interval each (their
+    /// own throttles, so one flood cannot hide the other), the held-back count on the next.
+    #[test]
+    fn timeout_and_bad_image_warnings_are_throttled_apart() {
+        let m = ModelMetrics::new("m", "CPU", "");
+        let every = u64::try_from(crate::metrics::LOG_THROTTLE_INTERVAL.as_millis()).unwrap();
+        let (w, t) = (Duration::from_secs(20), Duration::from_secs(15));
+        let e = anyhow::anyhow!("not an image");
+        let timeouts: Vec<_> = (0..20)
+            .map(|i| warn_timed_out(&m, 100 + i, "m", "r", w, t))
+            .collect();
+        let bad: Vec<_> = (0..20)
+            .map(|i| warn_decode_failure(&m, 100 + i, "m", ("r", "cam.jpg"), &e))
+            .collect();
+        for got in [&timeouts, &bad] {
+            assert_eq!(got.first(), Some(&Some(0)), "the first one logs");
+            assert!(got.iter().skip(1).all(Option::is_none), "{got:?}");
+        }
+        assert_eq!(warn_timed_out(&m, 100 + every, "m", "r", w, t), Some(19));
+        assert_eq!(
+            warn_decode_failure(&m, 100 + every, "m", ("r", "cam.jpg"), &e),
+            Some(19)
+        );
+    }
+
+    /// The verify lane's start is tried again only after the backoff, and the warning of the
+    /// next failure counts the requests that went unverified without a try.
+    #[test]
+    fn a_failed_verifier_start_backs_off() {
+        let t0 = Instant::now();
+        let mut b = SpawnBackoff::new();
+        assert!(b.may_try(t0));
+        assert_eq!(b.failed(t0), 0);
+        for s in 0..9 {
+            assert!(!b.may_try(t0 + Duration::from_secs(s)), "{s}");
+        }
+        assert!(b.may_try(t0 + VERIFY_SPAWN_BACKOFF));
+        assert_eq!(b.failed(t0 + VERIFY_SPAWN_BACKOFF), 9);
+        assert!(!b.may_try(t0 + VERIFY_SPAWN_BACKOFF));
+        b.started();
+        assert!(b.may_try(t0 + VERIFY_SPAWN_BACKOFF));
+        assert_eq!(b.skipped, 0);
     }
 }

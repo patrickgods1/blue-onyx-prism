@@ -16,17 +16,89 @@
 //!
 //! The saved trees are cached serialized ([`super::SavedView`]), so neither answer copies or
 //! re-serializes them; the body is serialized here, inside `blocking`.
+//!
+//! The devices snapshot behind the config view and the models' current state costs manifest
+//! reads and a stat of every runtime file, and the run page polls every 1.5 s while a benchmark
+//! (which measures latency on this machine) runs. [`views`] reuses one for [`SNAPSHOT_TTL`]
+//! while the registry, the config store, the config generation and revision stay the same.
 
 use super::{
-    AppState, LIVE_WARNING, config_view, devices_snapshot, models_now, raw, results_path,
-    saved_view,
+    AppState, DevicesSnapshot, LIVE_WARNING, config_view, devices_snapshot, models_now, raw,
+    results_path, saved_view,
 };
 use crate::benchmark::service::{RunState, Status};
+use crate::sync::LockExt;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+
+/// How long [`views`] reuses a devices snapshot. Nothing tells the server that a runtime
+/// install finished, so this bounds how late a fresh install shows on the run page (any config
+/// change or restart rebuilds at once); a few seconds is invisible next to a 1.5 s poll of a run
+/// that takes minutes.
+const SNAPSHOT_TTL: Duration = Duration::from_secs(5);
+
+/// One cached value with the key it was built for and when.
+struct OneEntry<K, V>(Mutex<Option<(K, Instant, Arc<V>)>>);
+
+impl<K: PartialEq, V> OneEntry<K, V> {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// The cached value when it was built for `key` less than `ttl` before `now`, else the
+    /// result of `build`, kept. Concurrent pollers wait for one build instead of making several.
+    fn get(&self, key: K, now: Instant, ttl: Duration, build: impl FnOnce() -> V) -> Arc<V> {
+        let mut slot = self.0.lock_recover();
+        if let Some((k, at, v)) = slot.as_ref()
+            && *k == key
+            && now.saturating_duration_since(*at) < ttl
+        {
+            return Arc::clone(v);
+        }
+        let v = Arc::new(build());
+        *slot = Some((key, now, Arc::clone(&v)));
+        v
+    }
+}
+
+/// What a devices snapshot was built from: the registry and config store by identity (a `Weak`
+/// keeps the allocation, so an address is never reused for another one; it does not keep the
+/// registry's models alive), the config generation and revision.
+struct SnapshotKey {
+    registry: Weak<crate::registry::ModelRegistry>,
+    config: Weak<crate::config_store::ConfigStore>,
+    generation: u64,
+    revision: u64,
+}
+
+impl PartialEq for SnapshotKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.registry.ptr_eq(&other.registry)
+            && self.config.ptr_eq(&other.config)
+            && self.generation == other.generation
+            && self.revision == other.revision
+    }
+}
+
+static SNAPSHOT: OneEntry<SnapshotKey, DevicesSnapshot> = OneEntry::new();
+
+/// The devices snapshot for a poll: [`devices_snapshot`], reused within [`SNAPSHOT_TTL`].
+fn poll_snapshot(state: &AppState) -> Arc<DevicesSnapshot> {
+    let key = SnapshotKey {
+        registry: Arc::downgrade(&state.registry),
+        config: Arc::downgrade(&state.config),
+        generation: state.config.generation(),
+        revision: state.config.revision(),
+    };
+    SNAPSHOT.get(key, Instant::now(), SNAPSHOT_TTL, || {
+        devices_snapshot(state)
+    })
+}
 
 /// The `X-Benchmark-View` header of the full answer: its `viewTag`.
 pub(super) const VIEW_HEADER: &str = "x-benchmark-view";
@@ -158,7 +230,7 @@ struct Views {
 }
 
 fn views(state: &AppState) -> Views {
-    let snap = devices_snapshot(state);
+    let snap = poll_snapshot(state);
     let config = raw(&config_view(state, &snap));
     let (revision, cfg) = state.config.snapshot();
     let now = models_now(state, &cfg, &snap);
@@ -335,6 +407,52 @@ mod tests {
     use axum::body::Body;
     use axum::http::{HeaderMap, Request, header};
     use tower::ServiceExt;
+
+    #[test]
+    fn a_snapshot_is_built_once_per_key_and_ttl() {
+        use super::OneEntry;
+        use std::time::{Duration, Instant};
+        let cache: OneEntry<u32, u32> = OneEntry::new();
+        let ttl = Duration::from_secs(5);
+        let t0 = Instant::now();
+        let mut built = 0;
+        let mut get = |key: u32, at: Duration| {
+            *cache.get(key, t0 + at, ttl, || {
+                built += 1;
+                key * 10
+            })
+        };
+        assert_eq!(get(1, Duration::ZERO), 10);
+        // Polls within the TTL reuse it.
+        assert_eq!(get(1, Duration::from_millis(1500)), 10);
+        assert_eq!(get(1, Duration::from_millis(4900)), 10);
+        // A new key rebuilds at once; going back to the old key rebuilds too (one entry).
+        assert_eq!(get(2, Duration::from_millis(5000)), 20);
+        assert_eq!(get(1, Duration::from_millis(5100)), 10);
+        // Age alone rebuilds.
+        assert_eq!(get(1, Duration::from_millis(10200)), 10);
+        assert_eq!(built, 4);
+    }
+
+    #[test]
+    fn snapshot_keys_tell_registries_and_revisions_apart() {
+        use super::SnapshotKey;
+        let a = state();
+        let b = state();
+        let _ca = Cleanup(a.config_path.parent().unwrap().to_path_buf());
+        let _cb = Cleanup(b.config_path.parent().unwrap().to_path_buf());
+        let key = |s: &std::sync::Arc<AppState>| SnapshotKey {
+            registry: std::sync::Arc::downgrade(&s.registry),
+            config: std::sync::Arc::downgrade(&s.config),
+            generation: s.config.generation(),
+            revision: s.config.revision(),
+        };
+        assert!(key(&a) == key(&a));
+        assert!(key(&a) != key(&b));
+        let mut changed = key(&a);
+        changed.revision += 1;
+        assert!(key(&a) != changed);
+    }
 
     /// Removes a test state's folder.
     struct Cleanup(std::path::PathBuf);

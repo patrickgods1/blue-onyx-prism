@@ -5,7 +5,9 @@
 //! `<dir>/imports.jsonl`. Each file is written atomically, image first, then sidecar, then the
 //! index line, like the collector does; when the sidecar or the index line fails (a full disk),
 //! the frame's files are removed again, so a frame is either complete or absent. A write that
-//! stops part way ([`write_frames_with`]) answers the frames written so far.
+//! stops part way ([`write_frames_with`]) answers the frames written so far. A frame already
+//! imported (the same camera, millisecond and dHash) is skipped; each day folder that check needs
+//! is listed once per write ([`Imported`]), not once per frame.
 //!
 //! The dataset folder is shared with the collector thread, whose retention rewrites day indexes and
 //! removes emptied folders: index lines go through [`layout::append_index`] (the dataset's
@@ -18,7 +20,9 @@ use crate::collect::layout::{self, Rel};
 use crate::collect::record::{self, ImageInfo, IndexLine, Provenance, Record, Stats};
 use crate::image_stats::ImageStats;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -118,47 +122,103 @@ fn record_of(f: &Frame, rel: &Rel, import_id: &str, bytes: u64, original: bool) 
     r
 }
 
-/// Whether the camera folder `camera_dir` already holds an imported frame (`<stamp>_imp-*.json`)
-/// of the millisecond `ts` (a frame stamp) with the dHash `hash`: the same footage imported
-/// again. Stamps are compared as instants, so a frame imported before the `timezone` key (UTC
-/// names) or in another zone is found: it looks in the day folder of `ts` in `zone`, then in the
-/// UTC day and the days either side of it (every zone's date is one of those three).
-fn already_imported(camera_dir: &Path, zone: Zone, ts: &str, hash: u64) -> bool {
-    let Some(at) = crate::clock::parse_frame_stamp(ts) else {
-        return false;
-    };
-    let utc = at.date_naive();
-    let mut days = vec![zone.day(at)];
-    for d in [utc.pred_opt(), Some(utc), utc.succ_opt()]
-        .into_iter()
-        .flatten()
-    {
-        if !days.contains(&d) {
-            days.push(d);
-        }
-    }
-    days.iter().any(|day| {
-        let folder = day.format("%Y-%m-%d").to_string();
-        imported_in(&camera_dir.join(folder), at, hash)
-    })
+/// The imported sidecars (`<stamp>_imp-*.json`, never a label file) of the day folders one
+/// write looked in, by stamp: each folder is listed once per [`write_frames_with`] and the frames
+/// it writes are added as they go, so the already-imported check costs one listing per folder
+/// rather than one per frame (a day of 5,000 imported frames used to be listed 5,000 times while
+/// it grew). A sidecar is read only on a stamp hit, for its dHash.
+#[derive(Debug, Default)]
+struct Imported {
+    days: HashMap<PathBuf, HashMap<DateTime<Utc>, Vec<PathBuf>>>,
 }
 
-/// [`already_imported`] in one day folder.
-fn imported_in(day: &Path, at: chrono::DateTime<chrono::Utc>, hash: u64) -> bool {
+#[cfg(test)]
+thread_local! {
+    /// Day folders listed by [`list_imported`] on this thread (tests count them).
+    static LISTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The stamp of `name` when it names an imported frame's sidecar (cheap name checks first, the
+/// stamp parsed only for those).
+fn imported_stamp(name: &str) -> Option<DateTime<Utc>> {
+    if !name.contains("_imp-")
+        || !name.ends_with(".json")
+        || name.ends_with(crate::collect::labels::LABELS_SUFFIX)
+    {
+        return None;
+    }
+    crate::clock::parse_frame_stamp(name)
+}
+
+/// The imported sidecars in `day` by stamp; none when it cannot be read (not there yet).
+fn list_imported(day: &Path) -> HashMap<DateTime<Utc>, Vec<PathBuf>> {
+    #[cfg(test)]
+    LISTED.with(|n| n.set(n.get() + 1));
+    let mut by_stamp: HashMap<DateTime<Utc>, Vec<PathBuf>> = HashMap::new();
     let Ok(rd) = std::fs::read_dir(day) else {
-        return false;
+        return by_stamp;
     };
-    rd.flatten().any(|e| {
-        let name = e.file_name().to_string_lossy().into_owned();
-        crate::clock::parse_frame_stamp(&name) == Some(at)
-            && name.contains("_imp-")
-            && name.ends_with(".json")
-            && !name.ends_with(crate::collect::labels::LABELS_SUFFIX)
-            && std::fs::read(e.path())
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Record>(&b).ok())
-                .is_some_and(|r| r.dhash == crate::collect::dhash::hex(hash))
-    })
+    for e in rd.flatten() {
+        if let Some(at) = imported_stamp(&e.file_name().to_string_lossy()) {
+            by_stamp.entry(at).or_default().push(e.path());
+        }
+    }
+    by_stamp
+}
+
+impl Imported {
+    /// Whether the camera folder `camera_dir` already holds an imported frame
+    /// (`<stamp>_imp-*.json`) of the millisecond `ts` (a frame stamp) with the dHash `hash`: the
+    /// same footage imported again. Stamps are compared as instants, so a frame imported before
+    /// the `timezone` key (UTC names) or in another zone is found: it looks in the day folder of
+    /// `ts` in `zone`, then in the UTC day and the days either side of it (every zone's date is
+    /// one of those three).
+    fn contains(&mut self, camera_dir: &Path, zone: Zone, ts: &str, hash: u64) -> bool {
+        let Some(at) = crate::clock::parse_frame_stamp(ts) else {
+            return false;
+        };
+        let utc = at.date_naive();
+        let mut days = vec![zone.day(at)];
+        for d in [utc.pred_opt(), Some(utc), utc.succ_opt()]
+            .into_iter()
+            .flatten()
+        {
+            if !days.contains(&d) {
+                days.push(d);
+            }
+        }
+        let want = crate::collect::dhash::hex(hash);
+        days.iter().any(|day| {
+            let folder = camera_dir.join(day.format("%Y-%m-%d").to_string());
+            let listed = self
+                .days
+                .entry(folder)
+                .or_insert_with_key(|f| list_imported(f));
+            listed.get(&at).is_some_and(|paths| {
+                paths.iter().any(|p| {
+                    std::fs::read(p)
+                        .ok()
+                        .and_then(|b| serde_json::from_slice::<Record>(&b).ok())
+                        .is_some_and(|r| r.dhash == want)
+                })
+            })
+        })
+    }
+
+    /// The sidecar `side` was just written: a later frame of this write finds it. A folder not
+    /// listed yet reads it from disk when it is.
+    fn add(&mut self, side: &Path) {
+        let (Some(day), Some(at)) = (
+            side.parent(),
+            side.file_name()
+                .and_then(|n| imported_stamp(&n.to_string_lossy())),
+        ) else {
+            return;
+        };
+        if let Some(listed) = self.days.get_mut(day) {
+            listed.entry(at).or_default().push(side.to_path_buf());
+        }
+    }
 }
 
 /// Write `frames` of import `import_id` into `dir`; returns the image paths relative to `dir`
@@ -231,12 +291,13 @@ fn write_into(
         .filter(char::is_ascii_alphanumeric)
         .take(8)
         .collect();
+    let mut imported = Imported::default();
     for (n, f) in frames.iter().enumerate() {
         hook(Step::Before(n))?;
         let scene = f.stats.scene().as_str().to_string();
         let date = layout::day_folder(zone, f.time);
         let ts = stamp(zone, f.time);
-        if already_imported(&dir.join(&scene).join(&f.camera), zone, &ts, f.dhash) {
+        if imported.contains(&dir.join(&scene).join(&f.camera), zone, &ts, f.dhash) {
             *skipped += 1;
             continue;
         }
@@ -282,6 +343,7 @@ fn write_into(
             let _ = std::fs::remove_file(&jpg);
             return Err(e).with_context(|| format!("writing {}", side.display()));
         }
+        imported.add(&side);
         let line = IndexLine::of(&rec, (bytes.len() + json.len()) as u64);
         if let Err(e) = layout::append_index(&day, &line) {
             let _ = std::fs::remove_file(&side);
@@ -593,6 +655,69 @@ mod tests {
         assert!(names.iter().all(|n| !n.ends_with(".tmp")), "{names:?}");
         assert_eq!(layout::read_index(&day.join(layout::INDEX_FILE)).len(), 2);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 (RA-128): the already-imported check lists each day folder once per write,
+    /// however many frames go into it, and still finds the same footage again (in that write
+    /// and in a later one).
+    #[test]
+    fn the_already_imported_check_lists_each_day_folder_once() {
+        let root = std::env::temp_dir().join(format!("bop-import-once-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("f.jpg");
+        let bytes = jpeg(false);
+        std::fs::write(&src, &bytes).unwrap();
+        let img = crate::image::decode(&bytes).unwrap();
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let frame = |i: u32, dhash: u64| Frame {
+            file: src.clone(),
+            image_name: "c.mp4".into(),
+            camera: "cam".into(),
+            time: frame_time(base, Some(f64::from(i))),
+            width: img.width,
+            height: img.height,
+            stats: ImageStats::compute(&img),
+            dhash,
+            provenance: Provenance::default(),
+        };
+        // 40 frames of one day, the last repeating the first one's millisecond and dHash.
+        let mut frames: Vec<Frame> = (0u32..40).map(|i| frame(i, u64::from(i) + 1)).collect();
+        frames.push(frame(0, 1));
+        let listed = || LISTED.with(std::cell::Cell::get);
+        let before = listed();
+        let (rels, skipped) = utc(&dir, "20261022-120000-ab12", &frames).unwrap();
+        assert_eq!((rels.len(), skipped), (40, 1), "a repeat within the write");
+        // The UTC day and the days either side of it, once each.
+        assert_eq!(listed() - before, 3);
+        // Again: every frame is found in its own day folder, listed once (the days either side
+        // are not looked in when the first folder has it).
+        let before = listed();
+        let (rels, skipped) = utc(&dir, "20261023-000000-cd34", &frames).unwrap();
+        assert_eq!((rels.len(), skipped), (0, 41));
+        assert_eq!(listed() - before, 1);
+        // Another picture at a known millisecond is not the same footage.
+        let (rels, skipped) = utc(&dir, "20261023-000000-cd34", &[frame(3, 999)]).unwrap();
+        assert_eq!((rels.len(), skipped), (1, 0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn imported_stamps_come_only_from_imported_sidecars() {
+        let at = crate::clock::parse_frame_stamp("20231114T221320000Z").unwrap();
+        assert_eq!(
+            imported_stamp("20231114T221320000Z_imp-ab12-00000.json"),
+            Some(at)
+        );
+        for name in [
+            "20231114T221320000Z_imp-ab12-00000.jpg",
+            "20231114T221320000Z_imp-ab12-00000.labels.json",
+            "20231114T221320000Z_req.json",
+            "index.jsonl",
+            "x_imp-.json",
+        ] {
+            assert_eq!(imported_stamp(name), None, "{name}");
+        }
     }
 
     #[test]
