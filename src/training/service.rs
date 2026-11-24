@@ -28,6 +28,9 @@
 //! change or a result), and a run's per-epoch metrics in its own `history.jsonl`, appended per
 //! epoch ([`history`]); `runs.json` holds none of them. No run record is dropped (a run owns its
 //! folder and model); `tasks.json` keeps the newest [`task::MAX_FINISHED_TASKS`] finished tasks.
+//! A job's log tail grows only through [`push_log`], which also counts the lines in memory
+//! (never in the files), so the CLI's `--verbose` ([`LogFollower`]) keeps following it once the
+//! tail is full.
 //!
 //! The running job can be paused ([`TrainingService::pause`]): its helper processes (Python,
 //! ffmpeg, run through the queue's [`CommandRunner`] wrapped in a [`PausableRunner`]) are
@@ -65,7 +68,7 @@ use crate::storage::busy;
 use crate::sync::LockExt;
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -90,6 +93,45 @@ fn trim_finished_log(r: &mut RunRecord) {
         r.log.drain(..skip);
     }
 }
+/// Characters of a child's line kept on a record.
+const LOG_LINE_CHARS: usize = 300;
+
+/// Add `line` (its first [`LOG_LINE_CHARS`] characters) to the log tail `log`, dropping the oldest
+/// line once it holds [`LOG_TAIL`], and count it in `seq`: the number of lines ever pushed, which
+/// [`LogFollower`] needs to tell new lines from old once the tail is full (QA-039). The one way a
+/// run's or a task's log grows.
+pub fn push_log(log: &mut Vec<String>, seq: &mut u64, line: &str) {
+    if log.len() >= LOG_TAIL {
+        let over = log.len() + 1 - LOG_TAIL;
+        log.drain(..over);
+    }
+    log.push(line.chars().take(LOG_LINE_CHARS).collect());
+    *seq = seq.saturating_add(1);
+}
+
+/// Follows a log tail that [`push_log`] keeps, for a reader that polls it (the CLI's
+/// `--verbose`): each poll gives the lines pushed since the last one, each once and in order.
+/// Lines pushed and evicted between two polls (more than [`LOG_TAIL`] of them) are skipped: the
+/// tail no longer holds them (the full text is in the run's `train.log`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LogFollower {
+    seen: u64,
+}
+
+impl LogFollower {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The lines of `log` not returned before, given `seq`, the push count `log` was read at.
+    pub fn new_lines<'a>(&mut self, log: &'a [String], seq: u64) -> &'a [String] {
+        let fresh = seq.saturating_sub(self.seen);
+        self.seen = self.seen.max(seq);
+        let n = usize::try_from(fresh).map_or(log.len(), |f| f.min(log.len()));
+        log.get(log.len() - n..).unwrap_or_default()
+    }
+}
+
 /// How often a running job's progress (percent, epoch, detail, log tail) is saved when nothing
 /// else changed; state changes, stage changes and results are saved at once.
 pub const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -540,7 +582,8 @@ pub fn unlisted_run_dirs(training_dir: &Path, records: &[RunRecord]) -> Vec<Path
 /// The queue's state. Lock order (a lock is only ever taken while holding locks before it):
 /// `admit` > `persist_lock` > `runs` > `tasks` > `stores`. `current` is held over others only by
 /// [`TrainingService::set_paused`] (`current` > `runs` / `tasks` > `clock`, with no `persist_lock`
-/// or `stores` under it); `cancelled`, `clock` and `live` are leaves.
+/// or `stores` under it); `cancelled`, `clock`, `live`, `run_log_seq` and `task_log_seq` are
+/// leaves.
 struct Inner {
     runner: Arc<dyn CommandRunner>,
     fetcher: Arc<dyn Fetcher>,
@@ -577,6 +620,11 @@ struct Inner {
     /// The running run's epochs (its record holds none, [`history`]): readers get these rather
     /// than the file, which may lag or have failed. A leaf lock.
     live: Mutex<Option<(String, Arc<Vec<EpochPoint>>)>>,
+    /// Log lines pushed so far per run id ([`push_log`]'s counter; memory only): what
+    /// [`LogFollower`] needs once the tail is full. A leaf lock, taken under `runs`.
+    run_log_seq: Mutex<HashMap<String, u64>>,
+    /// The same per task id, taken under `tasks`.
+    task_log_seq: Mutex<HashMap<String, u64>>,
 }
 
 /// The job on the queue's thread and its flags.
@@ -807,6 +855,28 @@ impl Inner {
         self.tasks_changed.notify_all();
     }
 
+    /// Add line `l` to run `id`'s log tail ([`push_log`]).
+    fn push_run_log(&self, id: &str, l: &str) {
+        let mut runs = self.runs.lock_recover();
+        if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
+            let mut seqs = self.run_log_seq.lock_recover();
+            push_log(&mut r.log, seqs.entry(id.to_string()).or_default(), l);
+        }
+        drop(runs);
+        self.runs_changed.notify_all();
+    }
+
+    /// Add line `l` to task `id`'s log tail ([`push_log`]).
+    fn push_task_log(&self, id: &str, l: &str) {
+        let mut tasks = self.tasks.lock_recover();
+        if let Some(r) = tasks.iter_mut().find(|r| r.id == id) {
+            let mut seqs = self.task_log_seq.lock_recover();
+            push_log(&mut r.log, seqs.entry(id.to_string()).or_default(), l);
+        }
+        drop(tasks);
+        self.tasks_changed.notify_all();
+    }
+
     fn persist_tasks(&self) {
         let _order = self.persist_lock.lock_recover();
         self.write_tasks();
@@ -956,6 +1026,8 @@ impl TrainingService {
             current: Mutex::new(None),
             clock: Mutex::new(None),
             live: Mutex::new(None),
+            run_log_seq: Mutex::new(HashMap::new()),
+            task_log_seq: Mutex::new(HashMap::new()),
             cancelled: Mutex::new(HashSet::new()),
             stores: Mutex::new(opened.stores),
             persist_lock: Mutex::new(()),
@@ -1059,6 +1131,8 @@ impl TrainingService {
                 current: Mutex::new(None),
                 clock: Mutex::new(None),
                 live: Mutex::new(None),
+                run_log_seq: Mutex::new(HashMap::new()),
+                task_log_seq: Mutex::new(HashMap::new()),
                 cancelled: Mutex::new(HashSet::new()),
                 stores: Mutex::new(Stores::default()),
                 persist_lock: Mutex::new(()),
@@ -1286,15 +1360,29 @@ impl TrainingService {
 
     /// Block until task `id` is no longer busy or `timeout` passes.
     pub fn wait_task(&self, id: &str, timeout: Duration) -> Option<TaskRecord> {
+        self.wait_task_logged(id, timeout).map(|(r, _)| r)
+    }
+
+    /// [`Self::wait_task`] with the number of log lines pushed to the task so far, read with the
+    /// record (for [`LogFollower::new_lines`]).
+    pub fn wait_task_logged(&self, id: &str, timeout: Duration) -> Option<(TaskRecord, u64)> {
         let deadline = Instant::now() + timeout;
         let mut tasks = self.inner.tasks.lock_recover();
         loop {
             let r = tasks.iter().find(|r| r.id == id).cloned();
+            let seq = || {
+                self.inner
+                    .task_log_seq
+                    .lock_recover()
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0)
+            };
             if r.as_ref().is_none_or(|r| !r.state.is_busy()) {
-                return r;
+                return r.map(|r| (r, seq()));
             }
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                return r;
+                return r.map(|r| (r, seq()));
             };
             tasks = self
                 .inner
@@ -1716,14 +1804,27 @@ impl TrainingService {
 
     /// Block until `id` is no longer busy or `timeout` passes.
     pub fn wait(&self, id: &str, timeout: Duration) -> Option<RunRecord> {
+        self.wait_logged(id, timeout).map(|(r, _)| r)
+    }
+
+    /// [`Self::wait`] with the number of log lines pushed to the run so far, read with the
+    /// record (for [`LogFollower::new_lines`]).
+    pub fn wait_logged(&self, id: &str, timeout: Duration) -> Option<(RunRecord, u64)> {
         let deadline = Instant::now() + timeout;
         let mut runs = self.inner.runs.lock_recover();
         loop {
             let r = runs.iter().find(|r| r.id == id).cloned();
             let done = r.as_ref().is_none_or(|r| !r.state.is_busy());
             if done || Instant::now() >= deadline {
+                let seq = self
+                    .inner
+                    .run_log_seq
+                    .lock_recover()
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0);
                 drop(runs);
-                return r.map(|r| self.inner.with_history(r));
+                return r.map(|r| (self.inner.with_history(r), seq));
             }
             let left = deadline.saturating_duration_since(Instant::now());
             runs = self
@@ -1979,12 +2080,7 @@ fn run_job(inner: &Inner, mut job: TrainJob) {
         }
         TrainReport::Line(l) => {
             tracing::debug!(target: "blue_onyx_prism::training::child", run = %id, "{l}");
-            inner.update(&id, |r| {
-                if r.log.len() >= LOG_TAIL {
-                    r.log.remove(0);
-                }
-                r.log.push(l.chars().take(300).collect());
-            });
+            inner.push_run_log(&id, l);
         }
         TrainReport::Progress(tp) => {
             let stored = match epochs.as_mut() {
@@ -2181,12 +2277,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
         }
         TaskReport::Line(l) => {
             tracing::debug!(target: "blue_onyx_prism::training::child", job = %id, "{l}");
-            inner.update_task(&id, |r| {
-                if r.log.len() >= LOG_TAIL {
-                    r.log.remove(0);
-                }
-                r.log.push(l.chars().take(300).collect());
-            });
+            inner.push_task_log(&id, l);
         }
     };
     let runner = PausableRunner {

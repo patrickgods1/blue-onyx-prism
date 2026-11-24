@@ -2886,7 +2886,8 @@ names its training run; the run folder is that run's `run_dir` in `runs.json` of
 validated on: a validation frame chose the checkpoint, so it is not unseen. Its held-out frames
 (`data/heldout/`) and frames reviewed since are unseen and are checked. A frame counts as seen when a listed
 image's name is the frame's flat name as the dataset spells it (with each `s<N>-` source prefix the lists
-use; the dataset's 120-byte cut included, so a name the cut made ambiguous leaves out every frame it may
+use; the dataset's 120-byte cut included: the stem-only cut of datasets written now and the whole-name
+cut of runs prepared before it, so a name the cut made ambiguous leaves out every frame it may
 be), and, for runs that record their image sources (`image_sources.json`, newer runs), when the source's
 file name is the frame's flat name (exact whatever the dataset named the image). The strictest reading
 available wins: a frame matched either way is skipped.

@@ -68,13 +68,14 @@ pub fn download_with_root(
 }
 
 /// Build config entries for the downloaded `.onnx` files (name = catalog name, family from the
-/// catalog, classes = the sibling `.yaml` when it was downloaded). Paths under `exe_dir` are
-/// stored relative to it, others absolute. Files not in the catalog are ignored.
-pub fn model_configs(files: &[PathBuf], exe_dir: &Path) -> Vec<ModelConfig> {
-    let exe_canon = exe_dir.canonicalize().ok();
+/// catalog, classes = the sibling `.yaml` when it was downloaded). Paths under `base`, the data
+/// root of the config that gets the entries (what [`Config::data_path`] resolves them against),
+/// are stored relative to it, others absolute. Files not in the catalog are ignored.
+pub fn model_configs(files: &[PathBuf], base: &Path) -> Vec<ModelConfig> {
+    let base_canon = base.canonicalize().ok();
     let rel = |p: &Path| -> PathBuf {
-        for base in [Some(exe_dir), exe_canon.as_deref()].into_iter().flatten() {
-            if let Ok(r) = p.strip_prefix(base) {
+        for b in [Some(base), base_canon.as_deref()].into_iter().flatten() {
+            if let Ok(r) = p.strip_prefix(b) {
                 return r.to_path_buf();
             }
         }
@@ -101,6 +102,13 @@ pub fn model_configs(files: &[PathBuf], exe_dir: &Path) -> Vec<ModelConfig> {
         });
     }
     out
+}
+
+/// [`model_configs`] for `config`, the config the entries are added to: relative to its data
+/// root, never the exe dir (QA-036: with `download_dir: "data"` an exe-relative
+/// `data/models/x.onnx` resolved to `<exe>/data/data/models/x.onnx`).
+pub fn model_configs_for(files: &[PathBuf], config: &Config) -> Vec<ModelConfig> {
+    model_configs(files, &config.data_root())
 }
 
 /// What [`add_to_config`] did with one downloaded model.
@@ -256,6 +264,28 @@ mod tests {
         assert_eq!(c[1].path, Path::new("/elsewhere/rt-detrv2-s.onnx"));
         assert_eq!(c[1].family, ModelFamilyKind::RtDetr);
         assert_eq!(c[1].classes, None);
+    }
+
+    /// QA-036: entries are relative to the data root they resolve against, not the exe dir.
+    #[test]
+    fn model_configs_are_relative_to_the_data_root() {
+        let exe = crate::exe_dir();
+        let data = exe.join("data");
+        let file = data.join("models").join("IPcam-general.onnx");
+        let c = model_configs(std::slice::from_ref(&file), &data);
+        assert_eq!(c[0].path, Path::new("models").join("IPcam-general.onnx"));
+
+        let config = Config {
+            download_dir: Some(data.clone()),
+            ..Default::default()
+        };
+        let c = model_configs_for(std::slice::from_ref(&file), &config);
+        assert_eq!(c[0].path, Path::new("models").join("IPcam-general.onnx"));
+        assert_eq!(
+            config.data_path(&c[0].path),
+            file,
+            "the service finds the file"
+        );
     }
 
     #[test]

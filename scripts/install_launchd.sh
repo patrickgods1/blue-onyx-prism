@@ -68,12 +68,12 @@ fi
 if [ ! -f "$CONFIG" ]; then
   src=""
   [ -f "$INSTALL_DIR/blue_onyx_prism_config.json" ] && src="$INSTALL_DIR/blue_onyx_prism_config.json"
-  if [ -n "$src" ] && grep -q '"download_dir"' "$src"; then
+  if [ -n "$src" ] && grep -Eq '"download_dir"[[:space:]]*:[[:space:]]*"' "$src"; then
     cp "$src" "$CONFIG"
     echo "Copied $src to $CONFIG; it already sets download_dir: check that it points at $DATA_DIR."
   elif [ -n "$src" ] && [ "$(head -n 1 "$src")" = "{" ]; then
     # Pretty JSON as the service writes it: insert the keys after the opening brace.
-    KEYS="$keys" awk 'NR == 1 { print; print ENVIRON["KEYS"]; next } { print }' "$src" > "$CONFIG"
+    bop_merge_keys "$keys" "$src" > "$CONFIG"
     echo "Moved the config to $CONFIG (download_dir, cache_dir, log_path and runtime dirs added)."
   elif [ -n "$src" ]; then
     cp "$src" "$CONFIG"

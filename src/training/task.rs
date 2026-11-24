@@ -10,8 +10,9 @@
 //!
 //! [`load_or_move_aside`] and [`save_file`] are how `tasks.json` and `runs.json` reach the disk: a
 //! damaged file or a record this build cannot read is set aside as `<name>.corrupt-<time>` before
-//! the next save could write over it. Each saved record carries a `format` ([`RECORD_FORMAT`]); the
-//! file stays a bare JSON list, so an older build (which ignores unknown fields) still reads it.
+//! the next save could write over it ([`crate::json_aside`]'s policy, shared with the benchmark's
+//! files). Each saved record carries a `format` ([`RECORD_FORMAT`]); the file stays a bare JSON
+//! list, so an older build (which ignores unknown fields) still reads it.
 //!
 //! One owner per training folder. The queue that writes `runs.json` and `tasks.json` holds
 //! [`QueueLock`] (`<training dir>/.queue.lock`, a zero-byte fs4 lock file that is never deleted)
@@ -270,19 +271,21 @@ pub struct Loaded<T> {
     pub writable: bool,
 }
 
-/// Reads of a job record file before it counts as unreadable.
-const READ_TRIES: u32 = 3;
-/// Wait between those reads.
-const READ_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+/// Tag of the asides of `runs.json` / `tasks.json` ([`crate::json_aside`]):
+/// `<name>.corrupt-<time>`.
+const ASIDE_TAG: &str = "corrupt";
 
 /// The records of the JSON list at `path`. A missing file is an empty list. Anything else that
 /// cannot be used is kept where the next save cannot reach it, logged as an error:
 ///
 /// - a file that was read and is not a JSON list moves to `<name>.corrupt-<time>`, and the history
-///   starts empty;
+///   starts empty. When it cannot be renamed (Windows: another process has it open) a copy will
+///   do and the next save replaces the original; a copy an earlier load made is not made again
+///   ([`crate::json_aside::move_or_copy_aside`]);
 /// - a file that cannot be read stays where it is: a failed read says nothing about its content,
-///   and antivirus or a backup can hold a file for a moment on Windows. After [`READ_TRIES`] tries
-///   the history is empty and nothing is saved over the file until a restart;
+///   and antivirus or a backup can hold a file for a moment on Windows. After
+///   [`crate::json_aside::READ_TRIES`] tries the history is empty and nothing is saved over the
+///   file until a restart;
 /// - a record of an otherwise good file that does not parse (a [`TaskKind`] of a later version,
 ///   after a downgrade), or of a later `format` than [`RECORD_FORMAT`] (it might parse into
 ///   something it does not mean), is copied, alone, to such a file, and the others load. The file
@@ -292,7 +295,7 @@ const READ_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
 /// Only the queue that owns the folder ([`QueueLock`]) loads through here; readers use
 /// [`read_records`] (a damaged file is no records for them, and stays where it is).
 pub fn load_or_move_aside<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
-    load_checked(path)
+    load_checked(path, &|from, to| std::fs::rename(from, to))
 }
 
 /// The records of `path` that parse, for a reader that only reads (the Review queue's steer):
@@ -312,10 +315,14 @@ pub fn read_records<T: DeserializeOwned>(path: &Path) -> Vec<T> {
         .collect()
 }
 
-fn load_checked<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
-    let bytes = match read_retrying(path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+/// [`load_or_move_aside`] with the rename step of a move aside given (tests make it fail).
+fn load_checked<T: DeserializeOwned>(
+    path: &Path,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Loaded<T> {
+    let bytes = match crate::json_aside::read_retrying(path) {
+        Ok(Some(b)) => b,
+        Ok(None) => {
             return Loaded {
                 records: Vec::new(),
                 writable: true,
@@ -335,7 +342,7 @@ fn load_checked<T: DeserializeOwned>(path: &Path) -> Loaded<T> {
     };
     let list: Vec<serde_json::Value> = match serde_json::from_slice(&bytes) {
         Ok(l) => l,
-        Err(e) => return move_aside(path, &format!("is damaged ({e})")),
+        Err(e) => return move_aside(path, &format!("is damaged ({e})"), rename),
     };
     let mut records = Vec::with_capacity(list.len());
     let mut unread = Vec::new();
@@ -379,91 +386,49 @@ struct Stamped<'a, T> {
     record: &'a T,
 }
 
-/// [`std::fs::read`], tried again for a moment on any failure but "not found".
-fn read_retrying(path: &Path) -> std::io::Result<Vec<u8>> {
-    let mut tries = 1;
-    loop {
-        match std::fs::read(path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound && tries < READ_TRIES => {
-                tries += 1;
-                std::thread::sleep(READ_RETRY);
-            }
-            done => return done,
-        }
-    }
-}
-
-/// `<name>.corrupt-<time>` beside `path`, in no use yet.
-fn aside_path(path: &Path) -> PathBuf {
-    let mut base = path.file_name().unwrap_or_default().to_os_string();
-    base.push(format!(
-        ".corrupt-{}",
-        crate::clock::name_stamp(std::time::SystemTime::now())
-    ));
-    let free = (0..)
-        .map(|i| {
-            let mut name = base.clone();
-            if i > 0 {
-                name.push(format!("-{i}"));
-            }
-            path.with_file_name(name)
-        })
-        .find(|p| !p.exists());
-    free.unwrap_or_else(|| path.with_file_name(base))
-}
-
-/// Move the whole of `path` aside. A copy will do when it cannot be renamed (Windows: another
-/// process has it open): the original can then be written over.
-fn move_aside<T>(path: &Path, why: &str) -> Loaded<T> {
-    let aside = aside_path(path);
-    let moved = std::fs::rename(path, &aside).or_else(|e| match std::fs::copy(path, &aside) {
-        Ok(_) => Ok(()),
-        Err(_) => Err(e),
-    });
-    if let Err(e) = &moved {
-        tracing::error!(
-            "{} {why} and could not be moved aside to {} ({e}); job history starts empty and \
-             nothing is saved over the file until a restart: check the permissions of its folder",
-            path.display(),
-            aside.display()
-        );
-    } else {
-        tracing::error!(
-            "{} {why}: moved to {}; job history starts empty. Nothing was deleted: restore that \
+/// Set the whole of `path` aside ([`crate::json_aside::move_or_copy_aside`]): renamed, else
+/// copied (Windows: another process has it open), and the original can then be written over.
+fn move_aside<T>(
+    path: &Path,
+    why: &str,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> Loaded<T> {
+    let set = crate::json_aside::move_or_copy_aside_with(path, ASIDE_TAG, rename);
+    match &set {
+        Err(e) => tracing::error!(
+            "{} {why} and could not be set aside ({e}); job history starts empty and nothing is \
+             saved over the file until a restart: check the permissions of its folder",
+            path.display()
+        ),
+        Ok((aside, how)) => tracing::error!(
+            "{} {why}: {} {}{}; job history starts empty. Nothing was deleted: restore that \
              file by hand if it can be repaired",
             path.display(),
-            aside.display()
-        );
+            how.verb(),
+            aside.display(),
+            match how {
+                crate::json_aside::Aside::Moved => "",
+                _ =>
+                    " (it could not be moved: another program may hold it; the next save \
+                       replaces it)",
+            }
+        ),
     }
     Loaded {
         records: Vec::new(),
-        writable: moved.is_ok(),
+        writable: set.is_ok(),
     }
 }
 
 /// Copy `unread`, the records of `path` this build cannot read, to a file of their own, unless an
-/// earlier load did. Returns whether they are safe there.
+/// earlier load did ([`crate::json_aside::keep_copy`]). Returns whether they are safe there.
 fn keep_aside(path: &Path, unread: &[serde_json::Value], error: &str) -> bool {
     let Ok(bytes) = serde_json::to_vec_pretty(unread) else {
         return false;
     };
-    let mut prefix = path.file_name().unwrap_or_default().to_os_string();
-    prefix.push(".corrupt-");
-    let prefix = prefix.to_string_lossy().into_owned();
-    let copied = path
-        .parent()
-        .and_then(|dir| std::fs::read_dir(dir).ok())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-        .any(|e| std::fs::read(e.path()).is_ok_and(|b| b == bytes));
-    if copied {
-        return true;
-    }
-    let aside = aside_path(path);
-    match crate::collect::layout::write_atomic(&aside, &bytes) {
-        Ok(()) => {
+    match crate::json_aside::keep_copy(path, &bytes, ASIDE_TAG) {
+        Ok((_, false)) => true,
+        Ok((aside, true)) => {
             tracing::error!(
                 "{}: {} record(s) this version cannot read ({error}), most likely written by a \
                  later version; kept in {}, the others loaded",
@@ -475,12 +440,11 @@ fn keep_aside(path: &Path, unread: &[serde_json::Value], error: &str) -> bool {
         }
         Err(e) => {
             tracing::error!(
-                "{}: {} record(s) this version cannot read ({error}) could not be copied to {} \
+                "{}: {} record(s) this version cannot read ({error}) could not be copied aside \
                  ({e}); nothing is saved over the file until a restart: check the disk and the \
                  permissions of its folder",
                 path.display(),
-                unread.len(),
-                aside.display()
+                unread.len()
             );
             false
         }
@@ -1103,6 +1067,37 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// QA-187 / QA-058: a damaged file that cannot be renamed (Windows: another process holds
+    /// it) is copied once: the first load copies it and stays writable, a second load adds no
+    /// copy, and a save then replaces the original.
+    #[test]
+    fn a_damaged_file_that_cannot_be_renamed_is_copied_once() {
+        let dir = scratch("held");
+        let p = dir.join(TASKS_FILE);
+        std::fs::write(&p, b"[{\"id\":\"cut").unwrap();
+        let held = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::other("held by another process"))
+        };
+        let l = load_checked::<TaskRecord>(&p, &held);
+        assert!(l.records.is_empty());
+        assert!(
+            l.writable,
+            "a copy is safe aside: the file may be written over"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"[{\"id\":\"cut", "still there");
+        let aside = asides(&p);
+        assert_eq!(aside.len(), 1);
+        assert_eq!(std::fs::read(&aside[0]).unwrap(), b"[{\"id\":\"cut");
+        // The file is still held and still damaged: no second copy.
+        let l = load_checked::<TaskRecord>(&p, &held);
+        assert!(l.writable);
+        assert_eq!(asides(&p), aside);
+        save_records(&p, &[record("a")]);
+        assert_eq!(load_records(&p), [record("a")]);
+        assert_eq!(asides(&p), aside);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -53,7 +53,8 @@
 //!    [`balance`]): repeat the training frames
 //!    of rare classes / scenes / cameras / camera days (and optionally drop frames of dominant
 //!    ones); validation and held-out frames are never balanced.
-//! 3. **Write** ([`write`]): `images/` + `labels/` (hard links, else copies), `classes.txt`,
+//! 3. **Write** ([`write`]): `images/` + `labels/` (hard links, else copies; file names by
+//!    [`names`], `s<source>-<file name>` cut to 120 bytes in the stem only), `classes.txt`,
 //!    `train.txt` / `valid.txt`, `data.yaml` (Ultralytics), `train.coco.json` /
 //!    `valid.coco.json` (category ids 0..C-1, for RF-DETR and transformers), the held-out set as
 //!    a benchmark `dir:` set (`heldout/`, every scene, tagged by [`heldout_tags`]),
@@ -77,6 +78,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod balance;
+pub mod names;
 pub mod reuse;
 mod valid;
 pub use balance::{Balance, BalanceAxis, BalanceCounts, BalanceReport};
@@ -2595,21 +2597,6 @@ pub struct SourceSummary {
 /// Licence noted for the user's own frames.
 pub const OWN_FRAMES_LICENSE: &str = "own camera footage (private)";
 
-fn safe_name(s: &str) -> String {
-    let mut out: String = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    out.truncate(120);
-    out
-}
-
 /// Whether `path` is a JPEG (by its bytes: it starts with the SOI marker) that does not end with
 /// the EOI marker: the one kind of image a trainer rewrites ("corrupt JPEG restored and saved").
 /// Ultralytics does it through a temporary file and a rename (`_replace_image`, "so hard links to
@@ -2953,29 +2940,14 @@ pub fn write_reusing(
             .and_then(|s| s.frames.get(r.1))
             .ok_or_else(|| anyhow::anyhow!("plan refers to a missing frame {r:?}"))
     };
-    // Unique file names: `<source>-<name>`.
-    let mut names: BTreeMap<FrameRef, String> = BTreeMap::new();
+    // Unique file names: `s<source>-<name>` ([`names`]).
+    let mut named: BTreeMap<FrameRef, names::ImageName> = BTreeMap::new();
     let mut used: BTreeSet<String> = BTreeSet::new();
-    let mut name_of = |r: FrameRef, f: &Frame| -> String {
-        if let Some(n) = names.get(&r) {
-            return n.clone();
-        }
-        let base = safe_name(&format!("s{}-{}", r.0, file_name(&f.image)));
-        let mut n = base.clone();
-        let mut k = 1;
-        while !used.insert(n.clone()) {
-            k += 1;
-            let p = Path::new(&base);
-            n = format!(
-                "{}-{k}.{}",
-                stem(p),
-                p.extension()
-                    .map(|e| e.to_string_lossy())
-                    .unwrap_or_default()
-            );
-        }
-        names.insert(r, n.clone());
-        n
+    let mut name_of = |r: FrameRef, f: &Frame| -> names::ImageName {
+        named
+            .entry(r)
+            .or_insert_with(|| names::image_name(r.0, &file_name(&f.image), &mut used))
+            .clone()
     };
     let mut sizes: BTreeMap<FrameRef, (u32, u32)> = BTreeMap::new();
     let mut size_of = |r: FrameRef, f: &Frame| -> Result<(u32, u32)> {
@@ -3019,13 +2991,11 @@ pub fn write_reusing(
     // The train / valid images to write (each once), in plan order; written together below.
     let mut written: BTreeSet<FrameRef> = BTreeSet::new();
     let mut to_write: Vec<(FrameRef, String)> = Vec::new();
-    let mut put = |r: FrameRef, f: &Frame, n: &str| -> Result<()> {
+    let mut put = |r: FrameRef, f: &Frame, n: &names::ImageName| -> Result<()> {
         check_cancel(cancel)?;
         if written.insert(r) {
-            to_write.push((r, n.to_string()));
-            let txt = out
-                .join("labels")
-                .join(format!("{}.txt", stem(Path::new(n))));
+            to_write.push((r, n.image.clone()));
+            let txt = out.join("labels").join(n.label());
             std::fs::write(&txt, label_text(f))
                 .with_context(|| format!("writing {}", txt.display()))?;
         }
@@ -3073,8 +3043,9 @@ pub fn write_reusing(
     let mut train_refs = Vec::new();
     for &(r, repeats) in &plan.train {
         let f = frame(r)?;
-        let n = name_of(r, f);
-        put(r, f, &n)?;
+        let named = name_of(r, f);
+        put(r, f, &named)?;
+        let n = named.image;
         image_sources.insert(n.clone(), f.image.clone());
         for _ in 0..repeats.max(1) {
             train_lines.push_str(&format!("./images/{n}\n"));
@@ -3085,8 +3056,9 @@ pub fn write_reusing(
     let mut valid_refs = Vec::new();
     for &r in &plan.valid {
         let f = frame(r)?;
-        let n = name_of(r, f);
-        put(r, f, &n)?;
+        let named = name_of(r, f);
+        put(r, f, &named)?;
+        let n = named.image;
         image_sources.insert(n.clone(), f.image.clone());
         valid_lines.push_str(&format!("./images/{n}\n"));
         valid_refs.push((r, n.clone()));
@@ -3184,7 +3156,8 @@ pub fn write_reusing(
                 unreadable += 1;
                 continue;
             };
-            let n = name_of(r, f);
+            let named = name_of(r, f);
+            let n = named.image.clone();
             let dst = hd.join("images").join(&n);
             let rel = format!("heldout/images/{n}");
             let before = file_id::FileId::of(&f.image);
@@ -3194,9 +3167,7 @@ pub fn write_reusing(
                 None => link_or_copy(&f.image, &dst)?,
             }
             recorder.add(rel, &f.image, before, &dst, None);
-            let txt = hd
-                .join("labels")
-                .join(format!("{}.txt", stem(Path::new(&n))));
+            let txt = hd.join("labels").join(named.label());
             std::fs::write(&txt, label_text(f))?;
             let mut tags = heldout_tags(f.scene.as_deref(), &f.camera, opts.scene, f.random_pick);
             tags.push(format!("camera:{}", f.camera));

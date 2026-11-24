@@ -4,7 +4,9 @@
 //! - **Download** queues the resource on the shared download manager. Resources over the
 //!   large-download threshold need `confirm_large` (the button that shows the size supplies it)
 //!   unless `allow_large_downloads` is set.
-//! - **Remove** deletes an install we made (a `.installed.json` manifest names it). It refuses
+//! - **Remove** deletes an install we made (a `.installed.json` manifest names it, and its folder
+//!   holds nothing else: `manager::exclusively_ours`; an install merged into a folder with other
+//!   files is left for the user to tidy by hand). It refuses
 //!   while the resource downloads, when this process has the runtime loaded (OpenVINO, the
 //!   loaded ONNX Runtime flavor, preloaded CUDA libraries: "restart required"), and when an
 //!   enabled model of the config uses the model files. Disabled config entries using them are
@@ -506,12 +508,29 @@ pub(super) fn model_paths(res: &Resource, config: &Config) -> Vec<PathBuf> {
     }
 }
 
-/// Our install of `res` (manifest names it), not a user-managed directory; for a runtime also a
-/// downloaded update of ours waiting beside a missing install ([`pending_update`]).
+/// Our install of `res` and nothing else ([`manager::exclusively_ours`], the rule the download
+/// manager replaces a directory by), so Remove may delete the whole directory; for a runtime also
+/// a downloaded update of ours waiting beside a missing install ([`pending_update`]). An install
+/// merged into a directory that holds other files is not (QA-025): Remove would delete them.
 fn ours(res: &Resource, config: &Config) -> bool {
     let dir = target_dir(config, res);
-    manager::read_manifest(&manager::manifest_path(res, &dir)).is_some_and(|m| m.id == res.id)
-        || pending_update(res, config).is_some()
+    manager::exclusively_ours(&dir, res.id)
+        || (std::fs::symlink_metadata(&dir).is_err() && pending_update(res, config).is_some())
+}
+
+/// Why Remove leaves `res` alone when it is not [`ours`]: user-managed, or our files sharing a
+/// directory with others.
+fn not_ours_reason(res: &Resource, config: &Config) -> String {
+    let dir = target_dir(config, res);
+    if manager::read_manifest(&manager::manifest_path(res, &dir)).is_some_and(|m| m.id == res.id) {
+        format!(
+            "{} also holds files Blue Onyx Prism did not install, so it is not removed as a \
+             whole; delete what you no longer need by hand",
+            dir.display()
+        )
+    } else {
+        "not installed by Blue Onyx Prism (user-managed); remove it by hand".into()
+    }
 }
 
 /// The downloaded update of the runtime `res` waiting beside its install for the next start
@@ -617,7 +636,7 @@ pub(super) fn remove_blocked(
         _ => {}
     }
     if !res.kind.is_model() && res.kind != ResourceKind::Tool && !ours(res, config) {
-        return Some("not installed by Blue Onyx Prism (user-managed); remove it by hand".into());
+        return Some(not_ours_reason(res, config));
     }
     None
 }
@@ -1164,6 +1183,62 @@ mod tests {
         let model = catalog::model("dfine-m").unwrap();
         assert_eq!(pending_update(model, &c), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// QA-025: Remove deletes a runtime's whole folder, so only a folder that is our install
+    /// alone is ours; one that also holds the user's files, or whose manifest says the install
+    /// was merged into it, is left for the user, with a reason that says so.
+    #[test]
+    fn a_merged_install_is_not_ours_to_remove() {
+        let root = crate::test_dirs::TempDir::new("status-merged");
+        let c = Config {
+            download_dir: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        let res = catalog::all()
+            .find(|r| r.kind == ResourceKind::OpenVinoRuntime)
+            .unwrap();
+        let dir = target_dir(&c, res);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.bin"), b"ours").unwrap();
+        let manifest = |merged: bool| {
+            let mut v = serde_json::to_value(manager::Manifest {
+                id: res.id.into(),
+                version: "9".into(),
+                sha256: Vec::new(),
+                files: vec!["lib.bin".into()],
+            })
+            .unwrap();
+            if merged {
+                v["merged"] = true.into();
+            }
+            std::fs::write(
+                dir.join(manager::MANIFEST_FILE),
+                serde_json::to_vec(&v).unwrap(),
+            )
+            .unwrap();
+        };
+        manifest(false);
+        assert!(ours(res, &c));
+        assert_eq!(remove_blocked(None, res, &c, None), None);
+        manifest(true);
+        assert!(!ours(res, &c), "merged into a folder that was there");
+        manifest(false);
+        std::fs::write(dir.join("keep.txt"), b"mine").unwrap();
+        assert!(!ours(res, &c), "the user's file beside ours");
+        let why = remove_blocked(None, res, &c, None).unwrap();
+        assert!(why.contains("did not install"), "{why}");
+        // A pending update beside it does not make the user's folder ours to remove.
+        let pending = manager::pending_dir(&dir).unwrap();
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("lib.bin"), b"v2").unwrap();
+        std::fs::copy(
+            dir.join(manager::MANIFEST_FILE),
+            pending.join(manager::MANIFEST_FILE),
+        )
+        .unwrap();
+        assert!(pending_update(res, &c).is_some());
+        assert!(!ours(res, &c));
     }
 
     /// The "update available" tail: an update blocks nobody and says when it is used.

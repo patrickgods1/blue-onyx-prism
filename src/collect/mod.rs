@@ -945,6 +945,27 @@ mod tests {
         assert!(d.record.camera.len() <= 64, "the camera folder's own cap");
     }
 
+    // QA-186: a Blue Iris camera short-named AUX gets a folder Windows can create.
+    #[test]
+    fn a_draft_of_a_camera_named_like_a_windows_device_gets_a_safe_folder() {
+        let d = Draft::new(&DraftInput {
+            model: "m",
+            device: "openvino:cpu",
+            request_id: "abc",
+            routed_from: None,
+            image_name: "AUX.20261116_140211.jpg",
+            stats: crate::image_stats::ImageStats::default(),
+            width: 100,
+            height: 80,
+            threshold: 0.5,
+            near_margin: None,
+        });
+        assert_eq!(d.record.camera_key, "m|cam:aux");
+        assert_ne!(d.record.camera, "aux");
+        assert_eq!(d.record.camera, "aux_");
+        assert!(!crate::fsx::is_windows_reserved(&d.record.camera));
+    }
+
     #[test]
     fn draft_records_detections_with_labels_and_clamped_boxes() {
         let stats = crate::image_stats::ImageStats {

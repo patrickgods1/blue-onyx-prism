@@ -1042,6 +1042,67 @@ mod tests {
         assert!(sweep.by_dataset.iter().all(|c| c.key != "pseudo"));
     }
 
+    /// QA-027 / QA-143: the reference model's As served and `--variants` jobs (named
+    /// `<model>+served`, `<model>+<variant>`) are its own detections on the pseudo set too: alone
+    /// there, they get no accuracy.
+    #[test]
+    fn served_and_variant_jobs_of_the_reference_are_not_scored_on_its_labels() {
+        let mut pseudo = ImageSet::sample();
+        pseudo.id = "pseudo".into();
+        pseudo.ground_truth = GroundTruth::Pseudo("Ref-Model on openvino:cpu".into());
+        pseudo.images[0].gt = Some(vec![GtBox {
+            label: "dog".into(),
+            bbox: [0.0, 0.0, 100.0, 100.0],
+            ignore: false,
+            crowd: false,
+        }]);
+        let all = vec![(&pseudo, &pseudo.images[0])];
+        let job = |name: &str| Job {
+            name: name.into(),
+            path: "m.onnx".into(),
+            family: ModelFamilyKind::Yolo5,
+            classes: crate::model::classes::coco80(),
+            device: "auto".into(),
+            gpu_precision: None,
+            confidence_threshold: None,
+            object_filter: None,
+            variant: None,
+            concurrency: None,
+            device_thresholds: Default::default(),
+        };
+        let eval = vec![PredBox {
+            label: "dog".into(),
+            confidence: 0.9,
+            bbox: [1.0, 1.0, 100.0, 100.0],
+            window: None,
+        }];
+        for name in ["ref-model+served", "Ref-Model.onnx+filters"] {
+            let j = job(name);
+            assert_eq!(reference_sets(&j.name, &all), ["pseudo"], "{name}");
+            let mut pi = vec![ImageRun {
+                set: pseudo.id.clone(),
+                file: pseudo.images[0].file.clone(),
+                total_ms: 1.0,
+                infer_ms: 1.0,
+                preds: vec![],
+                gt_matched: vec![],
+                counts: None,
+                scene: None,
+            }];
+            let (acc, note) = score(
+                &j,
+                &all,
+                &mut pi,
+                std::slice::from_ref(&eval),
+                0.5,
+                Default::default(),
+            );
+            assert!(acc.is_none(), "{name}: {acc:?}");
+            assert!(note.unwrap().contains("own detections"), "{name}");
+        }
+        assert!(reference_sets("ref-modelx+served", &all).is_empty());
+    }
+
     #[test]
     fn scored_labels_limit_a_set() {
         // A vehicles-only set: the person prediction is neither TP nor FP, person ground truth

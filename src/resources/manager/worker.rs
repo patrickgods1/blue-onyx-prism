@@ -539,12 +539,30 @@ pub(crate) fn remove_any(p: &Path) -> Result<()> {
 /// Move a finished `staging` directory to `target` (a runtime another process may have loaded goes
 /// through [`super::in_use::place`] first):
 /// - `target` absent: one rename.
-/// - `target` is a previous install of the same resource (its manifest says so): rename it
-///   aside, rename staging in, delete the old one (restored if the second rename fails).
-/// - otherwise (a directory we do not own exclusively, e.g. a legacy flat
-///   `onnxruntime/` that also holds per-flavor installs, or a user `--dir`): merge file by
-///   file, first removing ONNX Runtime files of a previous install so flavors never mix.
+/// - `target` is a previous install of the same resource and nothing else
+///   ([`super::exclusively_ours`]): rename it aside, rename staging in, delete the old one
+///   (restored if the second rename fails).
+/// - otherwise (a directory we do not own exclusively, e.g. a legacy flat `onnxruntime/` that
+///   also holds per-flavor installs, a user `--dir` / `--dest`, or an install merged into one
+///   earlier): merge file by file, first removing ONNX Runtime files of a previous install so
+///   flavors never mix. The manifest it brings says so ([`super::mark_merged`]), so the directory
+///   is never replaced as a whole later, even when its other files are gone (QA-025).
 pub(super) fn put_in_place(res: &Resource, staging: &Path, target: &Path) -> Result<()> {
+    let ort_windows = match res.kind {
+        ResourceKind::OnnxRuntime(_) => Some(res.platform.is_some_and(|p| p.os == "windows")),
+        _ => None,
+    };
+    put_files(res.id, ort_windows, staging, target)
+}
+
+/// [`put_in_place`] for resource `id`; `ort_windows` is Some for an ONNX Runtime install (whether
+/// its file names are Windows ones).
+pub(super) fn put_files(
+    id: &str,
+    ort_windows: Option<bool>,
+    staging: &Path,
+    target: &Path,
+) -> Result<()> {
     let in_use_hint = |e: std::io::Error| {
         anyhow!(e).context(format!(
             "replacing {} (if a running process has its libraries loaded, stop it or restart \
@@ -555,22 +573,21 @@ pub(super) fn put_in_place(res: &Resource, staging: &Path, target: &Path) -> Res
     if std::fs::symlink_metadata(target).is_err() {
         return std::fs::rename(staging, target).map_err(in_use_hint);
     }
-    let owned = read_manifest(&target.join(MANIFEST_FILE)).is_some_and(|m| m.id == res.id);
-    if owned {
+    if super::exclusively_ours(target, id) {
         return swap_owned(staging, target);
     }
-    if let ResourceKind::OnnxRuntime(_) = res.kind {
-        let windows = res.platform.is_some_and(|p| p.os == "windows");
-        if let Ok(rd) = std::fs::read_dir(target) {
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                let is_file = e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink());
-                if is_file && extract::is_ort_file(&name, windows) {
-                    let _ = std::fs::remove_file(e.path());
-                }
+    if let Some(windows) = ort_windows
+        && let Ok(rd) = std::fs::read_dir(target)
+    {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let is_file = e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink());
+            if is_file && extract::is_ort_file(&name, windows) {
+                let _ = std::fs::remove_file(e.path());
             }
         }
     }
+    super::mark_merged(staging)?;
     merge_dir(staging, target)?;
     remove_any(staging)
 }
@@ -578,7 +595,7 @@ pub(super) fn put_in_place(res: &Resource, staging: &Path, target: &Path) -> Res
 /// Replace the install `target` (ours, see [`put_in_place`]) by the complete directory `from`:
 /// rename `target` aside, rename `from` in, delete the old one (restored if the second rename
 /// fails).
-pub(super) fn swap_owned(from: &Path, target: &Path) -> Result<()> {
+fn swap_owned(from: &Path, target: &Path) -> Result<()> {
     let in_use_hint = |e: std::io::Error| {
         anyhow!(e).context(format!(
             "replacing {} (if a running process has its libraries loaded, stop it or restart \
@@ -2118,9 +2135,15 @@ mod tests {
             crate::backend::libs::read_active_flavor(&root.join("onnxruntime")).as_deref(),
             Some("cpu")
         );
+        assert!(
+            super::super::exclusively_ours(&dir, res.id),
+            "a fresh install is ours alone, so the next one swaps it"
+        );
+        assert!(!is_merged(&dir.join(MANIFEST_FILE)));
         make(b"v2");
         install_all(ManagerOptions::new(&root), vec![job()]).unwrap();
         assert_eq!(std::fs::read(dir.join("libonnxruntime.so")).unwrap(), b"v2");
+        assert!(!is_merged(&dir.join(MANIFEST_FILE)), "swapped, not merged");
         let leftovers: Vec<_> = std::fs::read_dir(root.join("onnxruntime"))
             .unwrap()
             .flatten()
@@ -2130,6 +2153,127 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// QA-025: an ONNX Runtime installed twice (a pin bump) into a user `--dir` that holds other
+    /// files is merged both times: the user's files stay, the library is updated, and the
+    /// manifest says the install was merged.
+    #[test]
+    fn a_second_install_into_a_user_dir_keeps_its_files() {
+        let root = crate::test_dirs::TempDir::new("mgr-user-dir");
+        let user = root.join("shared");
+        std::fs::create_dir_all(user.join("mine")).unwrap();
+        std::fs::write(user.join("keep.txt"), b"mine").unwrap();
+        std::fs::write(user.join("mine").join("notes.txt"), b"mine too").unwrap();
+        let install = |content: &[u8], version: &'static str| {
+            let archive = runtime_archive(content);
+            let server = serve(archive.clone(), false);
+            let res: &'static Resource = Box::leak(Box::new(Resource {
+                version,
+                ..*runtime_resource(&server.url, &archive)
+            }));
+            install_all(
+                ManagerOptions::new(&*root),
+                vec![Job::into_dir(res, user.clone())],
+            )
+            .unwrap();
+            res
+        };
+        install(b"v1", "1");
+        assert_eq!(
+            std::fs::read(user.join("libonnxruntime.so")).unwrap(),
+            b"v1"
+        );
+        assert!(is_merged(&user.join(MANIFEST_FILE)));
+        let res = install(b"v2", "2");
+        assert_eq!(
+            std::fs::read(user.join("libonnxruntime.so")).unwrap(),
+            b"v2"
+        );
+        assert_eq!(std::fs::read(user.join("keep.txt")).unwrap(), b"mine");
+        assert!(user.join("mine").join("notes.txt").is_file());
+        assert!(is_installed(res, &user));
+        assert!(!super::super::exclusively_ours(&user, res.id));
+    }
+
+    /// QA-025: the merge flag alone keeps a directory from being replaced as a whole: an install
+    /// into a folder that was there before (empty) is merged, and stays "not ours alone" although
+    /// it holds only our files; without the flag the same content is ours.
+    #[test]
+    fn an_install_into_an_existing_folder_is_never_ours_alone() {
+        let root = crate::test_dirs::TempDir::new("mgr-merged-flag");
+        let archive = runtime_archive(b"lib");
+        let server = serve(archive.clone(), false);
+        let res = runtime_resource(&server.url, &archive);
+        let user = root.join("existing");
+        std::fs::create_dir_all(&user).unwrap();
+        install_all(
+            ManagerOptions::new(&*root),
+            vec![Job::into_dir(res, user.clone())],
+        )
+        .unwrap();
+        let path = user.join(MANIFEST_FILE);
+        assert!(is_merged(&path));
+        assert!(!super::super::exclusively_ours(&user, res.id));
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored["merged"], true);
+        assert_eq!(read_manifest(&path).unwrap().id, res.id, "still readable");
+        // The same files under a manifest without the flag (an older one) are ours alone.
+        let m = read_manifest(&path).unwrap();
+        write_manifest(&path, &m, &user).unwrap();
+        assert!(super::super::exclusively_ours(&user, res.id));
+        // Folder litter does not make it anyone else's; another file does.
+        std::fs::write(user.join(".DS_Store"), b"x").unwrap();
+        std::fs::write(user.join("libonnxruntime.so.partial"), b"x").unwrap();
+        assert!(super::super::exclusively_ours(&user, res.id));
+        assert!(!super::super::exclusively_ours(&user, "onnxruntime-cuda"));
+        std::fs::write(user.join("keep.txt"), b"mine").unwrap();
+        assert!(!super::super::exclusively_ours(&user, res.id));
+    }
+
+    /// QA-025: `setup-openvino --dest <dir> --archive` reinstalls every time (a local archive
+    /// skips the "installed" check); into a folder holding other files both runs merge.
+    #[test]
+    fn a_local_openvino_archive_twice_into_a_user_dir_keeps_its_files() {
+        let root = crate::test_dirs::TempDir::new("mgr-ov-dest");
+        let archive = root.join("openvino.tgz");
+        let make = |content: &[u8]| {
+            let f = std::fs::File::create(&archive).unwrap();
+            let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+            let mut tar = tar::Builder::new(gz);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(content.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append_data(
+                &mut h,
+                "openvino_toolkit/runtime/lib/intel64/libopenvino_c.so.2026.4.0",
+                content,
+            )
+            .unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        };
+        let res = crate::resources::catalog::openvino_runtime("linux", "x86_64").unwrap();
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("keep.txt"), b"mine").unwrap();
+        let lib = dest
+            .join("runtime")
+            .join("lib")
+            .join("intel64")
+            .join("libopenvino_c.so.2026.4.0");
+        for content in [b"v1", b"v2"] {
+            make(content);
+            let job = Job {
+                local_archives: Some(vec![archive.clone()]),
+                ..Job::into_dir(res, dest.clone())
+            };
+            install_all(ManagerOptions::new(&*root), vec![job]).unwrap();
+            assert_eq!(std::fs::read(&lib).unwrap(), content);
+            assert_eq!(std::fs::read(dest.join("keep.txt")).unwrap(), b"mine");
+        }
+        assert!(is_merged(&dest.join(MANIFEST_FILE)));
     }
 
     /// Wait until `key`'s state passes `pred` (or fail after 30 s).

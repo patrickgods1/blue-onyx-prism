@@ -39,6 +39,7 @@
 //! - [`storage`]   disk use and the cleanup of rebuildable files (caches, staging, crashed job folders)
 //! - [`parallel`]  work-stealing maps on scoped threads (import analysis, dataset walks)
 //! - [`fsx`]       atomic writes, file-lock waits and safe on-disk names shared by every writer
+//! - [`json_aside`] setting a damaged JSON store aside (training's records, the benchmark's files)
 //! - [`children`]  registry of child processes the service started; the post-crash orphan sweep
 //! - [`command`]   the bounded runner for short helper programs (output drained and capped, stopped at the deadline)
 //! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
@@ -94,6 +95,7 @@ pub mod download;
 pub mod fsx;
 pub mod image;
 pub mod image_stats;
+pub mod json_aside;
 pub mod logbuf;
 pub mod logthrottle;
 pub mod main_thread;

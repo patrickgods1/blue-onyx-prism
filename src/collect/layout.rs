@@ -43,7 +43,11 @@ const MAX_CAMERA_LEN: usize = 64;
 const MAX_ID_LEN: usize = 32;
 
 /// The camera folder of a request: the camera part of `camera_key` (`<model>|cam:<camera>`),
-/// else `frame-<w>x<h>`; lowercase ASCII letters, digits, `-` and `_` only.
+/// else `frame-<w>x<h>`; lowercase ASCII letters, digits, `-` and `_` only. A Windows device name
+/// (`aux`, `con`, `nul`, `prn`, `com1`-style, [`crate::fsx::is_windows_reserved`]) gets a `_`
+/// (`aux_`) on every OS, since Windows cannot create such a folder and datasets get copied there
+/// (QA-059); a camera folder `aux` written before on Linux / macOS stays readable ([`camera_ok`],
+/// [`parse_rel`]), and that camera's new frames go to `aux_`.
 pub fn camera_dir(camera_key: &str, w: u32, h: u32) -> String {
     let raw = match camera_key.split_once("|cam:") {
         Some((_, cam)) => cam.to_string(),
@@ -63,6 +67,10 @@ pub fn camera_dir(camera_key: &str, w: u32, h: u32) -> String {
         .collect();
     if s.trim_matches('_').is_empty() {
         s = format!("frame-{w}x{h}");
+    }
+    // Never at the length limit: a reserved name has at most 4 characters.
+    if crate::fsx::is_windows_reserved(&s) {
+        s.push('_');
     }
     s
 }
@@ -979,6 +987,23 @@ mod tests {
         );
         assert_eq!(safe_id("ab/../c d"), "abcd");
         assert_eq!(safe_id("../"), "req");
+    }
+
+    // QA-059 / QA-186: a Windows device name never becomes a camera folder, on any OS; folders
+    // written under such a name before still read.
+    #[test]
+    fn camera_folders_are_never_windows_device_names() {
+        for n in ["AUX", "con", "Nul", "PRN", "com1", "LPT9"] {
+            let d = camera_dir(&format!("m|cam:{n}"), 1, 1);
+            assert!(!crate::fsx::is_windows_reserved(&d), "{d}");
+            assert!(camera_ok(&d), "{d}");
+            assert_eq!(d, format!("{}_", n.to_ascii_lowercase()));
+        }
+        assert_eq!(camera_dir("m|cam:AUX", 1, 1), "aux_");
+        assert_eq!(camera_dir("m|cam:console", 1, 1), "console");
+        assert_eq!(camera_dir("m|cam:com10", 1, 1), "com10");
+        assert!(camera_ok("aux"));
+        assert!(parse_rel("day/aux/2026-01-01/x.jpg").is_some());
     }
 
     #[test]

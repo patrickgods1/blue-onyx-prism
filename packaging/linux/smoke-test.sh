@@ -92,7 +92,7 @@ check_service
 
 sudo test -f "$CONFIG" || fail "config $CONFIG missing"
 [ "$(sudo stat -c %U:%G "$CONFIG")" = blueonyx:blueonyx ] || fail "config not owned by blueonyx"
-sudo grep -q '"download_dir"' "$CONFIG" || fail "config lacks download_dir"
+sudo grep -Eq '"download_dir"[[:space:]]*:[[:space:]]*"' "$CONFIG" || fail "config lacks download_dir"
 # The service rewrites the config on first start with every key ("openvino_dir": null): only a
 # path value names a runtime.
 if sudo grep -Eq '"(openvino_dir|onnxruntime_dir)": *"' "$CONFIG"; then fail "config names bundled runtimes"; fi

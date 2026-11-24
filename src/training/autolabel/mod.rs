@@ -885,10 +885,7 @@ pub fn plan_autolabel(
 /// name. None: not a frame of a dataset folder (a public image).
 pub(crate) fn trained_frame(line: &str) -> Option<String> {
     let name = line.trim().rsplit('/').next()?;
-    let (source, flat) = name.strip_prefix('s')?.split_once('-')?;
-    if source.is_empty() || !source.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
+    let (_, flat) = crate::training::dataset::names::split_source(name)?;
     Some(crate::collect::labels::export::parse_flat_name(flat)?.jpg())
 }
 

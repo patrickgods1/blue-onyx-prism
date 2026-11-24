@@ -72,6 +72,8 @@ must run as the service's account.
   shared lock on `.<name>.in-use`; covers OpenVINO, ORT flavors and `cuda-libs`). A pin bump reaches existing installs
   (OpenVINO and cuda-libs record their version; the old one stays usable; a large one without `allow_large_downloads` is
   only offered); a catalog model whose manifest names another version is re-downloaded; a model without a manifest stays.
+  A folder is replaced as a whole only when `manager::exclusively_ours` (our manifest, not `merged`, nothing else in
+  it); an install into a folder holding other files (`--dir`, `--dest`) is merged file by file and marked `merged`.
 
 **On-demand resources.** Pins, URLs, SHA-256 and sizes of everything downloadable live in `src/resources/catalog/`;
 change them only in reviewed commits. The service downloads what config + hardware need at startup (`auto_download`,
@@ -274,6 +276,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   `retention::prune_dataset`). `collect/health.rs` feeds `GET /v1/dataset`. Collect tab `/train/collect`.
 
 - **Data safety** (applies to every writer of user data).
+  - Damaged JSON stores (runs/tasks, benchmark results/history/preds) go through `json_aside`: a file that cannot be
+    read is never moved or saved over; only a parse failure moves it aside (copied once when the rename fails); a
+    benchmark save that would drop unreadable entries copies the whole file aside first.
   - One label write path: `labels::update` under `<dataset root>/.labels.lock` (`fs4`, CLI and service alike; a held
     lock is never given up on, only one that cannot work falls back to the process lock). A failed label write keeps the
     job's `work` and is named in its summary.
@@ -378,6 +383,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
 - **Training** (`src/training/`, `scripts/train_model.py`; docs/TRAINING.md): user-triggered only; `capability` gates by
   GPU (CUDA lanes by compute capability + driver, MPS on Apple); a separate `tools/train-env` from
   `scripts/model-export/locks/train-*.txt`; families YOLO26/11/v8, RF-DETR, RT-DETRv2, D-FINE.
+  - Prepared image names: one rule, `dataset::names` (`image_name` cuts only the stem to fit 120 bytes, label
+    stem from the same helper; readers also try `legacy_spelling`, the old whole-name cut).
   - Dataset assembly (`training/dataset.rs`, `dataset/`): held-out chosen from all review frames before the scene filter
     (`heldout_fingerprint`; random picks never in it), validation as whole camera days (`dataset/valid.rs`), ignore
     mode (`dataset::IgnoreMode`), static cap (`collect/labels/statics.rs`, pure: persons and animals never form spots),

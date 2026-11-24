@@ -737,6 +737,119 @@ fn a_models_value_that_is_not_an_object_is_moved_aside() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The `benchmark-history.json.bad-*` files in `dir`, sorted.
+fn history_asides(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{HISTORY_FILE}.bad-"))
+        })
+        .map(|e| e.path())
+        .collect();
+    v.sort();
+    v
+}
+
+fn append_r(h: &mut History) -> Result<()> {
+    h.append(entry("r9", vec![]));
+    Ok(())
+}
+
+/// QA-032 / QA-144: a history that cannot be read (a folder in its place) is not set aside and
+/// not written over: the update refuses.
+#[test]
+fn an_unreadable_history_is_refused_and_left_alone() {
+    let dir = crate::test_dirs::TempDir::new("history-unreadable");
+    let path = dir.join(HISTORY_FILE);
+    std::fs::create_dir(&path).unwrap();
+    let e = History::update(&path, None, append_r).unwrap_err();
+    let text = format!("{e:#}");
+    assert!(text.contains("not overwriting"), "{text}");
+    assert!(text.contains("cannot be read"), "{text}");
+    assert!(path.is_dir(), "still a folder");
+    assert!(history_asides(&dir).is_empty());
+}
+
+/// QA-057 / QA-144: two damaged histories set aside in the same second are both kept.
+#[test]
+fn a_second_damaged_history_does_not_replace_the_first() {
+    let dir = crate::test_dirs::TempDir::new("history-twice");
+    let path = dir.join(HISTORY_FILE);
+    std::fs::write(&path, b"first").unwrap();
+    History::update(&path, None, append_r).unwrap();
+    std::fs::write(&path, b"second").unwrap();
+    History::update(&path, None, append_r).unwrap();
+    let texts: std::collections::BTreeSet<Vec<u8>> = history_asides(&dir)
+        .iter()
+        .map(|a| std::fs::read(a).unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        [b"first".to_vec(), b"second".to_vec()]
+            .into_iter()
+            .collect()
+    );
+}
+
+/// QA-033 / QA-144: an entry this build cannot read (a pinned baseline, say) survives the
+/// update: the whole original file is copied aside before the save, once.
+#[test]
+fn a_dropped_history_entry_is_kept_aside_before_the_save() {
+    let dir = crate::test_dirs::TempDir::new("history-dropped");
+    let path = dir.join(HISTORY_FILE);
+    let mut h = History::default();
+    h.append(entry("r1", vec![]));
+    h.append(entry("r2", vec![]));
+    h.save(&path).unwrap();
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    v["models"]["IPcam-general"][0]["devices"] = serde_json::json!("from a later version");
+    let original = v.to_string();
+    std::fs::write(&path, &original).unwrap();
+    let ((), warnings) = History::update(&path, None, append_r).unwrap();
+    assert!(
+        warnings.iter().any(|w| w.contains("kept a copy")),
+        "{warnings:?}"
+    );
+    let aside = history_asides(&dir);
+    assert_eq!(aside.len(), 1);
+    assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), original);
+    // Saved without it; the next update drops nothing and copies nothing.
+    let ((), warnings) = History::update(&path, None, append_r).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(history_asides(&dir), aside);
+}
+
+/// QA-033: a history of a later format is not merged into and rewritten as this one: it is set
+/// aside whole, and a plain read refuses it too.
+#[test]
+fn a_history_of_a_later_format_is_set_aside() {
+    let dir = crate::test_dirs::TempDir::new("history-later");
+    let path = dir.join(HISTORY_FILE);
+    let mut h = History::default();
+    h.append(entry("r1", vec![]));
+    h.save(&path).unwrap();
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    v["version"] = (FORMAT_VERSION + 1).into();
+    let later = v.to_string();
+    std::fs::write(&path, &later).unwrap();
+    let e = History::load(&path).unwrap_err();
+    assert!(format!("{e:#}").contains("newer"), "{e:#}");
+    let ((), warnings) = History::update(&path, None, append_r).unwrap();
+    assert!(warnings[0].contains("moved it aside"), "{warnings:?}");
+    let aside = history_asides(&dir);
+    assert_eq!(aside.len(), 1);
+    assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), later);
+    assert_eq!(
+        History::load(&path).unwrap().unwrap().version,
+        FORMAT_VERSION
+    );
+}
+
 #[test]
 fn record_seeds_appends_once_per_model_and_skips_failures() {
     let dir = temp_dir();

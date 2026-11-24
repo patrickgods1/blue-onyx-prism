@@ -425,9 +425,10 @@ fn run(cli: Cli) -> Result<()> {
                     .config
                     .clone()
                     .unwrap_or_else(Config::default_config_path);
-                let models = download::model_configs(&files, &blue_onyx_prism::exe_dir());
                 // Under the config lock: a page save of a running service is never undone.
+                // Paths relative to that config's data root, which resolves them (QA-036).
                 let edited = config_file::edit_file(&path, config_file::Missing::Default, |cfg| {
+                    let models = download::model_configs_for(&files, cfg);
                     Ok(download::add_to_config(cfg, models))
                 })?;
                 for o in &edited.value {

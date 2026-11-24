@@ -300,14 +300,29 @@ fn the_strictest_reading_matches_a_cut_name_and_a_renamed_source() {
     // and stem at their longest: 150 bytes with the prefix).
     let long = reviewed(&f.dataset, &"e".repeat(64), &"x".repeat(64));
     assert_eq!(flat(&long).len() + 3, 150);
-    let cut = spelled("s0", &flat(&long));
+    // QA-136: a dataset written before QA-040 cut the whole name (extension included).
+    let cut = names::legacy_spelling(0, &flat(&long));
     assert_eq!(cut.len(), 120);
+    assert!(!cut.ends_with(".jpg"));
     let mut t = std::fs::read_to_string(data.join("train.txt")).unwrap();
     t.push_str(&format!("./images/{cut}\n"));
-    // A second source's frame (s1-), in the validation list.
+    // QA-040: a dataset written since cuts the stem only.
+    let long_new = reviewed(&f.dataset, &"g".repeat(64), &"x".repeat(64));
+    let cut_new = names::spelling(0, &flat(&long_new));
+    assert!(
+        cut_new.len() == 120 && cut_new.ends_with(".jpg"),
+        "{cut_new}"
+    );
+    t.push_str(&format!("./images/{cut_new}\n"));
+    // A second source's frame (s1-), in the validation list, and an old cut of source 10.
     let other = reviewed(&f.dataset, "foxtrot", "f1");
     let mut v = std::fs::read_to_string(data.join("valid.txt")).unwrap();
     v.push_str(&format!("./images/s1-{}\n", flat(&other)));
+    let long_ten = reviewed(&f.dataset, &"h".repeat(64), &"x".repeat(64));
+    v.push_str(&format!(
+        "./images/{}\n",
+        names::legacy_spelling(10, &flat(&long_ten))
+    ));
     // A public image: names no frame, skipped nothing.
     t.push_str("./images/s2-000000123456.jpg\n");
     std::fs::write(data.join("train.txt"), &t).unwrap();
@@ -321,9 +336,14 @@ fn the_strictest_reading_matches_a_cut_name_and_a_renamed_source() {
         &seen,
     );
     let checked: Vec<String> = qs.s.frames.iter().map(|x| x.rel.jpg()).collect();
-    assert!(!checked.contains(&long), "the cut name is the frame");
+    assert!(!checked.contains(&long), "the old cut name is the frame");
+    assert!(
+        !checked.contains(&long_new),
+        "the new cut name is the frame"
+    );
+    assert!(!checked.contains(&long_ten), "an old cut with source 10");
     assert!(!checked.contains(&other), "a second source's prefix");
-    assert_eq!((qs.trained_on, qs.validated_on), (3, 2));
+    assert_eq!((qs.trained_on, qs.validated_on), (4, 3));
     // With the record of sources: a listed image named otherwise (a `-2` for a name taken
     // twice) is matched by its source; one the record does not name refuses the check.
     let g = fixture("sources", true);

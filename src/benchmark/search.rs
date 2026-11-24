@@ -290,20 +290,41 @@ impl StoredPreds {
     /// entry drops only that run (the rule of [`super::report::parse_lenient`]). Streamed from
     /// the file: one run entry is held as JSON at a time, never the whole text or its tree.
     pub fn load_with_warnings(path: &Path) -> Result<(Option<Self>, Vec<String>)> {
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, Vec::new())),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        Self::load_counted(path).map(|l| (l.value, l.warnings))
+    }
+
+    /// [`Self::load_with_warnings`] with the count of runs dropped. The open is retried
+    /// ([`crate::json_aside::open_retrying`]); a file that cannot be opened, or whose read fails
+    /// part-way (a serde error that is an I/O error), is unreadable
+    /// ([`super::report::Unreadable`]: never set aside), not damaged (QA-032).
+    fn load_counted(path: &Path) -> Result<super::report::Load<Self>> {
+        let file = match crate::json_aside::open_retrying(path) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                return Ok(super::report::Load {
+                    value: None,
+                    warnings: Vec::new(),
+                    dropped: 0,
+                });
+            }
+            Err(e) => return Err(super::report::unreadable(path, e)),
         };
         let mut de = serde_json::Deserializer::from_reader(std::io::BufReader::new(file));
-        let parsed = serde::de::Deserializer::deserialize_map(&mut de, lenient::FileVisitor)
+        let parsed = match serde::de::Deserializer::deserialize_map(&mut de, lenient::FileVisitor)
             .and_then(|v| de.end().map(|()| v))
-            .with_context(|| format!("parsing {}", path.display()))?;
+        {
+            Ok(p) => p,
+            Err(e) if e.is_io() => {
+                return Err(super::report::unreadable(path, std::io::Error::from(e)));
+            }
+            Err(e) => return Err(e).with_context(|| format!("parsing {}", path.display())),
+        };
         let lenient::Parsed {
             version,
             runs,
             dropped,
         } = parsed;
+        let count = dropped.len();
         let warnings = dropped
             .into_iter()
             .map(|(name, err)| {
@@ -313,7 +334,11 @@ impl StoredPreds {
                 )
             })
             .collect();
-        Ok((Some(Self { version, runs }), warnings))
+        Ok(super::report::Load {
+            value: Some(Self { version, runs }),
+            warnings,
+            dropped: count,
+        })
     }
 
     /// Compact JSON through a temporary file of its own and a rename
@@ -646,8 +671,10 @@ mod lenient {
 }
 
 /// Merge the predictions of `new` into the file beside `results_file`. Does not fail the
-/// benchmark: returns the warnings (also logged). A file that does not load is moved aside
-/// (`<name>.bad-<timestamp>`) rather than overwritten; when that fails nothing is saved.
+/// benchmark: returns the warnings (also logged). Through [`super::report::load_or_move_aside`]:
+/// a file that does not load is set aside (`<name>.bad-<timestamp>`) rather than overwritten, one
+/// whose runs were dropped is first copied aside whole, and one that cannot be read is left
+/// alone; in those failures nothing is saved.
 pub(crate) fn save_beside(
     results_file: &Path,
     merged: &BenchmarkResults,
@@ -658,7 +685,7 @@ pub(crate) fn save_beside(
         .map(|d| d.join(PREDS_FILE))
         .unwrap_or_else(|| PathBuf::from(PREDS_FILE));
     let (prev, mut warnings) =
-        match super::report::load_or_move_aside(&path, StoredPreds::load_with_warnings) {
+        match super::report::load_or_move_aside(&path, StoredPreds::load_counted) {
             Ok(x) => x,
             Err(e) => {
                 let w = format!("stored predictions not saved: {e:#}");
@@ -779,10 +806,12 @@ pub struct SearchResult {
     pub classes: Vec<String>,
     /// At the threshold the run was configured with.
     pub configured: ThresholdPoint,
-    /// At the threshold configured now (the model's in the config, else the run's): what the
-    /// summary's "configured" columns and the gain compare against.
+    /// At the threshold configured now on the run's device (the model's confidence profile for
+    /// that device, else its threshold in the config, else the run's): what the summary's
+    /// "configured" columns and the gain compare against.
     pub now: ThresholdPoint,
-    /// At the model's threshold in the config now (when it differs from the run's).
+    /// At the model's threshold in the config now on the run's device (when it differs from the
+    /// run's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<ThresholdPoint>,
     pub best: Option<Pick>,
@@ -919,13 +948,27 @@ fn capped_of(results: &BenchmarkResults, run: &StoredRun) -> usize {
         .map_or(0, |r| r.preds_capped_images)
 }
 
+/// The threshold the config gives the result `model` on `device` now (QA-029): the owning
+/// model's ([`super::variant::owner`]) confidence profile for that device, else its own
+/// threshold, else the global one ([`crate::config::ModelConfig::threshold_on`], the rule the
+/// workers serve with). None: no configured model owns the result.
+pub fn configured_threshold(
+    config: &crate::config::Config,
+    model: &str,
+    device: &str,
+) -> Option<f32> {
+    super::variant::owner(config, model)
+        .map(|m| m.threshold_on(Some(device), config.confidence_threshold).0)
+}
+
 /// Search the stored predictions (see the module docs). `current` gives a model's threshold in
-/// the config now. Errors when there are no stored predictions at all.
+/// the config now on a device (model, device spec; usually [`configured_threshold`]). Errors
+/// when there are no stored predictions at all.
 pub fn search(
     results: &BenchmarkResults,
     preds: &StoredPreds,
     req: &SearchRequest,
-    current: &dyn Fn(&str) -> Option<f32>,
+    current: &dyn Fn(&str, &str) -> Option<f32>,
 ) -> Result<SearchOutput> {
     let started = Instant::now();
     if preds.runs.is_empty() {
@@ -971,7 +1014,7 @@ pub fn search(
                 continue;
             }
         };
-        match search_run(run, &sets, req, current(&run.model)) {
+        match search_run(run, &sets, req, current(&run.model, &run.device)) {
             Ok(mut r) => {
                 r.preds_capped_images = capped_of(results, run);
                 out.results.push(r);
@@ -1602,7 +1645,7 @@ pub(crate) mod tests {
             2
         );
         let (mut results, preds) = fixture();
-        let none = |_: &str| None;
+        let none = |_: &str, _: &str| None;
         let out = search(&results, &preds, &SearchRequest::default(), &none).unwrap();
         assert_eq!(
             out.results[0].preds_capped_images, 0,
@@ -1633,7 +1676,7 @@ pub(crate) mod tests {
     #[test]
     fn search_hand_computed_and_filters() {
         let (results, preds) = fixture();
-        let none = |_: &str| None;
+        let none = |_: &str, _: &str| None;
         let out = search(&results, &preds, &SearchRequest::default(), &none).unwrap();
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         let r = &out.results[0];
@@ -1688,7 +1731,7 @@ pub(crate) mod tests {
         let r = &search(&results, &preds, &req, &none).unwrap().results[0];
         assert_eq!(r.configured.counts.fp, 1);
         // The config's current threshold is evaluated too.
-        let cur = |_: &str| Some(0.3);
+        let cur = |_: &str, _: &str| Some(0.3);
         let r = &search(&results, &preds, &SearchRequest::default(), &cur)
             .unwrap()
             .results[0];
@@ -1733,7 +1776,7 @@ pub(crate) mod tests {
     #[test]
     fn search_frame_roc_and_youden() {
         let (results, preds) = fixture();
-        let none = |_: &str| None;
+        let none = |_: &str, _: &str| None;
         let req = SearchRequest {
             objective: Objective::Youden,
             ..Default::default()
@@ -1799,6 +1842,58 @@ pub(crate) mod tests {
         assert!(csv.contains("\nm,car,1,1,1.0000\n"), "{csv}");
     }
 
+    /// QA-029: "configured now" is the threshold the stored run's device serves at: its
+    /// confidence profile (what `--apply-threshold` writes), else the model's, else the global
+    /// one; an As served or variant result follows its model.
+    #[test]
+    fn configured_now_uses_the_device_profile() {
+        let (results, preds) = fixture();
+        let config = crate::config::Config {
+            confidence_threshold: 0.6,
+            models: vec![crate::config::ModelConfig {
+                name: Some("m".into()),
+                confidence_threshold: Some(0.45),
+                device_thresholds: [("ort:coreml".to_string(), 0.35)].into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let current = |m: &str, d: &str| configured_threshold(&config, m, d);
+        let at = |device: &str| {
+            let req = SearchRequest {
+                device: Some(device.into()),
+                ..Default::default()
+            };
+            search(&results, &preds, &req, &current).unwrap().results[0]
+                .now
+                .threshold
+        };
+        assert_eq!(at("ort:coreml"), 0.35, "the device's profile");
+        assert_eq!(at("openvino:cpu"), 0.45, "no profile: the model's own");
+        assert_eq!(
+            configured_threshold(&config, "m+served", "ort:coreml"),
+            Some(0.35)
+        );
+        assert_eq!(
+            configured_threshold(&config, "m+filters", "ort:cpu"),
+            Some(0.45)
+        );
+        assert_eq!(configured_threshold(&config, "zzz", "ort:cpu"), None);
+        let bare = crate::config::Config {
+            confidence_threshold: 0.6,
+            models: vec![crate::config::ModelConfig {
+                name: Some("m".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            configured_threshold(&bare, "m", "ort:cpu"),
+            Some(0.6),
+            "global"
+        );
+    }
+
     /// BQ-13: repeated or differently-cased model names search once.
     #[test]
     fn duplicate_model_names_search_once() {
@@ -1808,7 +1903,7 @@ pub(crate) mod tests {
                 models: names.iter().map(|n| n.to_string()).collect(),
                 ..Default::default()
             };
-            let out = search(&results, &preds, &req, &|_| None).unwrap();
+            let out = search(&results, &preds, &req, &|_, _| None).unwrap();
             assert_eq!(out.results.len(), 1, "{names:?}");
             assert!(out.errors.is_empty());
         }
@@ -1834,7 +1929,7 @@ pub(crate) mod tests {
     }
 
     fn out_of(results: &BenchmarkResults, preds: &StoredPreds) -> SearchOutput {
-        search(results, preds, &SearchRequest::default(), &|_| None).unwrap()
+        search(results, preds, &SearchRequest::default(), &|_, _| None).unwrap()
     }
 
     #[test]
@@ -1959,6 +2054,89 @@ pub(crate) mod tests {
             "a new file was saved"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `benchmark-preds.json.bad-*` files in `dir`, sorted.
+    fn preds_asides(dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{PREDS_FILE}.bad-"))
+            })
+            .map(|e| e.path())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// QA-032 / QA-144: stored predictions that cannot be read (a folder in the file's place)
+    /// are neither set aside nor written over.
+    #[test]
+    fn unreadable_preds_are_left_alone_and_not_saved_over() {
+        let (results, _) = fixture();
+        let dir = crate::test_dirs::TempDir::new("preds-unreadable");
+        let path = dir.join(PREDS_FILE);
+        std::fs::create_dir(&path).unwrap();
+        let warnings = save_beside(&dir.join("benchmark.json"), &results, &[]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("not saved"), "{}", warnings[0]);
+        assert!(warnings[0].contains("cannot be read"), "{}", warnings[0]);
+        assert!(path.is_dir(), "still a folder");
+        assert!(preds_asides(&dir).is_empty());
+    }
+
+    /// QA-057 / QA-144: two damaged files set aside in the same second are both kept.
+    #[test]
+    fn a_second_damaged_preds_file_does_not_replace_the_first() {
+        let (results, _) = fixture();
+        let dir = crate::test_dirs::TempDir::new("preds-twice");
+        let path = dir.join(PREDS_FILE);
+        std::fs::write(&path, b"first").unwrap();
+        save_beside(&dir.join("benchmark.json"), &results, &[]);
+        std::fs::write(&path, b"second").unwrap();
+        save_beside(&dir.join("benchmark.json"), &results, &[]);
+        let texts: std::collections::BTreeSet<Vec<u8>> = preds_asides(&dir)
+            .iter()
+            .map(|a| std::fs::read(a).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [b"first".to_vec(), b"second".to_vec()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// QA-033 / QA-144: a run this build cannot read survives the merge and save: the whole
+    /// original file is copied aside first, once.
+    #[test]
+    fn a_dropped_preds_run_is_kept_aside_before_the_save() {
+        let (results, preds) = fixture();
+        let dir = crate::test_dirs::TempDir::new("preds-dropped");
+        let path = dir.join(PREDS_FILE);
+        let mut v = serde_json::to_value(&preds).unwrap();
+        v["runs"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"model": "m", "device": "ort:cpu", "configured": "x"}));
+        let original = v.to_string();
+        std::fs::write(&path, &original).unwrap();
+        let warnings = save_beside(&dir.join("benchmark.json"), &results, &[]);
+        assert!(
+            warnings.iter().any(|w| w.contains("kept a copy")),
+            "{warnings:?}"
+        );
+        let aside = preds_asides(&dir);
+        assert_eq!(aside.len(), 1);
+        assert_eq!(std::fs::read_to_string(&aside[0]).unwrap(), original);
+        // Saved without the run; the next merge drops nothing and copies nothing.
+        assert_eq!(StoredPreds::load(&path).unwrap().unwrap().runs, preds.runs);
+        let warnings = save_beside(&dir.join("benchmark.json"), &results, &[]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(preds_asides(&dir), aside);
     }
 
     #[test]

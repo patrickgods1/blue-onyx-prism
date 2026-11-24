@@ -303,14 +303,15 @@ fn threshold_search_blocking(state: &AppState, form: &[(String, String)]) -> Res
         Ok(d) => d,
         Err(e) => return e.into_response(),
     };
-    let current = current_thresholds(&cfg);
-    let lookup = |m: &str| {
-        current.get(&crate::registry::normalize_name(m)).map(|t| {
+    // The device's profile, else the model's, else the global threshold (QA-029), at the
+    // 2 decimals the page shows.
+    let lookup = |m: &str, device: &str| {
+        crate::benchmark::search::configured_threshold(&cfg, m, device).map(|t| {
             #[allow(
                 clippy::cast_possible_truncation,
                 reason = "a confidence threshold (0..1); f32 is the precision the models use"
             )]
-            let t = *t as f32;
+            let t = crate::config::round_threshold_f64(t) as f32;
             t
         })
     };

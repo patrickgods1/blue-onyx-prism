@@ -238,7 +238,7 @@ fn compare_blocking(
 
 /// The saved confidence of `model` on `device` and its source.
 fn saved_of(cfg: &Config, model: &str, device: &str) -> Option<(f32, String)> {
-    let m = crate::benchmark::find_model(cfg, crate::benchmark::variant::base_name(model))?;
+    let m = crate::benchmark::variant::owner(cfg, model)?;
     let (t, src) = m.threshold_on(Some(device), cfg.confidence_threshold);
     Some((t, src.label()))
 }

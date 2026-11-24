@@ -44,6 +44,30 @@ bop_own_data_root() {
     || echo "Could not change the owner of everything in $_own, so the service may fail to read it (is it a network share?). Fix it with: sudo chown -hR $BOP_USER:$BOP_USER $_own/." >&2
 }
 
+# bop_merge_keys KEYS FILE: FILE (pretty JSON as the service writes it) with the member lines KEYS
+# after the opening brace. The file's own top-level lines (2-space indent) of those keys are
+# dropped first, so no key repeats (Config::load refuses duplicates), and a comma left before the
+# closing brace is removed.
+bop_merge_keys() {
+  KEYS="$1" awk '
+    BEGIN {
+      n = split(ENVIRON["KEYS"], L, "\n")
+      for (i = 1; i <= n; i++) {
+        if (L[i] ~ /^  "[^"]*"[ \t]*:/) { k = L[i]; sub(/^  "/, "", k); sub(/".*/, "", k); drop[k] = 1 }
+      }
+      m = 0
+    }
+    NR == 1 { out[++m] = $0; out[++m] = ENVIRON["KEYS"]; next }
+    {
+      if ($0 ~ /^  "[^"]*"[ \t]*:/) { k = $0; sub(/^  "/, "", k); sub(/".*/, "", k); if (k in drop) next }
+      out[++m] = $0
+    }
+    END {
+      for (i = 2; i <= m; i++) if (out[i] ~ /^}/ && out[i - 1] ~ /,[ \t]*$/) sub(/,[ \t]*$/, "", out[i - 1])
+      for (i = 1; i <= m; i++) print out[i]
+    }' "$2"
+}
+
 # bop_seed_config INSTALL_DIR DATA_DIR CONFIG WITH_RUNTIMES: write CONFIG unless it exists (never
 # overwrites), then fix owner/mode. download_dir and cache_dir always point at the data root.
 # WITH_RUNTIMES=1 (archive flow) also names the bundled, root-owned openvino/ and onnxruntime/
@@ -76,12 +100,12 @@ bop_seed_config() {
     if [ -f "$_inst/blue_onyx_prism_config.json" ]; then
       src="$_inst/blue_onyx_prism_config.json"
     fi
-    if [ -n "$src" ] && grep -q '"download_dir"' "$src"; then
+    if [ -n "$src" ] && grep -Eq '"download_dir"[[:space:]]*:[[:space:]]*"' "$src"; then
       cp "$src" "$_cfg"
       echo "Copied $src to $_cfg; it already sets download_dir: check that it points at $_data."
     elif [ -n "$src" ] && [ "$(head -n 1 "$src")" = "{" ]; then
       # Pretty JSON as the service writes it: insert the keys after the opening brace.
-      KEYS="$keys" awk 'NR == 1 { print; print ENVIRON["KEYS"]; next } { print }' "$src" > "$_cfg"
+      bop_merge_keys "$keys" "$src" > "$_cfg"
       echo "Moved the config to $_cfg (download_dir, cache_dir and runtime dirs added)."
     elif [ -n "$src" ]; then
       cp "$src" "$_cfg"

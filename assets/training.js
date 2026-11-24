@@ -334,7 +334,7 @@
       installed: "installed", failed: "failed"
     };
     var LOGIN = ["needs_login", "needs_access", "token_unreadable", "failed"];
-    var timer = null, sizeText = "";
+    var sizeText = "";
     var draw = function (s) {
       panel.hidden = false;
       var busy = s.state === "checking" || s.state === "downloading";
@@ -368,22 +368,31 @@
       remove.hidden = !(installed || s.parts_on_disk);
       remove.disabled = busy || s.in_use;
       remove.title = s.in_use ? "An auto-label run is using it" : "";
-      if (timer) { clearTimeout(timer); timer = null; }
-      // A poll while it is busy: it does not keep the session alive (live.js).
-      if (busy) timer = setTimeout(function () {
-        if (window.PrismPoll && window.PrismPoll.background) window.PrismPoll.background(load); else load();
-      }, 2000);
     };
     var fail = function (text) {
       msg.textContent = text;
       msg.className = "form-msg error-text";
     };
-    function load() {
-      fetch(API, { headers: { Accept: "application/json" } })
-        .then(function (res) { return res.json(); })
-        .then(function (s) { if (s.state) draw(s); })
-        .catch(function () {});
-    }
+    // One chained poll (live.js): it goes on after a failed answer (backing off), waits while the
+    // tab is hidden, parks when nothing runs and does not keep the session alive. act() kicks it
+    // after drawing a busy state.
+    var poll = window.PrismPoll.create({
+      period: 2000,
+      run: function () {
+        return fetch(API, { headers: { Accept: "application/json" } })
+          .then(function (res) {
+            if (!res.ok && res.status !== 409) throw new Error("HTTP " + res.status);
+            return res.json();
+          })
+          .then(function (s) {
+            if (!s || !s.state) throw new Error("no state");
+            draw(s);
+            return s;
+          });
+      },
+      more: function (s) { return s.state === "checking" || s.state === "downloading"; },
+      onError: function () { msg.textContent = "The server is not answering; trying again."; msg.className = "form-msg error-text"; }
+    });
     // The answer of a refused action is a state too (409 needs_login, ...), so it is drawn the same.
     var act = function (path, button) {
       button.disabled = true;
@@ -391,7 +400,10 @@
         .then(function (res) { return res.json(); })
         .then(function (s) {
           button.disabled = false;
-          if (s.state) draw(s); else fail(s.message || "The server gave no answer.");
+          if (s.state) {
+            draw(s);
+            if (s.state === "checking" || s.state === "downloading") poll.kick();
+          } else fail(s.message || "The server gave no answer.");
         })
         .catch(function (e) { button.disabled = false; fail(e.message); });
     };
@@ -414,7 +426,7 @@
       if (navigator.clipboard) navigator.clipboard.writeText(command.textContent).then(function () { said("copied"); }, byHand);
       else byHand();
     });
-    load();
+    poll.start();
   })();
 
   // The class picker's entries of catalog `cat`.

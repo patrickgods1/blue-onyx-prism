@@ -258,7 +258,9 @@ OpenVINO runtime in `openvino/`, the default ONNX Runtime in `onnxruntime/` (CPU
 macOS, DirectML on Windows), the binaries and the helper scripts. Or build from source (see
 [Developer setup](#developer-setup)) and run `blue-onyx-prism setup-openvino`. For NVIDIA, DirectML or
 CoreML devices run `blue-onyx-prism setup-onnxruntime` (`--flavor auto|cpu|cuda|directml`, default `auto`;
-installs into `onnxruntime/` next to the executable, `--dir` to change).
+installs into `onnxruntime/` next to the executable, `--dir` to change). `setup-openvino --dest` and
+`setup-onnxruntime --dir` add their files to a folder that already holds other files, file by file, and
+never replace that folder or delete what else is in it (the Resources card does not offer to remove it either).
 
 Windows (PowerShell):
 
@@ -632,6 +634,8 @@ and the default model; every key is in the *Models JSON* under it):
   and `inflight` (table above).
 - `blue-onyx-prism download-models --name IPcam-general --add-to-config` downloads and appends the
   model (family and classes file filled in) to the config, skipping names or paths already present.
+  Paths under the data root (`download_dir`, default the exe dir) are written relative to it, as the
+  service reads them.
   New entries are added disabled when the config already has an enabled model (otherwise the first
   one is enabled), so `download-models --all --add-to-config` does not load every model.
 - `--model <path>` always enables that model: an entry whose path resolves to the same file is
@@ -714,9 +718,15 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   `<data root>/bench/<id>/` (resource `bench:<id>`, also on the Config page's Resources card);
   `sample` (the embedded test image, offline); and folders (`dir:<path>` or
   `{"dir": "...", "gt": "...", "name": "..."}`, CLI `--images <dir> [--gt <file|dir>]`) with optional
-  ground truth as COCO instances JSON or YOLO txt labels and tags in `manifest.json`. Without ground
+  ground truth as COCO instances JSON or YOLO txt labels and tags in `manifest.json` (a YOLO label
+  file that cannot be read, e.g. UTF-16 or no permission, skips that folder with a warning naming the
+  file; a UTF-8 byte-order mark is fine). Without ground
   truth a dataset is scored against a reference model (the most accurate installed one, or
-  `benchmark.reference_model`); such scores are marked *relative*.
+  `benchmark.reference_model`); such scores are marked *relative*, and the reference model, its As
+  served result and its `--variants` results are never scored on it (they would grade their own
+  detections). A results, history or predictions file that cannot be read is never saved over; a
+  damaged one is moved aside as `<name>.bad-<time>`, and a file with entries this version cannot read
+  is copied aside the same way before a save drops them.
 - **What is timed**: each model runs as it serves. It is compiled with its worker's settings on that
   device (the hardware profile's performance hint, in-flight requests and ONNX Runtime sessions with
   the config's `performance_hint`, `inflight` and `ort_sessions`; OpenVINO's hint is part of its cache
@@ -823,7 +833,8 @@ the CLI and the UI read and write the same file (it stays there: `auto` device o
   confidence of the class in the frame (0 without a detection). AUC is exact (Mann-Whitney U, ties
   count half), per class, macro over classes (the headline) and micro (pooled), with the ROC curve and
   frame TPR / FPR (alert rate on frames with an object / false-alert rate on frames without) at the
-  configured and best thresholds. It uses the 0.05+ predictions: lower scores count as 0, which can
+  configured and best thresholds (configured: the device's confidence profile when it has one, else the
+  model's threshold, else the global one). It uses the 0.05+ predictions: lower scores count as 0, which can
   only understate the AUC slightly.
 - **Grades**: speed from the full-request p50 (A < 50 ms, B < 100, C < 200, D < 400, else F); accuracy
   by `benchmark.accuracy_metric` / `--accuracy-metric`: `ap50` (default; AP@0.5 over the classes with

@@ -438,8 +438,11 @@ pub fn detect_family(
                 return Ok(ModelFamilyKind::Yolo8);
             }
             if last == 6 {
-                let yolo5_rows = !(0..=1000).contains(&prev);
-                return Ok(if classes == Some(1) && yolo5_rows {
+                // QA-043: a static row count above 1000 is YOLOv5 whatever the class count (a
+                // wrong count then fails in `Yolo5::postprocess` and says so); a dynamic dim
+                // keeps the 1-class rule, since a YOLO26 export may have a symbolic row dim.
+                let yolo5_rows = prev > 1000 || (prev < 0 && classes == Some(1));
+                return Ok(if yolo5_rows {
                     ModelFamilyKind::Yolo5
                 } else {
                     ModelFamilyKind::Yolo26
@@ -630,6 +633,21 @@ mod tests {
                 "rows {rows}"
             );
         }
+        // QA-043: a YOLOv5 export with thousands of static rows is YOLOv5 whatever the class
+        // count (a model with no classes file gets the 80 COCO names); a dynamic row dim and
+        // YOLO26's fixed 300 rows stay YOLO26 unless the model has one class.
+        assert_eq!(
+            detect_family(&img, &[port("output", &[1, 25200, 6])], 80).unwrap(),
+            ModelFamilyKind::Yolo5
+        );
+        assert_eq!(
+            detect_family(&img, &[port("output", &[1, -1, 6])], 80).unwrap(),
+            ModelFamilyKind::Yolo26
+        );
+        assert_eq!(
+            detect_family(&img, &[port("output0", &[1, 300, 6])], 80).unwrap(),
+            ModelFamilyKind::Yolo26
+        );
         // A 1-class YOLO26 keeps its fixed 300 rows; a 1-class YOLOv8 is `[1, 5, 8400]`.
         assert_eq!(
             detect_family(&img, &[port("output0", &[1, 300, 6])], 1).unwrap(),

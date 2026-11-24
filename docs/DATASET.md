@@ -65,6 +65,10 @@ in a diagnostics bundle, never deleted by the storage sweeper, git-ignored.
   `driveway`.
   - A generic name (`image.jpg`, `blob`, ...) becomes `frame-<w>x<h>`.
   - Only `[a-z0-9_-]` is kept, at most 64 characters.
+  - A Windows device name (`aux`, `con`, `nul`, `prn`, `com0`-`com9`, `lpt0`-`lpt9`) gets a `_` (`aux_`) on
+    every OS, because Windows cannot create such a folder and a dataset may be copied there. A camera folder
+    `aux`, `con`, `nul` or `prn` already written on Linux or macOS stays readable, but that camera's new
+    frames go to `<name>_`, so it shows as two cameras.
   - Rate limits and dedup work per camera folder, across models.
 - **The `.jpg`** is the upload byte for byte when it is a JPEG (`image.original: true`). Any other
   format is re-encoded as a quality-92 JPEG (`original: false`).
@@ -298,7 +302,8 @@ empty, `model: "import"`, `threshold: 0`) plus:
   millisecond and dHash) also when the earlier copy was named in another zone or in UTC, except a Blue
   Iris clip imported before the key: its time was read differently.
 - The camera folder is `--camera`, else the Blue Iris camera of the file name, `meva-<site>-<camera>`
-  for MEVA, a URL's host, or `import`.
+  for MEVA, a URL's host, or `import`, named by the collector's rule above (a Windows device name such
+  as `--camera COM1` becomes `com1_`).
 - The import appends its frames to `review-queue.jsonl` and one line to `<dir>/imports.jsonl` (id,
   time, source, kind, licence, attribution, frames, cameras, frames per scene), which the Collect tab
   lists. Imported frames have no bucket, so the scene x bucket table does not count them; the frame

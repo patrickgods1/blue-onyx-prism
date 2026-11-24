@@ -127,7 +127,7 @@ mod tests {
             objective: target,
             ..Default::default()
         };
-        let out = crate::benchmark::search::search(&results, &preds, &req, &|_| None).unwrap();
+        let out = crate::benchmark::search::search(&results, &preds, &req, &|_, _| None).unwrap();
         let searched = out.results[0].best.as_ref().unwrap();
         assert_eq!(best.threshold, searched.threshold);
         assert_eq!(best.exact_threshold, searched.exact_threshold);

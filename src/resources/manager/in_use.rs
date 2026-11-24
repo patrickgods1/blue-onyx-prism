@@ -21,7 +21,10 @@
 //! which stages the update too.
 //!
 //! User-managed runtimes (`openvino_dir`, `onnxruntime_dir`) have no manifest of ours: they are
-//! never swapped and get no lock file beside them.
+//! never swapped and get no lock file beside them. An install into a user's `--dir` / `--dest`
+//! that held other files has our manifest, marked merged: it is locked and staged like any
+//! install of ours, but its update is merged in file by file, never swapped (QA-025,
+//! [`super::exclusively_ours`]).
 //!
 //! Spawned children: on Unix the lock belongs to the open file, and a child that another thread
 //! is spawning holds a copy of every descriptor from its fork until its exec (close-on-exec acts
@@ -32,7 +35,7 @@
 //! that moment, and a load that starts within it applies a staged update at the next start
 //! instead, so [`before_load`] does not retry the exclusive lock.
 
-use super::worker::{put_in_place, remove_any, swap_owned};
+use super::worker::{put_files, put_in_place, remove_any};
 use super::*;
 use std::fs::{File, TryLockError};
 
@@ -135,7 +138,10 @@ pub(super) enum Placed {
 }
 
 /// Move a finished `staging` directory of `res` to `target`, or stage it ([`Placed::Staged`]) when
-/// `target` is an install of ours that a process has loaded (see the module docs).
+/// `target` holds an install of ours (its manifest names `res`, also one merged into a user's
+/// directory) that a process has loaded (see the module docs). Whether the directory is then
+/// replaced as a whole or merged into is [`put_in_place`]'s rule, here and when the staged update
+/// is applied.
 pub(super) fn place(res: &Resource, staging: &Path, target: &Path) -> Result<Placed> {
     let ours = is_runtime(res.kind)
         && read_manifest(&target.join(MANIFEST_FILE)).is_some_and(|m| m.id == res.id);
@@ -299,9 +305,10 @@ fn shared_lock(dir: &Path) -> std::io::Result<Option<File>> {
     Ok((waited == crate::fsx::Waited::Held).then_some(file))
 }
 
-/// Swap the staged update `pending` of resource `id` into `target` (the caller holds the
-/// exclusive lock). An incomplete one is deleted (the resolver then plans the update again). True
-/// when swapped in.
+/// Put the staged update `pending` of resource `id` into `target` (the caller holds the
+/// exclusive lock): swapped in when `target` is our install alone, else merged file by file
+/// (`worker::put_files`, [`super::exclusively_ours`]). An incomplete one is deleted (the resolver
+/// then plans the update again). True when it is in place.
 fn apply_staged(id: &str, pending: &Path, target: &Path) -> bool {
     let path = pending.join(MANIFEST_FILE);
     let manifest = read_manifest(&path).filter(|m| m.id == id);
@@ -319,7 +326,17 @@ fn apply_staged(id: &str, pending: &Path, target: &Path) -> bool {
         let _ = remove_any(pending);
         return false;
     };
-    match swap_owned(pending, target) {
+    // The same rule as a direct install (QA-025): only an install that is ours alone is replaced
+    // as a whole; one merged into a user's directory is merged again, the user's files kept.
+    let platform = crate::resources::catalog::Platform::current();
+    let ort_windows =
+        crate::resources::catalog::find(id, platform.os, platform.arch).and_then(|r| {
+            match r.kind {
+                ResourceKind::OnnxRuntime(_) => Some(r.platform.is_some_and(|p| p.os == "windows")),
+                _ => None,
+            }
+        });
+    match put_files(id, ort_windows, pending, target) {
         Ok(()) => {
             tracing::info!(
                 "installed the downloaded {id} {} into {} (it was staged while the previous \
@@ -448,6 +465,52 @@ mod tests {
         );
         assert_eq!(content(&target), b"v2");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// QA-025: an install of ours merged into a user's folder (other files beside it) that a
+    /// process had loaded is staged like any install of ours, and the next load merges the
+    /// update in: the user's files stay. The same holds for a folder whose manifest says merged
+    /// and nothing else.
+    #[test]
+    fn a_staged_update_of_a_merged_install_keeps_the_users_files() {
+        let root = crate::test_dirs::TempDir::new("inuse-merged");
+        let res = openvino();
+        let target = root.join("shared");
+        install(&target, res.id, "old", b"v1");
+        std::fs::write(target.join("keep.txt"), b"mine").unwrap();
+        let other = open_lock(&target).unwrap();
+        other.lock_shared().unwrap();
+        let staging = root.join(".shared.staging");
+        install(&staging, res.id, res.version, b"v2");
+        let pending = pending_dir(&target).unwrap();
+        assert_eq!(
+            place(res, &staging, &target).unwrap(),
+            Placed::Staged(pending.clone())
+        );
+        other.unlock().unwrap();
+        drop(other);
+        before_load(&target);
+        assert_eq!(content(&target), b"v2");
+        assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"mine");
+        assert!(!pending.exists());
+        assert!(super::super::is_merged(&target.join(MANIFEST_FILE)));
+
+        // Merged earlier, nothing else there: still merged, not swapped (a swap would drop the
+        // file the merge left that the new version does not list).
+        let dir = root.join("flagged");
+        install(&dir, res.id, "old", b"v1");
+        std::fs::write(dir.join("old-only.bin"), b"from v1").unwrap();
+        let m = Manifest {
+            id: res.id.into(),
+            version: "old".into(),
+            sha256: Vec::new(),
+            files: vec!["lib.bin".into(), "old-only.bin".into()],
+        };
+        super::super::write_manifest_as(&dir.join(MANIFEST_FILE), &m, &dir, true).unwrap();
+        install(&pending_dir(&dir).unwrap(), res.id, res.version, b"v2");
+        assert!(apply_pending(&dir));
+        assert_eq!(content(&dir), b"v2");
+        assert!(dir.join("old-only.bin").is_file());
     }
 
     /// A staged update that lost a file is discarded, not swapped in.

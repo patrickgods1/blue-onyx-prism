@@ -1048,9 +1048,10 @@ impl RunCtx<'_> {
             if !args.json {
                 eprintln!("pseudo ground truth: {} on {device} ...", job.name);
             }
+            // Its As served / variant jobs too, by the scoring's own rule (B10, QA-027).
             if jobs
                 .iter()
-                .any(|p| p.job.name.eq_ignore_ascii_case(&job.name))
+                .any(|p| crate::benchmark::variant::owned_by(&p.job.name, &job.name))
             {
                 report.warn(
                     args.json,
@@ -1525,12 +1526,8 @@ fn threshold_search_cli(
     preds: &crate::benchmark::search::StoredPreds,
 ) -> Result<bool> {
     let req = search_request(args, config);
-    let current = |m: &str| {
-        crate::benchmark::find_model(config, m).map(|c| {
-            c.confidence_threshold
-                .unwrap_or(config.confidence_threshold)
-        })
-    };
+    let current =
+        |m: &str, device: &str| crate::benchmark::search::configured_threshold(config, m, device);
     let out = crate::benchmark::search::search(results, preds, &req, &current)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&out)?);

@@ -687,7 +687,9 @@ fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
 /// directory of YOLO txt labels) or found automatically (`_annotations.coco.json`,
 /// `annotations.json`, `instances*.json`; `labels/` or `<stem>.txt` beside the images).
 /// Returns the set and warnings (images left out because the ground truth does not cover
-/// them or their size is unknown, duplicate COCO file names).
+/// them or their size is unknown, duplicate COCO file names). A missing YOLO label file is an
+/// image without objects; one that does not read (permissions, not UTF-8) fails the folder,
+/// naming the file; a UTF-8 byte-order mark is skipped.
 pub fn load_dir(
     dir: &Path,
     gt: Option<&Path>,
@@ -1120,10 +1122,26 @@ fn apply_yolo(images: &mut Vec<SetImage>, labels: &Path, dir: &Path) -> Result<V
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let p = labels.join(format!("{stem}.txt"));
-        // No label file: an image without objects.
-        let text = std::fs::read_to_string(&p).unwrap_or_default();
+        // No label file: an image without objects. A file that is there but does not read
+        // (no permission, not UTF-8, e.g. UTF-16 from Notepad) fails the folder rather than
+        // scoring every detection on the frame as a false positive (QA-030).
+        let text = match std::fs::read_to_string(&p) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "reading the YOLO label file {}: save it as plain text (UTF-8) the \
+                         service can read, or remove it if the image has no objects",
+                        p.display()
+                    )
+                });
+            }
+        };
+        // A UTF-8 byte-order mark (some Windows editors write one) is not part of line 1.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         img.gt = Some(
-            parse_yolo(&text, &names, img.width, img.height)
+            parse_yolo(text, &names, img.width, img.height)
                 .with_context(|| format!("in {}", p.display()))?,
         );
     }
@@ -1684,6 +1702,40 @@ mod tests {
         std::fs::write(dir.join("labels/a.txt"), "0 0.5 0.5 0.5 0.5\n0 nan 0 0 0\n").unwrap();
         let e = format!("{:#}", load_dir(&dir, None, None).unwrap_err());
         assert!(e.contains("a.txt") && e.contains("line 2"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// QA-030: a YOLO label file that is there but does not read fails the folder, naming the
+    /// file, instead of becoming "no objects"; a UTF-8 byte-order mark parses; a missing file
+    /// is still an image without objects.
+    #[test]
+    fn unreadable_yolo_label_file_fails_the_folder() {
+        let dir = temp_set(&[("a.jpg", None), ("b.jpg", None)]);
+        std::fs::create_dir_all(dir.join("labels")).unwrap();
+        // UTF-16 LE with BOM, as Windows Notepad's "Unicode" writes it: not UTF-8.
+        let utf16: Vec<u8> = [0xFF_u8, 0xFE]
+            .into_iter()
+            .chain(
+                "0 0.5 0.5 0.5 0.5\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        std::fs::write(dir.join("labels/a.txt"), utf16).unwrap();
+        let e = format!("{:#}", load_dir(&dir, None, None).unwrap_err());
+        assert!(e.contains("a.txt") && e.contains("UTF-8"), "{e}");
+
+        std::fs::write(dir.join("labels/a.txt"), "\u{feff}0 0.5 0.5 0.5 0.5\n").unwrap();
+        let (set, _) = load_dir(&dir, None, None).unwrap();
+        let gt = |f: &str| {
+            set.images
+                .iter()
+                .find(|i| i.file == f)
+                .and_then(|i| i.gt.as_ref())
+                .map(Vec::len)
+        };
+        assert_eq!(gt("a.jpg"), Some(1), "the BOM file parses");
+        assert_eq!(gt("b.jpg"), Some(0), "no label file: no objects");
         std::fs::remove_dir_all(&dir).ok();
     }
 

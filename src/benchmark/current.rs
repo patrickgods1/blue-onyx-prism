@@ -217,7 +217,7 @@ pub(crate) mod tests {
     /// ends with the advice summary.
     pub(crate) fn advised_fixture() -> (BenchmarkResults, StoredPreds) {
         let (mut results, preds) = crate::benchmark::search::tests::fixture();
-        let r = search(&results, &preds, &SearchRequest::default(), &|_| None)
+        let r = search(&results, &preds, &SearchRequest::default(), &|_, _| None)
             .unwrap()
             .results
             .remove(0);
@@ -284,10 +284,12 @@ pub(crate) mod tests {
 
         // After "Apply threshold" (0.35, the best): exact from the stored predictions, equal
         // to the search's evaluation at the threshold configured now.
-        let s = search(&results, &preds, &SearchRequest::default(), &|_| Some(0.35))
-            .unwrap()
-            .results
-            .remove(0);
+        let s = search(&results, &preds, &SearchRequest::default(), &|_, _| {
+            Some(0.35)
+        })
+        .unwrap()
+        .results
+        .remove(0);
         let mut r = results.clone();
         let n35 = ModelNow {
             running: Some(0.5),
