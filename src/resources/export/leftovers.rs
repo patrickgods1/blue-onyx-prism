@@ -366,6 +366,7 @@ mod tests {
             platform: catalog::Platform::MACOS_ARM64,
             timeouts: super::super::Timeouts::default(),
             system_dir: None,
+            task: "export",
         };
         let fake = Fake::new();
         let cancel = std::sync::atomic::AtomicBool::new(false);

@@ -1272,7 +1272,8 @@ pub fn apply_ort_activation(
     Ok(None)
 }
 
-/// Install `jobs` now (CLI): one manager, no retries, wait for all. Errors list every failure.
+/// Install `jobs` now (CLI): one manager, no retries, wait for all. Errors list every job that
+/// is not installed (`not_installed`).
 pub fn install_all(opts: ManagerOptions, jobs: Vec<Job>) -> Result<Vec<Status>> {
     let manager = Manager::start(ManagerOptions {
         retry: false,
@@ -1281,13 +1282,7 @@ pub fn install_all(opts: ManagerOptions, jobs: Vec<Job>) -> Result<Vec<Status>> 
     let keys: Vec<String> = jobs.into_iter().map(|j| manager.enqueue(j)).collect();
     let statuses = manager.wait(&keys, None);
     manager.shutdown();
-    let failed: Vec<String> = statuses
-        .iter()
-        .filter_map(|s| match &s.state {
-            State::Failed { error, .. } => Some(format!("{}: {error}", s.id)),
-            _ => None,
-        })
-        .collect();
+    let failed = not_installed(&keys, &statuses);
     if !failed.is_empty() {
         bail!(
             "{} (check the network connection and proxy, then run the command again; \
@@ -1296,6 +1291,29 @@ pub fn install_all(opts: ManagerOptions, jobs: Vec<Job>) -> Result<Vec<Status>> 
         );
     }
     Ok(statuses)
+}
+
+/// One line per key of `keys` that `statuses` (a [`Manager::wait`]) does not show installed:
+/// failed, still queued or downloading (a wait ends early when the worker dies, before its jobs
+/// are marked failed), or missing. Only "installed" is success (QA-080: a worker that died could
+/// otherwise make a `fetch` report success with nothing installed).
+fn not_installed(keys: &[String], statuses: &[Status]) -> Vec<String> {
+    keys.iter()
+        .filter_map(|k| match statuses.iter().find(|s| &s.key == k) {
+            None => Some(format!(
+                "{k}: never started (the download worker stopped; see the log)"
+            )),
+            Some(s) => match &s.state {
+                State::Installed => None,
+                State::Failed { error, .. } => Some(format!("{}: {error}", s.id)),
+                other => Some(format!(
+                    "{}: {} when the download worker stopped (see the log)",
+                    s.id,
+                    other.describe()
+                )),
+            },
+        })
+        .collect()
 }
 
 mod in_use;
@@ -1308,3 +1326,54 @@ pub use in_use::{before_load, pending_dir, staged_version};
 pub(crate) use leftovers::{recover_missing, runtime_targets, set_aside_name, sweep_stale};
 pub use progress::*;
 pub use worker::*;
+
+#[cfg(test)]
+mod not_installed_tests {
+    use super::*;
+
+    fn status(key: &str, id: &'static str, state: State) -> Status {
+        Status {
+            key: key.into(),
+            id,
+            title: id,
+            size: 0,
+            target: PathBuf::from("t"),
+            state,
+        }
+    }
+
+    /// QA-080: a wait that ended because the worker died returns jobs still queued or
+    /// downloading (and none for a key it never saw); `install_all` fails on each of them, not
+    /// only on the ones marked failed.
+    #[test]
+    fn a_job_the_worker_did_not_finish_is_a_failure() {
+        let keys: Vec<String> = ["a@t", "b@t", "c@t", "d@t"].map(String::from).to_vec();
+        let statuses = vec![
+            status("a@t", "a", State::Installed),
+            status(
+                "b@t",
+                "b",
+                State::Downloading {
+                    bytes: 5_000_000,
+                    total: 10_000_000,
+                },
+            ),
+            status(
+                "c@t",
+                "c",
+                State::Failed {
+                    error: "HTTP 404".into(),
+                    retry_at: None,
+                    attempts: 1,
+                },
+            ),
+        ];
+        let failed = not_installed(&keys, &statuses);
+        assert_eq!(failed.len(), 3, "{failed:?}");
+        assert!(failed[0].starts_with("b: downloading 50%"), "{failed:?}");
+        assert_eq!(failed[1], "c: HTTP 404");
+        assert!(failed[2].starts_with("d@t: never started"), "{failed:?}");
+        let done = vec![status("a@t", "a", State::Installed)];
+        assert!(not_installed(&keys[..1], &done).is_empty());
+    }
+}

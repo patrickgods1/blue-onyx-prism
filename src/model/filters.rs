@@ -44,6 +44,16 @@ pub struct OverlapRule {
     pub night_only: bool,
 }
 
+impl OverlapRule {
+    /// `drop` and `if_overlaps` name the same label (case-insensitively). Such a rule has no
+    /// effect in [`apply`]: applied as written it would let two overlapping boxes of one label
+    /// remove each other, so a pair of people standing close would both vanish. Config
+    /// validation warns about it once instead of refusing a file that loaded before (QA-044).
+    pub fn is_self_overlap(&self) -> bool {
+        self.drop.eq_ignore_ascii_case(&self.if_overlaps)
+    }
+}
+
 /// The resolved rules for one request (per-model values over the global ones).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FilterRules {
@@ -189,7 +199,8 @@ fn overlaps(d: &Detection, other: &Detection, iou: f32) -> bool {
 /// - `min_box_area_frac`: a box whose area is below this share of the image area;
 /// - `suppress_overlaps`: the evidence boxes (`if_overlaps`) are all input detections, also
 ///   those removed by an earlier rule or later by the object filter (a "potted plant" box is
-///   evidence even when plants are not reported).
+///   evidence even when plants are not reported). A rule whose `drop` and `if_overlaps` name the
+///   same label is skipped ([`OverlapRule::is_self_overlap`]).
 ///
 /// Non-finite or empty boxes pass through untouched ([`super::to_predictions`] drops them).
 pub fn apply(
@@ -224,7 +235,7 @@ pub fn apply_recording(
     let overlap_rules: Vec<&OverlapRule> = rules
         .suppress_overlaps
         .iter()
-        .filter(|r| night || !r.night_only)
+        .filter(|r| (night || !r.night_only) && !r.is_self_overlap())
         .collect();
     let labels: Vec<std::borrow::Cow<'_, str>> = dets
         .iter()
@@ -510,6 +521,44 @@ mod tests {
         assert_eq!(run(pair.clone(), Scene::Day, &rules).0.len(), 2);
         assert_eq!(run(pair.clone(), Scene::Ir, &rules).0.len(), 1);
         assert_eq!(run(pair, Scene::Night, &rules).0.len(), 1);
+    }
+
+    // QA-044: a rule naming one label on both sides made two overlapping boxes of that label
+    // each the other's evidence, so both were dropped. It is skipped; other rules still apply.
+    #[test]
+    fn same_label_overlap_rule_keeps_both_boxes() {
+        let same = OverlapRule {
+            drop: "person".into(),
+            if_overlaps: "Person".into(),
+            iou: 0.5,
+            night_only: false,
+        };
+        assert!(same.is_self_overlap());
+        let plant_rule = OverlapRule {
+            drop: "person".into(),
+            if_overlaps: "potted plant".into(),
+            iou: 0.5,
+            night_only: false,
+        };
+        assert!(!plant_rule.is_self_overlap());
+        let a = det(100.0, 100.0, 200.0, 300.0, 0.9, 0);
+        let b = det(105.0, 100.0, 205.0, 300.0, 0.8, 0);
+        assert!(crate::model::nms::iou(&a, &b) > 0.5);
+        let rules = FilterRules {
+            suppress_overlaps: vec![same.clone()],
+            ..Default::default()
+        };
+        let (out, c) = run(vec![a.clone(), b.clone()], Scene::Day, &rules);
+        assert_eq!(out, vec![a.clone(), b.clone()]);
+        assert_eq!(c.get(SuppressReason::Overlap), 0);
+        let plant = det(100.0, 100.0, 200.0, 300.0, 0.7, 2);
+        let rules = FilterRules {
+            suppress_overlaps: vec![same, plant_rule],
+            ..Default::default()
+        };
+        let (out, c) = run(vec![a, b, plant.clone()], Scene::Day, &rules);
+        assert_eq!(out, vec![plant], "the plant rule still drops both people");
+        assert_eq!(c.get(SuppressReason::Overlap), 2);
     }
 
     #[test]

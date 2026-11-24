@@ -28,10 +28,10 @@
 })();
 // Pending restart badges follow the live config (another tab, Benchmark apply, the CLI).
 if (window.PrismLive) PrismLive.onConfig(function (j) {
-  var norm = function (n) { n = n.trim().toLowerCase(); var m = /^(.+)\.(onnx|xml)$/.exec(n); return m ? m[1] : n; };
   var byKey = {}; j.models.forEach(function (m) { byKey[m.key] = m; });
-  document.querySelectorAll("table.models .pending-badge[data-model]").forEach(function (b) {
-    var m = byKey[norm(b.dataset.model)];
+  document.querySelectorAll("table.models .pending-badge[data-key]").forEach(function (b) {
+    // `data-key` is the server's `normalize_name` of the model, as `m.key` is.
+    var m = byKey[b.dataset.key];
     var reasons = m ? m.reasons : ["removed from the config; still loaded"];
     b.hidden = !reasons.length; b.dataset.tip = reasons.join("; ");
   });

@@ -19,6 +19,7 @@
 //! refused with a message naming the folder, and each call tries the lock again
 //! ([`TrainingService::refresh`]).
 
+use super::form::checked;
 use super::train_area::{AUTOLABEL, IMPORT, MODELS, TRAIN, jobs_tab, tab_title};
 use super::{AppState, Shared, blocking, render, save_config};
 use crate::resources::catalog::{self, Platform};
@@ -411,6 +412,17 @@ impl Hooks for ServerHooks {
             Ok(())
         })?;
         Ok(format!("{msg} {saved}"))
+    }
+
+    fn config_has_model(&self, name: &str) -> bool {
+        // QA-101: the run-start re-check against the running config (a stopped service knows
+        // none, and `register` names that problem).
+        self.target.require("check the model name").is_ok_and(|s| {
+            s.config_read()
+                .models
+                .iter()
+                .any(|m| crate::model::name::same_model_name(&m.effective_name(), name))
+        })
     }
 
     fn benchmark(
@@ -2137,7 +2149,7 @@ pub(crate) fn data_fields(
     };
     Ok(DataFields {
         datasets,
-        include_public: field(f, "public").is_some(),
+        include_public: checked(f, "public"),
         scenes: scenes_of(f)?,
         classes: classes_of(f),
         excluded,
@@ -2213,9 +2225,7 @@ pub(crate) fn balance_of(
         axes,
         strength: strength.unwrap_or(d.strength),
         max_repeat: max_repeat.unwrap_or(d.max_repeat),
-        cap_dominant: field(f, "balance_cap_on")
-            .is_some()
-            .then(|| cap.unwrap_or(DEFAULT_CAP)),
+        cap_dominant: checked(f, "balance_cap_on").then(|| cap.unwrap_or(DEFAULT_CAP)),
     };
     if b.is_off() {
         return Ok(Balance::default());
@@ -2282,7 +2292,7 @@ pub(crate) fn requests_from_form(
     let cap = &cap.for_gpu(gpu.as_deref())?;
     let data = data_fields(f, training)?;
     let scenes = &data.scenes;
-    let night = field(f, "night_aug").is_some();
+    let night = checked(f, "night_aug");
     let base = if night {
         Augment::NIGHT
     } else {
@@ -2391,14 +2401,14 @@ pub(crate) fn requests_from_form(
             rename: data.rename.clone(),
             benchmark_sets: sets.clone(),
             benchmark_devices: bench_devices.clone(),
-            allow_large: field(f, "confirm_large").is_some(),
+            allow_large: checked(f, "confirm_large"),
             install_dir: field(f, "install_dir").map(PathBuf::from),
             gpu: gpu.clone(),
             excluded: data.excluded,
             balance: data.balance.clone(),
             compare_group: compare_group.clone(),
             train_seed: None,
-            ignore_memory_check: field(f, "ignore_memory_check").is_some(),
+            ignore_memory_check: checked(f, "ignore_memory_check"),
         };
         // Repeats train on the same frames (the assembly seed is the config's) with their own
         // trainer seed.
@@ -3101,7 +3111,7 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
                 let paths = TrainPaths::for_config(&config);
                 if !env::train_env_ready(&paths, Platform::current(), a.lane())
                     && !config.allow_large_downloads
-                    && field(&f, "confirm_large").is_none()
+                    && !checked(&f, "confirm_large")
                 {
                     let (dl, _) = a.lane().estimate();
                     anyhow::bail!(
@@ -3339,7 +3349,7 @@ pub(super) async fn remove(State(shared): State<Shared>, body: axum::body::Bytes
         let f = super::dataset::parse_form(&body);
         let tab = jobs_tab(field(&f, "tab"), TRAIN);
         let id = field(&f, "id").unwrap_or_default().to_string();
-        if field(&f, "delete_files").is_some() {
+        if checked(&f, "delete_files") {
             let config = state.config_read().clone();
             let size = service(&shared)
                 .record(&id)
@@ -3399,14 +3409,14 @@ pub(super) async fn use_model(
                 .ok_or_else(|| anyhow::anyhow!("run {id} has no installed model"))?;
             let role = field(&f, "role").unwrap_or("default").to_string();
             let target = field(&f, "target").map(str::to_string);
-            let threshold = if field(&f, "use_threshold").is_some() {
+            let threshold = if checked(&f, "use_threshold") {
                 let config = state.config_read().clone();
                 let m = crate::benchmark::find_model(&config, &out.name).ok_or_else(|| {
                     anyhow::anyhow!("{} is not in the config, so it has no benchmark", out.name)
                 })?;
                 let s = super::training_switch::suggestion_for(&state, &config, m)
                     .map_err(anyhow::Error::msg)?;
-                if s.confirm && field(&f, "confirm").is_none() {
+                if s.confirm && !checked(&f, "confirm") {
                     anyhow::bail!(
                         "the suggested threshold {:.2} rests on little data ({}); confirm to \
                          save it anyway (send confirm=1), or keep the threshold",
@@ -3419,7 +3429,7 @@ pub(super) async fn use_model(
                 None
             };
             let opts = UseOptions {
-                copy: field(&f, "copy").is_some(),
+                copy: checked(&f, "copy"),
                 threshold,
                 expect_current: field(&f, "expect_current").map(str::to_string),
                 replace_verifier: field(&f, "replace_verifier").map(str::to_string),
@@ -3927,6 +3937,36 @@ pub(super) mod tests {
         let (reqs, _) = requests_from_form(&form(&on), &cap, &training).unwrap();
         assert_eq!(reqs.len(), 2);
         assert!(reqs.iter().all(|r| r.ignore_memory_check));
+    }
+
+    /// QA-094: the queue form reads a false-like checkbox as unticked (`confirm_large=0` allowed
+    /// the multi-GB training environment before).
+    #[test]
+    fn the_queue_form_reads_false_like_checkboxes_as_unticked() {
+        let cap = mac();
+        let training = crate::training::config::TrainingConfig::default();
+        for v in crate::server::form::FALSE_LIKE {
+            let f = form(&[
+                ("model", "yolo26n"),
+                ("dataset", "/x"),
+                ("confirm_large", v),
+                ("ignore_memory_check", v),
+                ("public", v),
+            ]);
+            let (reqs, _) = requests_from_form(&f, &cap, &training).unwrap();
+            assert!(!reqs.is_empty(), "{v:?}");
+            for r in reqs {
+                assert!(!r.allow_large, "{v:?}");
+                assert!(!r.ignore_memory_check && !r.include_public, "{v:?}");
+            }
+        }
+        let f = form(&[
+            ("model", "yolo26n"),
+            ("dataset", "/x"),
+            ("confirm_large", "on"),
+        ]);
+        let (reqs, _) = requests_from_form(&f, &cap, &training).unwrap();
+        assert!(reqs.iter().all(|r| r.allow_large));
     }
 
     /// The form and `train run` build their recipe through `recipe::build_recipe`: the same

@@ -656,39 +656,54 @@
     restarting(text).classList.add("gave-up");
     restartButtons();
   }
-  // Wait for the next registry generation, then reload in place; gives up after 2 minutes.
-  function waitRestart(gen, epoch) {
+  // Poll /v1/config until the server is another generation (an in-process restart) or another
+  // process (`epoch`; a process that restarts starts at generation 1 again), then `h.onBack()`.
+  // `h.onWait(secs)` after each answer that is not it yet; `h.onGiveUp(secs)` after 2 minutes.
+  function waitNext(gen, epoch, h) {
     var started = Date.now();
     function again() {
-      if (Date.now() - started > RESTART_GIVE_UP_MS) {
-        restartFailed("Still restarting after 2 minutes. Check the server log (or the service) and reload this page by hand.");
-        return;
-      }
+      var secs = Math.round((Date.now() - started) / 1000);
+      if (Date.now() - started > RESTART_GIVE_UP_MS) { h.onGiveUp(secs); return; }
       PrismPoll.fetch("/v1/config", {cache: "no-store", headers: {"Accept": "application/json"}}).then(json).then(function (j) {
-        if (j.generation !== gen || j.epoch !== epoch) reloadKeep(null, true); else setTimeout(again, 700);
-      }, function () { setTimeout(again, 1000); });
+        if (j.generation !== gen || (epoch !== undefined && j.epoch !== epoch)) h.onBack(); else { h.onWait(secs); setTimeout(again, 700); }
+      }, function () { h.onWait(secs); setTimeout(again, 1000); });
     }
-    setTimeout(again, 700);
+    setTimeout(again, h.first || 700);
+  }
+  // Wait for the next registry generation (or process), then reload in place; gives up after 2 minutes.
+  function waitRestart(gen, epoch) {
+    waitNext(gen, epoch, {
+      onBack: function () { reloadKeep(null, true); },
+      onWait: function () {},
+      onGiveUp: function () {
+        restartFailed("Still restarting after 2 minutes. Check the server log (or the service) and reload this page by hand.");
+      }
+    });
   }
   function afterRestart() { waitRestart(last ? last.generation : null, last ? last.epoch : null); }
   // Restart (existing POST /config/restart flow), then reload once the next generation answers.
   // `opts.confirmed`: the page asked in its own words already (the Benchmark pages ask in the page).
   function restart(btn, opts) {
     if (!(opts && opts.confirmed) && !confirm("Restart the server now? It reloads the config file and recompiles the enabled models.")) return;
-    var gen = last ? last.generation : null, epoch = last ? last.epoch : null;
     if (btn) { if (btn.dataset.label === undefined) btn.dataset.label = btn.textContent; btn.disabled = true; btn.textContent = "Restarting…"; }
     restarting();
-    var done = function () { waitRestart(gen, epoch); };
-    fetch("/config/restart", {method: "POST", headers: {"Accept": "application/json"}}).then(function (r) {
-      // Refused (403: a rejected origin or host name, ...): nothing restarts. A 401 (signed out)
-      // never gets here: the fetch wrapper goes to the login page.
-      if (r.status >= 400 && r.status < 500) {
-        return r.json().catch(function () { return {}; }).then(function (j) {
-          restartFailed("Restart refused (HTTP " + r.status + ")" + (j && j.message ? ": " + j.message : "."));
-        });
-      }
-      done();
-    }, done);
+    // Pressed before the first /v1/config answer: read the current generation first, or the
+    // first answer would look like the next one.
+    (last ? Promise.resolve() : poll(true)).then(function () { post(); });
+    function post() {
+      var gen = last ? last.generation : null, epoch = last ? last.epoch : null;
+      var done = function () { waitRestart(gen, epoch); };
+      fetch("/config/restart", {method: "POST", headers: {"Accept": "application/json"}}).then(function (r) {
+        // Refused (403: a rejected origin or host name, ...): nothing restarts. A 401 (signed out)
+        // never gets here: the fetch wrapper goes to the login page.
+        if (r.status >= 400 && r.status < 500) {
+          return r.json().catch(function () { return {}; }).then(function (j) {
+            restartFailed("Restart refused (HTTP " + r.status + ")" + (j && j.message ? ": " + j.message : "."));
+          });
+        }
+        done();
+      }, done);
+    }
   }
   document.addEventListener("click", function (e) {
     var b = e.target.closest && e.target.closest("[data-restart]");
@@ -1040,30 +1055,27 @@
   }, true);
 
   // ---- the restart page (message.html) ---------------------------------------------------------
-  // `#restart-status[data-generation]`: poll until the next generation serves, then go to
+  // `#restart-status[data-generation][data-epoch]`: poll until the next generation (or process) serves, then go to
   // `data-target` (a path on this server; anything else goes home). Gives up after 2 minutes.
   function restartPage() {
     var status = document.getElementById("restart-status");
     if (!status || status.dataset.generation === undefined) return;
-    var target = status.dataset.target || "/", gen = Number(status.dataset.generation), started = Date.now();
+    var target = status.dataset.target || "/", gen = Number(status.dataset.generation);
+    // A page without `data-epoch` compares the generation only.
+    var epoch = status.dataset.epoch === undefined ? undefined : Number(status.dataset.epoch);
     if (!/^\/(?![\/\\])/.test(target)) target = "/";
-    function tick() {
-      var secs = Math.round((Date.now() - started) / 1000);
-      if (Date.now() - started > RESTART_GIVE_UP_MS) {
-        status.textContent = "The server has not come back after " + secs + " s. Check the server log (or the service) and reload this page by hand.";
-        status.className = "error";
-        return;
-      }
-      PrismPoll.fetch("/v1/config", {cache: "no-store", headers: {"Accept": "application/json"}}).then(json).then(function (j) {
-        if (j.generation === gen) throw failure("same generation");
+    waitNext(gen, epoch, {
+      first: 1500,
+      onBack: function () {
         status.textContent = "Server is back; reloading…";
         PrismPoll.navigate(target);
-      }).catch(function () {
-        status.textContent = "Waiting for the server… (" + secs + " s)";
-        setTimeout(tick, 1000);
-      });
-    }
-    setTimeout(tick, 1500);
+      },
+      onWait: function (secs) { status.textContent = "Waiting for the server… (" + secs + " s)"; },
+      onGiveUp: function (secs) {
+        status.textContent = "The server has not come back after " + secs + " s. Check the server log (or the service) and reload this page by hand.";
+        status.className = "error";
+      }
+    });
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", restartPage); else restartPage();
 

@@ -441,6 +441,7 @@ pub(super) fn refused(
             refresh_url: String::new(),
             restarting: false,
             generation: 0,
+            epoch: 0,
         };
         (status, render(&page)).into_response()
     } else {

@@ -156,7 +156,8 @@ fn rejected_message(path: &Path, e: &anyhow::Error) -> String {
         "config file {} changed on disk but was not applied: {e:#}. The service keeps running \
          with the previous config. Fix the file (valid JSON; values as the Config page \
          accepts them) and save it again: it is re-read within {} s. A save from the web pages \
-         replaces the file with the running config.",
+         that changes a setting replaces the file with the running config (one that changes \
+         nothing leaves the file as it is).",
         path.display(),
         DISK_POLL.as_secs()
     )
@@ -1196,6 +1197,34 @@ mod tests {
         assert_eq!(s.read().port, 4001);
         let sources: Vec<String> = s.changes(10).into_iter().map(|c| c.source).collect();
         assert_eq!(sources, [SOURCE_DISK, "config page"]);
+    }
+
+    /// QA-077: the warning about a broken file says what a save does to it. A save that changes
+    /// nothing writes nothing, so the hand-edited bytes stay for the user to fix; one that
+    /// changes a setting replaces them.
+    #[test]
+    fn the_broken_file_warning_matches_what_a_save_does() {
+        let path = tmp();
+        let s = ConfigStore::new(cfg(), path.clone());
+        s.update("test", |_| Ok(())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(s.check_disk().is_none());
+        let err = s.disk_error().expect("disk error recorded");
+        assert!(
+            err.contains("that changes a setting replaces the file"),
+            "{err}"
+        );
+        s.update("config page", |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        assert!(s.disk_error().is_some());
+        s.update("config page", |c| {
+            c.port = 4002;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(Config::load(&path).unwrap().port, 4002);
+        assert_eq!(s.disk_error(), None);
     }
 
     #[test]

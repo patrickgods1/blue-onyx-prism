@@ -456,19 +456,33 @@ async fn fetch_live(config: &Config) -> Live {
     live
 }
 
-/// `blue-onyx-prism diagnostics`: build the bundle for the config at `config_path` (defaults
-/// when the file does not exist or does not parse; the raw file is included either way), ask
-/// a service running on this machine for the live parts, and write the zip into `out` (default:
-/// the current directory). Returns the zip's path.
+/// `blue-onyx-prism diagnostics`: build the bundle for the config at `config_path` (its values
+/// unchecked when it parses but fails validation, defaults when the file does not exist or does
+/// not parse; the raw file is included either way), ask a service running on this machine for
+/// the live parts, and write the zip into `out` (default: the current directory). Returns the
+/// zip's path.
 pub fn command(config_path: &Path, out: Option<&Path>) -> Result<PathBuf> {
     let mut notes = Vec::new();
     let config = if config_path.exists() {
-        Config::load(config_path).unwrap_or_else(|e| {
-            notes.push(format!(
-                "config: {e:#}; the defaults are used for the rest (config-file.json is the \
-                 file as it is)"
-            ));
-            Config::default()
+        Config::load(config_path).unwrap_or_else(|e| match Config::parse_file(config_path) {
+            // A config that parses but fails a check (a value out of range, a later format):
+            // its log folder and data root still are the service's, and the bundle needs them
+            // for the logs and for the secrets it scrubs (QA-078).
+            Some(mut parsed) => {
+                parsed.normalize();
+                notes.push(format!(
+                    "config: {e:#}; the file's values are used for the rest as they are, \
+                     unchecked (config-file.json is the file as it is)"
+                ));
+                parsed
+            }
+            None => {
+                notes.push(format!(
+                    "config: {e:#}; the defaults are used for the rest (config-file.json is the \
+                     file as it is)"
+                ));
+                Config::default()
+            }
         })
     } else {
         notes.push(format!(
@@ -837,6 +851,41 @@ pub(crate) mod tests {
         let all = entries(&std::fs::read(&path).unwrap());
         let problems = &all.iter().find(|(n, _)| n == "problems.txt").unwrap().1;
         assert!(problems.contains("there is no config file"), "{problems}");
+    }
+
+    /// QA-078: a config that parses but fails validation still names the service's log folder
+    /// and data root: the bundle has its logs, scrubs its tokens and says which config it used.
+    #[test]
+    fn an_invalid_config_still_gives_its_logs_and_scrubs_its_secrets() {
+        let dir = Scratch::new();
+        let (_, path) = planted(&dir.0);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["worker_queue_size"] = serde_json::json!(1_000_000_000u64);
+        std::fs::write(&path, v.to_string()).unwrap();
+        assert!(
+            Config::load(&path).is_err(),
+            "the planted value is out of range"
+        );
+        let out = dir.0.join("out");
+        let zip = command(&path, Some(&out)).unwrap();
+        let bytes = std::fs::read(&zip).unwrap();
+        let all = entries(&bytes);
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"logs/blue_onyx_prism.log.2026-11-07"),
+            "{names:?}"
+        );
+        let mut hidden = planted_secrets();
+        hidden.extend(["JPEGFRAMEBYTES", "LABELFILE"]);
+        for (name, text) in &all {
+            for secret in &hidden {
+                assert!(!text.contains(secret), "{name} holds {secret}");
+            }
+        }
+        let problems = &all.iter().find(|(n, _)| n == "problems.txt").unwrap().1;
+        assert!(problems.contains("worker_queue_size"), "{problems}");
+        assert!(problems.contains("unchecked"), "{problems}");
     }
 
     /// Without the API token or the certificate the live parts are not asked for, and the

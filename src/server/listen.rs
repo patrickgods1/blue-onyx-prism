@@ -174,7 +174,10 @@ impl HttpsPlan {
 /// The process's listeners: HTTP bound once ([`bind`]), HTTPS started by [`serve_on`].
 #[derive(Debug)]
 pub struct Listeners {
+    /// The socket on the configured address (named for the usual IPv4 `bind_address`).
     pub(super) v4: tokio::net::TcpListener,
+    /// The companion socket [`bind_pair`] adds: `[::1]` beside an IPv4 wildcard or loopback,
+    /// `0.0.0.0` beside `::`.
     pub(super) v6: Option<tokio::net::TcpListener>,
     port: u16,
     https: Option<HttpsPlan>,
@@ -224,7 +227,10 @@ impl HttpsPort {
 }
 
 /// Bind `address:port`, and for `0.0.0.0` and `127.0.0.1` also `[::1]:port` (best effort,
-/// `localhost` may resolve to it, and some clients do not fall back to 127.0.0.1).
+/// `localhost` may resolve to it, and some clients do not fall back to 127.0.0.1), and for `::`
+/// also `0.0.0.0:port` (best effort, QA-089): Windows binds `::` IPv6-only, so without it an
+/// IPv4 Blue Iris gets connection refused there. Linux and macOS bind `::` dual-stack, where the
+/// companion usually fails with `AddrInUse` (logged at debug: IPv4 is served already).
 async fn bind_pair(
     address: IpAddr,
     port: u16,
@@ -234,9 +240,9 @@ async fn bind_pair(
     u16,
 )> {
     let addr = SocketAddr::new(address, port);
-    let v4 = tokio::net::TcpListener::bind(addr).await?;
-    let port = v4.local_addr().map(|a| a.port()).unwrap_or(port);
-    let v6 = match address {
+    let main = tokio::net::TcpListener::bind(addr).await?;
+    let port = main.local_addr().map(|a| a.port()).unwrap_or(port);
+    let companion = match address {
         IpAddr::V4(a) if a.is_unspecified() || a.is_loopback() => {
             let loopback6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
             match tokio::net::TcpListener::bind(loopback6).await {
@@ -247,9 +253,29 @@ async fn bind_pair(
                 }
             }
         }
+        IpAddr::V6(a) if a.is_unspecified() => {
+            let any4 = SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+            match tokio::net::TcpListener::bind(any4).await {
+                Ok(l) => Some(l),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    debug!(
+                        "not binding {any4} beside {addr}: {e} (this system's {addr} socket \
+                         already serves IPv4)"
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(
+                        "not listening on {any4}: {e}; IPv4 clients may not reach {addr}. Set \
+                         `bind_address` to 0.0.0.0 if Blue Iris connects over IPv4"
+                    );
+                    None
+                }
+            }
+        }
         _ => None,
     };
-    Ok((v4, v6, port))
+    Ok((main, companion, port))
 }
 
 /// Bind the HTTP listener on `address:port` (see [`bind_pair`]). Called once per process run: a
@@ -310,7 +336,7 @@ pub async fn serve_on(
     Ok(())
 }
 
-/// The accept loops of one listener's IPv4 and IPv6 sockets.
+/// The accept loops of one listener's main and companion sockets ([`bind_pair`]).
 async fn run_pair(v4: tokio::net::TcpListener, v6: Option<tokio::net::TcpListener>, l: Loop) {
     match v6 {
         Some(l6) => {

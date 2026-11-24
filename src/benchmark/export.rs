@@ -940,33 +940,47 @@ fn grades_section(metric: AccuracyMetric) -> Section {
     }
 }
 
-/// Text for a Markdown heading, paragraph or table title: one line, inline HTML neutralized
-/// and leading block syntax escaped (BM-08: model names, dataset ids and runtime error strings
-/// are not ours).
+/// Text for a Markdown heading, paragraph or table title: one line, inline HTML neutralized,
+/// leading block syntax escaped and every `[` escaped, so no link or image (`![x](url)`, a
+/// remote image a viewer would fetch) forms anywhere in the text; a `\` before ASCII
+/// punctuation is escaped too, so the text's own `\[` cannot undo that (BM-08, QA-060: model
+/// names, dataset ids and runtime error strings are not ours). Other backslashes (Windows
+/// paths) stay as they are.
 fn md_text(s: &str) -> String {
+    md_escape(s, false)
+}
+
+/// Text for a Markdown table cell: [`md_text`] plus every `\` and `|` escaped (a `\` before
+/// `|` would otherwise defeat the `\|`).
+fn md_cell(s: &str) -> String {
+    md_escape(s, true)
+}
+
+/// [`md_text`] (`cell` false) and [`md_cell`] (`cell` true).
+fn md_escape(s: &str, cell: bool) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     let mut first = true;
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             '\n' | '\r' => out.push(' '),
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            '#' | '*' | '_' | '`' | '[' | '|' | '-' | '+' if first => {
+            '\\' if cell || chars.peek().is_some_and(char::is_ascii_punctuation) => {
+                out.push_str("\\\\");
+            }
+            '|' if cell || first => out.push_str("\\|"),
+            '#' | '*' | '_' | '`' | '-' | '+' if first => {
                 out.push('\\');
                 out.push(c);
             }
+            '[' => out.push_str("\\["),
             c => out.push(c),
         }
         first = first && c.is_whitespace();
     }
     out
-}
-
-/// Text for a Markdown table cell: [`md_text`] plus `\\` and `|` escaped (a `\` before `|`
-/// would otherwise defeat the `\|`).
-fn md_cell(s: &str) -> String {
-    md_text(&s.replace('\\', "\\\\").replace('|', "\\|"))
 }
 
 /// Markdown report.
@@ -1236,6 +1250,15 @@ mod tests {
         assert_eq!(md_text("# a\nb <c> & d"), "\\# a b &lt;c&gt; &amp; d");
         assert_eq!(md_text("  * list"), "  \\* list");
         assert_eq!(md_text("plain * mid"), "plain * mid");
+        // QA-060: no image or link mid-text either.
+        assert_eq!(
+            md_text("dir:/x/![a](http://h/i.png) [l](http://h)"),
+            "dir:/x/!\\[a](http://h/i.png) \\[l](http://h)"
+        );
+        assert_eq!(md_cell("e [x](u)"), "e \\[x](u)");
+        // The text's own backslash cannot undo the escape; a Windows path stays readable.
+        assert_eq!(md_text("a \\[x](u)"), "a \\\\\\[x](u)");
+        assert_eq!(md_text("C:\\models\\m.onnx"), "C:\\models\\m.onnx");
         assert_eq!(md_cell("a \\| b"), "a \\\\\\| b");
         assert_eq!(md_cell("| x"), "\\| x");
         assert!(md.contains("| sample (Embedded sample"), "{md}");

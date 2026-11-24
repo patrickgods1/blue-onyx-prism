@@ -151,7 +151,43 @@ fn field<'f>(form: &'f [(String, String)], key: &str) -> Option<&'f str> {
         .filter(|v| !v.is_empty())
 }
 
-/// Save `edit` of the history (seeded from the saved results when there is no file yet).
+/// A pin or delete of a run the history (as read under its update lock) does not hold: 404,
+/// never the 500 of a failed write (QA-096: a second tab deleting the same run was told to check
+/// that the file is writable).
+#[derive(Debug)]
+struct UnknownRun {
+    model: String,
+    run_id: String,
+}
+
+impl UnknownRun {
+    /// `Err(UnknownRun)` unless `h` holds run `run_id` of `model`.
+    fn check(h: &History, model: &str, run_id: &str) -> anyhow::Result<()> {
+        if h.find(model, run_id).is_some() {
+            return Ok(());
+        }
+        Err(Self {
+            model: model.to_string(),
+            run_id: run_id.to_string(),
+        }
+        .into())
+    }
+}
+
+impl std::fmt::Display for UnknownRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "'{}' has no run {} in the benchmark history; reload the page",
+            self.model, self.run_id
+        )
+    }
+}
+
+impl std::error::Error for UnknownRun {}
+
+/// Save `edit` of the history (seeded from the saved results when there is no file yet). An
+/// [`UnknownRun`] from `edit` answers 404, any other error 500.
 fn edit_history(
     state: &AppState,
     what: &str,
@@ -188,6 +224,9 @@ fn edit_history(
             }))
             .into_response()
         }
+        Err(e) if e.downcast_ref::<UnknownRun>().is_some() => {
+            fail(StatusCode::NOT_FOUND, e.to_string())
+        }
         Err(e) => {
             warn!("benchmark history {what} failed: {e:#}");
             fail(
@@ -216,16 +255,10 @@ pub(in crate::server) async fn history_pin(
         let (Some(model), Some(run_id)) = (field(&form, "model"), field(&form, "run_id")) else {
             return fail(StatusCode::BAD_REQUEST, "give `model` and `run_id`");
         };
-        let pinned = field(&form, "pinned").is_none_or(super::truthy);
-        let (_, h, _) = load(&state);
-        if h.find(model, run_id).is_none() {
-            return fail(
-                StatusCode::NOT_FOUND,
-                format!("'{model}' has no run {run_id} in the benchmark history; reload the page"),
-            );
-        }
+        let pinned = field(&form, "pinned").is_none_or(crate::server::form::truthy);
         let (model, run_id) = (model.to_string(), run_id.to_string());
         edit_history(&state, "pin", move |h| {
+            UnknownRun::check(h, &model, &run_id)?;
             h.pin(&model, &run_id, pinned)?;
             Ok(if pinned {
                 format!(
@@ -256,26 +289,15 @@ pub(in crate::server) async fn history_delete(
     crate::server::blocking(move || {
         let model = field(&form, "model").map(str::to_string);
         let run_id = field(&form, "run_id").map(str::to_string);
-        let all = field(&form, "all").is_some_and(super::truthy);
+        let all = field(&form, "all").is_some_and(crate::server::form::truthy);
         match (model, run_id, all) {
-            (Some(model), Some(run_id), false) => {
-                let (_, h, _) = load(&state);
-                if h.find(&model, &run_id).is_none() {
-                    return fail(
-                        StatusCode::NOT_FOUND,
-                        format!(
-                            "'{model}' has no run {run_id} in the benchmark history; reload the \
-                             page"
-                        ),
-                    );
-                }
-                edit_history(&state, "delete", move |h| {
-                    h.delete(&model, &run_id)?;
-                    Ok(format!(
-                        "Deleted run {run_id} of {model} from the benchmark history."
-                    ))
-                })
-            }
+            (Some(model), Some(run_id), false) => edit_history(&state, "delete", move |h| {
+                UnknownRun::check(h, &model, &run_id)?;
+                h.delete(&model, &run_id)?;
+                Ok(format!(
+                    "Deleted run {run_id} of {model} from the benchmark history."
+                ))
+            }),
             (Some(model), None, true) => edit_history(&state, "delete", move |h| {
                 let n = h.delete_model(&model);
                 Ok(format!(
@@ -346,6 +368,32 @@ mod tests {
             });
         assert_eq!(answer.0, StatusCode::OK, "{}", answer.1);
         assert!(hist.exists());
+    }
+
+    /// QA-096: a pin or delete of a run another tab deleted while this one waited answers 404
+    /// (the run was checked before the lock, so it was a 500 "check that ... is writable").
+    #[tokio::test]
+    async fn a_run_deleted_meanwhile_is_404_not_500() {
+        use crate::benchmark::results_io::{Holder, lock};
+        for route in ["pin", "delete"] {
+            let st = state();
+            let path = results_path(&st.config_path);
+            let hist = history_path(&path);
+            let results = results_with(T1, 40.0);
+            results.save(&path).unwrap();
+            let held = lock(&path, Holder::Writer).unwrap();
+            let body = format!("model=ipcam-general&run_id={T1_FORM}");
+            let uri = format!("/v1/benchmark/history/{route}");
+            let (answer, ()) = tokio::join!(call(&st, post(&uri, &body)), async {
+                // The other tab's delete lands while this request waits for the lock.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                History::update(&hist, Some(&results), |h| h.delete("ipcam-general", T1)).unwrap();
+                drop(held);
+            });
+            assert_eq!(answer.0, StatusCode::NOT_FOUND, "{route}: {}", answer.1);
+            let msg = answer.1["message"].as_str().unwrap_or_default();
+            assert!(msg.contains("reload the page"), "{route}: {}", answer.1);
+        }
     }
 
     #[tokio::test]

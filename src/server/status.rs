@@ -1,6 +1,10 @@
 //! `GET /v1/status`: machine-readable readiness for container orchestrators, systemd wrappers
 //! and Blue Iris watchdogs. Cheap (no file I/O) and open to every client; `curl -f` works
-//! because the HTTP status is 503 while the service cannot serve detections. `fileLogCapped`
+//! because the HTTP status is 503 while the service cannot serve detections: no model is usable
+//! (ready or lazy). A usable model next to one still downloading or compiling is `degraded` with
+//! 200 (audit 2026-11, QA-069: a model added on the Config page, or a download that keeps
+//! failing, must not mark a container that serves Blue Iris unhealthy); `loading` names the
+//! models still initializing, so that case is told apart from a failed one. `fileLogCapped`
 //! says today's log file reached its cap ([`crate::cli::file_log_capped`]): only errors still
 //! reach it until tomorrow, so something logs far more than usual.
 
@@ -51,20 +55,22 @@ pub(super) enum Kind {
 }
 
 /// Combine model states. A lazy model (loads on its first request) can serve, so it counts as
-/// usable like a Ready one but never blocks readiness. Usable and no non-lazy model still
-/// initializing = ready (or degraded when another failed). Nothing usable but something
+/// usable like a Ready one. Usable: ready when every other model is usable too, else degraded
+/// (another one failed or is still initializing; both answer 200). Nothing usable but something
 /// initializing = initializing. Otherwise failed (also with no models).
 pub(super) fn overall(kinds: &[Kind]) -> Overall {
     let has = |k| kinds.contains(&k);
     let usable = has(Kind::Ready) || has(Kind::Lazy);
-    if has(Kind::Initializing) {
+    if usable {
+        if has(Kind::Failed) || has(Kind::Initializing) {
+            Overall::Degraded
+        } else {
+            Overall::Ready
+        }
+    } else if has(Kind::Initializing) {
         Overall::Initializing
-    } else if !usable {
-        Overall::Failed
-    } else if has(Kind::Failed) {
-        Overall::Degraded
     } else {
-        Overall::Ready
+        Overall::Failed
     }
 }
 
@@ -73,6 +79,7 @@ pub(super) async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     let workers = state.registry.workers();
     let mut kinds = Vec::with_capacity(workers.len());
     let mut models = Vec::with_capacity(workers.len());
+    let mut loading = Vec::new();
     for w in &workers {
         let (kind, label, detail) = match w.state.get() {
             ModelState::Ready => (Kind::Ready, "ready", None),
@@ -83,6 +90,9 @@ pub(super) async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             ModelState::Initializing => (Kind::Initializing, "initializing", state_view(w).2),
         };
         kinds.push(kind);
+        if kind == Kind::Initializing {
+            loading.push(w.name.clone());
+        }
         // The threshold that runs: the profile for the device it loaded on, else the model's /
         // global value (additive fields; the Blue Iris response shape is untouched).
         let (threshold, source) = w.effective_threshold();
@@ -103,6 +113,8 @@ pub(super) async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         "uptimeSecs": state.metrics.uptime().as_secs(),
         "generation": state.config.generation(),
         "models": models,
+        // Additive: non-lazy models still downloading or compiling (QA-069).
+        "loading": loading,
         "version": crate::VERSION,
         "fileLogCapped": crate::cli::file_log_capped(),
     });
@@ -164,8 +176,12 @@ mod tests {
         assert_eq!(overall(&[Ready, Lazy]), Overall::Ready);
         assert_eq!(overall(&[Lazy]), Overall::Ready);
         assert_eq!(overall(&[Ready, Failed]), Overall::Degraded);
-        assert_eq!(overall(&[Ready, Initializing]), Overall::Initializing);
+        // QA-069: a usable model next to one still loading serves: degraded, 200.
+        assert_eq!(overall(&[Ready, Initializing]), Overall::Degraded);
+        assert_eq!(overall(&[Lazy, Initializing]), Overall::Degraded);
+        assert_eq!(overall(&[Initializing]), Overall::Initializing);
         assert_eq!(overall(&[Failed, Initializing]), Overall::Initializing);
+        assert_eq!(overall(&[Lazy, Failed, Initializing]), Overall::Degraded);
         assert_eq!(Overall::Degraded.http(), StatusCode::OK);
         assert_eq!(
             Overall::Initializing.http(),
@@ -200,6 +216,7 @@ mod tests {
         assert_eq!(v["generation"], 1);
         // Tests log to no file, so the file log is never capped here.
         assert_eq!(v["fileLogCapped"], false);
+        assert_eq!(v["loading"], json!([]));
 
         let (code, v) = get(&state_with(&[
             ("a", ModelState::Ready),
@@ -215,9 +232,22 @@ mod tests {
             ("b", ModelState::Initializing),
         ]))
         .await;
+        // QA-069: "a" serves Blue Iris while "b" downloads or compiles.
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["status"], "degraded");
+        assert_eq!(v["ready"], true);
+        assert_eq!(v["models"][1]["state"], "initializing");
+        assert_eq!(v["loading"], json!(["b"]));
+
+        let (code, v) = get(&state_with(&[
+            ("a", ModelState::Failed("boom".into())),
+            ("b", ModelState::Initializing),
+        ]))
+        .await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(v["status"], "initializing");
         assert_eq!(v["ready"], false);
+        assert_eq!(v["loading"], json!(["b"]));
     }
 
     #[tokio::test]

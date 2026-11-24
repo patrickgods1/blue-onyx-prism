@@ -16,6 +16,14 @@ use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use std::sync::Arc;
 
+/// After a bulk write that changed `frames` frames: the Refine tab's caches read the label files,
+/// so they go ([`crate::server::refine::label_files_changed`], QA-091).
+pub(super) fn wrote(frames: usize) {
+    if frames > 0 {
+        crate::server::refine::label_files_changed();
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AcceptAutoBody {
@@ -63,6 +71,7 @@ pub(in crate::server) async fn accept_auto(
                 "frames": o.done,
             }));
         }
+        wrote(o.done_count);
         let mut message = format!(
             "Accepted {} frame(s) the auto-labelers settled (saved as reviewed).",
             o.done_count
@@ -141,6 +150,7 @@ pub(in crate::server) async fn reject_low(
                 "frames": o.done,
             }));
         }
+        wrote(o.done_count);
         let mut message = format!(
             "Rejected {} auto box(es) scoring below {min} on {} frame(s) (kept as hard \
              negatives; the frames stay unreviewed).",
@@ -197,6 +207,7 @@ pub(in crate::server) async fn accept_repeats(
                 "frames": o.done,
             }));
         }
+        wrote(o.done_count);
         let mut message = format!("Saved {} repeat-only frame(s) as reviewed.", o.done_count);
         push_failed(&mut message, o.failed_count, "not saved", "review");
         push_past_limit(&mut message, o.eligible, limit, "more");
@@ -248,6 +259,9 @@ pub(in crate::server) async fn reject_stacked(
             done.overlaps_left,
             done.overlaps_left_reviewed,
         );
+        if !dry_run {
+            wrote(o.done_count);
+        }
         let mut message = if o.boxes == 0 {
             "No stacked duplicates on the frames these filters select.".to_string()
         } else if dry_run {
@@ -333,6 +347,7 @@ pub(in crate::server) async fn restore_reopened(
                 "frames": o.done,
             }));
         }
+        wrote(o.done_count);
         let mut message = format!(
             "Restored {} reopened frame(s) to reviewed (their boxes are unchanged; they are back \
              in exports).",
@@ -392,7 +407,7 @@ struct SuggestOverlapsBody {
 /// on the label files of the folder under review those filters select, reviewed frames too (no
 /// `source` or `status` narrows it, a reviewed frame need not be in the review queue). It writes
 /// suggestions and nothing else. `dry_run` only counts (`frames`, `pairs`, `crops`, `no_zoom`,
-/// `answered`, `passed_over`), and needs no GPU; its `memory` is `{refusal, override_label}` when
+/// `answered`, `passed_over`, `no_room`: [`select::Selection`]), and needs no GPU; its `memory` is `{refusal, override_label}` when
 /// a start now would be refused for memory commit on Windows ([`crate::training::commit::Preview`],
 /// null when it fits or there is no crop), and `ignore_memory_check: true` then starts it anyway.
 /// Otherwise `{success, message, id}`, the task id in `GET /v1/training` `tasks[]`.
@@ -442,9 +457,18 @@ pub(in crate::server) async fn suggest_overlaps(
                 } else {
                     ""
                 };
+                let full = if s.no_room > 0 {
+                    format!(
+                        "; {} more wait until a reviewer settles some (their frames already hold \
+                         the most suggestions a frame keeps)",
+                        s.no_room
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
                     "No open overlap without an answer on these frames ({} pairs answered before, \
-                     {} frames skipped or checked by a reviewer){again}.",
+                     {} frames skipped or checked by a reviewer){full}{again}.",
                     s.answered, s.passed_over
                 )
             });
@@ -463,6 +487,7 @@ pub(in crate::server) async fn suggest_overlaps(
                 "crops": s.crops,
                 "answered": s.answered,
                 "passed_over": s.passed_over,
+                "no_room": s.no_room,
                 "message": message,
                 "memory": memory,
             }));
@@ -549,6 +574,7 @@ pub(in crate::server) async fn reject_other_class(
                 "reviewed_with_unwanted": reviewed,
             }));
         }
+        wrote(o.done_count);
         let mut message = format!(
             "Rejected {} pending box(es) of unwanted classes on {} frame(s) (kept as evidence, \
              reason other_class; the frames stay unreviewed).",
@@ -630,6 +656,7 @@ pub(in crate::server) async fn reject_unwanted_reviewed(
             }));
         }
         let o = bulk::bulk_reject_unwanted(&dir, &wanted, bulk::Scope::Reviewed, limit, false);
+        wrote(o.done_count);
         let eligible = o.eligible;
         let mut message = format!(
             "Rejected {} accepted box(es) of unwanted classes on {} reviewed frame(s) (kept as \

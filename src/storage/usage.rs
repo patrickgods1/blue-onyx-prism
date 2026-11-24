@@ -18,7 +18,9 @@
 //!   so they are never superseded). Sizes only: nothing here is deleted automatically, and only
 //!   exports have a Remove on this card.
 //!
-//! Parts ([`Item::parts`]) are listed under their row and already counted in its size.
+//! Parts (`Item::parts`) are listed under their row and already counted in its size; so are
+//! the checkpoints row (in Training runs) and a review folder inside the dataset folder, or the
+//! reverse (noted "included in ..."): `data_bytes` counts each byte once.
 //!
 //! Sizes are bytes deleting a thing frees ([`crate::training::retry::disk_use`]: an export's frames
 //! are hard links to the dataset's, so they count where they are not shared). Measuring walks
@@ -540,6 +542,18 @@ fn unlisted_runs_item(training: &Path, runs: &[RunRecord]) -> Option<Item> {
     )
 }
 
+/// Whether folder `inner` is `outer` or lies inside it (as written made absolute, or once
+/// resolved: a symlinked or differently spelled path).
+fn dir_within(inner: &Path, outer: &Path) -> bool {
+    let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    abs(inner).starts_with(abs(outer))
+        || inner
+            .canonicalize()
+            .ok()
+            .zip(outer.canonicalize().ok())
+            .is_some_and(|(i, o)| i.starts_with(o))
+}
+
 /// Whether `a` and `b` name the same folder (as written, or once resolved).
 fn same_dir(a: &Path, b: &Path) -> bool {
     a == b
@@ -756,18 +770,29 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
     }
 
     let mut data = Vec::new();
-    for (i, dir) in s.dataset_dirs().iter().enumerate() {
-        let (id, title) = if i == 0 {
+    // Rows already counted in another row: left out of `data_bytes`.
+    let mut counted_elsewhere: Vec<&str> = vec!["checkpoints"];
+    let dataset_dirs = s.dataset_dirs();
+    let dataset_title = |i: usize| {
+        if i == 0 {
             ("dataset", "Dataset (collected and imported frames, labels)")
         } else {
             ("review-folder", "Folder under review")
-        };
-        data.push(Item::new(
-            id,
-            title,
-            dir,
-            crate::training::retry::disk_use(dir),
-        ));
+        }
+    };
+    for (i, dir) in dataset_dirs.iter().enumerate() {
+        let (id, title) = dataset_title(i);
+        let mut item = Item::new(id, title, dir, crate::training::retry::disk_use(dir));
+        // A review folder inside the dataset folder (or the reverse) is in both walks (QA-079).
+        if let Some(outer) = dataset_dirs
+            .iter()
+            .enumerate()
+            .position(|(j, o)| j != i && dir_within(dir, o) && (j < i || !dir_within(o, dir)))
+        {
+            item = item.note(format!("included in {}", dataset_title(outer).1));
+            counted_elsewhere.push(id);
+        }
+        data.push(item);
     }
     let listed = exports(&training);
     if let Some(item) = unfinished_item(&unfinished_exports, &listed, &training) {
@@ -828,7 +853,7 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
         safe_bytes: safe.iter().map(|i| i.bytes).sum(),
         data_bytes: data
             .iter()
-            .filter(|i| i.id != "checkpoints")
+            .filter(|i| !counted_elsewhere.contains(&i.id.as_str()))
             .map(|i| i.bytes)
             .sum(),
         safe,
@@ -842,8 +867,19 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
 /// One finished measurement: when, of which folders ([`key_of`]), and the report.
 struct Measured {
     at: Instant,
-    key: String,
+    key: Key,
     report: Arc<Report>,
+}
+
+/// The folders a measurement reads ([`key_of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Key {
+    data_root: PathBuf,
+    models_dir: PathBuf,
+    training_dir: PathBuf,
+    cache_root: Option<PathBuf>,
+    dataset_dirs: Vec<PathBuf>,
+    log_dir: Option<PathBuf>,
 }
 
 /// The last measurement of each set of folders (newest first, at most [`KEPT`]) and whether one
@@ -852,10 +888,15 @@ struct Measured {
 /// overwrite each other's report before the other looks, and each measures again, round after
 /// round, until its wait runs out (seen on Linux CI, where measuring an empty folder takes less
 /// than one 25 ms look).
+///
+/// `epoch` counts [`invalidate`] calls: a measurement stores its report only when no Clear or
+/// Remove happened since it started (QA-076: one that walked a cache before its Clear would
+/// otherwise show the cleared sizes again, as fresh, for [`FRESH`]).
 #[derive(Default)]
 struct Cache {
     last: Vec<Measured>,
     running: bool,
+    epoch: u64,
 }
 
 /// How many sets of folders [`Cache`] keeps a report of (the service has one; tests have more).
@@ -864,6 +905,7 @@ const KEPT: usize = 8;
 static CACHE: Mutex<Cache> = Mutex::new(Cache {
     last: Vec::new(),
     running: false,
+    epoch: 0,
 });
 
 /// Clears [`Cache::running`] when the measuring thread ends, also by a panic in [`measure`] (which
@@ -887,6 +929,19 @@ impl Drop for Measuring {
 static PANIC_FOR: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(test)]
 static PANICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tests: the measuring thread for settings of this data root says it started, waits to be
+/// released before it measures, and says when it has stored (or dropped) its report.
+#[cfg(test)]
+struct Hold {
+    root: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    done: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+static HOLD_FOR: Mutex<Option<Hold>> = Mutex::new(None);
 
 /// The measurement to show: a fresh one of the same folders ([`key_of`]) is returned at once;
 /// otherwise one is started on its own thread (after a measurement of other folders has ended,
@@ -914,6 +969,7 @@ pub fn current(s: Settings, runs: Vec<RunRecord>, wait: Duration) -> (Option<Arc
                 let (s, runs) = (s.clone(), runs.clone());
                 c.running = true;
                 let k = key.clone();
+                let epoch = c.epoch;
                 let spawned = std::thread::Builder::new()
                     .name("storage-usage".into())
                     .spawn(move || {
@@ -926,18 +982,40 @@ pub fn current(s: Settings, runs: Vec<RunRecord>, wait: Duration) -> (Option<Arc
                             PANICKED.store(true, std::sync::atomic::Ordering::SeqCst);
                             panic!("test: measuring panics");
                         }
+                        #[cfg(test)]
+                        let hold = {
+                            let mut h = HOLD_FOR.lock_recover();
+                            if h.as_ref().map(|h| &h.root) == Some(&s.config().data_root()) {
+                                h.take()
+                            } else {
+                                None
+                            }
+                        };
+                        #[cfg(test)]
+                        if let Some(h) = &hold {
+                            let _ = h.entered.send(());
+                            let _ = h.release.recv_timeout(Duration::from_secs(60));
+                        }
                         let report = Arc::new(measure(&s, &runs));
                         let mut c = CACHE.lock_recover();
-                        c.last.retain(|l| l.key != k);
-                        c.last.insert(
-                            0,
-                            Measured {
-                                at: Instant::now(),
-                                key: k,
-                                report,
-                            },
-                        );
-                        c.last.truncate(KEPT);
+                        // A Clear or Remove since the start: what was measured may be gone.
+                        if c.epoch == epoch {
+                            c.last.retain(|l| l.key != k);
+                            c.last.insert(
+                                0,
+                                Measured {
+                                    at: Instant::now(),
+                                    key: k,
+                                    report,
+                                },
+                            );
+                            c.last.truncate(KEPT);
+                        }
+                        drop(c);
+                        #[cfg(test)]
+                        if let Some(h) = hold {
+                            let _ = h.done.send(());
+                        }
                     });
                 if let Err(e) = spawned {
                     c.running = false;
@@ -955,21 +1033,25 @@ pub fn current(s: Settings, runs: Vec<RunRecord>, wait: Duration) -> (Option<Arc
 
 /// The folders a measurement covers: a report counts only for the same ones (a generation
 /// restart that moves `download_dir`, or tests with their own data roots, measure others).
-fn key_of(s: &Settings) -> String {
-    format!(
-        "{:?}",
-        (
-            s.config().data_root(),
-            s.models_dir(),
-            s.training_dir(),
-            s.cache_root()
-        )
-    )
+/// The key holds every folder [`measure`] reads, so a change of any of them (`collect.dir`,
+/// `collect.review_dir`, `log_path` included) measures again.
+fn key_of(s: &Settings) -> Key {
+    Key {
+        data_root: s.config().data_root(),
+        models_dir: s.models_dir(),
+        training_dir: s.training_dir(),
+        cache_root: s.cache_root(),
+        dataset_dirs: s.dataset_dirs(),
+        log_dir: s.log_dir(),
+    }
 }
 
-/// Forget the last measurement (after a Clear or Remove), so the next look measures again.
+/// Forget the last measurement (after a Clear or Remove), so the next look measures again; a
+/// measurement running now stores nothing (`Cache::epoch`).
 pub fn invalidate() {
-    CACHE.lock_recover().last.clear();
+    let mut c = CACHE.lock_recover();
+    c.last.clear();
+    c.epoch = c.epoch.wrapping_add(1);
 }
 
 #[cfg(test)]
@@ -1103,6 +1185,47 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// QA-076: a measurement that was running when a Clear forgot the cache stores nothing, so
+    /// the next look measures again rather than showing the cleared sizes as fresh.
+    #[test]
+    fn a_measurement_running_across_a_clear_is_not_kept() {
+        let root = std::env::temp_dir().join(format!("bop-usage-epoch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let s = settings_at(&root);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        *HOLD_FOR.lock_recover() = Some(Hold {
+            root: s.config().data_root(),
+            entered: entered_tx,
+            release: release_rx,
+            done: done_tx,
+        });
+        // Other tests share the cache and may be measuring their own folders: look until ours
+        // starts (and is held before it measures).
+        let step = Duration::from_secs(60);
+        let deadline = Instant::now() + step;
+        loop {
+            let _ = current(s.clone(), Vec::new(), Duration::ZERO);
+            if entered.recv_timeout(Duration::from_millis(10)).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the measurement never started");
+        }
+        invalidate();
+        release.send(()).unwrap();
+        done.recv_timeout(step).expect("the measurement ended");
+        let key = key_of(&s);
+        assert!(
+            CACHE.lock_recover().last.iter().all(|l| l.key != key),
+            "a report measured before the Clear was kept"
+        );
+        // The next look measures again.
+        let (r, running) = current(s, Vec::new(), step);
+        assert!(r.is_some() && !running);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_card_splits_safe_from_data() {
         let root = std::env::temp_dir().join(format!("bop-usage-{}", uuid::Uuid::new_v4()));
@@ -1149,6 +1272,64 @@ mod tests {
                 .iter()
                 .all(|i| i.action.is_none() || i.id.starts_with("export:"))
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// QA-079: a review folder inside the dataset folder (or the reverse) keeps its row, noted
+    /// as included in the other, and its bytes count once in `data_bytes`.
+    #[test]
+    fn a_nested_review_folder_is_counted_once() {
+        let root = std::env::temp_dir().join(format!("bop-usage-nest-{}", uuid::Uuid::new_v4()));
+        let put = |p: &Path, n: usize| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; n]).unwrap();
+        };
+        let mut c = crate::config::Config {
+            download_dir: Some(root.clone()),
+            cache_dir: root.join("cache").display().to_string(),
+            ..Default::default()
+        };
+        c.models.clear();
+        put(&root.join("ds/day/cam/a.jpg"), 1000);
+        put(&root.join("ds/review/day/cam/b.jpg"), 300);
+        let total = |r: &Report, id: &str| r.data.iter().find(|i| i.id == id).unwrap().clone();
+        for (dir, review, inner, outer_title) in [
+            ("ds", "ds/review", "review-folder", "Dataset"),
+            ("ds/review", "ds", "dataset", "Folder under review"),
+        ] {
+            c.collect.dir = Some(root.join(dir));
+            c.collect.review_dir = Some(root.join(review));
+            let s = Settings::for_config(&c);
+            assert_eq!(s.dataset_dirs().len(), 2);
+            let r = measure(&s, &[]);
+            let outer_id = if inner == "dataset" {
+                "review-folder"
+            } else {
+                "dataset"
+            };
+            let (inner_row, outer_row) = (total(&r, inner), total(&r, outer_id));
+            assert_eq!((outer_row.bytes, inner_row.bytes), (1300, 300), "{r:?}");
+            assert!(
+                inner_row
+                    .note
+                    .starts_with(&format!("included in {outer_title}")),
+                "{}",
+                inner_row.note
+            );
+            assert!(outer_row.note.is_empty(), "{}", outer_row.note);
+            let rest: u64 = r
+                .data
+                .iter()
+                .filter(|i| i.id != "dataset" && i.id != "review-folder")
+                .map(|i| i.bytes)
+                .sum();
+            assert_eq!(r.data_bytes, 1300 + rest, "the review folder counts once");
+        }
+        // Side by side: both count.
+        c.collect.dir = Some(root.join("ds/day"));
+        c.collect.review_dir = Some(root.join("ds/review"));
+        let r = measure(&Settings::for_config(&c), &[]);
+        assert!(r.data.iter().all(|i| !i.note.starts_with("included in")));
         let _ = std::fs::remove_dir_all(&root);
     }
 

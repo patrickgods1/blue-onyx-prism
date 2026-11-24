@@ -546,9 +546,14 @@
   // and coverage are read again, once.
   function follow() {
     return fetch('/v1/train/jobs?tasks=busy', { headers: { Accept: 'application/json' }, cache: 'no-store' })
-      .then(function (r) { return r.ok ? r.json() : null; })
+      // A failed answer rejects, so PrismPoll backs off instead of polling a down server every 3 s
+      // (QA-115).
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
       .then(function (j) {
-        if (!j || !j.jobs) return true;
+        if (!j || !j.jobs) throw new Error('the jobs list is missing from the answer');
         var mine = j.jobs.active.concat(j.jobs.queued).filter(function (x) {
           return x.link && x.link.indexOf('/train/refine#job-') === 0;
         })[0];

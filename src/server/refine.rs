@@ -392,11 +392,23 @@ fn open_cached_in(
     kept.map(|(open, _)| open)
 }
 
-/// Drop every kept count: a label write (the static spots' bulk accept, a review save that
-/// answered or changed suggestions) changed what a walk would find, so the strip shows no count
-/// until the next walk and the Refine tab walks again.
+/// Drop every kept count: a review save that answered or changed suggestions changed what a walk
+/// would find, so the strip shows no count until the next walk and the Refine tab walks again.
+/// Other label writes call [`label_files_changed`].
 pub(super) fn forget_counts() {
     OPEN.forget();
+}
+
+/// Drop every Refine cache of the process: the kept open counts and the static spots', size
+/// floor's and coverage's answers. Each reads the label files, so every label write the Review and
+/// Refine routes make outside a single review save (a bulk tool or spot edit that changed a frame,
+/// an import, a rescan, the Refine tab's own writes) calls this, all four alike: dropping some
+/// left the others stale (QA-091).
+pub(super) fn label_files_changed() {
+    OPEN.forget();
+    super::refine_spots::forget();
+    super::refine_floor::forget();
+    super::refine_coverage::forget();
 }
 
 /// Count the open suggestions of `dir` now and keep the answer, as the Refine tab does; whether
@@ -1253,6 +1265,27 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    /// QA-091: one call drops all four Refine caches (other tests may drop them too meanwhile,
+    /// so each count only has to have moved).
+    #[test]
+    fn label_files_changed_drops_every_refine_cache() {
+        let counts = || {
+            (
+                OPEN.generation.load(Ordering::SeqCst),
+                super::super::refine_spots::forgotten(),
+                super::super::refine_floor::forgotten(),
+                super::super::refine_coverage::forgotten(),
+            )
+        };
+        let before = counts();
+        label_files_changed();
+        let after = counts();
+        assert!(after.0 > before.0, "open counts");
+        assert!(after.1 > before.1, "static spots");
+        assert!(after.2 > before.2, "size floor");
+        assert!(after.3 > before.3, "coverage");
+    }
 
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("bo_refine_{}", uuid::Uuid::new_v4()));

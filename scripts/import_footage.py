@@ -614,6 +614,35 @@ def self_test() -> int:
     gen.close()
     assert not any(t.name == "embed-prefetch" for t in threading.enumerate()), "the thread stops on close"
     assert list(prefetched([])) == []
+
+    # QA-105: a playlist is refused before any download; one video is read, then downloaded.
+    class StubYdl:
+        def __init__(self, probe, full=None):
+            self.probe, self.full, self.calls = probe, full, []
+
+        def extract_info(self, url, download=True, process=True):
+            self.calls.append((download, process))
+            if download:
+                return self.full
+            return self.probe
+
+    for kind in MANY_VIDEOS:
+        ydl = StubYdl({"_type": kind, "entries": iter(())})
+        try:
+            download_one(ydl, "https://example.com/list")
+            raise AssertionError(f"a {kind} was not refused")
+        except SystemExit as e:
+            assert "is a playlist" in str(e), e
+        assert ydl.calls == [(False, False)], ydl.calls
+    ydl = StubYdl({"_type": "url", "url": "https://example.com/v"}, {"id": "v", "title": "t"})
+    assert download_one(ydl, "https://example.com/v")["id"] == "v"
+    assert ydl.calls == [(False, False), (True, True)], ydl.calls
+    redirect = StubYdl({"_type": "url"}, {"_type": "playlist", "entries": []})
+    try:
+        download_one(redirect, "https://example.com/r")
+        raise AssertionError("a playlist behind a redirect was not refused")
+    except SystemExit as e:
+        assert "is a playlist" in str(e), e
     tmp = Path(tempfile.mkdtemp(prefix="import_footage_selftest_"))
     try:
         try:
@@ -632,6 +661,36 @@ def self_test() -> int:
     return 0
 
 
+# What an unresolved yt-dlp result of more than one video says it is (`_type`).
+MANY_VIDEOS = ("playlist", "multi_video")
+
+
+def download_one(ydl, url: str, download_error=Exception) -> dict:
+    """The info of the one video at `url`, downloaded by `ydl` (a `yt_dlp.YoutubeDL`). A playlist
+    is refused before anything is downloaded: `process=False` returns the unresolved result at
+    once, while `download=False` alone would still resolve every entry, and `noplaylist` only
+    covers a video URL that carries a list."""
+    try:
+        probe = ydl.extract_info(url, download=False, process=False)
+    except download_error as e:
+        fail(f"yt-dlp could not read {url}: {e}")
+    if probe is None:
+        fail(f"{url}: nothing to download (a live stream or a filtered format)")
+    if probe.get("_type") in MANY_VIDEOS:
+        fail(f"{url} is a playlist; give the URL of one video")
+    try:
+        info = ydl.extract_info(url, download=True)
+    except download_error as e:
+        fail(f"yt-dlp could not download {url}: {e}")
+    if info is None:
+        fail(f"{url}: nothing to download (a live stream or a filtered format)")
+    # A URL that only redirects to a playlist resolves to one here (at most its first entry was
+    # fetched: `playlist_items`).
+    if info.get("_type") in MANY_VIDEOS:
+        fail(f"{url} is a playlist; give the URL of one video")
+    return info
+
+
 def fetch_url(a) -> int:
     import yt_dlp
 
@@ -648,6 +707,7 @@ def fetch_url(a) -> int:
         "format": f"bv*[height<={h}][ext=mp4]/bv*[height<={h}]/b[height<={h}]/wv*/w",
         "outtmpl": str(a.out / "video.%(ext)s"),
         "noplaylist": True,
+        "playlist_items": "1",
         "max_filesize": a.max_bytes,
         "match_filter": yt_dlp.utils.match_filter_func("!is_live"),
         "quiet": True,
@@ -661,14 +721,7 @@ def fetch_url(a) -> int:
         "retries": 3,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
-        try:
-            info = ydl.extract_info(a.url, download=True)
-        except yt_dlp.utils.DownloadError as e:
-            fail(f"yt-dlp could not download {a.url}: {e}")
-        if info is None:
-            fail(f"{a.url}: nothing to download (a live stream or a filtered format)")
-        if info.get("_type") == "playlist":
-            fail(f"{a.url} is a playlist; give the URL of one video")
+        info = download_one(ydl, a.url, yt_dlp.utils.DownloadError)
         files = [p for p in a.out.iterdir() if p.is_file() and p.name.startswith("video.") and not p.name.endswith((".part", ".ytdl"))]
         if not files:
             fail(f"{a.url}: no file was written (larger than {a.max_bytes // 1_000_000} MB, or no video-only format up to {h} px)")

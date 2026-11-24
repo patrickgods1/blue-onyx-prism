@@ -35,7 +35,7 @@ path = "src/bin/test_blue_onyx_prism.rs"
 [features]
 default = ["onnxruntime"]
 # ONNX Runtime backend (CUDA, TensorRT, DirectML, CoreML, CPU execution providers).
-onnxruntime = ["dep:ort"]
+onnxruntime = ["dep:ort", "dep:half"]
 
 [dependencies]
 openvino = { version = "=0.11.0", features = ["runtime-linking"] }
@@ -87,7 +87,10 @@ libloading = "0.9"
 # ONNX Runtime (feature `onnxruntime`): the shared library is loaded at runtime (`load-dynamic`),
 # so nothing is linked or downloaded at build time. All `ort` code lives in src/backend/ort.rs.
 # No `api-NN` feature: any ONNX Runtime 1.17+ library loads (`setup-onnxruntime` pins 1.24.4).
-ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["std", "load-dynamic", "tracing", "cuda", "tensorrt", "directml", "coreml"] }
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["std", "load-dynamic", "tracing", "cuda", "tensorrt", "directml", "coreml", "half"] }
+# ort's `half` feature: f16 model outputs are read as `half::f16` and widened to f32, as the
+# OpenVINO backend does (feature `onnxruntime` only; ort names the type, it does not re-export it).
+half = { version = "2.7", optional = true, default-features = false }
 arc-swap = "1"
 fs4 = { version = "1.1.0", default-features = false, features = ["sync"] }
 # The HTTP listener (`server::serve_on`): hyper with a timer, so request-head and idle

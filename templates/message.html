@@ -5,6 +5,6 @@
 <h1>{{ heading }}</h1>
 <p{% if restarting %} class="notice" id="restart-banner"{% endif %}>{{ message }}</p>
 {% if restarting %}
-<p class="muted" id="restart-status" data-target="{{ refresh_url }}" data-generation="{{ generation }}">Waiting for the server&hellip;</p>
+<p class="muted" id="restart-status" data-target="{{ refresh_url }}" data-generation="{{ generation }}" data-epoch="{{ epoch }}">Waiting for the server&hellip;</p>
 {% endif %}
 {% endblock %}

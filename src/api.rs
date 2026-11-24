@@ -131,8 +131,29 @@ pub struct VersionInfo {
 }
 
 impl VersionInfo {
+    /// `[v]major.minor.patch[-pre][+build]` (segments past the third are ignored). A semver
+    /// pre-release (`-rc.1`: ASCII letters, digits, dots and hyphens) is kept in `preRelease`;
+    /// build metadata (`+build5`) is dropped, as semver gives it no order (QA-068: a tag with
+    /// either failed the whole update check). Equality and order look at the three numbers
+    /// only, so `0.3.0-rc.1` is the same version as `0.3.0` here (GitHub's latest release is
+    /// never a pre-release).
     pub fn parse(version_str: &str, release_notes: Option<String>) -> anyhow::Result<Self> {
-        let v = version_str.trim().trim_start_matches('v');
+        let full = version_str.trim().trim_start_matches('v');
+        let (v, build) = full
+            .split_once('+')
+            .map_or((full, None), |(v, b)| (v, Some(b)));
+        let (v, pre) = v.split_once('-').map_or((v, None), |(v, p)| (v, Some(p)));
+        let well_formed = |s: &str| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        };
+        if let Some(p) = pre.filter(|p| !well_formed(p)) {
+            anyhow::bail!("Failed to parse the pre-release '{p}' of '{version_str}'");
+        }
+        if let Some(b) = build.filter(|b| !well_formed(b)) {
+            anyhow::bail!("Failed to parse the build metadata '{b}' of '{version_str}'");
+        }
         let parts: Vec<_> = v.split('.').collect();
         let seg = |i: usize, name: &str| -> anyhow::Result<u8> {
             parts
@@ -145,6 +166,7 @@ impl VersionInfo {
             major: seg(0, "major")?,
             minor: seg(1, "minor")?,
             patch: seg(2, "patch")?,
+            preRelease: pre.map(str::to_string),
             releaseNotes: release_notes.unwrap_or_default(),
             ..Default::default()
         })
@@ -183,6 +205,35 @@ mod tests {
             VersionInfo::parse("1.2.3", Some("notes".into())).unwrap()
         );
         assert!(VersionInfo::parse("1.2", None).is_err());
+    }
+
+    /// QA-068: a pre-release or build suffix is kept or dropped, never a parse failure; a
+    /// malformed one still is.
+    #[test]
+    fn version_with_a_pre_release_or_build_suffix_parses() {
+        let rc = VersionInfo::parse("v0.3.0-rc.1", None).unwrap();
+        assert_eq!(
+            (rc.major, rc.minor, rc.patch, rc.preRelease.as_deref()),
+            (0, 3, 0, Some("rc.1"))
+        );
+        let b = VersionInfo::parse("0.3.0+build5", None).unwrap();
+        assert_eq!((b.patch, b.preRelease), (0, None));
+        let both = VersionInfo::parse("1.2.3-beta-2+exp.sha.5114f85", None).unwrap();
+        assert_eq!(
+            (both.patch, both.preRelease.as_deref()),
+            (3, Some("beta-2"))
+        );
+        assert!(VersionInfo::parse("0.2.0", None).unwrap() < rc);
+        for bad in [
+            "1.2.3-",
+            "1.2.3+",
+            "1.2.3-rc 1",
+            "1.2.3-<b>",
+            "1.-2.3",
+            "1.2.x-rc",
+        ] {
+            assert!(VersionInfo::parse(bad, None).is_err(), "{bad}");
+        }
     }
 
     /// The in-process `dropped` kind never reaches the wire: a dropped answer serializes to the

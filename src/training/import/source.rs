@@ -349,6 +349,16 @@ fn host_of(url: &str) -> Option<String> {
     (!h.is_empty()).then_some(h)
 }
 
+/// The site a URL import names its camera after when none is given: the URL's host without
+/// credentials, port, brackets or a leading `www.` ([`host_of`]; QA-107: never the user name of
+/// `https://user:pw@host/`), else `web`.
+pub(super) fn site_of(url: &str) -> String {
+    host_of(&url.trim().to_ascii_lowercase())
+        .map(|h| h.trim_start_matches("www.").to_string())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "web".into())
+}
+
 /// Name endings that only ever mean this machine or the local network, whatever a resolver
 /// answers.
 const INTERNAL_SUFFIXES: [&str; 3] = [".localhost", ".local", ".internal"];
@@ -764,6 +774,26 @@ pub fn camera_of(file: &Path, camera: Option<&str>) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// QA-107: credentials, a port, `www.`, capitals and an IPv6 literal never name the camera.
+    #[test]
+    fn a_url_imports_camera_is_named_after_its_host() {
+        assert_eq!(
+            site_of("https://user:pw@www.Example.com:8443/v.mp4"),
+            "example.com"
+        );
+        assert_eq!(site_of("HTTPS://example.com/v.mp4?x=1"), "example.com");
+        assert_eq!(site_of("https://[2001:db8::1]:443/v.mp4"), "2001:db8::1");
+        assert_eq!(site_of("ftp://example.com/v.mp4"), "web");
+        let clip = Path::new("video.mp4");
+        assert_eq!(
+            camera_of(
+                clip,
+                Some(&site_of("https://user:pw@www.Example.com:8443/v.mp4"))
+            ),
+            camera_of(clip, Some("example.com"))
+        );
+    }
 
     /// Every spelling of an internal address is refused without touching the network.
     #[test]

@@ -171,14 +171,26 @@ fn from_report(r: &StatusReport) -> (Health, String) {
             Health::Ready,
             format!("running \u{2014} {}", models_ready(usable)),
         ),
-        "degraded" => (
-            Health::Degraded,
-            format!(
-                "running \u{2014} {} of {total} model{} failed",
-                failed.len(),
-                if total == 1 { "" } else { "s" }
-            ),
-        ),
+        // Degraded is also "one serves while another still loads" (QA-069): name what it is.
+        "degraded" => {
+            let loading = r
+                .models
+                .iter()
+                .filter(|m| m.state == "initializing")
+                .count();
+            let (n, what) = if failed.is_empty() && loading > 0 {
+                (loading, "loading")
+            } else {
+                (failed.len(), "failed")
+            };
+            (
+                Health::Degraded,
+                format!(
+                    "running \u{2014} {n} of {total} model{} {what}",
+                    if total == 1 { "" } else { "s" }
+                ),
+            )
+        }
         "initializing" => {
             let detail = r
                 .models
@@ -354,6 +366,25 @@ mod tests {
         assert_eq!(d.status_line, "Blue Onyx Prism: failed (b: no GPU found)");
         assert_eq!(d.color, IconColor::Red);
         assert!(d.can_stop && d.can_restart && d.can_open_ui && !d.can_start);
+    }
+
+    #[test]
+    fn degraded_while_a_model_loads_says_loading() {
+        // QA-069: /v1/status is 200 "degraded" while one model serves and another loads.
+        let http = answer(
+            200,
+            "degraded",
+            vec![
+                model("a", "ready", None),
+                model("b", "initializing", Some("compiling on GPU")),
+            ],
+        );
+        let d = show(Some(ServiceState::Running), &http);
+        assert_eq!(d.health, Health::Degraded);
+        assert_eq!(
+            d.status_line,
+            "Blue Onyx Prism: running \u{2014} 1 of 2 models loading"
+        );
     }
 
     #[test]

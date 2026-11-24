@@ -123,14 +123,17 @@ pub(crate) fn agreement(
     reference: &[Detection],
     reference_spec: &str,
 ) -> Agreement {
-    let c: Comparison = compare(device, reference, MATCH_IOU);
-    let mut a = verdict_of(
-        &c,
-        image_score(&c, device.len(), reference.len()),
-        reference_spec,
-    );
+    let (c, score) = detections_comparison(device, reference);
+    let mut a = verdict_of(&c, score, reference_spec);
     a.images = 1;
     a
+}
+
+/// One image's comparison and its [`image_score`].
+fn detections_comparison(device: &[Detection], reference: &[Detection]) -> (Comparison, f32) {
+    let c: Comparison = compare(device, reference, MATCH_IOU);
+    let score = image_score(&c, device.len(), reference.len());
+    (c, score)
 }
 
 /// One image's agreement score: `matched / max(n_device, n_reference)`, 1 when both are empty.
@@ -141,14 +144,8 @@ fn image_score(c: &Comparison, n_device: usize, n_reference: usize) -> f32 {
     }
 }
 
-/// Agreement of `device`'s detections with `reference`'s, image by image over the images both
-/// ran (matched by set and file name, B7), both at the same threshold, so the only difference
-/// left is the hardware path (a broken kernel, an FP16 overflow), never the user's saved
-/// confidence profiles: [`agreement_threshold`] applied to both sides ([`agreement_dets`]). The
-/// score is the mean per-image score ([`image_score`]), the counts and confidence differences
-/// are summed over those images. Two runs without per-image results (results of old versions)
-/// compare their first image's detections; runs that share no image are
-/// [`Verdict::NotChecked`].
+/// Agreement of `device`'s detections with `reference`'s: [`paired_comparison`] turned into a
+/// verdict; runs that share no image are [`Verdict::NotChecked`].
 pub(crate) fn run_agreement(
     device: &RunResult,
     reference: &RunResult,
@@ -156,6 +153,33 @@ pub(crate) fn run_agreement(
 ) -> Agreement {
     if device.per_image.is_empty() && reference.per_image.is_empty() {
         return agreement(&device.detections, &reference.detections, reference_spec);
+    }
+    let Some((c, score, images)) = paired_comparison(device, reference) else {
+        return Agreement {
+            reference: reference_spec.to_string(),
+            ..Agreement::not_checked()
+        };
+    };
+    let mut a = verdict_of(&c, score, reference_spec);
+    a.images = images;
+    a
+}
+
+/// `device`'s detections against `reference`'s, image by image over the images both ran
+/// (matched by set and file name, B7), both at the same threshold, so the only difference left
+/// is the hardware path (a broken kernel, an FP16 overflow), never the user's saved confidence
+/// profiles: [`agreement_threshold`] applied to both sides ([`agreement_dets`]). Returns the
+/// summed comparison (`only_primary` = only on `device`), the mean per-image score
+/// ([`image_score`]) and the images compared. Two runs without per-image results (results of
+/// old versions) compare their first image's detections; None = the runs share no image. The
+/// sweep's agreement ([`run_agreement`]) and `--compare-cpu` both use it (QA-049).
+pub(crate) fn paired_comparison(
+    device: &RunResult,
+    reference: &RunResult,
+) -> Option<(Comparison, f32, usize)> {
+    if device.per_image.is_empty() && reference.per_image.is_empty() {
+        let (c, score) = detections_comparison(&device.detections, &reference.detections);
+        return Some((c, score, 1));
     }
     let (source, t) = agreement_threshold(device, reference);
     // A name listed twice (a hand-made set) pairs its occurrences in order.
@@ -183,19 +207,14 @@ pub(crate) fn run_agreement(
         total.merge(&c);
     }
     if n == 0 {
-        return Agreement {
-            reference: reference_spec.to_string(),
-            ..Agreement::not_checked()
-        };
+        return None;
     }
     #[allow(
         clippy::cast_possible_truncation,
         reason = "a mean of scores in 0..=1, kept as f32 like the other fields"
     )]
     let score = (sum / n as f64) as f32;
-    let mut a = verdict_of(&total, score, reference_spec);
-    a.images = n;
-    a
+    Some((total, score, n))
 }
 
 /// Which predictions [`run_agreement`] compares.
@@ -2441,6 +2460,46 @@ mod tests {
         }
         let a = run_agreement(&broken, &cpu, "openvino:cpu");
         assert_ne!(a.verdict, Verdict::Agrees, "{a:?}");
+    }
+
+    /// QA-049: `--compare-cpu` pairs the runs through [`paired_comparison`], both at one
+    /// threshold: a GPU profile at 0.3 and a CPU one at 0.5 over the same raw boxes leave no box
+    /// "only on the device" (zipping the stored predictions counted the 0.4 box as one).
+    #[test]
+    fn compare_cpu_ignores_saved_threshold_profiles() {
+        let boxes = |t: f32| -> Vec<Detection> {
+            [
+                det("person", 0.9, [0, 0, 50, 80]),
+                det("car", 0.4, [200, 0, 300, 80]),
+            ]
+            .into_iter()
+            .filter(|d| d.confidence >= t)
+            .collect()
+        };
+        let run_at = |spec: &str, t: f32| {
+            let mut r = run(spec, 10.0, vec![]);
+            r.served_threshold = Some(t);
+            r.per_image = vec![image_run("a.jpg", boxes(t)), image_run("b.jpg", boxes(t))];
+            r
+        };
+        let (gpu, cpu) = (run_at("openvino:gpu", 0.3), run_at("openvino:cpu", 0.5));
+        let (c, score, images) = paired_comparison(&gpu, &cpu).unwrap();
+        assert_eq!(
+            (c.matched, c.only_primary, c.only_cpu, score, images),
+            (2, 0, 0, 1.0, 2)
+        );
+        // Images paired by name, not position.
+        let mut swapped = cpu.clone();
+        swapped.per_image.reverse();
+        swapped.per_image[0].preds.clear();
+        let (c, _, _) = paired_comparison(&gpu, &swapped).unwrap();
+        assert_eq!((c.matched, c.only_primary), (1, 1));
+        // No image in common: nothing compared.
+        let mut other = cpu.clone();
+        for i in &mut other.per_image {
+            i.file = format!("x-{}", i.file);
+        }
+        assert!(paired_comparison(&gpu, &other).is_none());
     }
 
     /// B7: only a checked, agreeing device (or the reference) is recommended: a faster device

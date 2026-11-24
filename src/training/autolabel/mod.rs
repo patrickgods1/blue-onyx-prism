@@ -247,8 +247,18 @@ impl FrameFilter {
     /// Parse `text` (empty = defaults: every frame, unreviewed). `default_status` is used when
     /// `status` is not given.
     pub fn parse(text: &str, default_status: &str) -> Result<Self> {
+        Self::parse_with_default(text, default_status, DEFAULT_LIMIT)
+    }
+
+    /// [`Self::parse`] with `default_limit` when `limit` is not given (the overlap check's larger
+    /// one). Decided by the parsed keys, never by the text (QA-106: `limit = 7`, `LIMIT=7`).
+    pub fn parse_with_default(
+        text: &str,
+        default_status: &str,
+        default_limit: usize,
+    ) -> Result<Self> {
         let mut query = BTreeMap::new();
-        let mut limit = DEFAULT_LIMIT;
+        let mut limit = default_limit;
         for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             let (k, v) = part
                 .split_once('=')
@@ -734,7 +744,7 @@ pub fn preview_autolabel(
         && let Some(a) = preview_accelerator(job.request.gpu.as_deref())
     {
         // First: a run that cannot load matters more than anything about its frames.
-        let gpu = gpu_notes(&job.request, &a);
+        let gpu = gpu_notes(&job.request, &job.classes, &a);
         p.warnings.splice(0..0, gpu);
     }
     if let Some(m) = commit_preview(&job.request, &job.classes, (job.headroom)().as_ref()) {
@@ -809,14 +819,20 @@ fn commit_line(m: &super::commit::Preview) -> String {
     )
 }
 
-/// What the preview and the run say about the labelers' GPU `a`: a labeler the card cannot hold
+/// What the preview and the run say about the labelers' GPU `a` for a run on `classes`: a labeler the card cannot hold
 /// ([`memory::too_big`], which [`plan_autolabel`] refuses) or too little free memory now
 /// ([`memory::gpu_warning`]).
-pub fn gpu_notes(request: &AutolabelRequest, a: &super::capability::Accelerator) -> Vec<String> {
-    if let Some(e) = memory::too_big(request, a.memory_mb(), &a.choice_label()) {
+pub fn gpu_notes(
+    request: &AutolabelRequest,
+    classes: &[String],
+    a: &super::capability::Accelerator,
+) -> Vec<String> {
+    if let Some(e) = memory::too_big(request, classes, a.memory_mb(), &a.choice_label()) {
         return vec![format!("This run would be refused: {e}.")];
     }
-    memory::gpu_warning(request, a).into_iter().collect()
+    memory::gpu_warning(request, classes, a)
+        .into_iter()
+        .collect()
 }
 
 /// Plan an auto-label run of `request` on `config`, the config file at `config_path` (fails fast
@@ -867,10 +883,10 @@ pub fn plan_autolabel(
             .map(|r| (r, super::pyenv::weights_dir(paths, r)))
             .collect();
         super::pyenv::check_large(&list, allow_large)?;
-        if let Some(e) = memory::too_big(request, a.memory_mb(), &a.choice_label()) {
+        if let Some(e) = memory::too_big(request, &job.classes, a.memory_mb(), &a.choice_label()) {
             bail!(e);
         }
-        if let Some(w) = memory::gpu_warning(request, a) {
+        if let Some(w) = memory::gpu_warning(request, &job.classes, a) {
             tracing::warn!("auto-label: {w}");
         }
         request.gpu = super::capability::gpu_arg(request.gpu.as_deref())?.map(|_| a.device_arg());
@@ -909,7 +925,8 @@ pub fn frame_of_file(file: &str) -> Option<String> {
 
 /// The frames `model` trained on (`<scene>/<camera>/<date>/<stem>.jpg`, each once, however often
 /// balancing repeated it): its `<stem>.provenance.json` beside the model file names the run, whose
-/// `<training dir>/<run_id>/data/train.txt` lists them. Validation and held-out frames are not in
+/// `<training dir>/<run_id>/data/train.txt` lists them, each read as the frame it was made from
+/// ([`crate::training::dataset::seen_sources`]). Validation and held-out frames are not in
 /// that list. A model without the record (a catalog or plain local model) trained on nothing of
 /// here as far as anyone can tell: a warning, no frames. A record that does not read, or a run
 /// whose list is gone, is an error: the frames cannot be left out, and the model would be asked
@@ -967,37 +984,29 @@ pub fn seen_frames(
             )
         })?;
     let data = super::training_dir(config).join(&run).join("data");
-    let list = data.join("train.txt");
-    let text = std::fs::read_to_string(&list).map_err(|e| {
+    // QA-104: each listed image as the frame it was made from (`image_sources.json`), so a name
+    // the dataset cut or numbered still names its frame.
+    let seen = crate::training::dataset::seen_sources(&data).map_err(|e| {
         anyhow!(
-            "{name} was trained in run {run}, but its frame list {} does not read ({e}), so the \
-             frames it trained on cannot be left out; restore that run folder, or choose a model \
-             whose run folder still exists",
-            list.display()
+            "{name} was trained in run {run}, but its frame lists in {} do not read ({e:#}), so \
+             the frames it trained on cannot be left out; restore that run folder, or choose a \
+             model whose run folder still exists",
+            data.display()
         )
     })?;
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let frames: BTreeSet<String> = lines.iter().filter_map(|l| trained_frame(l)).collect();
-    let other = lines.iter().filter(|l| trained_frame(l).is_none()).count();
+    let frame = |s: &String| crate::collect::labels::export::parse_flat_name(s).map(|r| r.jpg());
+    let frames: BTreeSet<String> = seen.train.iter().filter_map(frame).collect();
+    let other = seen.train.iter().filter(|s| frame(s).is_none()).count();
     if other > 0 {
         warnings.push(format!(
             "{other} of the {} lines of {} name no frame of a dataset folder (public images, or a \
              name cut short); a frame among them is not left out",
-            lines.len(),
-            list.display()
+            seen.train.len(),
+            data.join("train.txt").display()
         ));
     }
-    let valid_list = data.join("valid.txt");
-    let valid = match std::fs::read_to_string(&valid_list) {
-        Ok(t) => t.lines().filter_map(trained_frame).collect(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
-        Err(e) => bail!(
-            "{name} was trained in run {run}, but its validation list {} does not read ({e}), so \
-             the frames it validated on cannot be left out; restore that run folder, or choose \
-             another model",
-            valid_list.display()
-        ),
-    };
+    warnings.extend(seen.notes);
+    let valid = seen.valid.iter().filter_map(frame).collect();
     Ok(Seen {
         train: frames,
         valid,
@@ -1406,6 +1415,65 @@ mod tests {
         assert_eq!(got, want);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].starts_with("1 of the 5 lines"), "{warnings:?}");
+    }
+
+    /// QA-104: a name the dataset cut (and numbered) still names its frame through the run's
+    /// `image_sources.json`, for the training and the validation list alike.
+    #[test]
+    fn a_cut_image_name_is_its_source_frame_by_the_runs_record() {
+        use crate::training::dataset::names;
+        let t = tmp("trained-cut");
+        let (config, entry) = trained_setup(&t.0, "20261031-2");
+        let data = crate::training::training_dir(&config)
+            .join("20261031-2")
+            .join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        // A 60-byte camera and stem (both under the dataset's 64): 143 bytes with the prefix.
+        let camera = format!("back-yard-{}", "c".repeat(50));
+        let long = format!("day.{camera}.2026-10-25.{}.jpg", "x".repeat(60));
+        let mut used = std::collections::BTreeSet::new();
+        let first = names::image_name(0, &long, &mut used).image;
+        let second = names::image_name(0, &long, &mut used).image;
+        assert!(second.contains("-2."), "{second}");
+        let valid_src = format!("night.{camera}.2026-10-26.{}.jpg", "v".repeat(60));
+        let valid_name = names::image_name(1, &valid_src, &mut used).image;
+        std::fs::write(
+            data.join("train.txt"),
+            format!("./images/{first}\n./images/{second}\n"),
+        )
+        .unwrap();
+        std::fs::write(data.join("valid.txt"), format!("./images/{valid_name}\n")).unwrap();
+        let other = long.replace("x.jpg", "y.jpg");
+        std::fs::write(
+            data.join(crate::training::dataset::IMAGE_SOURCES_FILE),
+            serde_json::json!({
+                first.clone(): format!("/exports/a/images/train/{long}"),
+                second.clone(): format!("/exports/b/images/train/{other}"),
+                valid_name.clone(): format!("/exports/a/images/train/{valid_src}"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let seen = seen_frames(&config, &entry, &mut warnings).unwrap();
+        let stem = |f: &str| {
+            crate::collect::labels::export::parse_flat_name(f)
+                .unwrap()
+                .jpg()
+        };
+        assert_eq!(
+            seen.train,
+            [stem(&long), stem(&other)]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(seen.valid, [stem(&valid_src)].into_iter().collect());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Without the record a cut name is read as it is: its stem is cut, so it is not the
+        // frame (the old datasets' whole-name cut reads as no frame at all, with a warning).
+        std::fs::remove_file(data.join(crate::training::dataset::IMAGE_SOURCES_FILE)).unwrap();
+        let seen = seen_frames(&config, &entry, &mut warnings).unwrap();
+        assert!(!seen.train.contains(&stem(&long)), "{:?}", seen.train);
     }
 
     #[test]

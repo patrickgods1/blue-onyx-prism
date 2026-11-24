@@ -33,8 +33,10 @@ pub(super) fn parse_form(body: &[u8]) -> Vec<(String, String)> {
             match c {
                 b'+' => out.push(b' '),
                 b'%' => {
+                    // Two hex digits only: `from_str_radix` alone takes `%+5` as 0x05.
                     let hex = b
                         .get(i + 1..i + 3)
+                        .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
                         .and_then(|h| std::str::from_utf8(h).ok())
                         .and_then(|h| u8::from_str_radix(h, 16).ok());
                     match hex {
@@ -593,6 +595,15 @@ mod tests {
         assert_eq!(f[1].1, "b c");
         assert_eq!(f[3].1, "%zz");
         assert_eq!(f[4], ("k".into(), String::new()));
+    }
+
+    /// q-extras [17]: `%` takes two hex digits only; `from_str_radix` alone read `%+5` as 0x05.
+    #[test]
+    fn a_percent_without_two_hex_digits_is_kept_literally() {
+        let f = parse_form(b"a=%+5&b=%-1x&c=%41%4");
+        assert_eq!(f[0].1, "% 5");
+        assert_eq!(f[1].1, "%-1x");
+        assert_eq!(f[2].1, "A%4");
     }
 
     #[test]

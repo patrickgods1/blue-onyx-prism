@@ -28,9 +28,9 @@ use crate::benchmark::report::{HardwareSummary, RuntimeVersions};
 use crate::benchmark::service::breadcrumb::{self, Trail};
 use crate::benchmark::threshold::Objective;
 use crate::benchmark::{
-    Bench, BenchmarkResults, Comparison, Job, MATCH_IOU, ModelResult, Phase, SweepOptions, compare,
-    config_models, configured_device, export, job_as_served, job_for_config, job_for_file,
-    no_pseudo_gt_device, pick_reference, pseudo_ground_truth, pseudo_gt_device, results_path,
+    Bench, BenchmarkResults, Job, ModelResult, Phase, SweepOptions, config_models,
+    configured_device, export, job_as_served, job_for_config, job_for_file, no_pseudo_gt_device,
+    pick_reference, pseudo_ground_truth, pseudo_gt_device, results_path,
 };
 use crate::config::{Config, DatasetRef, ModelConfig};
 use crate::config_form::{
@@ -1229,20 +1229,14 @@ impl RunCtx<'_> {
             } else {
                 match bench.run(self.runtimes, job, "CPU") {
                     Ok(cpu) => {
-                        let mut c = Comparison::default();
-                        for (a, b) in model_report.primary.per_image.iter().zip(&cpu.per_image) {
-                            let a: Vec<_> = a
-                                .preds
-                                .iter()
-                                .map(crate::benchmark::Detection::from)
-                                .collect();
-                            let b: Vec<_> = b
-                                .preds
-                                .iter()
-                                .map(crate::benchmark::Detection::from)
-                                .collect();
-                            c.merge(&compare(&a, &b, MATCH_IOU));
-                        }
+                        // QA-049: both runs at one threshold, paired by image name, like the
+                        // sweep's agreement (saved device profiles are no disagreement).
+                        let c = crate::benchmark::report::paired_comparison(
+                            &model_report.primary,
+                            &cpu,
+                        )
+                        .map(|(c, _, _)| c)
+                        .unwrap_or_default();
                         model_report.comparison = Some(c);
                         model_report.cpu = Some(cpu);
                     }

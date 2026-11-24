@@ -378,9 +378,23 @@ fn resolve(cfg: &Config, raw: &str, trust_picked: bool) -> Result<PathBuf, Brows
     Ok(plain(&canon))
 }
 
-/// `p` without the Windows verbatim prefix ([`display`]); unchanged elsewhere.
+/// `p` without the Windows verbatim prefix ([`display`]); unchanged elsewhere, so a name that
+/// is not valid UTF-8 (Linux allows any bytes) stays the folder it names rather than a lossy
+/// spelling with U+FFFD that does not exist (extra [16]; [`super::pick`] does the same).
 pub(super) fn plain(p: &Path) -> PathBuf {
-    PathBuf::from(display(p))
+    #[cfg(windows)]
+    {
+        // Only a path that is valid Unicode is rewritten; any other stays as it is.
+        if p.to_str().is_some() {
+            PathBuf::from(display(p))
+        } else {
+            p.to_path_buf()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        p.to_path_buf()
+    }
 }
 
 /// `shown` is what the client asked for (never a path the server resolved).
@@ -487,6 +501,17 @@ pub(super) fn list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extra [16]: a folder name that is not valid UTF-8 keeps its bytes (no U+FFFD spelling of
+    /// a folder that does not exist).
+    #[cfg(unix)]
+    #[test]
+    fn plain_keeps_a_name_that_is_not_utf8() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let p = Path::new("/srv").join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+        assert_eq!(plain(&p), p);
+        assert_eq!(plain(Path::new("/srv/x")), Path::new("/srv/x"));
+    }
 
     fn setup() -> (PathBuf, Config) {
         let root = std::env::temp_dir().join(format!("bop-browse-{}", uuid::Uuid::new_v4()));

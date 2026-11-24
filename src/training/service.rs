@@ -63,6 +63,7 @@ use super::job::{
 };
 use super::progress::{EpochPoint, TrainProgress};
 use super::task::{self, Task, TaskContext, TaskRecord, TaskReport};
+use crate::model::name::same_model_name;
 use crate::resources::export::{CommandRunner, Fetcher, PausableRunner};
 use crate::storage::busy;
 use crate::sync::LockExt;
@@ -1206,7 +1207,10 @@ impl TrainingService {
             }
             // Under the runs lock too: a store move cannot come between the check and the push.
             self.inner.refuse_guest()?;
-            if runs.iter().any(|r| r.state.is_busy() && r.name == job.name) {
+            if runs
+                .iter()
+                .any(|r| r.state.is_busy() && same_model_name(&r.name, &job.name))
+            {
                 return Err(format!(
                     "a run training {} is already queued or running",
                     job.name
@@ -1245,7 +1249,10 @@ impl TrainingService {
                 return Err(STOPPED.into());
             }
             self.inner.refuse_guest()?;
-            if runs.iter().any(|r| r.state.is_busy() && r.name == job.name) {
+            if runs
+                .iter()
+                .any(|r| r.state.is_busy() && same_model_name(&r.name, &job.name))
+            {
                 return Err(format!(
                     "a run training {} is already queued or running",
                     job.name

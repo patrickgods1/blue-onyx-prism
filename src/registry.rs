@@ -119,7 +119,8 @@ fn default_by_name(
         .or((served > 0).then_some(0))
 }
 
-/// Decode + preprocess threads of a generation: the configured `preprocess_threads`, else the
+/// Decode + preprocess threads of a generation: the configured `preprocess_threads` (at most
+/// [`crate::profile::MAX_PREPROCESS_THREADS_SETTING`], warned about once above it), else the
 /// profile's, capped when every model is headed for a CPU device (`planned`: the first runnable
 /// device of each model, None when nothing can run).
 pub fn preprocess_threads(
@@ -128,9 +129,11 @@ pub fn preprocess_threads(
     planned: &[Option<crate::backend::spec::Device>],
 ) -> usize {
     if config.preprocess_threads > 0 {
-        return config
-            .preprocess_threads
-            .min(crate::profile::MAX_PREPROCESS_THREADS * 4);
+        let cap = crate::profile::MAX_PREPROCESS_THREADS_SETTING;
+        if config.preprocess_threads > cap {
+            crate::profile::warn_capped("", "preprocess_threads", config.preprocess_threads, cap);
+        }
+        return config.preprocess_threads.min(cap);
     }
     let mut known = planned.iter().flatten().peekable();
     let all_cpu =
@@ -484,6 +487,10 @@ impl Spawner {
             return handle;
         }
 
+        let concurrency =
+            crate::worker::Concurrency::for_model(self.profile.clone(), config, &model);
+        // Once per model and value, not per load (QA-120).
+        concurrency.overrides.warn_if_capped(&name);
         let cfg = WorkerConfig {
             name,
             device,
@@ -493,11 +500,7 @@ impl Spawner {
             queue_size: config.worker_queue_size,
             lazy,
             can_use_gpu: self.can_use_gpu,
-            concurrency: Some(crate::worker::Concurrency::for_model(
-                self.profile.clone(),
-                config,
-                &model,
-            )),
+            concurrency: Some(concurrency),
             model,
             wait,
             prep: Some(self.prep.clone()),
@@ -627,6 +630,21 @@ struct Stop {
 }
 
 impl Stop {
+    /// How [`ModelRegistry::replace_at_once`] stops the worker it took out of the slot, whose
+    /// replacement waits on `gate` (when there is one): a worker that `serves` (Ready, not
+    /// stuck) finishes its requests and the replacement need not wait for it (`gate` opens now);
+    /// a failed or stuck one stops first ([`Self::first`]).
+    fn replaced(old: &WorkerHandle, serves: bool, gate: Option<LoadGate>) -> Self {
+        match gate {
+            Some(gate) if !serves => Self::first(gate),
+            Some(gate) => {
+                gate.open();
+                Self::draining(old)
+            }
+            None => Self::draining(old),
+        }
+    }
+
     /// A worker that served: its requests finish (the handle's sender goes away with the last
     /// HTTP handler that uses it, and the worker exits once its channel is empty), at most the
     /// request timeout plus a second.
@@ -839,7 +857,14 @@ impl Served {
             if s.pending.get(key).is_none_or(|r| r.id != id) {
                 return false;
             }
-            s.pending.remove(key).and_then(|r| s.install(key, r.slot))
+            let Some(r) = s.pending.remove(key) else {
+                return false;
+            };
+            // QA-119: a replacement loaded beside the old worker left the stats alone, and the
+            // swap thread that would hand them over sees it taken over and returns. It now loads
+            // from scratch: its requested device, no execution provider yet (leaf locks).
+            r.slot.handle.metrics.begin_load(r.requested);
+            s.install(key, r.slot)
         };
         let Some(old) = old else {
             return false;
@@ -1628,7 +1653,18 @@ impl ModelRegistry {
         let (old, stale) = {
             let mut s = self.write();
             let stale = s.pending.remove(key);
-            let old = s.by_name.get(key).copied().map(|i| s.workers.remove(i));
+            let old = s
+                .by_name
+                .get(key)
+                .copied()
+                .filter(|&i| i < s.workers.len())
+                .map(|i| s.workers.remove(i));
+            // Decided from the worker actually removed (QA-122): a background replacement may
+            // have taken over, Ready, since the caller looked.
+            let old = old.map(|o| {
+                let serves = o.handle.state.is_ready() && !o.handle.is_stuck();
+                (o, serves)
+            });
             s.workers.push(slot);
             *s.reloads.entry(key.to_string()).or_default() += u64::from(old.is_some());
             s.reindex(config);
@@ -1637,11 +1673,8 @@ impl ModelRegistry {
         self.discard(stale);
         // The new worker waits on this gate, so it opens whatever happens here.
         let mut opens = OpensGate(freed);
-        if let Some(old) = old {
-            let how = match opens.0.take() {
-                Some(gate) => Stop::first(gate),
-                None => Stop::draining(&old.handle),
-            };
+        if let Some((old, serves)) = old {
+            let how = Stop::replaced(&old.handle, serves, opens.0.take());
             self.served.retire(old, how);
         }
         text
@@ -1960,7 +1993,7 @@ mod tests {
             CancellationToken::new(),
         );
         gate.open();
-        state.set_initializing("downloading 42%");
+        state.set_waiting_for_download("downloading 42%");
         let h = wait(state.clone(), gate.clone(), stop.clone());
         std::thread::sleep(Duration::from_millis(600));
         state.set(ModelState::Ready);
@@ -2228,6 +2261,14 @@ mod tests {
         assert_eq!(preprocess_threads(&c, &profile, &[None]), 3);
         c.preprocess_threads = 6;
         assert_eq!(preprocess_threads(&c, &profile, &[Some(cpu)]), 6);
+        // QA-120: accepted up to 256, applied up to the cap (with a warning, once).
+        c.preprocess_threads = 200;
+        let cap = crate::profile::MAX_PREPROCESS_THREADS_SETTING;
+        assert_eq!(preprocess_threads(&c, &profile, &[Some(gpu)]), cap);
+        assert!(
+            !crate::profile::warn_capped("", "preprocess_threads", 200, cap),
+            "the call above warned"
+        );
     }
 
     #[test]

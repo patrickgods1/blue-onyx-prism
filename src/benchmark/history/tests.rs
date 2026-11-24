@@ -372,8 +372,62 @@ fn compare_with_history_picks_the_baseline() {
     let c = compare_with_history(&[r1, r2], &current);
     assert_eq!(c.baseline.unwrap().run_id, "r2");
     // Entries after the current one are not its baseline.
-    let c = compare_with_history(&[current.clone(), r3], &current);
+    let c = compare_with_history(&[current.clone(), r3.clone()], &current);
     assert!(c.baseline.is_none());
+    // QA-066: not even a pinned one (the change would run backwards).
+    let mut later = r3;
+    later.pinned = true;
+    let c = compare_with_history(&[current.clone(), later], &current);
+    assert!(c.baseline.is_none(), "{c:?}");
+}
+
+/// QA-065: the same image sets listed in another order are the same images.
+#[test]
+fn datasets_in_another_order_are_comparable() {
+    let d = |p50: f64| vec![snap("openvino:cpu", p50, Some(0.8), 300)];
+    let mut a = entry("r1", d(100.0));
+    let mut b = entry("r2", d(50.0));
+    a.settings.datasets = vec!["coco-cctv".into(), "exdark-night".into()];
+    b.settings.datasets = vec!["exdark-night".into(), "coco-cctv".into()];
+    assert_eq!(comparable(&a, &b), Ok(()));
+    let c = compare_with_history(&[a.clone(), b.clone()], &b);
+    assert!(c.comparable, "{c:?}");
+    b.settings.datasets = vec!["exdark-night".into()];
+    let reasons = comparable(&a, &b).unwrap_err();
+    assert_eq!(
+        reasons,
+        ["different datasets: coco-cctv, exdark-night -> exdark-night"]
+    );
+}
+
+/// QA-064: one GPU recorded as `openvino:gpu` in one run and `openvino:gpu.0` in the other is
+/// one device: the runs are comparable and show its speed change.
+#[test]
+fn a_device_spelled_with_or_without_index_0_is_one_device() {
+    let a = entry("r1", vec![snap("openvino:gpu", 100.0, Some(0.8), 300)]);
+    let b = entry("r2", vec![snap("openvino:gpu.0", 50.0, Some(0.8), 300)]);
+    assert_eq!(comparable(&a, &b), Ok(()));
+    assert_eq!(
+        a.device("openvino:gpu.0").map(|d| d.device.as_str()),
+        Some("openvino:gpu")
+    );
+    let c = compare(&a, &b);
+    assert!(c.comparable, "{c:?}");
+    assert_eq!(metric(&c, "p50_ms").verdict, Verdict::Better);
+    // The exact spelling wins over another one naming the same device.
+    let both = entry(
+        "r3",
+        vec![
+            snap("openvino:gpu", 100.0, None, 0),
+            snap("openvino:gpu.0", 40.0, None, 0),
+        ],
+    );
+    assert_eq!(
+        both.device("openvino:gpu.0").unwrap().total_p50_ms,
+        Some(40.0)
+    );
+    // A different GPU stays different.
+    assert!(a.device("openvino:gpu.1").is_none());
 }
 
 #[test]
@@ -1344,6 +1398,12 @@ fn the_goal_metric_changes_only_when_the_intervals_part_and_old_entries_load() {
     assert_eq!(m("goal").verdict, Verdict::Same);
     assert_eq!(m("live_requests_per_min").after, Some(14.0));
     assert!(m("live_requests_per_min").why.contains("14.0"));
+    // QA-067: one sentence, no run of spaces from a wrapped literal.
+    assert!(
+        !m("live_requests_per_min").why.contains("  "),
+        "{}",
+        m("live_requests_per_min").why
+    );
     // An entry of an older version has neither field.
     let old: DeviceSnap = serde_json::from_str(r#"{"device":"ort:cpu"}"#).unwrap();
     assert!(old.goal.is_none() && old.live_requests_per_min.is_none());

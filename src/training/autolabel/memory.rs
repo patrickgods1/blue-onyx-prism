@@ -6,7 +6,10 @@
 //! run, so they add up. A labeler takes about its checkpoint as stored (the script loads each at
 //! the checkpoint's precision: MM-Grounding-DINO, RF-DETR, SAM 3 and MegaDetector v6 (opt-in, on night frames) in f32, Qwen3-VL in bf16 / f16);
 //! SigLIP 2 ranks a few crops per frame on the CPU when other models use the GPU and there are at
-//! most 12 animal classes (the script's `siglip_device`), so it takes nothing there. An import's
+//! most [`SIGLIP_CPU_MAX_ANIMALS`] animal classes (the script's `siglip_device`), so it takes
+//! nothing there; with more (a wildlife class list) it goes on the GPU, counted at its whole
+//! checkpoint: the script moves all of it to the card, beside the labelers already loaded, before
+//! it sends the text tower back to the CPU, so that is the peak. An import's
 //! embeddings put SigLIP 2's vision tower alone on the GPU ([`embed_need`]). The sizes come from the catalog pins, so a new pin
 //! moves them.
 //!
@@ -50,6 +53,7 @@ fn title(key: &str) -> String {
         "qwen3-vl-8b" => "Qwen3-VL 8B".into(),
         "sam3" => "SAM 3".into(),
         "rfdetr-large" => "RF-DETR L".into(),
+        "siglip2-base" => "SigLIP 2".into(),
         super::night::MDV6_MODEL => "MegaDetector v6".into(),
         other => other.into(),
     }
@@ -62,9 +66,24 @@ fn on_gpu(key: &str, res: Option<&'static Resource>) -> Option<OnGpu> {
     })
 }
 
-/// The labelers `r` puts on the GPU, in load order (none for a run with a model, which runs in
-/// this process on its own device). SigLIP 2 is left out: it runs on the CPU beside them.
-pub fn labelers_on_gpu(r: &AutolabelRequest) -> Vec<OnGpu> {
+/// Most animal classes with which SigLIP 2 ranks on the CPU beside labelers on the GPU; more and
+/// it goes on the GPU. The script's `SIGLIP_CPU_MAX_ANIMALS` (a test reads it there, QA-072).
+pub const SIGLIP_CPU_MAX_ANIMALS: usize = 12;
+
+/// The animal classes of `classes` ([`super::Category::Animal`]): what SigLIP 2 ranks, and
+/// whether the script loads it at all (two or more) and where ([`SIGLIP_CPU_MAX_ANIMALS`]).
+fn animal_count(classes: &[String]) -> usize {
+    classes
+        .iter()
+        .filter(|c| super::Category::of(c) == super::Category::Animal)
+        .count()
+}
+
+/// The labelers `r` on `classes` puts on the GPU, in load order (none for a run with a model,
+/// which runs in this process on its own device). SigLIP 2 is in it only as the script's
+/// `siglip_device` puts it there: two or more animal classes, and more than
+/// [`SIGLIP_CPU_MAX_ANIMALS`] of them or nothing else on the GPU (it runs on the CPU otherwise).
+pub fn labelers_on_gpu(r: &AutolabelRequest, classes: &[String]) -> Vec<OnGpu> {
     if r.with_model.is_some() {
         return Vec::new();
     }
@@ -89,6 +108,13 @@ pub fn labelers_on_gpu(r: &AutolabelRequest) -> Vec<OnGpu> {
     }
     if let Some(q) = r.vlm {
         v.extend(on_gpu(q.key(), res_catalog::autolabel_weights(q.key())));
+    }
+    let animals = animal_count(classes);
+    if r.siglip && animals >= 2 && (v.is_empty() || animals > SIGLIP_CPU_MAX_ANIMALS) {
+        v.extend(on_gpu(
+            "siglip2-base",
+            res_catalog::autolabel_weights("siglip2-base"),
+        ));
     }
     v
 }
@@ -115,11 +141,16 @@ pub fn form_option_need_mb(value: &str) -> Option<u64> {
 
 /// Why `r` cannot run on a card of `memory_mb` (0 = unknown: nothing is refused): a labeler
 /// whose weights alone do not fit, with what would. Pure.
-pub fn too_big(r: &AutolabelRequest, memory_mb: u64, gpu: &str) -> Option<String> {
+pub fn too_big(
+    r: &AutolabelRequest,
+    classes: &[String],
+    memory_mb: u64,
+    gpu: &str,
+) -> Option<String> {
     if memory_mb == 0 {
         return None;
     }
-    let big: Vec<String> = labelers_on_gpu(r)
+    let big: Vec<String> = labelers_on_gpu(r, classes)
         .into_iter()
         .filter(|l| option_need_mb(l.weights_mb) > memory_mb)
         .map(|l| {
@@ -154,8 +185,8 @@ fn smaller_vlm(memory_mb: u64) -> Option<VlmSize> {
 
 /// What the run needs on its GPU for the warning: the labelers' weights plus [`WORKING_PERCENT`]
 /// plus [`CONTEXT_MB`]. None when nothing goes on the GPU.
-pub fn job_need(r: &AutolabelRequest) -> Option<JobNeed> {
-    let on = labelers_on_gpu(r);
+pub fn job_need(r: &AutolabelRequest, classes: &[String]) -> Option<JobNeed> {
+    let on = labelers_on_gpu(r, classes);
     if on.is_empty() {
         return None;
     }
@@ -250,11 +281,7 @@ pub fn commit_need(r: &AutolabelRequest, classes: &[String]) -> Option<Need> {
             super::night::mdv6_weights(),
         ));
     }
-    let animals = classes
-        .iter()
-        .filter(|c| super::Category::of(c) == super::Category::Animal)
-        .count();
-    if r.siglip && animals >= 2 {
+    if r.siglip && animal_count(classes) >= 2 {
         parts.push(("SigLIP 2".into(), SIGLIP_COMMIT_BYTES));
     }
     let mut by_size = parts.clone();
@@ -330,11 +357,15 @@ pub fn embed_need(cc_major: Option<u32>) -> JobNeed {
     }
 }
 
-/// The warning before a labelers run of `r` on `accel` when the card is short of free memory
+/// The warning before a labelers run of `r` on `classes` on `accel` when the card is short of free memory
 /// now; None when it fits, cannot be read, or on Apple silicon (unified memory).
-pub fn gpu_warning(r: &AutolabelRequest, accel: &Accelerator) -> Option<String> {
+pub fn gpu_warning(
+    r: &AutolabelRequest,
+    classes: &[String],
+    accel: &Accelerator,
+) -> Option<String> {
     match accel {
-        Accelerator::Cuda { ordinal, .. } => vram::check_cuda_job(*ordinal, &job_need(r)?),
+        Accelerator::Cuda { ordinal, .. } => vram::check_cuda_job(*ordinal, &job_need(r, classes)?),
         Accelerator::Mps { .. } => None,
     }
 }
@@ -356,9 +387,63 @@ mod tests {
             .div_ceil(MIB)
     }
 
+    /// QA-072: the script's limit, read from the script itself.
+    #[test]
+    fn the_siglip_cpu_limit_is_the_scripts() {
+        let script = include_str!("../../../scripts/autolabel.py");
+        let value = script
+            .lines()
+            .find_map(|l| l.strip_prefix("SIGLIP_CPU_MAX_ANIMALS = "))
+            .expect("SIGLIP_CPU_MAX_ANIMALS in scripts/autolabel.py");
+        assert_eq!(
+            value.trim().parse::<usize>().unwrap(),
+            SIGLIP_CPU_MAX_ANIMALS
+        );
+    }
+
+    /// QA-072: SigLIP 2 goes on the GPU, at its whole checkpoint, with more animal classes than
+    /// the script ranks on the CPU; with fewer it does not, and under two it is not loaded.
+    #[test]
+    fn siglip_is_on_the_gpu_with_many_animal_classes() {
+        let animals = |n: usize| -> Vec<String> {
+            let mut v = vec!["person".to_string(), "car".into()];
+            v.extend(
+                [
+                    "dog", "cat", "raccoon", "deer", "fox", "coyote", "bear", "rabbit", "squirrel",
+                    "opossum", "skunk", "bird", "horse", "cow",
+                ]
+                .into_iter()
+                .take(n)
+                .map(String::from),
+            );
+            assert_eq!(animal_count(&v), n, "{v:?}");
+            v
+        };
+        let siglip = |classes: &[String], r: &AutolabelRequest| {
+            labelers_on_gpu(r, classes)
+                .into_iter()
+                .find(|l| l.name == "SigLIP 2")
+        };
+        let r = request();
+        assert!(r.siglip);
+        let on = siglip(&animals(SIGLIP_CPU_MAX_ANIMALS + 1), &r).expect("13 animal classes");
+        assert_eq!(on.weights_mb, mb("siglip2-base"));
+        assert!(siglip(&animals(SIGLIP_CPU_MAX_ANIMALS), &r).is_none());
+        assert!(siglip(&animals(1), &r).is_none());
+        let mut off = r.clone();
+        off.siglip = false;
+        assert!(siglip(&animals(SIGLIP_CPU_MAX_ANIMALS + 1), &off).is_none());
+        // The warning counts it.
+        let many = animals(SIGLIP_CPU_MAX_ANIMALS + 1);
+        let with = job_need(&r, &many).unwrap();
+        let without = job_need(&r, &animals(2)).unwrap();
+        assert!(with.need_mb > without.need_mb);
+        assert!(with.detail.contains("SigLIP 2"), "{}", with.detail);
+    }
+
     #[test]
     fn the_default_run_puts_three_labelers_on_the_gpu() {
-        let names: Vec<String> = labelers_on_gpu(&request())
+        let names: Vec<String> = labelers_on_gpu(&request(), &[])
             .into_iter()
             .map(|l| l.name)
             .collect();
@@ -369,13 +454,13 @@ mod tests {
         let mut sam = request();
         sam.gdino = None;
         sam.sam3 = true;
-        assert_eq!(labelers_on_gpu(&sam)[0].name, "SAM 3");
+        assert_eq!(labelers_on_gpu(&sam, &[])[0].name, "SAM 3");
         let mut model = request();
         model.with_model = Some("IPcam-general".into());
-        assert!(labelers_on_gpu(&model).is_empty());
-        assert_eq!(job_need(&model), None);
-        let need = job_need(&request()).unwrap();
-        let weights: u64 = labelers_on_gpu(&request())
+        assert!(labelers_on_gpu(&model, &[]).is_empty());
+        assert_eq!(job_need(&model, &[]), None);
+        let need = job_need(&request(), &[]).unwrap();
+        let weights: u64 = labelers_on_gpu(&request(), &[])
             .iter()
             .map(|l| l.weights_mb)
             .sum();
@@ -391,9 +476,9 @@ mod tests {
         let mut r = request();
         // Unknown memory: nothing refused.
         r.vlm = Some(VlmSize::Qwen8b);
-        assert_eq!(too_big(&r, 0, "GPU"), None);
+        assert_eq!(too_big(&r, &[], 0, "GPU"), None);
         // Qwen3-VL 8B (17.5 GB) on an 8 GB card.
-        let e = too_big(&r, 8192, "NVIDIA GeForce GTX 1070 Ti (cuda:0)").unwrap();
+        let e = too_big(&r, &[], 8192, "NVIDIA GeForce GTX 1070 Ti (cuda:0)").unwrap();
         assert!(e.starts_with("Qwen3-VL 8B needs at least "), "{e}");
         assert!(
             e.contains("NVIDIA GeForce GTX 1070 Ti (cuda:0) has 8.0 GB"),
@@ -405,19 +490,19 @@ mod tests {
         );
         // 4B (8.9 GB) does not fit 8 GB either; it does fit 12 GB, where 8B does not.
         r.vlm = Some(VlmSize::Qwen4b);
-        assert!(too_big(&r, 8192, "g").is_some());
-        assert_eq!(too_big(&r, 12288, "g"), None);
+        assert!(too_big(&r, &[], 8192, "g").is_some());
+        assert_eq!(too_big(&r, &[], 12288, "g"), None);
         r.vlm = Some(VlmSize::Qwen8b);
         assert!(
-            too_big(&r, 12288, "g")
+            too_big(&r, &[], 12288, "g")
                 .unwrap()
                 .contains("choose Qwen3-VL 4B")
         );
-        assert_eq!(too_big(&r, 24576, "g"), None);
+        assert_eq!(too_big(&r, &[], 24576, "g"), None);
         // The default run fits an 8 GB card; on a 4 GB one 2B does not and nothing smaller exists.
         let d = request();
-        assert_eq!(too_big(&d, 8192, "g"), None);
-        let small = too_big(&d, 4096, "g").unwrap();
+        assert_eq!(too_big(&d, &[], 8192, "g"), None);
+        let small = too_big(&d, &[], 4096, "g").unwrap();
         assert!(small.contains("Qwen3-VL 2B needs"), "{small}");
         assert!(
             small.contains("For the VLM check turn the VLM check off"),
@@ -477,7 +562,7 @@ mod tests {
             name: "Apple M1".into(),
             memory_mb: 1,
         };
-        assert_eq!(gpu_warning(&request(), &mps), None);
+        assert_eq!(gpu_warning(&request(), &[], &mps), None);
     }
 
     const GIB: u64 = 1 << 30;

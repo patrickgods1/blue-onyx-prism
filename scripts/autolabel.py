@@ -111,9 +111,34 @@ def log(msg: str) -> None:
 EVENT_TAG = ["autolabel"]  # the tag of the `@<tag> {json}` lines; --zoom-pairs sets "overlaps"
 
 
+def jsonable(v):
+    """`v` as plain JSON for an event: a NaN or an infinity as None (JSON has neither, and the
+    service drops a whole line holding the bare token), a numpy / torch scalar or array as its
+    Python value (`tolist`), dicts, lists and tuples item by item, anything else as its text (a
+    Path)."""
+    if v is None or isinstance(v, (bool, int, str)):
+        return v
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, dict):
+        return {str(k): jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [jsonable(x) for x in v]
+    tolist = getattr(v, "tolist", None)
+    if callable(tolist):
+        try:
+            return jsonable(tolist())
+        except Exception:
+            pass
+    return str(v)
+
+
 def event(kind: str, **fields) -> None:
+    """One `@<tag> {json}` event: fields through `jsonable` (a NaN is `null`), `allow_nan=False`
+    so one that slips past it fails here, not as a line the service drops."""
     fields["event"] = kind
-    print(f"\n@{EVENT_TAG[0]} " + json.dumps(fields, separators=(",", ":"), default=str), flush=True)
+    text = json.dumps(jsonable(fields), separators=(",", ":"), allow_nan=False)
+    print(f"\n@{EVENT_TAG[0]} " + text, flush=True)
 
 
 def fail(msg: str) -> None:
@@ -810,6 +835,27 @@ def self_test(parity: Path = None) -> int:
             raise SystemExit(f"[autolabel] self-test failed: {what}")
         n += 1
 
+    # QA-073: an event with a NaN, an infinity or a numpy scalar is one line of plain JSON.
+    import contextlib
+    import io
+
+    def no_constant(c):
+        raise ValueError(f"bare {c} in an event")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        event("frame", score=float("nan"), box=[1.0, float("inf")], nested={"x": float("-inf")}, path=Path("a"))
+    line = buf.getvalue().strip()
+    ev = json.loads(line.split(" ", 1)[1], parse_constant=no_constant)
+    check(ev == {"score": None, "box": [1.0, None], "nested": {"x": None}, "path": "a", "event": "frame"},
+          f"a NaN event is plain JSON: {line}")
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        check(jsonable({"s": np.float32(0.5), "n": np.int64(3), "a": np.array([1.0, np.nan])})
+              == {"s": 0.5, "n": 3, "a": [1.0, None]}, "numpy scalars and arrays as plain values")
     check(siglip_device("cuda:0", 3, 9) == "cpu", "siglip beside the labelers: cpu")
     check(siglip_device("mps", 1, 2) == "cpu", "siglip beside one labeler on mps: cpu")
     check(siglip_device("cuda:1", 3, 13) == "cuda:1", "siglip with many animal classes: the gpu")

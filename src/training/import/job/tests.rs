@@ -1456,3 +1456,55 @@ fn pick_rows(groups: &[&str], rows: &[Vec<f32>], total: usize, balance: bool) ->
     out.sort_unstable();
     out
 }
+
+/// QA-108: two Blue Iris cameras `cam1` and `cam10` with a frame at the same time, `cam1`'s
+/// imported before and skipped: the import's record counts `cam10` only, and its scenes sum to the
+/// frames written.
+#[test]
+fn a_skipped_frame_is_not_counted_beside_a_written_one_of_the_same_time() {
+    let t = tmp("tally");
+    let dir = t.0.join("dataset");
+    let src = t.0.join("f.jpg");
+    let bytes = jpeg(1, false);
+    std::fs::write(&src, &bytes).unwrap();
+    let img = crate::image::decode(&bytes).unwrap();
+    let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_710_491_412);
+    let frame = |camera: &str| write::Frame {
+        file: src.clone(),
+        image_name: format!("{camera}.20240315_083012.mp4"),
+        camera: camera.into(),
+        time: at,
+        width: img.width,
+        height: img.height,
+        stats: ImageStats::compute(&img),
+        dhash: 7,
+        provenance: Provenance::default(),
+    };
+    let zone = crate::clock::Zone::Utc;
+    write::write_frames_with(
+        &dir,
+        zone,
+        "20261022-120000-ab12",
+        &[frame("cam1")],
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    let frames = [frame("cam1"), frame("cam10")];
+    let mut written = Vec::new();
+    let (rels, skipped) =
+        write::write_frames_with(&dir, zone, "20261022-120001-cd34", &frames, &mut |st| {
+            if let write::Step::Written(k) = st {
+                written.push(k);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((rels.len(), skipped), (1, 1), "{rels:?}");
+    assert!(
+        rels[0].contains("cam1") && rels[0].contains("cam10"),
+        "the trap: {rels:?}"
+    );
+    let (scenes, cameras) = written_tally(&frames, &written);
+    assert_eq!(cameras, ["cam10"]);
+    assert_eq!(scenes.values().sum::<usize>(), rels.len());
+}

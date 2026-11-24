@@ -13,6 +13,10 @@
 //!   `d = a + b * luma` by least squares over the sample and takes the mean absolute residual;
 //!   `tint_spread = (residual(R-G) + residual(G-B)) / 2`. A colour scene has hues that do not
 //!   follow brightness, so its residual stays large;
+//!   When the sample's luma is exactly flat (variance below [`FLAT_LUMA_VAR`], e.g. a camera's
+//!   solid blue "no video" screen) every difference is constant, the fit is exact and the residual
+//!   says nothing, so `tint_spread = chroma_spread` there (a flat gray frame stays IR, a flat
+//!   colour one does not);
 //! - the frame is **IR** when `chroma_spread < IR_CHROMA_MAX` or `tint_spread < IR_CHROMA_MAX`.
 //!
 //! [`ImageStats::scene`]: IR wins over dark (IR illuminators make a night frame bright).
@@ -25,6 +29,10 @@ pub const IR_CHROMA_MAX: f32 = 3.0;
 /// Below this mean BT.601 luma (0..255) a frame counts as dark (`NIGHT_LUMA` of the bench
 /// build script).
 pub const DARK_LUMA_MAX: f32 = 50.0;
+/// Below this luma variance (0..255 scale, squared) the sample is flat and the tint fit is
+/// degenerate: `tint_spread` falls back to `chroma_spread`. Only an exactly uniform luma is under
+/// it; a dark, nearly flat tinted-IR frame still has its fit (QA-045).
+pub const FLAT_LUMA_VAR: f64 = 1e-6;
 /// Samples per axis (at most; a smaller image is sampled at every pixel).
 pub const SAMPLE_GRID: u32 = 64;
 
@@ -150,12 +158,21 @@ impl ImageStats {
         }
         let n = lum.len() as f64;
         let mean_luma = lum.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
+        let luma_var = lum
+            .iter()
+            .map(|&v| (f64::from(v) - mean_luma).powi(2))
+            .sum::<f64>()
+            / n;
         #[allow(
             clippy::cast_possible_truncation,
             reason = "means of 0..255 values fit f32"
         )]
         let (mean_luma, chroma_spread) = (mean_luma as f32, (spread / n / 2.0) as f32);
-        let tint_spread = (fit_residual(&lum, &rg) + fit_residual(&lum, &gb)) / 2.0;
+        let tint_spread = if luma_var < FLAT_LUMA_VAR {
+            chroma_spread
+        } else {
+            (fit_residual(&lum, &rg) + fit_residual(&lum, &gb)) / 2.0
+        };
         Self {
             mean_luma,
             chroma_spread,
@@ -275,6 +292,24 @@ mod tests {
         let s = ImageStats::compute(&img);
         assert!(s.is_dark && s.is_ir);
         assert_eq!(s.scene(), Scene::Ir);
+    }
+
+    // QA-045: a flat colour frame (a camera's blue "no video" screen) fitted exactly, so its
+    // tint residual was 0 and it was filed as IR.
+    #[test]
+    fn flat_colour_frame_is_not_ir() {
+        let blue = ImageStats::compute(&image(640, 480, |_, _| [0, 0, 255]));
+        assert!((blue.chroma_spread - 127.5).abs() < 1e-3, "{blue:?}");
+        assert_eq!(blue.tint_spread, blue.chroma_spread, "{blue:?}");
+        assert!(!blue.is_ir, "{blue:?}");
+        // Mean luma 29: dark.
+        assert_eq!(blue.scene(), Scene::Night);
+        let green = ImageStats::compute(&image(1, 1, |_, _| [0, 255, 0]));
+        assert!(!green.is_ir, "{green:?}");
+        assert_eq!(green.scene(), Scene::Day);
+        // A flat gray frame is still IR (its chroma spread is 0).
+        let gray = ImageStats::compute(&image(64, 64, |_, _| [128, 128, 128]));
+        assert_eq!(gray.scene(), Scene::Ir);
     }
 
     #[test]

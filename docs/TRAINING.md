@@ -932,7 +932,9 @@ support rule (no `support`) as the metric's all-class value.
 checkpoint (it then exports, installs and benchmarks as usual): the **Finish now** button beside Cancel
 on the Train tab (loopback / admin, like Cancel; a paused run is resumed first), or create the file
 `<run dir>/work/stop-request` (the run dir is `<training dir>/<run id>`, see `train list`). The trainer
-checks the file after each epoch; a stale one is removed before training starts. Ctrl-C in the CLI still
+checks the file after each epoch; a stale one is removed before training starts. A request made during
+an attempt that then runs out of memory and restarts holds for the restart, which stops after its first
+epoch (the log says "finish requested: the retry stops after its first epoch"). Ctrl-C in the CLI still
 cancels.
 
 **The `stop` event.** When the rule (or the stop file) ends training the script prints
@@ -1008,7 +1010,8 @@ Stages (page and `train run` show them with percent and ETA):
    keeps `<run>/work`, see [Retry export](#retry-export). Progress: every event is one
    stdout line `@train {json}` (`start`, `batch`, `epoch` with loss and validation mAP50 where the
    trainer reports it, `eval`, `phase`, `done`; `epoch` / `eval` also carry every scalar metric, see
-   [Metrics per epoch](#metrics-per-epoch)); everything else goes to `<run>/train.log` (capped
+   [Metrics per epoch](#metrics-per-epoch); a NaN or infinite value is written as `null`, since a bare
+   `NaN` is no JSON and the line would be lost); everything else goes to `<run>/train.log` (capped
    at 20 MB). Out of GPU memory, missing kernels and unusable images get their own messages (lower the
    batch or input size, ...); other failures go through the export's classifier. **Out of GPU memory
    before 3 finished epochs** restarts the training at half the batch (down to 1, at most 3 restarts):
@@ -2397,7 +2400,7 @@ wrong, a set that cannot show a real second object removed.
 
 **A run** is a task of the training queue, like an auto-label run: one job at a time, the training lock,
 low priority, pause, and Cancel keeps the finished crops (a rerun skips every pair with an answer, `unclear`
-ones too, so it resumes; `again=1` in the filter looks afresh). The stages are *selecting pairs*, *setting
+ones too, so it resumes; `again=1` in the filter looks afresh). A frame keeps at most 64 suggestions; without `again=1` a run judges only as many new pairs as its list has room for, and the rest wait until a reviewer settles some (the dry run and the job summary count them). The stages are *selecting pairs*, *setting
 up the environment* (the training environment, RF-DETR L's weights through the pinned download if they are
 missing), *zoom check* (`scripts/autolabel.py --zoom-pairs`) and *writing suggestions*. A failed script
 keeps what finished too. It needs an NVIDIA GPU or Apple silicon, about 500 MB of VRAM and on Windows about

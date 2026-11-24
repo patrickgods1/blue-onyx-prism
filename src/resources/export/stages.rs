@@ -14,6 +14,10 @@ pub struct ExportJob {
     /// Where the system's Visual C++ runtime DLLs are probed on Windows (`%SystemRoot%\System32`;
     /// None: treated as absent). Tests point it at a directory of their own.
     pub system_dir: Option<PathBuf>,
+    /// What the job is for, in its failure messages (`failure::FailureContext::task`):
+    /// "export" ([`Self::new`]) or "training environment setup" (`train::env_job`), so a
+    /// failed setup is never told to "export again" (QA-084).
+    pub task: &'static str,
 }
 
 impl ExportJob {
@@ -24,6 +28,7 @@ impl ExportJob {
             platform: Platform::current(),
             timeouts: Timeouts::default(),
             system_dir: vc_runtime::system_dir(),
+            task: "export",
         }
     }
 }
@@ -110,7 +115,7 @@ fn explained(
             system_msvcp140: msvcp140,
             tools: &job.paths.tools,
             python_script,
-            task: "export",
+            task: job.task,
         },
     )
 }
@@ -172,7 +177,13 @@ pub(crate) fn run_export(
 ) -> Result<ExportOutput, ExportError> {
     let mut stage: Option<Stage> = None;
     let result = run_stages(job, runner, fetcher, report, cancel, &mut stage);
-    result.map_err(|e| {
+    result.map_err(|e| ExportError::from_run(&e, stage, cancel))
+}
+
+impl ExportError {
+    /// The error of a run that failed with `e` at `stage`: "cancelled" when `e` is a
+    /// [`Cancelled`] or `cancel` is set, else `e`'s message with its causes.
+    pub(crate) fn from_run(e: &anyhow::Error, stage: Option<Stage>, cancel: &AtomicBool) -> Self {
         let cancelled = e.downcast_ref::<Cancelled>().is_some() || cancel.load(Ordering::Relaxed);
         ExportError {
             stage,
@@ -183,7 +194,7 @@ pub(crate) fn run_export(
             },
             cancelled,
         }
-    })
+    }
 }
 
 fn run_stages(

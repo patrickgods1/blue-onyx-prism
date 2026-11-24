@@ -192,10 +192,52 @@ fn ranks_of(ranking: &[crate::benchmark::report::RankRow]) -> HashMap<String, us
     out
 }
 
-/// The last [`ranks_of`] of the saved results, keyed by the results file and its stamp: the Stats
-/// poll (every 5 s) parses the file again only after a benchmark rewrote it.
+/// The last [`ranks_of`] of the saved results, keyed by [`ranks_key`]: the Stats poll (every 5 s)
+/// parses the file again only after a benchmark rewrote it, the config changed or a model moved
+/// to another device or threshold.
 static RANKS_CACHE: crate::benchmark::search::IdleCache<String, Arc<HashMap<String, usize>>> =
     crate::benchmark::search::IdleCache::new(crate::benchmark::search::CACHE_IDLE);
+
+/// What the served models run with now, sorted by name: each worker's loaded device and running
+/// threshold. Part of [`model_ranks`]' key (QA-095: a fallback to another device or a new
+/// running threshold changes no file and no config revision, yet [`models_now`] rebases the
+/// ranks on it). Read from the registry's memory only: the Stats poll never probes devices.
+fn running_stamp(state: &AppState) -> Vec<(String, Option<String>, u32)> {
+    let mut out: Vec<_> = state
+        .registry
+        .workers()
+        .iter()
+        .map(|w| {
+            let device = w
+                .device
+                .read()
+                .ok()
+                .and_then(|d| d.as_ref().map(|d| d.spec.clone()));
+            (w.name.clone(), device, w.effective_threshold().0.to_bits())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The [`RANKS_CACHE`] key of the results at `path` (stamped `stamp`): the files the ranks are
+/// computed from, the config revision and the [`running_stamp`].
+fn ranks_key(
+    state: &AppState,
+    path: &std::path::Path,
+    stamp: (Option<std::time::SystemTime>, u64),
+) -> String {
+    let preds = crate::benchmark::search::preds_path(&state.config_path);
+    let gt = crate::benchmark::cameras::snapshot::path_beside(path);
+    format!(
+        "{}|{stamp:?}|{:?}|{:?}|{}|{:?}",
+        path.display(),
+        file_stamp(&preds),
+        file_stamp(&gt),
+        state.config.revision(),
+        running_stamp(state)
+    )
+}
 
 /// [`ranks_of`] of the results beside the config (empty without results), in the goal's order
 /// on the default Compare set ([`goal_order`]). Blocking: it may parse the files.
@@ -205,14 +247,7 @@ pub(in crate::server) fn model_ranks(state: &AppState) -> Arc<HashMap<String, us
         return Arc::default();
     };
     let preds = crate::benchmark::search::preds_path(&state.config_path);
-    let gt = crate::benchmark::cameras::snapshot::path_beside(&path);
-    let revision = state.config.revision();
-    let key = format!(
-        "{}|{stamp:?}|{:?}|{:?}|{revision}",
-        path.display(),
-        file_stamp(&preds),
-        file_stamp(&gt)
-    );
+    let key = ranks_key(state, &path, stamp);
     RANKS_CACHE.get_or_insert_with(key, || {
         Arc::new(
             BenchmarkResults::load_or_warn(&path)
@@ -422,13 +457,6 @@ pub(super) fn json_error(status: StatusCode, message: String) -> Response {
         .into_response()
 }
 
-pub(super) fn truthy(v: &str) -> bool {
-    !matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "" | "0" | "false" | "off" | "no"
-    )
-}
-
 /// An API error answered as `{"success": false, "message": ...}` with its status (see
 /// [`json_error`]); small, unlike a [`Response`], so helpers can return it in a `Result`.
 #[derive(Debug)]
@@ -497,6 +525,35 @@ mod tests {
         assert!(std::mem::size_of::<ApiError>() <= 32);
         let r = ApiError::new(StatusCode::NOT_FOUND, "nope").into_response();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// QA-095: a model moving to another device or running threshold, with no file or config
+    /// revision change, changes the Home / Stats ranks' cache key (they stayed stale before).
+    #[test]
+    fn model_ranks_key_follows_the_running_device_and_threshold() {
+        let st = state();
+        let path = results_path(&st.config_path);
+        let stamp = (None, 0);
+        let first = ranks_key(&st, &path, stamp);
+        assert_eq!(ranks_key(&st, &path, stamp), first, "nothing changed");
+        let w = st.registry.workers()[0].clone();
+        *w.device.write().unwrap() = Some(crate::backend::DeviceInfo {
+            spec: "openvino:cpu".into(),
+            ..crate::backend::DeviceInfo::default()
+        });
+        let on_cpu = ranks_key(&st, &path, stamp);
+        assert_ne!(on_cpu, first, "a device fallback");
+        let mut m = ModelConfig::default();
+        m.device_thresholds.insert("openvino:cpu".into(), 0.3);
+        w.set_live(crate::worker::LiveSettings::for_model(
+            &Config::default(),
+            &m,
+        ));
+        assert_ne!(
+            ranks_key(&st, &path, stamp),
+            on_cpu,
+            "a new running threshold"
+        );
     }
 
     pub(super) fn state() -> Arc<AppState> {

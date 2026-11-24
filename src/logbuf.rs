@@ -216,24 +216,33 @@ impl LogBuffer {
             entries,
             last: r.last_seq,
             first,
-            truncated: after + 1 < first && after < r.last_seq,
+            // `after` comes from the query: `after + 1` overflows at u64::MAX (QA-087).
+            truncated: after < r.last_seq && after.saturating_add(1) < first,
         }
     }
 }
 
-/// Collects the `message` field and the other fields of an event.
+/// Collects the `message` field and the other fields of an event. Events bridged from the `log`
+/// crate (tracing-subscriber's default `tracing-log` feature) carry `log.target`,
+/// `log.module_path`, `log.file` and `log.line` and the metadata target `log`: the real target
+/// is kept from `log.target`, the other `log.*` fields are dropped (QA-088).
 #[derive(Default)]
 struct FieldText {
     message: String,
     fields: String,
+    /// `log.target` of a bridged `log` record.
+    target: Option<String>,
 }
 
 impl Visit for FieldText {
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
+        let name = field.name();
+        if name == "message" {
             self.message.push_str(value);
-        } else {
-            let _ = write!(self.fields, " {}={}", field.name(), value);
+        } else if name == "log.target" {
+            self.target = Some(value.to_string());
+        } else if !name.starts_with("log.") {
+            let _ = write!(self.fields, " {name}={value}");
         }
     }
 
@@ -259,7 +268,11 @@ impl<S: Subscriber> Layer<S> for LogBuffer {
             }
         }
         let meta = event.metadata();
-        self.push(*meta.level(), meta.target(), text);
+        self.push(
+            *meta.level(),
+            v.target.as_deref().unwrap_or(meta.target()),
+            text,
+        );
     }
 }
 
@@ -387,6 +400,44 @@ mod tests {
         assert_eq!(p.entries[1].target, "custom");
         assert_eq!(p.entries[1].message, "plain");
         assert!(chrono::DateTime::parse_from_rfc3339(&p.entries[0].ts).is_ok());
+    }
+
+    // QA-088
+    #[test]
+    fn bridged_log_records_show_their_own_target_and_no_log_fields() {
+        let b = LogBuffer::new(10);
+        let sub = tracing_subscriber::registry().with(b.clone());
+        tracing::subscriber::with_default(sub, || {
+            tracing::info!(
+                target: "log",
+                {
+                    log.target = "reqwest::connect",
+                    log.module_path = "reqwest::connect",
+                    log.file = "src/connect.rs",
+                    log.line = 42u64,
+                    peer = "x",
+                },
+                "starting new connection"
+            );
+        });
+        let e = &b.since(0, None, 10).entries[0];
+        assert_eq!(e.target, "reqwest::connect");
+        assert_eq!(e.message, "starting new connection peer=x");
+    }
+
+    // QA-087
+    #[test]
+    fn a_cursor_at_u64_max_returns_nothing_and_does_not_overflow() {
+        let b = LogBuffer::new(3);
+        let empty = b.since(u64::MAX, None, 10);
+        assert!(empty.entries.is_empty() && !empty.truncated);
+        for i in 0..5 {
+            b.push(Level::INFO, "t", format!("m{i}"));
+        }
+        let p = b.since(u64::MAX, None, 10);
+        assert!(p.entries.is_empty());
+        assert!(!p.truncated);
+        assert_eq!(p.last, 5);
     }
 
     #[test]

@@ -349,10 +349,20 @@ pub struct Running {
     pub started: Option<Instant>,
 }
 
-/// Refused start: a run is in progress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("a benchmark is already running")]
-pub struct Busy;
+/// Why a start did not start a run.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StartError {
+    /// A run is in progress (a route answers 409).
+    #[error("a benchmark is already running")]
+    Busy,
+    /// The run's thread could not be created (the system is out of threads or memory); the
+    /// run is recorded Failed and finished with this reason (QA-047; a route answers 500).
+    #[error(
+        "could not start the benchmark thread ({0}); the system may be short of memory or \
+         threads: close other programs and start the benchmark again"
+    )]
+    Spawn(String),
+}
 
 #[derive(Debug)]
 struct Inner {
@@ -497,9 +507,11 @@ impl BenchmarkService {
         running
     }
 
-    /// Start `job` on a new thread unless a run is in progress. `job` returns the final message
-    /// (an error ending in [`super::Cancelled`] marks the run cancelled).
-    pub fn start_job<F>(self: &Arc<Self>, request: RunRequest, job: F) -> Result<(), Busy>
+    /// Start `job` on a new thread unless a run is in progress ([`StartError::Busy`]). `job`
+    /// returns the final message (an error ending in [`super::Cancelled`] marks the run
+    /// cancelled). A thread that cannot be created is [`StartError::Spawn`], with the run
+    /// recorded Failed and finished.
+    pub fn start_job<F>(self: &Arc<Self>, request: RunRequest, job: F) -> Result<(), StartError>
     where
         F: FnOnce(&RunHandle) -> Result<String> + Send + 'static,
     {
@@ -508,14 +520,18 @@ impl BenchmarkService {
 
     /// [`Self::start_job`] answering the run's id, for [`Self::status_of`],
     /// [`Self::is_run_running`] and [`Self::cancel_run`].
-    pub fn start_job_run<F>(self: &Arc<Self>, request: RunRequest, job: F) -> Result<u64, Busy>
+    pub fn start_job_run<F>(
+        self: &Arc<Self>,
+        request: RunRequest,
+        job: F,
+    ) -> Result<u64, StartError>
     where
         F: FnOnce(&RunHandle) -> Result<String> + Send + 'static,
     {
         let run_id = {
             let mut g = self.lock();
             if g.state == RunState::Running {
-                return Err(Busy);
+                return Err(StartError::Busy);
             }
             // Reset before the state says Running, inside the lock `cancel` takes (BM-05).
             self.cancel.store(false, Ordering::SeqCst);
@@ -577,9 +593,17 @@ impl BenchmarkService {
                 }
             });
         if let Err(e) = spawned {
+            // QA-047: the run never started: recorded Failed and finished, and the caller is told.
+            let e = StartError::Spawn(e.to_string());
+            tracing::error!("{e}");
             let mut g = self.lock();
-            g.state = RunState::Failed;
-            g.error = Some(format!("could not start the benchmark thread: {e}"));
+            if g.run_id == run_id {
+                g.state = RunState::Failed;
+                g.error = Some(e.to_string());
+                g.finished_at = Some(now());
+                g.progress = None;
+            }
+            return Err(e);
         }
         Ok(run_id)
     }
@@ -613,12 +637,16 @@ impl BenchmarkService {
     }
 
     /// Start a real benchmark of `request` (see [`run`]).
-    pub fn start(self: &Arc<Self>, ctx: RunContext, request: RunRequest) -> Result<(), Busy> {
+    pub fn start(self: &Arc<Self>, ctx: RunContext, request: RunRequest) -> Result<(), StartError> {
         self.start_run(ctx, request).map(|_| ())
     }
 
     /// [`Self::start`] answering the run's id ([`Self::start_job_run`]).
-    pub fn start_run(self: &Arc<Self>, ctx: RunContext, request: RunRequest) -> Result<u64, Busy> {
+    pub fn start_run(
+        self: &Arc<Self>,
+        ctx: RunContext,
+        request: RunRequest,
+    ) -> Result<u64, StartError> {
         self.claim_breadcrumb(&ctx.config.data_root());
         let req = request.clone();
         self.start_job_run(request, move |h| run(&ctx, &req, h))
@@ -1835,7 +1863,10 @@ mod tests {
         })
         .unwrap();
         assert!(svc.is_running());
-        assert_eq!(svc.start_job(req.clone(), |_| Ok(String::new())), Err(Busy));
+        assert_eq!(
+            svc.start_job(req.clone(), |_| Ok(String::new())),
+            Err(StartError::Busy)
+        );
         assert!(svc.cancel());
         assert!(svc.wait_idle(Duration::from_secs(5)));
         let st = svc.status();

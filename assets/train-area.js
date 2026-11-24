@@ -150,12 +150,31 @@
 
   // One chain per list (PrismPoll: a chained timeout, never two requests of a list in flight, none
   // while the tab is hidden). A refresh asks the same chain to run now; it never starts another.
-  var onQueue = null;
+  var onQueue = null, jobsNote = null;
+  // One line above the list while the server does not answer (the list keeps its last state).
+  function jobsOutage(text) {
+    if (!jobsBox) return;
+    if (!jobsNote) {
+      if (!text) return;
+      jobsNote = document.createElement("p");
+      jobsNote.className = "muted";
+      jobsNote.setAttribute("role", "status");
+      jobsBox.parentNode.insertBefore(jobsNote, jobsBox);
+    }
+    jobsNote.textContent = text;
+    jobsNote.hidden = !text;
+  }
+  // Rejects on an answer that is not the list (HTTP error, HTML from a proxy): PrismPoll then backs
+  // off (6, 12, ... 30 s) instead of asking every 3 s through an outage, and onError says so.
   function loadJobs() {
     return fetch("/v1/train/jobs", { headers: { Accept: "application/json" }, cache: "no-store" })
-      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
       .then(function (j) {
-        if (!j || !j.jobs) return;
+        if (!j || !j.jobs) throw new Error("no job list in the answer");
+        jobsOutage("");
         var all = j.jobs.active.concat(j.jobs.queued);
         var key = all.map(function (x) { return x.id; }).join();
         jobsCount.textContent = all.length;
@@ -164,12 +183,17 @@
         // A job ended or started: the counts and the next step moved too.
         if (onQueue !== null && key !== onQueue) summaryPoller.kick();
         onQueue = key;
-      })
-      .catch(function () { /* the list stays as it was */ })
-      .then(function () { return !!jobsBox; });
+        return !!jobsBox;
+      });
   }
   // Only the Jobs tab keeps following the list; the other tabs read it when asked (the count on its label).
-  var jobsPoller = PrismPoll.create({ run: loadJobs, period: 3000, more: function (again) { return again; } });
+  var jobsPoller = PrismPoll.create({
+    run: loadJobs, period: 3000, more: function (again) { return again; },
+    onError: function () {
+      if (!jobsBox) { jobsPoller.stop(); return; }
+      jobsOutage("The server is not answering; this list may be out of date. Trying again shortly.");
+    }
+  });
 
   function load() {
     return fetch("/v1/train/summary", { headers: { Accept: "application/json" }, cache: "no-store" })

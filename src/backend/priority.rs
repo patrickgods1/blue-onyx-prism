@@ -9,7 +9,8 @@
 //!   `SetPriorityClass(BELOW_NORMAL_PRIORITY_CLASS)` when a CPU device starts (its compile, warm-up
 //!   and timing) and restores the previous class (read with `GetPriorityClass` first; 0 =
 //!   failure, then nothing is restored) when a non-CPU device starts or the run ends.
-//! - Unix: `setpriority(PRIO_PROCESS, 0, 10)` in the CLI only, before the runtimes exist, and
+//! - Unix: `setpriority(PRIO_PROCESS, 0, 10)` (only when the nice value is below 10, never
+//!   lowering a higher one, `benchmark_nice`) in the CLI only, before the runtimes exist, and
 //!   only for a run whose devices are all CPUs ([`lower_up_front`]): on Linux nice is per thread
 //!   and inherited by the threads created afterwards. OpenVINO's TBB pool and ONNX Runtime's pools
 //!   are not ours, so a running service cannot lower them after the fact: in the service this is
@@ -293,6 +294,16 @@ pub const fn nice_target(current: i32, action: ThreadAction) -> Option<i32> {
     }
 }
 
+/// The nice value [`lower_up_front`] sets on Unix for a process at `current` (pure): at least
+/// [`CHILD_NICE`], never lowering a higher one (a CLI run under `nice -n 15` keeps 15; QA-042).
+#[cfg_attr(
+    not(unix),
+    allow(dead_code, reason = "used by the Unix `imp::lower` and tests")
+)]
+const fn benchmark_nice(current: i32) -> Option<i32> {
+    nice_target(current, ThreadAction::NiceAtLeast(CHILD_NICE))
+}
+
 /// Apply [`thread_action`] for `role` to the calling thread (best effort: a failure is logged at
 /// debug level and the thread keeps its priority). True when the priority changed. Call it first
 /// thing on a thread the caller spawned for background work; see the module docs.
@@ -440,22 +451,31 @@ mod imp {
         }
     }
 
-    /// Nice value of a low-priority benchmark.
-    const NICE: libc::c_int = 10;
-
     pub(super) fn lower() -> Guard {
+        // SAFETY: getpriority only reads the calling process's (Linux: thread's) nice value. A
+        // -1 is either nice -1 or an error; both lead to the setpriority call below, as before
+        // this read existed, so errno need not be cleared.
+        let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let Some(target) = super::benchmark_nice(current) else {
+            tracing::info!(
+                "benchmark: the process already runs at nice {current} (at least {}); its \
+                 priority is left as it is (benchmark.low_priority)",
+                super::CHILD_NICE
+            );
+            return Guard::noop();
+        };
         // SAFETY: setpriority only changes the scheduling priority of the calling thread
         // (Linux) / process; no memory is touched.
-        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, NICE) };
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, target) };
         if rc == 0 {
             tracing::info!(
-                "benchmark: process priority lowered to nice {NICE} for this CPU-only run \
+                "benchmark: process priority lowered to nice {target} for this CPU-only run \
                  (benchmark.low_priority)"
             );
         } else {
             tracing::warn!(
-                "benchmark: could not lower the process priority ({}); the run keeps the \
-                 normal priority",
+                "benchmark: could not lower the process priority ({}); the run keeps nice \
+                 {current}",
                 std::io::Error::last_os_error()
             );
         }
@@ -609,6 +629,18 @@ mod tests {
         // Up front is a no-op where the priority switches per device.
         drop(lower_up_front(true, true));
         assert_eq!(class(), before);
+    }
+
+    // QA-042: the Unix benchmark set nice 10 unconditionally, raising the priority of a CLI run
+    // started under `nice -n 15` (as root) or failing with EACCES and a false log line.
+    #[test]
+    fn benchmark_nice_never_lowers_a_higher_nice() {
+        assert_eq!(benchmark_nice(0), Some(CHILD_NICE));
+        assert_eq!(benchmark_nice(-1), Some(CHILD_NICE));
+        assert_eq!(benchmark_nice(CHILD_NICE - 1), Some(CHILD_NICE));
+        assert_eq!(benchmark_nice(CHILD_NICE), None);
+        assert_eq!(benchmark_nice(15), None);
+        assert_eq!(benchmark_nice(19), None);
     }
 
     #[test]

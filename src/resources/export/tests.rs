@@ -112,6 +112,7 @@ fn job(root: &Path, platform: Platform) -> ExportJob {
         platform,
         timeouts: Timeouts::default(),
         system_dir: None,
+        task: "export",
     }
 }
 

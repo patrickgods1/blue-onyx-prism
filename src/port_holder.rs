@@ -121,6 +121,11 @@ fn lookup_unix(port: u16) -> Lookup {
         TOOL_TIMEOUT,
     );
     match &lsof {
+        // Without `ss` to ask, an empty lsof answer is only "free" when it could see every
+        // account's sockets (QA-056).
+        Ok(out) if !cfg!(target_os = "linux") => {
+            return lsof_lookup(&out.text, crate::command::euid(), port);
+        }
         Ok(out) => {
             if let Some(h) = parse_lsof(&out.text) {
                 return Lookup::Held(h);
@@ -223,6 +228,28 @@ pub fn parse_lsof(out: &str) -> Option<Holder> {
     holder
 }
 
+/// What an `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fpc` run says where no other tool is asked
+/// (macOS and the other non-Linux Unixes). lsof run by an account other than root lists only
+/// that account's processes and prints nothing for another's listener, so an empty answer is
+/// [`Lookup::Free`] only for root (`euid` 0) and else [`Lookup::Unknown`] with the command to
+/// run as root (QA-056; Linux asks `ss`, which tells an unseen listener apart, instead).
+#[cfg_attr(
+    any(windows, target_os = "linux"),
+    allow(dead_code, reason = "macOS and other Unixes only; tested everywhere")
+)]
+fn lsof_lookup(out: &str, euid: Option<u32>, port: u16) -> Lookup {
+    if let Some(h) = parse_lsof(out) {
+        return Lookup::Held(h);
+    }
+    if euid == Some(0) {
+        return Lookup::Free;
+    }
+    Lookup::Unknown(format!(
+        "no process of this account listens there, and a process of another account may hold \
+         it, which this account cannot see; run `sudo lsof -nP -iTCP:{port} -sTCP:LISTEN`"
+    ))
+}
+
 /// `ss -ltnpH` output: a line means a listener; its `users:(("name",pid=N,fd=M))` names the
 /// process when this account may see it.
 pub fn parse_ss(out: &str) -> Lookup {
@@ -306,6 +333,28 @@ Active Connections\r
         );
         assert_eq!(parse_lsof(""), None);
         assert_eq!(parse_lsof("p7\n"), Some(Holder { pid: 7, name: None }));
+    }
+
+    // QA-056
+    #[test]
+    fn an_empty_lsof_answer_is_free_only_for_root() {
+        let held = Lookup::Held(Holder {
+            pid: 812,
+            name: Some("codeproject".into()),
+        });
+        for euid in [Some(0), Some(501), None] {
+            assert_eq!(lsof_lookup("p812\nccodeproject\n", euid, 32168), held);
+        }
+        assert_eq!(lsof_lookup("", Some(0), 32168), Lookup::Free);
+        for euid in [Some(501), None] {
+            let Lookup::Unknown(why) = lsof_lookup("", euid, 32168) else {
+                panic!("{euid:?}: an account that is not root cannot see every listener");
+            };
+            assert!(
+                why.contains("sudo lsof -nP -iTCP:32168 -sTCP:LISTEN"),
+                "{why}"
+            );
+        }
     }
 
     #[test]

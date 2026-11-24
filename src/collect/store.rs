@@ -258,6 +258,9 @@ pub struct Store {
     /// Tests: make the next writes fail with this error kind.
     #[cfg(test)]
     pub(super) fail_writes: Option<std::io::ErrorKind>,
+    /// Tests: make the next index appends fail with this error kind (image and sidecar written).
+    #[cfg(test)]
+    pub(super) fail_index: Option<std::io::ErrorKind>,
     /// Tests: the zone of day folders and stems instead of the process-wide one.
     #[cfg(test)]
     pub(super) zone: Option<crate::clock::Zone>,
@@ -462,6 +465,8 @@ impl Store {
             passes: 0,
             #[cfg(test)]
             fail_writes: None,
+            #[cfg(test)]
+            fail_index: None,
             #[cfg(test)]
             zone: None,
         }
@@ -872,7 +877,9 @@ impl Store {
     }
 
     /// Image, sidecar, index line: each atomic; the sidecar after the image, so a sidecar
-    /// always has its image. Returns the image path relative to `dir`.
+    /// always has its image. A frame is complete or absent: a failed sidecar write removes the
+    /// image, a failed index append both (as the import's writer does). Returns the image path
+    /// relative to `dir`.
     fn write(
         &mut self,
         dir: &Path,
@@ -921,13 +928,27 @@ impl Store {
         let jpg = day.join(format!("{stem}.jpg"));
         layout::write_in_day(&day, &jpg, &bytes)?;
         let json = serde_json::to_vec_pretty(&*r).map_err(std::io::Error::other)?;
-        if let Err(e) = layout::write_atomic(&day.join(format!("{stem}.json")), &json) {
+        let side = day.join(format!("{stem}.json"));
+        if let Err(e) = layout::write_atomic(&side, &json) {
             let _ = std::fs::remove_file(&jpg);
             return Err(e);
         }
         let total = (bytes.len() + json.len()) as u64;
         let line = IndexLine::of(r, total);
-        layout::append_index(&day, &line)?;
+        #[cfg(test)]
+        let appended = match self.fail_index {
+            Some(kind) => Err(std::io::Error::from(kind)),
+            None => layout::append_index(&day, &line),
+        };
+        #[cfg(not(test))]
+        let appended = layout::append_index(&day, &line);
+        if let Err(e) = appended {
+            // QA-054: no index line, no frame. Left behind, it would be counted by retention and
+            // listed as a stray, yet missing from the summary and the review queue.
+            let _ = std::fs::remove_file(&side);
+            let _ = std::fs::remove_file(&jpg);
+            return Err(e);
+        }
         self.summary.add(&line, &date);
         self.usage.prunable_bytes = self.usage.prunable_bytes.saturating_add(total);
         Ok(rel.jpg())
@@ -1857,6 +1878,36 @@ mod tests {
             Handled::Dropped(Dropped::Error)
         );
         assert!(shared.lock().unwrap().disabled.is_none());
+    }
+
+    /// QA-054: an index append that fails (a full disk) leaves neither the image nor the sidecar,
+    /// and the full disk stops collecting as a failed image write does.
+    #[test]
+    fn a_failed_index_append_leaves_no_image_or_sidecar() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |c| c.buckets.positive.per_camera_min_interval_s = 0);
+        let free = Arc::new(AtomicU64::new(PLENTY));
+        let shared = Arc::new(Mutex::new(Status::default()));
+        let mut st = probed_store(&free, &shared);
+        st.fail_index = Some(std::io::ErrorKind::StorageFull);
+        assert_eq!(
+            st.handle(frame(&s, positive("a", "r1", t(0)), 1)),
+            Handled::Dropped(Dropped::Disk)
+        );
+        let mut left = Vec::new();
+        let mut todo = vec![tmp.0.clone()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    todo.push(p);
+                } else if p.extension().is_some_and(|x| x == "jpg" || x == "json") {
+                    left.push(p);
+                }
+            }
+        }
+        assert!(left.is_empty(), "{left:?}");
+        assert!(shared.lock().unwrap().disabled.is_some());
     }
 
     #[test]

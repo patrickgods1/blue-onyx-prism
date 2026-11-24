@@ -89,6 +89,9 @@ pub(super) const USER_MARKER: &str = "<!--bop:user-->";
 /// The place in `templates/base.html` (`<html data-tz="...">`) where the configured time zone
 /// goes, for the page's scripts ([`personalize`], [`crate::clock::browser_name`]).
 pub(super) const TZ_MARKER: &str = "<!--bop:tz-->";
+/// The place in `templates/base.html` (`data-tz-abbr="..."`) where the zone's letter abbreviations
+/// go ([`crate::clock::Zone::abbreviation_map`]), so `assets/time.js` prints what the server prints.
+pub(super) const TZ_ABBR_MARKER: &str = "<!--bop:tzabbr-->";
 /// Largest page [`personalize`] rewrites (every page of the UI is far smaller).
 const PERSONALIZE_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -675,10 +678,22 @@ struct Personalized;
 /// always replaced, by "" when nothing is left of `zone`). Both are cut to their safe alphabets
 /// (names `[a-z0-9._-]`, zones `[A-Za-z0-9_/+:-]`), so nothing needs escaping. None when the
 /// page has neither marker.
+#[cfg(test)]
 pub(super) fn fill_markers(text: &str, user: Option<&str>, zone: &str) -> Option<String> {
+    fill_all_markers(text, user, zone, "")
+}
+
+/// [`fill_markers`] plus `abbr` at [`TZ_ABBR_MARKER`] (cut to `[A-Za-z0-9+:,-]`).
+pub(super) fn fill_all_markers(
+    text: &str,
+    user: Option<&str>,
+    zone: &str,
+    abbr: &str,
+) -> Option<String> {
     let user = user.filter(|_| text.contains(USER_MARKER));
     let has_zone = text.contains(TZ_MARKER);
-    if user.is_none() && !has_zone {
+    let has_abbr = text.contains(TZ_ABBR_MARKER);
+    if user.is_none() && !has_zone && !has_abbr {
         return None;
     }
     let mut page = text.to_string();
@@ -696,6 +711,13 @@ pub(super) fn fill_markers(text: &str, user: Option<&str>, zone: &str) -> Option
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '+' | ':' | '-'))
             .collect();
         page = page.replacen(TZ_MARKER, &zone, 1);
+    }
+    if has_abbr {
+        let abbr: String = abbr
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | ':' | ',' | '-'))
+            .collect();
+        page = page.replacen(TZ_ABBR_MARKER, &abbr, 1);
     }
     Some(page)
 }
@@ -727,7 +749,12 @@ pub(super) async fn personalize(resp: Response, user: Option<&str>) -> Response 
         return (StatusCode::INTERNAL_SERVER_ERROR, "page could not be read").into_response();
     };
     let text = String::from_utf8_lossy(&bytes);
-    match fill_markers(&text, user, &crate::clock::browser_name()) {
+    match fill_all_markers(
+        &text,
+        user,
+        &crate::clock::browser_name(),
+        &crate::clock::abbreviation_map(),
+    ) {
         None => Response::from_parts(parts, axum::body::Body::from(bytes)),
         Some(page) => {
             parts.headers.remove(header::CONTENT_LENGTH);

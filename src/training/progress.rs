@@ -70,13 +70,13 @@ pub enum TrainEvent {
     Epoch {
         epoch: u32,
         epochs: u32,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "finite_opt")]
         loss: Option<f64>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "finite_opt")]
         map50: Option<f64>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "finite_opt")]
         map: Option<f64>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "finite_opt")]
         elapsed_s: Option<f64>,
         /// Every scalar metric of the epoch, raw key -> value ([`canonical`] maps the keys).
         #[serde(
@@ -89,7 +89,7 @@ pub enum TrainEvent {
     Eval {
         #[serde(default)]
         epoch: u32,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "finite_opt")]
         val_loss: Option<f64>,
         #[serde(
             default,
@@ -110,7 +110,7 @@ pub enum TrainEvent {
         epoch: u32,
         #[serde(default)]
         best_epoch: u32,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "finite_opt")]
         best: Option<f64>,
     },
     /// The rule reached a stop point while the smoothed validation value still rose: training
@@ -131,7 +131,7 @@ pub enum TrainEvent {
         classes: Vec<String>,
         #[serde(default)]
         imgsz: u32,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "finite_opt")]
         seconds: Option<f64>,
         #[serde(default)]
         device: Option<String>,
@@ -472,14 +472,16 @@ pub fn canonical(raw: &str) -> Option<&'static str> {
 /// history keys points by epoch already.
 const COUNTER_KEYS: &[&str] = &["epoch", "step", "global_step", "eval_epoch"];
 
-/// A finite number, else None (a `null`, a string or a NaN does not lose the event).
+/// A finite number, else None: a `null`, a string or an infinity read as a number does not lose
+/// the event. A bare `NaN` / `Infinity` token is no JSON, so a line holding one never parses at
+/// all; the scripts write those as `null` (`jsonable` in `scripts/train_model.py`, QA-073).
 fn finite_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
     let v: Option<serde_json::Value> = Option::deserialize(d)?;
     Ok(v.and_then(|v| v.as_f64()).filter(|f| f.is_finite()))
 }
 
-/// A JSON object of metrics, keeping finite numbers only (a `null`, a string or a NaN the
-/// script let through does not lose the whole event) and no [`COUNTER_KEYS`].
+/// A JSON object of metrics, keeping finite numbers only (a `null` or a string does not lose the
+/// whole event; a bare `NaN` token would, see [`finite_opt`]) and no [`COUNTER_KEYS`].
 fn finite_metrics<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, f64>, D::Error> {
     let raw: Option<BTreeMap<String, serde_json::Value>> = Option::deserialize(d)?;
     Ok(raw
@@ -1850,6 +1852,121 @@ mod tests {
         assert_eq!(parse_line("Epoch 1/3 loss 2"), None);
         assert_eq!(parse_line(r#"@train {"event":"telemetry"}"#), None);
         assert_eq!(parse_line("@train {broken"), None);
+    }
+
+    /// QA-073: a `null` or a string where a number goes leaves the rest of the event; a bare
+    /// `NaN` token is no JSON and loses the line, which is why the scripts never write one.
+    #[test]
+    fn a_null_or_string_number_keeps_the_event_and_a_bare_nan_loses_it() {
+        let eval = parse_line(
+            r#"@train {"event":"eval","epoch":3,"val_loss":null,"metrics":{"eval_map":0.4}}"#,
+        )
+        .unwrap();
+        let TrainEvent::Eval {
+            epoch: 3,
+            val_loss: None,
+            metrics,
+        } = eval
+        else {
+            panic!("{eval:?}")
+        };
+        assert_eq!(metrics.get("eval_map"), Some(&0.4));
+        let epoch = parse_line(
+            r#"@train {"event":"epoch","epoch":2,"epochs":9,"loss":"0.5","map":0.3,"elapsed_s":null}"#,
+        );
+        assert!(
+            matches!(epoch, Some(TrainEvent::Epoch { loss: None, map: Some(m), elapsed_s: None, .. }) if (m - 0.3).abs() < 1e-9),
+            "{epoch:?}"
+        );
+        let stop = parse_line(r#"@train {"event":"stop","reason":"finish","epoch":2,"best":"x"}"#);
+        assert!(
+            matches!(stop, Some(TrainEvent::Stop { best: None, .. })),
+            "{stop:?}"
+        );
+        assert_eq!(
+            parse_line(r#"@train {"event":"eval","epoch":3,"val_loss":NaN}"#),
+            None
+        );
+    }
+
+    /// QA-073: the training script's `event` writes a NaN, an infinity and a numpy scalar as
+    /// plain JSON, so the line parses here with the NaN as None (skipped without Python 3; the
+    /// numpy part without numpy).
+    #[test]
+    fn the_scripts_events_carry_no_nan() {
+        let script = include_str!("../../scripts/train_model.py");
+        let code = r#"
+import sys
+ns = {"__name__": "train_model"}
+exec(compile(sys.stdin.read(), "train_model.py", "exec"), ns)
+try:
+    import numpy as np
+    m = np.float32(0.5)
+except ImportError:
+    m = 0.5
+ns["event"]("eval", epoch=3, val_loss=float("nan"), metrics={"eval_map": m, "eval_loss": float("inf")})
+ns["event"]("epoch", epoch=2, epochs=9, loss=float("nan"), map=m, elapsed_s=float("-inf"))
+"#;
+        let Some(python) = test_python::python3("event NaN") else {
+            return;
+        };
+        let out = test_python::run(python, &["-I", "-c", code], script);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let events: Vec<TrainEvent> = text.lines().filter_map(parse_line).collect();
+        assert_eq!(events.len(), 2, "{text}");
+        assert!(
+            !text.contains("NaN") && !text.contains("Infinity"),
+            "{text}"
+        );
+        let TrainEvent::Eval {
+            val_loss: None,
+            ref metrics,
+            ..
+        } = events[0]
+        else {
+            panic!("{text}")
+        };
+        assert_eq!(metrics.len(), 1, "{text}");
+        assert!((metrics["eval_map"] - 0.5).abs() < 1e-9, "{text}");
+        assert!(
+            matches!(events[1], TrainEvent::Epoch { loss: None, map: Some(m), elapsed_s: None, .. } if (m - 0.5).abs() < 1e-9),
+            "{text}"
+        );
+    }
+
+    /// QA-074: the export checks fail on a NaN or infinite difference (`NaN > tolerance` is
+    /// False), and the box check matches queries listed in another order but not boxes whose
+    /// coordinates moved (skipped without Python 3 and numpy).
+    #[test]
+    fn the_export_checks_fail_on_nan_and_on_moved_boxes() {
+        let script = include_str!("../../scripts/train_model.py");
+        let code = r#"
+import json, sys
+import numpy as np
+ns = {"__name__": "train_model"}
+exec(compile(sys.stdin.read(), "train_model.py", "exec"), ns)
+dis = ns["export_disagrees"]
+gates = [dis(float("nan"), 1e-2), dis(float("inf"), 0.5), dis(0.005, 1e-2), dis(0.02, 1e-2), dis(0.5, 0.5)]
+qbd = ns["query_box_difference"]
+scores = np.array([[0.9, 0.1], [0.2, 0.8], [0.05, 0.05]])
+boxes = np.array([[0.5, 0.5, 0.2, 0.3], [0.2, 0.7, 0.1, 0.1], [0.1, 0.1, 0.05, 0.05]])
+order = [2, 0, 1]
+same = qbd(scores, boxes, scores[order], boxes[order], k=2)
+swapped = boxes[:, [1, 0, 3, 2]]
+moved = qbd(scores, boxes, scores, swapped, k=2)
+print(json.dumps({"gates": gates, "same": same, "moved": moved}))
+"#;
+        let Some(python) = test_python::python3_with_numpy("export checks") else {
+            return;
+        };
+        let out = test_python::run(python, &["-I", "-c", code], script);
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            v["gates"],
+            serde_json::json!([true, true, false, true, false])
+        );
+        assert_eq!(v["same"].as_f64(), Some(0.0), "{v}");
+        assert!(v["moved"].as_f64().unwrap() > 0.1, "{v}");
     }
 
     #[test]

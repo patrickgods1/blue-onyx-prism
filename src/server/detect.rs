@@ -772,13 +772,17 @@ async fn detect_on(
             return (StatusCode::OK, resp);
         }
         // It became ready (or got room) meanwhile: serve it normally (the request is
-        // already counted).
+        // already counted). An upload that does not parse is no request on the Ready path
+        // ([`dispatch`] counts after the parse), so it is not one here either (QA-097).
         let (status, resp) = match parse_counted(state, upload, no_collect).await {
             Ok(r) => (
                 StatusCode::OK,
                 send_to_worker(handle, r, start, request_id).await,
             ),
-            Err(e) => (e.status, VisionDetectionResponse::error(e.message)),
+            Err(e) => {
+                handle.metrics.requests.fetch_sub(1, Ordering::Relaxed);
+                (e.status, VisionDetectionResponse::error(e.message))
+            }
         };
         return (
             status,

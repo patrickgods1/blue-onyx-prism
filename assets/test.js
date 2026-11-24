@@ -1,7 +1,36 @@
 // Blue Onyx Prism: Test page (served from /static/; no inline scripts under the CSP).
 // Client-side flow: preview, drag-drop / paste, submit to the API with fetch and draw the boxes
 // on a canvas. Without JavaScript the form posts to /test and the server draws the image.
+
+// The pure part, no DOM (tested in node against the Rust twins, src/server/pages.rs).
 (function () {
+  // `effective_threshold` of src/worker/mod.rs: a request value over 1 is a percentage, over 100
+  // it is ignored; never under the 0.01 floor.
+  var FLOOR = 0.01;
+  function effective(asked, configured) {
+    var t = asked > 0 && isFinite(asked) ? (asked <= 1 ? asked : asked <= 100 ? asked / 100 : configured) : configured;
+    return isFinite(t) && t >= FLOOR ? t : FLOOR;
+  }
+  function fmtT(t) { return t.toFixed(3).replace(/0$/, ""); }
+  // Twin of `no_objects_line` (src/server/pages.rs): what an answer with no predictions says,
+  // [sentence, hint], for the Min confidence field's text and the model's thresholds `m`
+  // ({t, night?}, the select's data-thresholds entry; none = unknown model).
+  function noneLine(askedText, m) {
+    var asked = parseFloat(askedText), t, night = null;
+    if (asked > 0 && asked <= 100) t = effective(asked, 0);
+    else if (m && typeof m.t === "number") {
+      t = effective(0, m.t);
+      if (typeof m.night === "number") night = effective(0, m.night);
+    } else return ["No objects found.", "Lower Min confidence to see weaker detections."];
+    if (night !== null && fmtT(night) === fmtT(t)) night = null;
+    var line = "No objects at or above " + fmtT(t) + (night !== null ? " (" + fmtT(night) + " on night and IR frames)" : "") + ".";
+    return [line, Math.min(t, night === null ? t : night) > FLOOR ? "Lower Min confidence to see weaker detections." : ""];
+  }
+  globalThis.PrismTestPage = {FLOOR: FLOOR, effective: effective, fmtT: fmtT, noneLine: noneLine};
+})();
+
+(function () {
+  if (typeof document === "undefined") return; // loaded by a node test: only PrismTestPage
   var UPLOAD_TIMEOUT_MS = 60000;
   var form = document.getElementById("test-form"), input = document.getElementById("image");
   var preview = document.getElementById("preview"), drop = document.getElementById("drop");
@@ -99,29 +128,12 @@
       ctx.fillText(text, x0 + 4, ty + 3);
     });
   }
-  // `effective_threshold` of src/worker/mod.rs: a request value over 1 is a percentage, over 100
-  // it is ignored; never under the 0.01 floor.
-  var FLOOR = 0.01;
-  function effective(asked, configured) {
-    var t = asked > 0 && isFinite(asked) ? (asked <= 1 ? asked : asked <= 100 ? asked / 100 : configured) : configured;
-    return isFinite(t) && t >= FLOOR ? t : FLOOR;
-  }
-  function fmtT(t) { return t.toFixed(3).replace(/0$/, ""); }
-  // Twin of `no_objects_line` (src/server/pages.rs): what an answer with no predictions says,
-  // [sentence, hint]. The model's thresholds come from the select's data-thresholds.
+  // The sentence for an answer with no predictions: PrismTestPage.noneLine (the pure part, above).
   function noneLine(model) {
-    var field = form.querySelector('[name="min_confidence"]'), asked = parseFloat(field ? field.value : "");
+    var field = form.querySelector('[name="min_confidence"]');
     var map = {}, sel = document.getElementById("model");
     try { map = JSON.parse((sel && sel.dataset.thresholds) || "{}") || {}; } catch (e) { map = {}; }
-    var m = map[model], t, night = null;
-    if (asked > 0 && asked <= 100) t = effective(asked, 0);
-    else if (m && typeof m.t === "number") {
-      t = effective(0, m.t);
-      if (typeof m.night === "number") night = effective(0, m.night);
-    } else return ["No objects found.", "Lower Min confidence to see weaker detections."];
-    if (night !== null && fmtT(night) === fmtT(t)) night = null;
-    var line = "No objects at or above " + fmtT(t) + (night !== null ? " (" + fmtT(night) + " on night and IR frames)" : "") + ".";
-    return [line, Math.min(t, night === null ? t : night) > FLOOR ? "Lower Min confidence to see weaker detections." : ""];
+    return PrismTestPage.noneLine(field ? field.value : "", map[model]);
   }
   function show(j, model) {
     var err = document.getElementById("client-error");

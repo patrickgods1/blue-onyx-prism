@@ -948,3 +948,69 @@ async fn the_card_lists_accounts_marks_you_and_has_no_inline_code() {
     );
     assert!(!page.contains("<b>x</b>"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Log lines
+// ---------------------------------------------------------------------------------------------
+
+/// Refusals that cost no hashing (the API token, the address limit) are logged at most once a
+/// minute per kind, not once per request (phase 6 did this for sign-ins).
+#[tokio::test]
+async fn refused_account_changes_are_logged_at_most_once_a_minute() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let state = two_accounts();
+    let token = "ab".repeat(32);
+    std::fs::write(
+        crate::admin_token::path_in(state.auth.data_root()),
+        format!("{token}\n"),
+    )
+    .unwrap();
+    let wrong = vec![("name", BOB), ("current", WRONG)];
+    for _ in 0..crate::server::auth::MAX_FAILURES {
+        let (s, _, _) = call(&state, post("/config/accounts/unlock", &wrong, false)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+    let buf = crate::logbuf::LogBuffer::new(1000);
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(buf.clone()));
+    tracing::callsite::rebuild_interest_cache();
+    for _ in 0..20 {
+        let (s, _, _) = call(&state, post("/config/accounts/unlock", &wrong, false)).await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+        let r = bearer(post("/config/accounts/unlock", &wrong, false), &token);
+        let (s, _, _) = call(&state, r).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+    let entries = buf.since(0, None, 1000).entries;
+    let count = |needle: &str| {
+        entries
+            .iter()
+            .filter(|e| e.message.contains(needle))
+            .count()
+    };
+    // Another test may have taken this minute's line; either way, not one per request.
+    for needle in [
+        "too many wrong attempts from this address",
+        "an account change with the API token was refused",
+    ] {
+        let lines = count(needle);
+        assert!(lines <= 1, "{needle}: {lines} lines");
+    }
+}
+
+/// Extra [14]: the line of a wrong current password says when the account now waits, not only
+/// when it is disabled.
+#[test]
+fn a_wrong_current_password_says_when_the_account_starts_waiting() {
+    use super::after_wrong;
+    use crate::accounts::lockout::{DELAY_AFTER, DISABLE_AT, State};
+    let at = |failures, disabled| State {
+        failures,
+        last_failure: Some(1),
+        disabled,
+    };
+    assert_eq!(after_wrong(None), "");
+    assert_eq!(after_wrong(Some(&at(DELAY_AFTER - 1, false))), "");
+    assert!(after_wrong(Some(&at(DELAY_AFTER, false))).contains("now waits"));
+    assert!(after_wrong(Some(&at(DISABLE_AT - 1, false))).contains("now waits"));
+    assert!(after_wrong(Some(&at(DISABLE_AT, true))).contains("disabled until"));
+}

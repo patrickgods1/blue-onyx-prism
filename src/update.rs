@@ -1,7 +1,8 @@
 //! Release update check against the project's GitHub releases.
 //!
 //! The answer is untrusted data: the body is read up to [`MAX_BODY_BYTES`] and then parsed
-//! (a longer one is an error), the tag is parsed as `major.minor.patch` only, the release
+//! (a longer one is an error), the tag is parsed as `major.minor.patch` (with an optional
+//! pre-release / build suffix, [`VersionInfo::parse`]) only, the release
 //! notes are cut to [`MAX_NOTES_CHARS`], and nothing is ever downloaded or applied; the result
 //! is only shown on the status page.
 
@@ -134,11 +135,22 @@ pub fn check_off(current: &str) -> StatusUpdateResponse {
 }
 
 async fn check_uncached(current: &str) -> StatusUpdateResponse {
+    check_with(current, fetch_latest()).await
+}
+
+/// [`check_uncached`] with the fetch given (tests fail it). `current` is parsed first and kept
+/// in a failed answer too, as [`check_off`] does (QA-080: an unreachable GitHub showed the
+/// running version as 0.0.0).
+async fn check_with(
+    current: &str,
+    fetch: impl std::future::Future<Output = Result<Release>>,
+) -> StatusUpdateResponse {
+    let current_v = VersionInfo::parse(current, None);
     let run = async {
-        let current_v = VersionInfo::parse(current, None)?;
-        let rel = fetch_latest().await?;
+        let current_v = current_v.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        let rel = fetch.await?;
         let latest = VersionInfo::parse(&rel.tag_name, rel.body)?;
-        Ok::<_, anyhow::Error>((current_v, latest))
+        Ok::<_, anyhow::Error>((current_v.clone(), latest))
     };
     match run.await {
         Ok((current_v, latest)) => StatusUpdateResponse {
@@ -152,6 +164,7 @@ async fn check_uncached(current: &str) -> StatusUpdateResponse {
         Err(e) => StatusUpdateResponse {
             success: false,
             message: format!("{e:#}"),
+            current: current_v.unwrap_or_default(),
             ..Default::default()
         },
     }
@@ -207,6 +220,9 @@ mod tests {
             let v = VersionInfo::parse(&rel.tag_name, rel.body);
             if tag == "1.2.3.4.5" {
                 assert!(v.is_ok(), "extra segments are ignored");
+            } else if tag == "v1.2.3-rc1" {
+                // QA-068: a pre-release suffix is kept, not refused.
+                assert_eq!(v.unwrap().preRelease.as_deref(), Some("rc1"));
             } else {
                 assert!(v.is_err(), "{tag}");
             }
@@ -242,6 +258,39 @@ mod tests {
             ))
             .unwrap_err();
         assert!(format!("{err:#}").contains("cut"));
+    }
+
+    /// QA-080: a failed check (GitHub unreachable, a tag that does not parse) still reports the
+    /// running version, and offers no update.
+    #[test]
+    fn a_failed_check_keeps_the_current_version() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let r = rt.block_on(check_with("0.2.0", async {
+            Err(anyhow::anyhow!("requesting latest release: timed out"))
+        }));
+        assert!(!r.success && !r.updateAvailable);
+        assert!(r.message.contains("timed out"), "{}", r.message);
+        assert_eq!(
+            (r.current.major, r.current.minor, r.current.patch),
+            (0, 2, 0)
+        );
+        let r = rt.block_on(check_with("0.2.0", async {
+            Ok(Release {
+                tag_name: "latest".into(),
+                body: None,
+            })
+        }));
+        assert!(!r.success);
+        assert_eq!((r.current.minor, r.latest.minor), (2, 0));
+        let r = rt.block_on(check_with("0.2.0", async {
+            Ok(Release {
+                tag_name: "v0.3.0".into(),
+                body: None,
+            })
+        }));
+        assert!(r.success && r.updateAvailable, "{}", r.message);
     }
 
     #[test]

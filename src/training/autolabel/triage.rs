@@ -410,6 +410,9 @@ pub struct ApplyReport {
     pub annotated: usize,
     /// Pending boxes of another label that got the proposal's class as a suggestion.
     pub class_suggestions: usize,
+    /// Proposals [`merge_proposals`] would have added with no room left in the file
+    /// ([`labels::MAX_BOXES`], the most a Review save takes): left out, the last first.
+    pub full: usize,
 }
 
 /// Merge `boxes` into `f`. Per proposal, against the existing (pre-merge) boxes at IoU >=
@@ -421,7 +424,10 @@ pub struct ApplyReport {
 /// - when no box of the same label matches and the best box is a pending one of another label
 ///   without evidence, it gets the proposal's evidence as a class suggestion (`auto_label`,
 ///   `auto_score`, triage `review`, a reason) and the proposal is dropped (no duplicate box);
-/// - everything else goes to [`merge_proposals`] by its rule.
+/// - everything else goes to [`merge_proposals`] by its rule, up to [`labels::MAX_BOXES`] boxes in
+///   the file (QA-110: one over it fails every later Review save); the proposals it would add past
+///   that are left out and counted ([`ApplyReport::full`]). Evidence and suggestions on existing
+///   boxes are applied either way.
 pub fn apply(f: &mut LabelFile, boxes: Vec<LabelBox>) -> ApplyReport {
     /// Index of the existing box (the first `existing`) of highest IoU >= [`MATCH_IOU`] with
     /// `p` among those `keep` accepts.
@@ -478,7 +484,23 @@ pub fn apply(f: &mut LabelFile, boxes: Vec<LabelBox>) -> ApplyReport {
         }
         rest.push(p);
     }
-    r.merge = merge_proposals(f, rest);
+    if existing + rest.len() <= labels::MAX_BOXES {
+        r.merge = merge_proposals(f, rest);
+        return r;
+    }
+    // Which proposals the merge adds depends only on the existing boxes and the proposals added
+    // before it, so merging just the first ones it adds adds exactly those.
+    let mut trial = f.clone();
+    let all = merge_proposals(&mut trial, rest);
+    let room = labels::MAX_BOXES.saturating_sub(existing);
+    let kept: Vec<LabelBox> = trial
+        .boxes
+        .drain(existing.min(trial.boxes.len())..)
+        .take(room)
+        .collect();
+    r.full = all.added.saturating_sub(kept.len());
+    r.merge = merge_proposals(f, kept);
+    r.merge.dropped += all.dropped;
     r
 }
 
@@ -1491,6 +1513,56 @@ mod tests {
         let v = serde_json::to_value(b).unwrap();
         assert_eq!(v["triage"], "accept");
         assert_eq!(v["labelers"]["rfdetr"], serde_json::json!(0.9f32));
+    }
+
+    #[test]
+    fn merge_stops_at_the_most_boxes_a_review_save_takes() {
+        // QA-110: 499 boxes and 5 proposals that overlap nothing: 1 is added, 4 counted full.
+        let at = |i: usize| {
+            let (x, y) = ((i % 40) as f32 * 16.0, (i / 40) as f32 * 16.0);
+            LabelBox {
+                label: "car".into(),
+                bbox: [x, y, x + 10.0, y + 10.0],
+                source: Source::Model,
+                score: Some(0.6),
+                state: BoxState::Pending,
+                origin: Some(labels::Origin::Prediction),
+                reason: None,
+                model_label: None,
+                orig_bbox: None,
+                difficult: false,
+                reject_reason: None,
+                auto: AutoInfo::default(),
+            }
+        };
+        let mut f = LabelFile {
+            boxes: (0..labels::MAX_BOXES - 1).map(at).collect(),
+            status: Status::Reviewed,
+            ..LabelFile::default()
+        };
+        let proposals: Vec<LabelBox> = (labels::MAX_BOXES - 1..labels::MAX_BOXES + 4)
+            .map(|i| {
+                let mut b = at(i);
+                b.source = Source::Auto;
+                b
+            })
+            .collect();
+        let rep = apply(&mut f, proposals.clone());
+        assert_eq!(f.boxes.len(), labels::MAX_BOXES);
+        assert_eq!((rep.merge.added, rep.full, rep.merge.dropped), (1, 4, 0));
+        assert!(rep.merge.reopened);
+        assert_eq!(
+            f.boxes.last().map(|b| b.bbox),
+            proposals.first().map(|b| b.bbox)
+        );
+        // A full file gets no box and is not reopened for nothing.
+        let mut full = f.clone();
+        full.status = Status::Reviewed;
+        let rep = apply(&mut full, proposals);
+        assert_eq!(full.boxes.len(), labels::MAX_BOXES);
+        assert_eq!((rep.merge.added, rep.full, rep.merge.dropped), (0, 4, 1));
+        assert!(!rep.merge.reopened);
+        assert_eq!(full.status, Status::Reviewed);
     }
 
     #[test]

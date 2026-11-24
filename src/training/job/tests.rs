@@ -43,6 +43,10 @@ struct TrainFake {
     /// Run out of GPU memory when `--batch` is above this, after `oom_epochs` finished epochs.
     oom_above: Option<u32>,
     oom_epochs: u32,
+    /// Write the stop file (the user's Finish now) just before running out of GPU memory.
+    finish_before_oom: bool,
+    /// Whether the stop file existed when each training command started (not the self-check).
+    stop_at_start: Mutex<Vec<bool>>,
     /// Run out of system memory (the incident's lines) when `--workers` is above this.
     host_oom_above: Option<u32>,
     /// Write `<work>/run/weights/best.pt`, as Ultralytics does after an epoch.
@@ -105,6 +109,9 @@ impl CommandRunner for TrainFake {
                 .join("weights");
             std::fs::create_dir_all(&w).unwrap();
             std::fs::write(w.join("best.pt"), vec![7u8; 2048]).unwrap();
+        }
+        if let Some(stop) = arg_after(cmd, "--stop-file") {
+            self.stop_at_start.lock().unwrap().push(stop.exists());
         }
         let export_only = arg_after(cmd, "--export-only").is_some();
         if self.rfdetr_files && !export_only {
@@ -173,6 +180,11 @@ impl CommandRunner for TrainFake {
             }));
         }
         if self.oom_above.is_some_and(|max| batch > max) {
+            if self.finish_before_oom {
+                let stop = arg_after(cmd, "--stop-file").unwrap();
+                std::fs::create_dir_all(stop.parent().unwrap()).unwrap();
+                std::fs::write(&stop, "finish").unwrap();
+            }
             for e in 1..=self.oom_epochs {
                 on_line(&format!(
                     "@train {{\"event\":\"epoch\",\"epoch\":{e},\"epochs\":9,\"loss\":1.0}}"
@@ -3290,5 +3302,123 @@ fn a_cancel_during_the_dataset_stage_stops_it_and_removes_the_data() {
             .iter()
             .all(|c| c.display().contains("--self-check")),
         "no training started"
+    );
+}
+
+/// QA-101: the queue's same-name check uses the name rule registration uses, so a run training
+/// `RACCOON` or `raccoon.onnx` beside a queued `raccoon` is refused at enqueue, not after hours of
+/// training when registering it fails.
+#[test]
+fn a_name_differing_only_in_case_or_extension_is_already_queued() {
+    let t = tmp("queue-same-name");
+    let fake = Arc::new(TrainFake {
+        hang: true,
+        ..TrainFake::new()
+    });
+    let svc = TrainingService::start(
+        fake.clone(),
+        fake.clone(),
+        Arc::new(NoHooks),
+        Some(t.0.join("training").join("runs.json")),
+    );
+    let mut a = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    a.run_dir = t.0.join("training/a");
+    let name = a.name.clone();
+    let ida = svc.enqueue(a.clone()).unwrap();
+    for (i, other) in [name.to_uppercase(), format!(" {name}.onnx")]
+        .into_iter()
+        .enumerate()
+    {
+        let mut dup = a.clone();
+        dup.id = format!("other-{i}");
+        dup.name = other.clone();
+        let e = svc.enqueue(dup).unwrap_err();
+        assert!(e.contains("already queued or running"), "{other}: {e}");
+    }
+    assert!(svc.cancel(&ida));
+    let _ = svc.wait(&ida, Duration::from_secs(10));
+    svc.shutdown();
+}
+
+/// Says every name is in the config already.
+struct NameTaken;
+
+impl Hooks for NameTaken {
+    fn register(&self, _: &TrainOutput) -> Result<String> {
+        panic!("a run whose name the config has is not registered")
+    }
+    fn benchmark(
+        &self,
+        _: &TrainOutput,
+        _: &[String],
+        _: &[String],
+        _: &AtomicBool,
+    ) -> Result<Option<BenchSummary>> {
+        panic!("not benchmarked")
+    }
+    fn config_has_model(&self, _: &str) -> bool {
+        true
+    }
+}
+
+/// QA-101: a model of the run's name added to the config after the enqueue check fails the run
+/// when it starts, before any training command.
+#[test]
+fn a_name_the_config_gained_after_queueing_fails_the_run_before_training() {
+    let t = tmp("name-taken");
+    let j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    let fake = TrainFake::new();
+    let (r, _) = run(&j, &fake, &NameTaken, &AtomicBool::new(false));
+    let e = r.unwrap_err();
+    assert!(
+        e.message.contains("the config already has a model named"),
+        "{}",
+        e.message
+    );
+    assert!(fake.train_cmds.lock().unwrap().is_empty(), "nothing ran");
+}
+
+/// QA-103: Finish now during an attempt that then runs out of GPU memory early holds for the
+/// retry: the stop request is there when the retry starts, and the log says so. A stop request
+/// left from before the run is still removed before the first attempt.
+#[test]
+fn a_finish_request_carries_over_to_the_out_of_memory_retry() {
+    let t = tmp("finish-oom");
+    let mut j = job(&t.0, TrainFamily::Yolo26, "n", mps(), Platform::MACOS_ARM64);
+    j.request.recipe.batch = 8;
+    let stale = stop_file(&j.run_dir);
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, "an earlier run").unwrap();
+    let fake = TrainFake {
+        oom_above: Some(4),
+        oom_epochs: 1,
+        finish_before_oom: true,
+        ..TrainFake::new()
+    };
+    let mut lines = Vec::new();
+    let r = run_training(
+        &j,
+        &fake,
+        &fake,
+        &NoHooks,
+        &mut |p| {
+            if let TrainReport::Line(l) = p {
+                lines.push(l.to_string());
+            }
+        },
+        &AtomicBool::new(false),
+    );
+    r.unwrap();
+    assert_eq!(train_batches(&fake), [8, 4]);
+    assert_eq!(
+        *fake.stop_at_start.lock().unwrap(),
+        [false, true],
+        "the stale request removed, the user's kept for the retry"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("finish requested: the retry stops after its first epoch")),
+        "{lines:?}"
     );
 }

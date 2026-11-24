@@ -313,6 +313,57 @@ impl Zone {
     }
 }
 
+impl Zone {
+    /// The letter abbreviations an IANA zone uses over the next year, for the browser
+    /// (`<html data-tz-abbr>`): `offset-minutes:ABBR` pairs joined by `,` (`60:CET,120:CEST`),
+    /// first one seen per offset, numeric abbreviations (`-03`) left out. The page's script
+    /// (`assets/time.js`) looks up the offset of the instant it shows, so it prints what
+    /// [`Self::abbreviation`] prints; `Intl` has no such names for most zones outside the US.
+    /// Empty for `UTC`, fixed offsets and a `local` zone whose IANA name is unknown. Only
+    /// `[A-Za-z0-9+:,-]`.
+    ///
+    /// ```
+    /// # use blue_onyx_prism::clock::Zone;
+    /// let now = chrono::DateTime::parse_from_rfc3339("2026-11-16T22:02:11Z").unwrap();
+    /// let berlin: Zone = "Europe/Berlin".parse().unwrap();
+    /// assert_eq!(berlin.abbreviation_map(now), "60:CET,120:CEST");
+    /// assert_eq!(Zone::Utc.abbreviation_map(now), "");
+    /// ```
+    pub fn abbreviation_map(self, now: impl Into<DateTime<Utc>>) -> String {
+        let now: DateTime<Utc> = now.into();
+        let tz = match self {
+            Zone::Named(tz) => Some(tz),
+            Zone::Local => local_iana_at(now),
+            Zone::Utc | Zone::Fixed(_) => None,
+        };
+        let Some(tz) = tz else {
+            return String::new();
+        };
+        let mut seen: Vec<(i32, String)> = Vec::new();
+        for month in 0..13_i64 {
+            let t = now + TimeDelta::days(30 * month);
+            let abbr = t.with_timezone(&tz).format("%Z").to_string();
+            if abbr.is_empty() || abbr.starts_with(['+', '-']) || !abbr.chars().all(browser_safe) {
+                continue;
+            }
+            let minutes = Zone::Named(tz).offset_at(t).local_minus_utc() / 60;
+            if !seen.iter().any(|(m, _)| *m == minutes) {
+                seen.push((minutes, abbr));
+            }
+        }
+        seen.sort_by_key(|(m, _)| *m);
+        seen.iter()
+            .map(|(m, a)| format!("{m}:{a}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+/// [`Zone::abbreviation_map`] of the process-wide zone, now.
+pub fn abbreviation_map() -> String {
+    zone().abbreviation_map(Utc::now())
+}
+
 /// The instant at the start of `s` when it begins with a frame stamp ([`Zone::frame_stamp`]):
 /// `YYYYMMDDTHHMMSSmmm` followed by `Z`, `-hhmm`, `phhmm` (or `+hhmm`), then the end or a
 /// character that is not a letter or digit (stems are `<stamp>_<id>`). Old UTC stems

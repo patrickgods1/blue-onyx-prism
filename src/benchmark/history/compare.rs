@@ -129,7 +129,14 @@ pub fn comparable(a: &HistoryEntry, b: &HistoryEntry) -> Result<(), Vec<String>>
     if !same_model(&a.model, &b.model) {
         reasons.push(format!("different models: {} -> {}", a.model, b.model));
     }
-    if sa.datasets != sb.datasets {
+    // The same sets in another order are the same images (QA-065); the text keeps each order.
+    let set_of = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.sort();
+        v.dedup();
+        v
+    };
+    if set_of(&sa.datasets) != set_of(&sb.datasets) {
         reasons.push(format!(
             "different datasets: {} -> {}",
             list(&sa.datasets),
@@ -726,7 +733,8 @@ fn live_load_change(dev: &str, a: &DeviceSnap, b: &DeviceSnap) -> MetricChange {
         rel: None,
         verdict: Verdict::Same,
         why: format!(
-            "detection requests answered while it ran, per minute: {} -> {} (a busier run is              slower and noisier)",
+            "detection requests answered while it ran, per minute: {} -> {} (a busier run is \
+             slower and noisier)",
             txt(x),
             txt(y)
         ),
@@ -939,9 +947,9 @@ pub fn compare_with_history(entries: &[HistoryEntry], current: &HistoryEntry) ->
         .iter()
         .filter(|e| e.run_id != current.run_id)
         .collect();
-    let pinned = entries
-        .iter()
-        .find(|e| e.pinned && e.run_id != current.run_id);
+    // QA-066: a pinned entry after `current` is no baseline of it (the change would run
+    // backwards); the newest pinned earlier one.
+    let pinned = candidates.iter().rev().find(|e| e.pinned).copied();
     let base = pinned
         .or_else(|| {
             candidates

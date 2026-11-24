@@ -1296,6 +1296,7 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                 let mut last_print = std::time::Instant::now();
                 // QA-039: followed by the push count, not the tail's length.
                 let mut follow = service::LogFollower::new();
+                let mut balance_shown = false;
                 while let Some((r, seq)) = svc.wait_logged(id, Duration::from_secs(1)) {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         for i in &ids {
@@ -1305,9 +1306,10 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
                     for l in follow.new_lines(&r.log, seq) {
                         if verbose {
                             eprintln!("    {l}");
-                        } else if l.starts_with("dataset: balanced:") {
-                            eprintln!("[{}] {}", r.name, l.trim_start_matches("dataset: "));
                         }
+                    }
+                    if let Some(b) = balance_note(r.dataset.as_ref(), &mut balance_shown) {
+                        eprintln!("[{}] balanced: {b}", r.name);
                     }
                     // One line per stage or percent change, else at most every 10 s.
                     let line = format!("[{}] {:>3}% {}", r.name, r.percent, r.describe());
@@ -1733,6 +1735,18 @@ fn classes_json(inv: &[dataset::ClassCount], scene: Option<SceneFilter>) -> Resu
     Ok(serde_json::to_string_pretty(&rows)?)
 }
 
+/// The balance result a run's record carries, the first time it does (`shown` remembers it).
+/// QA-100: read from [`service::DatasetCounts::balance_summary`], never parsed out of log text
+/// (the job writes its `dataset: balanced:` line to train.log only).
+fn balance_note<'a>(d: Option<&'a service::DatasetCounts>, shown: &mut bool) -> Option<&'a str> {
+    if *shown {
+        return None;
+    }
+    let b = d?.balance_summary.as_deref()?;
+    *shown = true;
+    Some(b)
+}
+
 fn report_run(r: &service::RunRecord) {
     println!("{}: {}", r.name, r.describe());
     if let Some(d) = &r.dataset {
@@ -2093,6 +2107,15 @@ impl Hooks for CliHooks {
         Ok(format!("{} ({})", edited.value, self.config_path.display()))
     }
 
+    fn config_has_model(&self, name: &str) -> bool {
+        // A config that does not load is left to `register`, which names the problem.
+        load_config(&self.config_path).is_ok_and(|c| {
+            c.models
+                .iter()
+                .any(|m| crate::model::name::same_model_name(&m.effective_name(), name))
+        })
+    }
+
     fn benchmark(
         &self,
         out: &TrainOutput,
@@ -2155,6 +2178,22 @@ mod tests {
         assert!(!t.contains("--gpu"), "one GPU: nothing to choose: {t}");
         let none = capability::capability(&HardwareInfo::new("linux", "x86_64", vec![]), None);
         assert!(capability_text(&none).contains("train_model.py"));
+    }
+
+    /// QA-100: a balanced run's summary is printed once, from the record, when it first appears.
+    #[test]
+    fn the_balance_summary_is_printed_once_from_the_record() {
+        let mut d = service::DatasetCounts::default();
+        let mut shown = false;
+        assert_eq!(balance_note(None, &mut shown), None, "nothing prepared yet");
+        assert_eq!(balance_note(Some(&d), &mut shown), None, "not balanced");
+        assert!(!shown);
+        d.balance_summary = Some("209 -> 412 images/epoch".into());
+        assert_eq!(
+            balance_note(Some(&d), &mut shown),
+            Some("209 -> 412 images/epoch")
+        );
+        assert_eq!(balance_note(Some(&d), &mut shown), None, "once only");
     }
 
     #[derive(clap::Parser)]

@@ -342,13 +342,15 @@ pub fn rescore_locked(
         }
         snap
     };
+    // QA-050: every read that can fail comes before the first write, so a damaged preds file
+    // leaves the snapshot and the results as they were (not a new snapshot beside old results).
+    let preds = StoredPreds::load(preds_path)?;
     let id = new_snap.save(&gt_path)?;
     new_info.snapshot = Some(id);
     new_info.labels_stale = None;
     if let Some(slot) = results.image_sets.get_mut(old_set) {
         *slot = new_info;
     }
-    let preds = StoredPreds::load(preds_path)?;
     let (models, runs, not_rescored) = rescore_runs(&mut results, preds.as_ref(), &gone);
     results.regrade(config.benchmark.accuracy_metric, config.benchmark.weights);
     let frames_now = results.image_set(ID).map_or(0, |s| s.images.len());

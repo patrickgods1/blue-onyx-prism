@@ -637,6 +637,15 @@ impl OrtRuntime {
             };
             image_input_size(&path, &pinned)?;
         }
+        // Output element types are checked here, so an unsupported one fails the load (and the
+        // next candidate is tried) with its name, not every warm-up inference.
+        if let Some(reason) = unsupported_output(&meta_outputs) {
+            bail!(
+                "{} cannot run model {}: {reason}",
+                cand.device,
+                path.display()
+            );
+        }
         let overrides = dimension_overrides(&inputs, &syms, image_idx, extra_idx, &image_default);
         if let Some(reason) = unsupported_on(target, &inputs, &syms, &overrides) {
             bail!(
@@ -1878,13 +1887,33 @@ pub(crate) fn extra_value(port: &PortSpec, extra: &ExtraInput) -> Result<DynValu
     })
 }
 
-/// Copy one output value into `out`, reusing its buffer.
+/// The output element types [`read_output_into`] reads (f16 is widened to f32, as the OpenVINO
+/// backend does).
+const OUTPUT_ELEMS: [PortElem; 4] = [PortElem::F32, PortElem::F16, PortElem::I64, PortElem::I32];
+
+/// Why `outputs` cannot be read, naming the first output of another element type (a bool or
+/// u8 head, a non-tensor output), or `None`.
+fn unsupported_output(outputs: &[PortSpec]) -> Option<String> {
+    let p = outputs.iter().find(|p| !OUTPUT_ELEMS.contains(&p.elem))?;
+    Some(format!(
+        "output '{}' has element type {:?}; only f32, f16, i64 and i32 outputs are supported \
+         (re-export the model with float or integer outputs)",
+        p.name, p.elem
+    ))
+}
+
+/// Copy one output value into `out`, reusing its buffer. f16 outputs are widened to f32.
 fn read_output_into(name: &str, v: &DynValue, out: &mut NamedOutput) -> Result<()> {
     let ty = v.dtype().tensor_type();
     let shape: &[i64] = match ty {
         Some(TensorElementType::Float32) => {
             let (s, d) = v.try_extract_tensor::<f32>().map_err(ort_err)?;
             out.data.f32_mut().extend_from_slice(d);
+            s
+        }
+        Some(TensorElementType::Float16) => {
+            let (s, d) = v.try_extract_tensor::<half::f16>().map_err(ort_err)?;
+            out.data.f32_mut().extend(d.iter().map(|&h| f32::from(h)));
             s
         }
         Some(TensorElementType::Int64) => {
@@ -2836,6 +2865,76 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(!held(&hung), "released with the thread");
+    }
+
+    // QA-046 / extra [2]: an output type `read_output_into` cannot read fails the load, naming
+    // the output, instead of every warm-up inference.
+    #[test]
+    fn unsupported_output_types_are_refused_at_compile() {
+        let ok = [
+            port("boxes", &[1, 300, 4], PortElem::F32),
+            port("half_head", &[1, 84, 8400], PortElem::F16),
+            port("labels", &[1, 300], PortElem::I64),
+            port("count", &[1], PortElem::I32),
+        ];
+        assert_eq!(unsupported_output(&ok), None);
+        assert_eq!(unsupported_output(&[]), None);
+        for elem in [PortElem::U8, PortElem::Other] {
+            let mut outs = ok.to_vec();
+            outs.push(port("keep_mask", &[1, 300], elem));
+            let why = unsupported_output(&outs).expect("refused");
+            assert!(why.contains("output 'keep_mask'"), "{why}");
+            assert!(why.contains(&format!("{elem:?}")), "{why}");
+        }
+    }
+
+    // QA-046: an f16 output is widened to f32 (it failed with "unsupported element type").
+    // Needs an ONNX Runtime library (tensors are created through its API): `ORT_DYLIB_PATH`, or
+    // the flavor `target/release/onnxruntime/active.txt` names:
+    // `cargo test --lib -- --ignored backend::ort::tests::f16_output_is_widened`.
+    #[test]
+    #[ignore = "needs an ONNX Runtime library"]
+    fn f16_output_is_widened_to_f32() {
+        use super::super::{CoreOptions, OrtOptions, Runtimes};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = repo.join("target/release/onnxruntime");
+        let lib_dir = std::env::var_os("ORT_DYLIB_PATH")
+            .map(PathBuf::from)
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .or_else(|| {
+                let flavor = std::fs::read_to_string(root.join("active.txt")).ok()?;
+                Some(root.join(flavor.trim()))
+            })
+            .expect("set ORT_DYLIB_PATH or install a flavor under target/release/onnxruntime");
+        let rt = Runtimes::new_with(
+            &CoreOptions {
+                cache_dir: None,
+                intra_threads: 0,
+                openvino_dir: None,
+            },
+            &OrtOptions {
+                onnxruntime_dir: Some(lib_dir),
+                ..OrtOptions::default()
+            },
+        );
+        assert!(rt.has_ort(), "{:?}", rt.onnxruntime_error());
+        let want = [
+            0.0f32,
+            -1.5,
+            65504.0,
+            6.1035156e-5,
+            5.9604645e-8,
+            f32::INFINITY,
+        ];
+        let data: Vec<half::f16> = want.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let v = Tensor::from_array((vec![2usize, 3], data))
+            .unwrap()
+            .into_dyn();
+        let mut out = NamedOutput::default();
+        read_output_into("half_head", &v, &mut out).unwrap();
+        assert_eq!(out.shape, [2, 3]);
+        assert_eq!(out.as_f32().unwrap(), want);
+        assert_eq!(out.name, "half_head");
     }
 
     /// A `no_cache` CoreML load (a fold model) leaves nothing in `cache/` and nothing beside the

@@ -42,18 +42,14 @@ pub(super) async fn resources_json(State(state): State<Arc<AppState>>) -> Respon
     .await
 }
 
-/// Form (or urlencoded API) fields of the resource actions: `id`, optional `confirm_large`.
+/// Form (or urlencoded API) fields of the resource actions: `id`, optional `confirm_large`
+/// ([`super::form::truthy`]: `0`, `no`, `false`, `off` or empty do not confirm).
 fn action_fields(form: &HashMap<String, String>) -> (String, bool) {
     let id = form
         .get("id")
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    let confirm = form.get("confirm_large").is_some_and(|v| {
-        !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "off"
-        )
-    });
+    let confirm = super::form::checked_in(form, "confirm_large");
     (id, confirm)
 }
 
@@ -352,12 +348,7 @@ pub(super) async fn resources_export(
     blocking(move || {
         let form = form.map(|Form(f)| f).unwrap_or_default();
         let (id, confirm) = action_fields(&form);
-        let add = form.get("add_to_config").is_some_and(|v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "" | "0" | "false" | "off"
-            )
-        });
+        let add = super::form::checked_in(&form, "add_to_config");
         let cfg = state.config_read().clone();
         let on_done: Option<crate::resources::export::OnDone> = add.then(|| {
             let config = state.config.clone();
@@ -442,6 +433,21 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    /// QA-094: `confirm_large` of the download and export routes reads false-like values as off
+    /// (`no` confirmed a large download before).
+    #[test]
+    fn false_like_confirm_large_does_not_confirm() {
+        for v in crate::server::form::FALSE_LIKE {
+            let f = HashMap::from([
+                ("id".to_string(), " x ".to_string()),
+                ("confirm_large".to_string(), v.to_string()),
+            ]);
+            assert_eq!(action_fields(&f), ("x".to_string(), false), "{v:?}");
+        }
+        let f = HashMap::from([("confirm_large".to_string(), "1".to_string())]);
+        assert!(action_fields(&f).1);
+    }
 
     #[tokio::test]
     async fn resources_download_add_and_remove() {
@@ -842,6 +848,12 @@ mod tests {
         let (s, b) = post_action(&state, "/v1/resources/export", "id=model%3Ayolo26n").await;
         assert_eq!(s, StatusCode::CONFLICT, "{b}");
         assert!(b["message"].as_str().unwrap().contains("confirm"), "{b}");
+        // QA-094: a false-like confirmation is no confirmation (`no` used to confirm here).
+        for v in crate::server::form::FALSE_LIKE {
+            let body = format!("id=model%3Ayolo26n&confirm_large={}", v.replace(' ', "+"));
+            let (s, b) = post_action(&state, "/v1/resources/export", &body).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{v:?}: {b}");
+        }
         assert!(fake.cmds().is_empty());
         let (s, _) = post_action(&state, "/v1/resources/export", "id=model%3Anope").await;
         assert_eq!(s, StatusCode::NOT_FOUND);

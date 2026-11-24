@@ -133,17 +133,21 @@ impl GtSnapshot {
     }
 
     /// The file at `path`; None when there is none. A later format, or a file that does not
-    /// parse, is an error (never moved aside: it is user data).
+    /// parse, is an error, and so is one that cannot be read (an
+    /// `report::Unreadable` in the chain, after
+    /// [`crate::json_aside::read_retrying`]'s tries). A load never moves the file; a run's save
+    /// sets a damaged or later-format one aside first and refuses to write over an unreadable one
+    /// ([`super::write_snapshot`], QA-051).
     pub fn load(path: &Path) -> Result<Option<Self>> {
         Ok(Self::load_with_id(path)?.map(|(s, _)| s))
     }
 
     /// [`Self::load`] with the file's identity.
     pub fn load_with_id(path: &Path) -> Result<Option<(Self, SnapshotId)>> {
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        let Some(bytes) = crate::json_aside::read_retrying(path)
+            .map_err(|e| crate::benchmark::report::unreadable(path, e))?
+        else {
+            return Ok(None);
         };
         #[derive(Deserialize)]
         struct Head {
