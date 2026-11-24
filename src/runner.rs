@@ -1187,6 +1187,61 @@ fn config_for_resources_restart(store: &crate::config_store::ConfigStore) -> (u6
     store.snapshot()
 }
 
+/// A cancellation token a thread can wait on together with a crossbeam channel
+/// ([`Self::recv`]): the token's cancel wakes the waiting thread through a waker that sends on a
+/// channel of its own, so the wait needs no runtime and no timeout to notice the cancel (a
+/// parent token's cancel counts too).
+struct CancelSignal {
+    cancelled: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+    waker: std::task::Waker,
+    woke: crossbeam_channel::Receiver<()>,
+}
+
+/// The waker of a [`CancelSignal`]: one pending wake is enough (a full channel already holds
+/// one).
+struct SendOnWake(crossbeam_channel::Sender<()>);
+
+impl std::task::Wake for SendOnWake {
+    fn wake(self: Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let _ = self.0.try_send(());
+    }
+}
+
+impl CancelSignal {
+    fn new(token: CancellationToken) -> Self {
+        let (tx, woke) = crossbeam_channel::bounded(1);
+        Self {
+            cancelled: Box::pin(token.cancelled_owned()),
+            waker: std::task::Waker::from(Arc::new(SendOnWake(tx))),
+            woke,
+        }
+    }
+
+    /// True once the token is cancelled; otherwise the next cancel wakes [`Self::recv`].
+    fn is_cancelled(&mut self) -> bool {
+        let mut cx = std::task::Context::from_waker(&self.waker);
+        self.cancelled.as_mut().poll(&mut cx).is_ready()
+    }
+
+    /// The next message of `rx`; None once the token is cancelled or `rx` is disconnected.
+    fn recv<T>(&mut self, rx: &crossbeam_channel::Receiver<T>) -> Option<T> {
+        loop {
+            if self.is_cancelled() {
+                return None;
+            }
+            crossbeam_channel::select! {
+                recv(rx) -> msg => return msg.ok(),
+                // The waker fired: look at the token again.
+                recv(self.woke) -> _ => {}
+            }
+        }
+    }
+}
+
 /// Watch the download manager during one generation and log every outcome. When a model file
 /// is installed, the models of this generation that failed for want of it reload on their own
 /// (per-model reload, [`server::reload_models`]); models waiting for it load by themselves.
@@ -1205,14 +1260,11 @@ fn spawn_watcher(
     std::thread::Builder::new()
         .name("resources".into())
         .spawn(move || {
+            // Blocks on the next event or the generation's cancel: no wake-up in between.
+            let mut stop = CancelSignal::new(generation.clone());
             loop {
-                if generation.is_cancelled() {
+                let Some(ev) = stop.recv(&events) else {
                     return;
-                }
-                let ev = match events.recv_timeout(std::time::Duration::from_millis(250)) {
-                    Ok(ev) => ev,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
                 };
                 let text = crate::resources::provision::describe_event(&ev);
                 let crate::resources::manager::Event::Installed { id, .. } = ev else {
@@ -1451,5 +1503,40 @@ mod tests {
         let err = stop_server(&rt, done, Duration::from_secs(5)).unwrap_err();
         assert!(err.to_string().contains("bind failed"));
         rt.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    }
+
+    /// The resources watcher's wait: an event arrives as soon as it is sent; a cancel (of the
+    /// token or a parent) ends a wait with no event within a second, with the channel still
+    /// open; a disconnected channel ends it too.
+    #[test]
+    fn cancel_signal_wakes_a_channel_wait() {
+        let (tx, rx) = crossbeam_channel::unbounded::<u32>();
+        let parent = CancellationToken::new();
+        let mut stop = CancelSignal::new(parent.child_token());
+        tx.send(7).unwrap();
+        assert_eq!(stop.recv(&rx), Some(7));
+
+        let h = std::thread::spawn(move || {
+            let got = stop.recv(&rx);
+            (got, rx)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!h.is_finished(), "returned with no event and no cancel");
+        let t = Instant::now();
+        parent.cancel();
+        while !h.is_finished() {
+            assert!(
+                t.elapsed() < Duration::from_secs(1),
+                "the cancel did not wake the wait"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (got, _rx) = h.join().unwrap();
+        assert_eq!(got, None);
+        drop(tx);
+
+        let (tx, rx) = crossbeam_channel::unbounded::<u32>();
+        drop(tx);
+        assert_eq!(CancelSignal::new(CancellationToken::new()).recv(&rx), None);
     }
 }

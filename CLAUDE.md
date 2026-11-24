@@ -119,7 +119,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     upload, `OVERLOAD_DRAINS`); uploads still arriving have a 10 s deadline, a per-address read limit
     (`BODY_READS_PER_PEER`, never a cap on one Blue Iris's total requests) and a shared byte budget
     (`server/body_budget.rs`). `GET /v1/status` is readiness (200/503; Docker HEALTHCHECK, systemd `Type=notify` +
-    watchdog via `sdnotify.rs`).
+    watchdog via `sdnotify.rs`). Every connection has a 30 s write-stall deadline below TLS and signed-in / login
+    routes a 30 s body idle deadline (`server/deadline.rs`).
 
 - **Network, TLS and sign-in** (security boundary; user view in README "HTTPS", "Local network only", "Accounts",
   "Signing in").
@@ -181,7 +182,14 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     still waits on is skipped and its upgrade tries held until the reaper ends (`worker::reap::hung_device`).
   - Logs: per-request debug line (`model/device/request_id/inference_ms/process_ms/round_trip_ms`) and an
     `X-Request-Id` header; `log_format: text|json` (file appender only); `cli::log_files` caps size and age, today's
-    file never deleted. Error messages state what happened, the likely cause and the next action.
+    file never deleted (errors pass a capped day up to a reserve; `fileLogCapped`; the day a lasting fault began is
+    kept first). A line a lasting fault repeats per request / frame / connection goes through its own
+    `logthrottle::Throttle` (never one shared by unrelated lines, never a map keyed by client text). The Windows
+    Event Log layer passes ERROR always, INFO/WARN once per call site per 10 s. Error messages state what happened,
+    the likely cause and the next action.
+  - Idle: background threads wait with `sync::nap` (parks; a token or parent cancel wakes it), never in short
+    steps that only look at a token; documented intervals stay. Long in-process job work uses
+    `parallel::Spawned::Background`.
 
 - **Backend** (`src/backend/`, the only place `unsafe` is allowed): runtimes behind a `Backend` enum
   (`OpenVino | Ort`). OpenVINO wrapper (properties CACHE_DIR, f16 on GPU and the GPU hint: the hardware profile's choice

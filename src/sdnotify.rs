@@ -1,5 +1,6 @@
 //! systemd service notification (`Type=notify`, watchdog) without libsystemd: datagrams to
-//! `$NOTIFY_SOCKET`. Everything is a no-op on Windows or when the variable is unset.
+//! `$NOTIFY_SOCKET`. Everything is a no-op on Windows or when the variable is unset. The
+//! watchdog thread sleeps a whole ping interval at a time and wakes at once on shutdown.
 
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -91,22 +92,15 @@ fn spawn_with(
     std::thread::Builder::new()
         .name("sd-watchdog".into())
         .spawn(move || {
-            let step = Duration::from_millis(100).min(interval);
-            let mut waited = Duration::ZERO;
-            loop {
-                if shutdown.is_cancelled() {
-                    send("STOPPING=1");
-                    return;
+            // Parked for the whole interval (`sync::nap`): one wake-up per ping, and a cancel
+            // sends STOPPING=1 at once. A zero interval (`WATCHDOG_USEC=1`) would spin.
+            let interval = interval.max(Duration::from_millis(1));
+            while crate::sync::nap(interval, &shutdown) {
+                if ready() {
+                    send("WATCHDOG=1");
                 }
-                if waited >= interval {
-                    waited = Duration::ZERO;
-                    if ready() {
-                        send("WATCHDOG=1");
-                    }
-                }
-                std::thread::sleep(step);
-                waited += step;
             }
+            send("STOPPING=1");
         })
         .ok()
 }
@@ -182,5 +176,60 @@ mod tests {
         assert_eq!(&buf[..n], b"READY=1");
         assert!(!notify_to(dir.join("missing").as_os_str(), "READY=1"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One ping per interval, none in between, and a cancel during a long interval sends
+    /// STOPPING=1 within a second.
+    #[test]
+    fn watchdog_wakes_once_per_interval_and_stops_at_once() {
+        let count = |sent: &Arc<Mutex<Vec<String>>>, m: &str| {
+            sent.lock().unwrap().iter().filter(|s| *s == m).count()
+        };
+        let recorder = |sent: &Arc<Mutex<Vec<String>>>| {
+            let s = sent.clone();
+            move |m: &str| {
+                s.lock().unwrap().push(m.to_string());
+                true
+            }
+        };
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let token = CancellationToken::new();
+        let h = spawn_with(
+            Duration::from_millis(50),
+            || true,
+            token.clone(),
+            recorder(&sent),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(525));
+        token.cancel();
+        h.join().unwrap();
+        let pings = count(&sent, "WATCHDOG=1");
+        assert!(
+            (3..=11).contains(&pings),
+            "{pings} pings in ~525 ms at 50 ms"
+        );
+
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let token = CancellationToken::new();
+        let h = spawn_with(
+            Duration::from_secs(600),
+            || true,
+            token.clone(),
+            recorder(&sent),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        let t = Instant::now();
+        token.cancel();
+        while !h.is_finished() {
+            assert!(
+                t.elapsed() < Duration::from_secs(1),
+                "the watchdog did not stop within 1 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        h.join().unwrap();
+        assert_eq!(*sent.lock().unwrap(), vec!["STOPPING=1".to_string()]);
     }
 }

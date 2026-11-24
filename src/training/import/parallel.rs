@@ -9,8 +9,9 @@
 //!   progress tick beside the lines ([`Note::Tick`]): the full-resolution pass of the kept frames,
 //!   one helper per video as well, counts its frames with it.
 //! - [`map`] ([`crate::parallel::map`]): the analysis (decode, dHash, scene of every candidate),
-//!   CPU-bound, work-stealing by index over `threads` threads; the calling thread polls a counter
-//!   for the progress.
+//!   CPU-bound, work-stealing by index over `threads` threads below normal priority
+//!   ([`crate::parallel::Spawned::Background`]: an import never competes with detections); the
+//!   calling thread polls a counter for the progress.
 //!
 //! Both stop starting work once `cancel` is set (a running helper is killed by the command
 //! runner, which watches the same flag); items never started come back as `None`.

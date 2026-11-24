@@ -547,18 +547,86 @@ impl LoadGate {
 
     /// Block until the gate opens or `shutdown` is cancelled. Returns true when opened.
     pub fn wait(&self, shutdown: &CancellationToken) -> bool {
-        let (lock, cv) = &*self.0;
-        let mut g = lock.lock_recover();
-        while !*g {
-            if shutdown.is_cancelled() {
-                return false;
+        loop {
+            match self.wait_timeout(shutdown, GATE_WAIT_SLICE) {
+                GateWait::Open => return true,
+                GateWait::Cancelled => return false,
+                GateWait::TimedOut => {}
             }
-            g = cv
-                .wait_timeout(g, POLL)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
         }
-        true
+    }
+
+    /// Block until the gate opens, `stop` is cancelled (the token or a parent) or `timeout`
+    /// passes, whichever comes first. The thread sleeps on the gate's condvar the whole time: a
+    /// cancel wakes it through the token's waker, so nothing polls.
+    pub fn wait_timeout(&self, stop: &CancellationToken, timeout: Duration) -> GateWait {
+        let (lock, cv) = &*self.0;
+        let woke = Arc::new(AtomicBool::new(false));
+        let waker = std::task::Waker::from(Arc::new(GateWaker {
+            gate: self.0.clone(),
+            woke: woke.clone(),
+        }));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cancelled = std::pin::pin!(stop.cancelled());
+        let end = Instant::now().checked_add(timeout);
+        loop {
+            // Polled without the gate's lock: the waker takes it.
+            if cancelled.as_mut().poll(&mut cx).is_ready() {
+                return GateWait::Cancelled;
+            }
+            let g = lock.lock_recover();
+            if *g {
+                return GateWait::Open;
+            }
+            // A wake that came since the poll: look at the token again. Checked under the lock
+            // the waker takes before it notifies, so a later wake finds this thread waiting.
+            if woke.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            let left = match end {
+                Some(end) => match end.checked_duration_since(Instant::now()) {
+                    Some(left) if !left.is_zero() => left,
+                    _ => return GateWait::TimedOut,
+                },
+                None => GATE_WAIT_SLICE,
+            };
+            drop(cv.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner()));
+        }
+    }
+}
+
+/// Longest single condvar wait of [`LoadGate::wait`] (it waits again until the gate opens or
+/// its token is cancelled; both wake it at once, so this only bounds one wait call).
+const GATE_WAIT_SLICE: Duration = Duration::from_secs(3600);
+
+/// How a [`LoadGate::wait_timeout`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateWait {
+    /// The gate is open.
+    Open,
+    /// The token was cancelled first.
+    Cancelled,
+    /// Neither within the timeout.
+    TimedOut,
+}
+
+/// Wakes a [`LoadGate::wait_timeout`] when its token is cancelled.
+struct GateWaker {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    woke: Arc<AtomicBool>,
+}
+
+impl std::task::Wake for GateWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woke.store(true, Ordering::Release);
+        // Taken (and dropped) before the notify: a waiter that checked `woke` under the lock
+        // before the store is now waiting, so the notify reaches it.
+        drop(self.gate.0.lock_recover());
+        self.gate.1.notify_all();
     }
 }
 
@@ -1181,6 +1249,57 @@ mod tests {
         let h = std::thread::spawn(move || g3.wait(&t3));
         token.cancel();
         assert!(!h.join().unwrap());
+    }
+
+    /// `wait_timeout` ends on the gate, on a cancel of the token or a parent (within a second
+    /// of a long timeout), or at its timeout; an open gate or a cancelled token answer at once.
+    #[test]
+    fn gate_wait_timeout_ends_on_open_cancel_or_time() {
+        let g = LoadGate::new();
+        let token = CancellationToken::new();
+        let t = Instant::now();
+        assert_eq!(
+            g.wait_timeout(&token, Duration::from_millis(60)),
+            GateWait::TimedOut
+        );
+        assert!(t.elapsed() >= Duration::from_millis(60));
+
+        for through_parent in [false, true] {
+            let parent = CancellationToken::new();
+            let child = parent.child_token();
+            let canceller = if through_parent {
+                parent.clone()
+            } else {
+                child.clone()
+            };
+            let g2 = g.clone();
+            let h = std::thread::spawn(move || g2.wait_timeout(&child, Duration::from_secs(600)));
+            std::thread::sleep(Duration::from_millis(30));
+            let t = Instant::now();
+            canceller.cancel();
+            while !h.is_finished() {
+                assert!(
+                    t.elapsed() < Duration::from_secs(1),
+                    "a cancel did not wake it"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(h.join().unwrap(), GateWait::Cancelled);
+        }
+
+        let token = CancellationToken::new();
+        let g2 = g.clone();
+        let t2 = token.clone();
+        let h = std::thread::spawn(move || g2.wait_timeout(&t2, Duration::from_secs(600)));
+        std::thread::sleep(Duration::from_millis(30));
+        g.open();
+        assert_eq!(h.join().unwrap(), GateWait::Open);
+        assert_eq!(g.wait_timeout(&token, Duration::ZERO), GateWait::Open);
+        token.cancel();
+        assert_eq!(
+            LoadGate::new().wait_timeout(&token, Duration::from_secs(600)),
+            GateWait::Cancelled
+        );
     }
 
     #[test]

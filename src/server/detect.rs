@@ -719,8 +719,7 @@ pub(super) async fn detection_custom(
     };
     let Some(handle) = state.registry.by_name(&model) else {
         discard_body(upload).await;
-        // Client-chosen text: shortened and debug-escaped before it reaches the log.
-        warn!(model = ?short(&model), request_id = %id, "request for unknown model");
+        note_unknown_model(&state.metrics, state.metrics.now_ms(), &model, &id);
         let mut r = VisionDetectionResponse::error(format!(
             "Unknown model '{model}': it is not configured or not enabled; check the model \
              name in Blue Iris against /v1/vision/custom/list."
@@ -792,6 +791,26 @@ async fn detect_on(
     };
     let resp = run_detection(state, handle, req, start, command, request_id).await;
     (status, resp)
+}
+
+/// Count a request for no enabled model and warn at most once per
+/// [`crate::metrics::LOG_THROTTLE_INTERVAL`] at `now_ms` (on [`Metrics::now_ms`]): a camera
+/// still calling a removed, renamed or disabled model sends one per frame. One throttle for
+/// every name (the names are the client's text); the line that gets through names the latest
+/// one, shortened and debug-escaped. True when this call logged.
+fn note_unknown_model(metrics: &Metrics, now_ms: u64, model: &str, request_id: &str) -> bool {
+    metrics.record_rejected(RejectReason::UnknownModel);
+    let Some(held_back) = metrics.unknown_model_log.allow(now_ms) else {
+        return false;
+    };
+    warn!(
+        model = ?short(model),
+        request_id = %request_id,
+        similar_since_last_warning = held_back,
+        "request for unknown model: it is not configured or not enabled; check the model name \
+         in Blue Iris against /v1/vision/custom/list"
+    );
+    true
 }
 
 /// Longest client-chosen name written to the log.
@@ -978,12 +997,34 @@ async fn send_to_worker(
     match tokio::time::timeout(handle.request_timeout() + RESPONSE_GRACE, rx).await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => {
-            warn!(model = %name, "worker dropped the request without replying");
+            // Throttled: a worker that ends drops every request still queued on it.
+            if let Some(held_back) = handle
+                .metrics
+                .worker_gone_log
+                .allow(handle.metrics.now_ms())
+            {
+                warn!(
+                    model = %name,
+                    similar_since_last_warning = held_back,
+                    "worker dropped the request without replying"
+                );
+            }
             handle.metrics.record_drop(DropReason::WorkerGone);
             refused(DropReason::WorkerGone, "Worker dropped the request")
         }
         Err(_) => {
-            warn!(model = %name, "timed out waiting for the worker");
+            // Throttled like the line above: a hung inference times out every queued request.
+            if let Some(held_back) = handle
+                .metrics
+                .worker_gone_log
+                .allow(handle.metrics.now_ms())
+            {
+                warn!(
+                    model = %name,
+                    similar_since_last_warning = held_back,
+                    "timed out waiting for the worker"
+                );
+            }
             handle.metrics.record_drop(DropReason::Timeout);
             refused(DropReason::Timeout, "Operation timed out")
         }
@@ -2439,5 +2480,53 @@ mod tests {
         drop(held);
         assert_eq!(state.metrics.inflight(), 0);
         assert!(admit(&state, "detect", &mut upload).is_ok());
+    }
+
+    /// RA-108: a camera calling a removed model at frame rate logs one line per interval, with
+    /// the count held back and the latest (shortened) name, and counts every request.
+    #[test]
+    fn unknown_model_requests_log_once_per_interval() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let metrics = Metrics::new("0");
+        let every = u64::try_from(crate::metrics::LOG_THROTTLE_INTERVAL.as_millis()).unwrap();
+        let buf = crate::logbuf::LogBuffer::new(100);
+        let sub = tracing_subscriber::registry().with(buf.clone());
+        let long = "x".repeat(10_000);
+        let logged: Vec<bool> = tracing::subscriber::with_default(sub, || {
+            tracing::callsite::rebuild_interest_cache();
+            let mut logged = Vec::new();
+            for i in 0..50u64 {
+                logged.push(note_unknown_model(&metrics, 1_000 + i, "old-cam", "r1"));
+            }
+            logged.push(note_unknown_model(&metrics, 1_000 + every, &long, "r2"));
+            logged
+        });
+        assert_eq!(logged.iter().filter(|l| **l).count(), 2, "{logged:?}");
+        assert!(logged[0] && logged[50]);
+        assert_eq!(metrics.rejected(RejectReason::UnknownModel), 51);
+        let lines: Vec<String> = buf
+            .since(0, None, 100)
+            .entries
+            .into_iter()
+            .map(|e| e.message)
+            .filter(|m| m.contains("unknown model"))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("similar_since_last_warning=0"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("similar_since_last_warning=49"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[1].contains("request_id=r2"), "{}", lines[1]);
+        assert!(
+            lines[1].len() < 600,
+            "the client's name is shortened: {}",
+            lines[1]
+        );
     }
 }

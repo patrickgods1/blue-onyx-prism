@@ -13,8 +13,9 @@
 //!
 //! Replacing a model that serves: the replacement loads in the background and takes over when
 //! it is Ready, so requests never see "initializing" for a config change. It is held in
-//! [`Slots::pending`] and swapped in under the slots lock by a `swap-{name}` thread. When its
-//! first candidate has no memory beside the old worker, the worker asks for room
+//! [`Slots::pending`] and swapped in under the slots lock by a `swap-{name}` thread (asleep on
+//! the replacement's [`LoadGate`] until the load ends, so a long compile costs no wake-ups).
+//! When its first candidate has no memory beside the old worker, the worker asks for room
 //! ([`crate::worker::MakeRoom`]): the old one retires and the replacement takes its place at
 //! once, a gap of "initializing" answers that is logged. No VRAM is estimated up front. A model
 //! that does not serve (failed, stuck, still loading) has nothing worth keeping: its worker
@@ -36,7 +37,8 @@ use crate::resources::provision::Provision;
 use crate::startup::ModelState;
 use crate::sync::{LockExt, RwLockExt};
 use crate::worker::{
-    LiveSettings, LoadGate, MakeRoom, Peers, WorkerConfig, WorkerHandle, spawn_worker_after,
+    GateWait, LiveSettings, LoadGate, MakeRoom, Peers, WorkerConfig, WorkerHandle,
+    spawn_worker_after,
 };
 use anyhow::{Result, bail};
 use std::collections::HashMap;
@@ -542,8 +544,62 @@ pub const FREE_WAIT: Duration = Duration::from_secs(2);
 /// Of [`FREE_WAIT`], how long the requests of a worker retired for its memory may finish.
 const FREE_DRAIN: Duration = Duration::from_millis(1500);
 
-/// How often a `swap-{name}` thread looks at its replacement.
-const SWAP_POLL: Duration = Duration::from_millis(50);
+/// Longest a `swap-{name}` thread sleeps on its replacement's [`LoadGate`] before it looks
+/// again whether the replacement is still pending (a `make_room` may have put it in place
+/// already, with no cancel). The gate's opening and a cancel wake it at once, so this only
+/// bounds how long a thread outlives a replacement that left pending that way.
+const SWAP_RECHECK: Duration = Duration::from_secs(1);
+
+/// How often a `swap-{name}` thread looks at a replacement whose gate is open while it is still
+/// `Initializing`: it waits for a download (the gate opens before that wait) or compiles after
+/// one. The worker's own download poll ([`crate::worker`]'s 250 ms `POLL`).
+const SWAP_DOWNLOAD_POLL: Duration = Duration::from_millis(250);
+
+/// How a `swap-{name}` wait ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapEnd {
+    Ready,
+    Failed,
+    /// Cancelled, or no longer the pending replacement.
+    Gone,
+}
+
+/// The `swap-{name}` thread's wait for its replacement: until it is `Ready` or `Failed`, its
+/// token is cancelled, or `pending` says it is no longer the pending replacement. It sleeps on
+/// the replacement's [`LoadGate`] (which opens right after the load, the state already set)
+/// for at most `recheck` at a time, and looks every `download_poll` while the gate is open and
+/// the model still `Initializing` (a download wait). Returns the end and how many times it
+/// looked at the state (tests check the wait does not spin).
+fn await_replacement(
+    state: &crate::startup::StateHandle,
+    gate: &LoadGate,
+    stop: &CancellationToken,
+    pending: impl Fn() -> bool,
+    recheck: Duration,
+    download_poll: Duration,
+) -> (SwapEnd, u32) {
+    let mut looks = 0u32;
+    loop {
+        looks = looks.saturating_add(1);
+        if stop.is_cancelled() || !pending() {
+            return (SwapEnd::Gone, looks);
+        }
+        match state.get() {
+            ModelState::Ready => return (SwapEnd::Ready, looks),
+            ModelState::Failed(_) => return (SwapEnd::Failed, looks),
+            ModelState::Initializing if gate.is_open() => {
+                if !crate::sync::nap(download_poll, stop) {
+                    return (SwapEnd::Gone, looks);
+                }
+            }
+            ModelState::Initializing => {
+                if gate.wait_timeout(stop, recheck) == GateWait::Cancelled {
+                    return (SwapEnd::Gone, looks);
+                }
+            }
+        }
+    }
+}
 
 /// Longest [`ModelRegistry::shutdown`] waits for its threads, all of them together (one deadline
 /// shared by every worker and helper, after every worker's token is cancelled), and longest a
@@ -879,17 +935,18 @@ impl Served {
             .spawn({
                 let key = key.clone();
                 move || {
-                    loop {
-                        if stop.is_cancelled() || !served.is_pending(&key, id) {
-                            return;
-                        }
-                        match handle.state.get() {
-                            ModelState::Ready => return served.finish_replacement(&key, id, false),
-                            ModelState::Failed(_) => {
-                                return served.finish_replacement(&key, id, true);
-                            }
-                            ModelState::Initializing => std::thread::sleep(SWAP_POLL),
-                        }
+                    let (end, _) = await_replacement(
+                        &handle.state,
+                        &handle.load_gate(),
+                        &stop,
+                        || served.is_pending(&key, id),
+                        SWAP_RECHECK,
+                        SWAP_DOWNLOAD_POLL,
+                    );
+                    match end {
+                        SwapEnd::Ready => served.finish_replacement(&key, id, false),
+                        SwapEnd::Failed => served.finish_replacement(&key, id, true),
+                        SwapEnd::Gone => {}
                     }
                 }
             });
@@ -1827,6 +1884,115 @@ mod tests {
         drop(g);
         assert_eq!(h.join().unwrap(), Some(1));
         assert_eq!(RELOAD_LOCK_WAIT, Duration::from_secs(2));
+    }
+
+    /// The `swap-{name}` wait sleeps on the gate: a replacement that stays `Initializing` is
+    /// looked at about once per recheck (the old 50 ms poll looked ~10 times in 500 ms), a
+    /// cancel ends the wait at once, and a replacement that turns Ready ends it at once.
+    #[test]
+    fn swap_wait_sleeps_on_the_gate_and_ends_at_once() {
+        use crate::startup::StateHandle;
+        let wait = |state: StateHandle, gate: LoadGate, stop: CancellationToken| {
+            std::thread::spawn(move || {
+                await_replacement(
+                    &state,
+                    &gate,
+                    &stop,
+                    || true,
+                    Duration::from_secs(60),
+                    Duration::from_millis(250),
+                )
+            })
+        };
+        let until_done = |h: &std::thread::JoinHandle<(SwapEnd, u32)>, what: &str| {
+            let t = Instant::now();
+            while !h.is_finished() {
+                assert!(t.elapsed() < Duration::from_secs(1), "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // Stays Initializing: one look, then asleep until the cancel.
+        let (state, gate, stop) = (
+            StateHandle::new(),
+            LoadGate::new(),
+            CancellationToken::new(),
+        );
+        let h = wait(state.clone(), gate.clone(), stop.child_token());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!h.is_finished());
+        stop.cancel();
+        until_done(&h, "a cancel did not end the wait within 1 s");
+        let (end, looks) = h.join().unwrap();
+        assert_eq!(end, SwapEnd::Gone);
+        assert!(looks <= 2, "{looks} looks in 500 ms while Initializing");
+
+        // Turns Ready (the state is set before the gate opens): taken over at once.
+        let (state, gate, stop) = (
+            StateHandle::new(),
+            LoadGate::new(),
+            CancellationToken::new(),
+        );
+        let h = wait(state.clone(), gate.clone(), stop.clone());
+        std::thread::sleep(Duration::from_millis(50));
+        state.set(ModelState::Ready);
+        gate.open();
+        until_done(&h, "a Ready replacement was not taken within 1 s");
+        assert_eq!(h.join().unwrap().0, SwapEnd::Ready);
+
+        // Failed works the same way.
+        let (state, gate, stop) = (
+            StateHandle::new(),
+            LoadGate::new(),
+            CancellationToken::new(),
+        );
+        let h = wait(state.clone(), gate.clone(), stop.clone());
+        state.set(ModelState::Failed("no device".into()));
+        gate.open();
+        until_done(&h, "a Failed replacement was not seen within 1 s");
+        assert_eq!(h.join().unwrap().0, SwapEnd::Failed);
+
+        // Waiting for a download (gate open, still Initializing): looks at the slower poll,
+        // then takes over once it is Ready.
+        let (state, gate, stop) = (
+            StateHandle::new(),
+            LoadGate::new(),
+            CancellationToken::new(),
+        );
+        gate.open();
+        state.set_initializing("downloading 42%");
+        let h = wait(state.clone(), gate.clone(), stop.clone());
+        std::thread::sleep(Duration::from_millis(600));
+        state.set(ModelState::Ready);
+        let t = Instant::now();
+        while !h.is_finished() {
+            assert!(
+                t.elapsed() < Duration::from_secs(2),
+                "not taken after the download"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (end, looks) = h.join().unwrap();
+        assert_eq!(end, SwapEnd::Ready);
+        assert!(looks <= 5, "{looks} looks in ~600 ms of a download wait");
+
+        // No longer pending (put in place by make_room): ends at the next recheck.
+        let (state, gate) = (StateHandle::new(), LoadGate::new());
+        let pending = std::sync::atomic::AtomicBool::new(true);
+        std::thread::scope(|sc| {
+            let h = sc.spawn(|| {
+                await_replacement(
+                    &state,
+                    &gate,
+                    &CancellationToken::new(),
+                    || pending.load(std::sync::atomic::Ordering::SeqCst),
+                    Duration::from_millis(100),
+                    Duration::from_millis(250),
+                )
+            });
+            pending.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(h.join().unwrap().0, SwapEnd::Gone);
+        });
     }
 
     /// A slot whose "worker" thread runs until its token is cancelled, or for `ignore` when it

@@ -1002,7 +1002,8 @@ Stages (page and `train run` show them with percent and ETA):
    fingerprint, a time in the future), and a training process that fails forgets the pass, so the next run
    checks again. The dataset check's folds are training runs: its first fold checks, the others skip.
 3. **weights**: the base weights (and the public subset), SHA-256 checked.
-4. **dataset**: assembled as above.
+4. **dataset**: assembled as above. A Cancel here stops between frames and removes the half-written
+   `<run>/data` (a stop for process exit leaves it, like `work`).
 5. **train**: `train_model.py` trains, then exports and checks the ONNX; a failure at any later point
    keeps `<run>/work`, see [Retry export](#retry-export). Progress: every event is one
    stdout line `@train {json}` (`start`, `batch`, `epoch` with loss and validation mAP50 where the
@@ -1251,7 +1252,9 @@ added to the creation flags (beside `CREATE_NO_WINDOW`; the job object is unchan
 what the helper starts (DataLoader workers, ffmpeg). Unix: nice raised to at least 10 between fork
 and exec (`backend::priority::lower_child`; a higher nice, e.g. `Nice=15` in the unit, is kept),
 inherited by its threads and children. The model export's own commands (uv, the export script) keep
-the normal priority.
+the normal priority. The jobs' work inside the service (an import's analysis threads, a training run's
+dataset downscale and linking) runs on threads below normal priority too (Windows `BELOW_NORMAL`
+thread priority, Linux nice 10 per thread, macOS unchanged); the job's own thread keeps its priority.
 
 The export after training runs in the same process as the training, which is where a 16 GB Windows
 machine with a fixed paging file froze (hard reset right after an RF-DETR run finished: the trainer

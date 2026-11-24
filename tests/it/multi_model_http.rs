@@ -248,7 +248,8 @@ async fn multiple_models_served_concurrently() {
     assert_eq!(stats_model(&stats, "yolo26s")["requests"], 1);
     assert_eq!(stats_model(&stats, IPCAM)["requests"], 0);
 
-    // Unknown model: HTTP 200, success:false, counted nowhere.
+    // Unknown model: HTTP 200, success:false, counted only in
+    // `requests_rejected_total{reason="unknown_model"}` (no model's stats).
     let r = post_image(&client, &format!("{base}/v1/vision/custom/nope"), &image).await;
     assert!(!r.success);
     assert!(

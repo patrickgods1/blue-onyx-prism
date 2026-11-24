@@ -4131,7 +4131,7 @@ fn a_seed_with_the_same_plan_links_the_first_seeds_images_and_writes_the_same_da
     let out = tmp("reuse-out");
     let seed = |n: &str| out.0.join(n).join("data");
     let (a, b, plain) = (seed("s0"), seed("s1"), seed("plain"));
-    let (_, ra) = write_reusing(&s, &p, &opts, &a, &[]).unwrap();
+    let (_, ra) = write_reusing(&s, &p, &opts, &a, &[], &AtomicBool::new(false)).unwrap();
     assert_eq!(
         ra,
         Reused {
@@ -4142,7 +4142,15 @@ fn a_seed_with_the_same_plan_links_the_first_seeds_images_and_writes_the_same_da
     );
     assert!(a.join(reuse::PREPARED_FILES_FILE).is_file());
     // The next seed: every image linked from the first (a missing donor is passed over).
-    let (pb, rb) = write_reusing(&s, &p, &opts, &b, &[seed("gone"), a.clone()]).unwrap();
+    let (pb, rb) = write_reusing(
+        &s,
+        &p,
+        &opts,
+        &b,
+        &[seed("gone"), a.clone()],
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(rb.from.as_deref(), Some(a.as_path()));
     assert!(rb.images > 0);
     assert_eq!(rb.linked, rb.images, "{rb:?}");
@@ -4181,7 +4189,15 @@ fn a_seed_with_the_same_plan_links_the_first_seeds_images_and_writes_the_same_da
     );
     // A donor file changed since it was written is never linked: written again from its source.
     let c = seed("s2");
-    let (_, rc) = write_reusing(&s, &p, &opts, &c, std::slice::from_ref(&a)).unwrap();
+    let (_, rc) = write_reusing(
+        &s,
+        &p,
+        &opts,
+        &c,
+        std::slice::from_ref(&a),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(rc.linked, rc.images - 1, "{rc:?}");
     assert_eq!(data_files(&c).get(&first), data_files(&plain).get(&first));
     // A donor's folder removed (Remove on its run): the linked seed keeps its bytes.
@@ -4209,7 +4225,15 @@ fn a_seed_with_the_same_plan_links_the_first_seeds_images_and_writes_the_same_da
             .0
             .join(format!("other-{}", uuid::Uuid::new_v4()))
             .join("data");
-        let (_, r) = write_reusing(&s, &po, &other, &d, &[c.clone(), b.clone()]).unwrap();
+        let (_, r) = write_reusing(
+            &s,
+            &po,
+            &other,
+            &d,
+            &[c.clone(), b.clone()],
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!((r.from, r.linked), (None, 0));
     }
     // A source changed since: that image is written from it again.
@@ -4223,7 +4247,15 @@ fn a_seed_with_the_same_plan_links_the_first_seeds_images_and_writes_the_same_da
         .unwrap();
     drop(f);
     let e = seed("s3");
-    let (_, re) = write_reusing(&s, &p, &opts, &e, std::slice::from_ref(&c)).unwrap();
+    let (_, re) = write_reusing(
+        &s,
+        &p,
+        &opts,
+        &e,
+        std::slice::from_ref(&c),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
     assert_eq!(re.linked, re.images - 1, "{re:?}");
     let fresh = seed("plain2");
     write(&s, &p, &opts, &fresh).unwrap();
@@ -4320,4 +4352,109 @@ process.stdout.write(JSON.stringify(tags.map((t) => ctx.BenchTags.cellTag(t))));
     let rust: Vec<bool> = tags.iter().map(|t| is_cell_tag(t)).collect();
     assert_eq!(page, rust, "{tags:?}");
     assert!(rust.iter().filter(|x| **x).count() >= 4);
+}
+
+/// A flat export of `n` frames over 3 cameras x 4 days (most train / validate), for the cancel
+/// tests.
+fn many_frames_export(dir: &Path, n: usize) {
+    let frames: Vec<(String, Vec<String>)> = (0..n)
+        .map(|i| {
+            let cam = ["drive", "yard", "gate"][i % 3];
+            let day = format!("2026-10-0{}", 1 + (i / 3) % 4);
+            (
+                format!("{cam}-{day}-{i}.jpg"),
+                vec!["day".into(), format!("camera:{cam}"), format!("date:{day}")],
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, &str, Vec<&str>)> = frames
+        .iter()
+        .map(|(f, t)| {
+            (
+                f.as_str(),
+                "0 0.5 0.5 0.2 0.4\n",
+                t.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    let refs2: Vec<(&str, &str, &[&str])> = refs
+        .iter()
+        .map(|(f, l, t)| (*f, *l, t.as_slice()))
+        .collect();
+    flat_export(dir, &["cat"], &refs2);
+}
+
+fn files_in(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |d| d.count())
+}
+
+/// Audit 2026-11 (RA-127): a cancel set before the write stops it before the first frame, with
+/// `Cancelled`: no label and no image is written.
+#[test]
+fn a_cancelled_write_stops_before_any_frame() {
+    let t = tmp("cancel-before");
+    many_frames_export(&t.0, 48);
+    let s = vec![read_export(&t.0).unwrap()];
+    let opts = Options {
+        prepared_short_side: Some(32),
+        ..Options::default()
+    };
+    let p = plan(&s, &opts).unwrap();
+    assert!(p.train.len() + p.valid.len() > 10, "{p:?}");
+    let out = tmp("cancel-before-out");
+    let data = out.0.join("data");
+    let e = write_reusing(&s, &p, &opts, &data, &[], &AtomicBool::new(true)).unwrap_err();
+    assert!(
+        e.downcast_ref::<crate::resources::export::Cancelled>()
+            .is_some(),
+        "{e:#}"
+    );
+    assert_eq!(files_in(&data.join("labels")), 0);
+    assert_eq!(files_in(&data.join("images")), 0);
+    assert!(!data.join("dataset.json").exists());
+}
+
+/// Audit 2026-11 (RA-127): a cancel while the images are downscaled (on several threads) stops
+/// the writers: far fewer images than planned are written, and the answer is `Cancelled`.
+#[test]
+fn a_cancel_while_the_images_are_written_stops_the_writers() {
+    let t = tmp("cancel-during");
+    let n = 1200;
+    many_frames_export(&t.0, n);
+    let s = vec![read_export(&t.0).unwrap()];
+    let opts = Options {
+        prepared_short_side: Some(32),
+        ..Options::default()
+    };
+    let p = plan(&s, &opts).unwrap();
+    let planned = {
+        let mut r: BTreeSet<FrameRef> = p.train.iter().map(|(r, _)| *r).collect();
+        r.extend(p.valid.iter().copied());
+        r.len()
+    };
+    assert!(planned > n / 3, "{planned}");
+    let out = tmp("cancel-during-out");
+    let data = out.0.join("data");
+    let cancel = AtomicBool::new(false);
+    let r = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while files_in(&data.join("images")) == 0 && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            cancel.store(true, Ordering::Relaxed);
+        });
+        write_reusing(&s, &p, &opts, &data, &[], &cancel)
+    });
+    let e = r.unwrap_err();
+    assert!(
+        e.downcast_ref::<crate::resources::export::Cancelled>()
+            .is_some(),
+        "{e:#}"
+    );
+    let images = files_in(&data.join("images"));
+    assert!(
+        images < planned / 2,
+        "{images} of {planned} images written after the cancel"
+    );
 }

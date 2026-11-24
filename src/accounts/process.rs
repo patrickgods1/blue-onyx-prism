@@ -20,7 +20,7 @@ use crate::sync::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// The sign-in state of the process (see the module docs).
@@ -109,9 +109,7 @@ impl Auth {
         std::thread::Builder::new()
             .name("auth-flush".into())
             .spawn(move || {
-                while nap(every, &stop) {
-                    me.flush(super::now(), false);
-                }
+                every_until(every, &stop, || me.flush(super::now(), false));
                 me.flush(super::now(), true);
             })
     }
@@ -198,17 +196,13 @@ fn effective(state: &lockout::State, in_flight: u32, now: u64) -> lockout::State
     }
 }
 
-/// Sleep `total` in short steps; false when `stop` was triggered meanwhile.
-fn nap(total: Duration, stop: &CancellationToken) -> bool {
-    let step = Duration::from_millis(200);
-    let end = Instant::now() + total;
-    while Instant::now() < end {
-        if stop.is_cancelled() {
-            return false;
-        }
-        std::thread::sleep(step.min(end.saturating_duration_since(Instant::now())));
+/// Call `tick` every `every` until `stop` is cancelled. The thread parks for the whole interval
+/// ([`crate::sync::nap`]): no wake-up in between, and a cancel ends the wait at once (the forced
+/// flush at shutdown is prompt).
+fn every_until(every: Duration, stop: &CancellationToken, mut tick: impl FnMut()) {
+    while crate::sync::nap(every, stop) {
+        tick();
     }
-    !stop.is_cancelled()
 }
 
 #[cfg(test)]
@@ -298,5 +292,46 @@ mod tests {
         // The forced flush at stop wrote the removal.
         assert!(Sessions::load(&d, now).is_empty());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The flusher's wait ticks once per interval (no short steps in between) and a cancel ends
+    /// even a long interval at once.
+    #[test]
+    fn the_flush_loop_ticks_per_interval_and_stops_at_once() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Instant;
+        let n = Arc::new(AtomicU32::new(0));
+        let stop = CancellationToken::new();
+        let (c, s) = (n.clone(), stop.clone());
+        let h = std::thread::spawn(move || {
+            every_until(Duration::from_millis(50), &s, || {
+                c.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        std::thread::sleep(Duration::from_millis(525));
+        stop.cancel();
+        h.join().unwrap();
+        let ticks = n.load(Ordering::SeqCst);
+        // About 10; a loaded test machine sleeps longer, never shorter.
+        assert!(
+            (3..=11).contains(&ticks),
+            "{ticks} ticks in ~525 ms at 50 ms"
+        );
+
+        let stop = CancellationToken::new();
+        let s = stop.clone();
+        let h = std::thread::spawn(move || every_until(Duration::from_secs(600), &s, || {}));
+        std::thread::sleep(Duration::from_millis(30));
+        let t = Instant::now();
+        stop.cancel();
+        let until = t + Duration::from_secs(1);
+        while !h.is_finished() {
+            assert!(
+                Instant::now() < until,
+                "the flusher did not stop within 1 s"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        h.join().unwrap();
     }
 }

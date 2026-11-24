@@ -52,7 +52,9 @@ pub fn find(dir: &Path) -> Strays {
     let mut strays: Vec<String> = Vec::new();
     unreadable += wrong_depth(dir, &mut strays);
     let threads = crate::parallel::walk_threads_over(days.len());
-    let found = crate::parallel::map_all(days.len(), threads, &|i| {
+    // A UI walk like the review index's: its spawned threads run below normal priority.
+    let spawned = crate::parallel::Spawned::Background;
+    let found = crate::parallel::map_all_at(days.len(), threads, spawned, &|i| {
         days.get(i)
             .map(|day| in_day(dir, day, &queued))
             .unwrap_or_default()

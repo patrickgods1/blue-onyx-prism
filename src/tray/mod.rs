@@ -5,6 +5,7 @@
 //!
 //! - [`model`]: pure state -> texts, icon color and enabled menu actions.
 //! - [`probe`]: `GET /v1/status` over a plain `TcpStream` and its parser.
+//! - [`schedule`]: when the poll thread probes and asks the service manager (pure).
 //! - [`icon`]: the runtime-drawn icon.
 //! - [`config`]: port / address / CLI path resolution.
 //! - [`elevate`]: UAC / password-prompt elevation, error dialog, opening the browser.
@@ -17,6 +18,7 @@ pub mod elevate;
 pub mod icon;
 pub mod model;
 pub mod probe;
+pub mod schedule;
 
 #[cfg(any(windows, target_os = "macos"))]
 mod app;

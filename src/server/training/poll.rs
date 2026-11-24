@@ -26,13 +26,21 @@
 //! [`POLL_LOG_LINES`], a run's install, benchmark and folder fields ([`UNREAD_RUN_FIELDS`]; of
 //! `dataset` only `warnings`), the tasks' `result`, and the static `metrics` catalog once the page
 //! sends `have` (its first poll has none and keeps the catalog). Without `poll` the answer is the
-//! full one.
+//! full one. What is left out is cleared before the record is serialized, never serialized only
+//! to be dropped.
+//!
+//! A run's digests are computed once per history: [`Digests`] keeps them by run id and the
+//! history's shared `Arc` (the running job's live one or the history cache's, a new `Arc` for
+//! every change), so a poll of an unchanged run hashes nothing; it holds only the runs the last
+//! answer listed.
 
+use crate::sync::LockExt;
 use crate::training::progress::EpochPoint;
 use crate::training::service::RunRecord;
 use crate::training::task::TaskRecord;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Weak};
 
 /// Log lines of a busy run or task in a poll answer (the page shows the last 40).
 pub(super) const POLL_LOG_LINES: usize = 40;
@@ -128,6 +136,59 @@ fn digests(rows: &[EpochPoint]) -> Vec<u64> {
     out
 }
 
+/// The digests ([`digests`]) of each run's history the polls answered, by run id: the history
+/// they are of (weak: it does not keep the epochs alive, and the allocation it pins cannot be
+/// reused by another history while the entry lives, so a pointer match is the same `Arc`, whose
+/// epochs never change) and the digests. Rebuilt for a run whose history is another `Arc`; runs
+/// an answer does not list are dropped ([`answer`]), so it holds at most the listed runs.
+pub(super) struct Digests {
+    by_run: Mutex<Option<DigestMap>>,
+    /// Histories hashed (tests).
+    #[cfg(test)]
+    hashed: std::sync::atomic::AtomicUsize,
+}
+
+type DigestMap = HashMap<String, (Weak<Vec<EpochPoint>>, Arc<Vec<u64>>)>;
+
+/// The server's polls' digests.
+static DIGESTS: Digests = Digests::new();
+
+impl Digests {
+    pub(super) const fn new() -> Self {
+        Self {
+            by_run: Mutex::new(None),
+            #[cfg(test)]
+            hashed: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// [`digests`] of run `id`'s `rows`, kept when they are of the same `Arc`.
+    fn of(&self, id: &str, rows: &Arc<Vec<EpochPoint>>) -> Arc<Vec<u64>> {
+        if let Some((w, d)) = self.by_run.lock_recover().as_ref().and_then(|c| c.get(id))
+            && std::ptr::eq(w.as_ptr(), Arc::as_ptr(rows))
+        {
+            return Arc::clone(d);
+        }
+        #[cfg(test)]
+        self.hashed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Hashed outside the lock.
+        let d = Arc::new(digests(rows));
+        self.by_run
+            .lock_recover()
+            .get_or_insert_with(HashMap::new)
+            .insert(id.to_string(), (Arc::downgrade(rows), Arc::clone(&d)));
+        d
+    }
+
+    /// Drop the digests of every run not in `listed` (removed runs).
+    fn keep(&self, listed: &std::collections::HashSet<&str>) {
+        if let Some(c) = self.by_run.lock_recover().as_mut() {
+            c.retain(|id, _| listed.contains(id.as_str()));
+        }
+    }
+}
+
 /// A key as the page sends it back.
 fn hex(k: u64) -> String {
     format!("{k:016x}")
@@ -153,9 +214,15 @@ fn resume_at(rows: &[EpochPoint], d: &[u64], have: Option<&Have>) -> Option<(usi
     }
 }
 
-/// `r` with its epochs `rows` as the poll answers it ([`answer`]). `rows` is borrowed (the
-/// history cache's or the running job's shared copy): only the rows sent are serialized.
-fn run_value(mut r: RunRecord, rows: &[EpochPoint], have: Option<&Have>) -> Value {
+/// `r` with its epochs `rows` as the poll answers it ([`answer`]). `rows` is shared (the
+/// history cache's or the running job's copy): only the rows sent are serialized, and their
+/// digests come from `digests` ([`Digests::of`]).
+fn run_value(
+    mut r: RunRecord,
+    rows: &Arc<Vec<EpochPoint>>,
+    have: Option<&Have>,
+    digests: &Digests,
+) -> Value {
     if let Some(p) = r.progress.as_mut() {
         p.losses.clear();
         // A record that still holds epochs of its own was handed `rows` from them
@@ -166,7 +233,16 @@ fn run_value(mut r: RunRecord, rows: &[EpochPoint], have: Option<&Have>) -> Valu
     if busy {
         let skip = r.log.len().saturating_sub(POLL_LOG_LINES);
         r.log.drain(..skip);
+    } else {
+        // Removed from the answer below: not serialized first.
+        r.log = Vec::new();
     }
+    // [`UNREAD_RUN_FIELDS`], likewise (their keys are removed below).
+    r.output = None;
+    r.registered = None;
+    r.benchmark = None;
+    r.benchmark_error = None;
+    r.baseline = None;
     let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);
     let Some(obj) = v.as_object_mut() else {
         return v;
@@ -182,7 +258,7 @@ fn run_value(mut r: RunRecord, rows: &[EpochPoint], have: Option<&Have>) -> Valu
     }
     if let Some(p) = obj.get_mut("progress").and_then(Value::as_object_mut) {
         p.remove("losses");
-        let d = digests(rows);
+        let d = digests.of(&r.id, rows);
         let (from, since) = match resume_at(rows, &d, have) {
             Some((i, since)) => (i, Some(since)),
             None => (0, None),
@@ -296,8 +372,23 @@ pub(super) fn answer(
     metrics: Value,
     have: Option<&HashMap<String, Have>>,
 ) -> Value {
+    answer_with(&DIGESTS, runs, tasks, busy, metric_columns, metrics, have)
+}
+
+/// [`answer`] with the digests kept in `digests`.
+fn answer_with(
+    digests: &Digests,
+    runs: Vec<crate::training::service::Shown>,
+    tasks: &[TaskRecord],
+    busy: bool,
+    metric_columns: Value,
+    metrics: Value,
+    have: Option<&HashMap<String, Have>>,
+) -> Value {
     let none = HashMap::new();
     let held = have.unwrap_or(&none);
+    let listed: std::collections::HashSet<&str> = runs.iter().map(|(r, _)| r.id.as_str()).collect();
+    digests.keep(&listed);
     let mut out = Map::new();
     out.insert("busy".into(), Value::from(busy));
     out.insert(
@@ -306,7 +397,7 @@ pub(super) fn answer(
             runs.into_iter()
                 .map(|(r, rows)| {
                     let h = held.get(&r.id);
-                    run_value(r, &rows, h)
+                    run_value(r, &rows, h, digests)
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -629,6 +720,9 @@ mod tests {
         let held = parse_have(&have_of("r", &first));
         let mut done = run_with("d", rows.clone());
         done.state = RunState::Done;
+        // Fields the poll leaves out, cleared rather than serialized: the same answer.
+        done.registered = Some("night-yolo26n".into());
+        done.benchmark_error = Some("the benchmark failed".into());
         for have in [None, held.get("r")] {
             for r in [
                 run_with("r", rows.clone()),
@@ -639,7 +733,7 @@ mod tests {
                 // From the record's own epochs (an older runs.json) and from a shared copy.
                 let mut own = r.clone();
                 let h = crate::training::service::history::share(&mut own, None);
-                let now = run_value(own, &h, have);
+                let now = run_value(own, &h, have, &Digests::new());
                 assert_eq!(now.to_string(), before.to_string());
                 let mut bare = r.clone();
                 let rows = bare
@@ -647,9 +741,68 @@ mod tests {
                     .as_mut()
                     .map(|p| std::sync::Arc::new(std::mem::take(&mut p.history)))
                     .unwrap_or_default();
-                assert_eq!(run_value(bare, &rows, have).to_string(), before.to_string());
+                assert_eq!(
+                    run_value(bare, &rows, have, &Digests::new()).to_string(),
+                    before.to_string()
+                );
             }
         }
+    }
+
+    /// Audit 2026-11 (RA-125): a poll of runs whose histories did not change hashes none of
+    /// them (the digests are kept per run and history `Arc`); a changed history (a new `Arc`)
+    /// is hashed again and answers with its new keys; a removed run's digests go.
+    #[test]
+    fn unchanged_histories_are_not_hashed_again() {
+        let digests = Digests::new();
+        let hashed = || digests.hashed.load(std::sync::atomic::Ordering::Relaxed);
+        let rows = vec![row(1, 0.1), row(2, 0.2), row(3, 0.3)];
+        let mut done = run_with("d", rows.clone());
+        done.state = RunState::Done;
+        let runs = shared(vec![run_with("r", rows.clone()), done]);
+        let ask = |runs: Vec<crate::training::service::Shown>, have: &str| {
+            answer_with(
+                &digests,
+                runs,
+                &[],
+                true,
+                Value::Null,
+                Value::Null,
+                Some(&parse_have(have)),
+            )
+        };
+        let first = ask(runs.clone(), "");
+        assert_eq!(hashed(), 2);
+        let have = have_of("r", &first);
+        for _ in 0..5 {
+            let again = ask(runs.clone(), &have);
+            assert_eq!(again["runs"][0]["progress"]["history_since"], 4);
+            assert_eq!(epochs(&again), Vec::<u64>::new());
+        }
+        assert_eq!(hashed(), 2, "nothing changed: nothing hashed");
+        // A new epoch: a new `Arc`, hashed once, answered from the page's last epoch on.
+        let mut more = rows.clone();
+        more.push(row(4, 0.4));
+        let changed = vec![
+            (runs[0].0.clone(), std::sync::Arc::new(more)),
+            runs[1].clone(),
+        ];
+        let next = ask(changed.clone(), &have);
+        assert_eq!(epochs(&next), [4]);
+        assert_ne!(have_of("r", &next), have);
+        assert_eq!(hashed(), 3);
+        // Run `d` removed: its digests go with it.
+        ask(changed[..1].to_vec(), &have);
+        let kept: Vec<String> = digests
+            .by_run
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(kept, ["r"]);
     }
 
     /// Whether `node` runs here; missing, a skip, or with `BOP_REQUIRE_NODE=1` (CI) a failure.

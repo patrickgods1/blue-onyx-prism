@@ -27,7 +27,10 @@
 //! stops it with exit code 1 (the panic hook logs the message, [`blue_onyx_prism::panic`]).
 //!
 //! Logs go to the configured `log_path` (daily rolling file; stdout is discarded for services)
-//! and, at INFO and above, to the Application event log under the source `BlueOnyxPrism`.
+//! and, at INFO and above, to the Application event log under the source `BlueOnyxPrism`
+//! ([`event_log_gate`]: a model export's child-process output never goes there, and an INFO or
+//! WARN line reaches it at most once per [`event_log_gate::EVERY`] per call site; ERROR always
+//! does; the file log keeps every line).
 //! Modeled on the blue-onyx service binary (MIT).
 
 #![cfg_attr(
@@ -64,6 +67,121 @@ const SET_PRESHUTDOWN: &str = "--set-preshutdown-timeout";
 #[cfg(windows)]
 fn set_preshutdown_requested() -> bool {
     std::env::args().skip(1).any(|a| a == SET_PRESHUTDOWN)
+}
+
+/// What of the service's log reaches the Application event log (audit RA-118). Each line costs
+/// a synchronous `ReportEventW` and lands in the log every other program shares, so lines that
+/// repeat (a lasting fault, a child process's progress) must not flood it: the file log keeps
+/// all of them. Portable so it is tested on every OS; only the Windows service uses it.
+#[cfg(any(windows, test))]
+mod event_log_gate {
+    use blue_onyx_prism::logthrottle::Throttle;
+    use blue_onyx_prism::sync::LockExt;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tracing::callsite::Identifier;
+    use tracing::subscriber::Interest;
+    use tracing::{Event, Level, Metadata};
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::layer::Context;
+
+    /// Target of a model export's child-process output lines (`resources::export::exporter`):
+    /// a uv install and the Python export print hundreds, each `\r` redraw of a progress bar
+    /// counting as one. Kept in the export's in-memory tail and the file log at debug.
+    pub const EXPORT_CHILD_TARGET: &str = "blue_onyx_prism::resources::export::child";
+
+    /// Smallest gap between two INFO / WARN event log records of one call site. The crate's
+    /// throttle interval for per-request lines ([`blue_onyx_prism::logthrottle::DEFAULT_EVERY`]).
+    pub const EVERY: Duration = blue_onyx_prism::logthrottle::DEFAULT_EVERY;
+
+    /// Call sites throttled one by one. Call sites are static (a few thousand in the binary),
+    /// so the map is bounded by the code; past this the rest share one throttle.
+    const MAX_CALLSITES: usize = 4096;
+
+    /// The event log layer's filter: INFO and above, nothing of [`EXPORT_CHILD_TARGET`], and
+    /// per call site at most one INFO / WARN record per [`EVERY`]. ERROR always passes (one
+    /// shared `error!` site can carry distinct failures, e.g. one per model).
+    #[derive(Debug)]
+    pub struct Gate {
+        targets: Targets,
+        sites: Mutex<HashMap<Identifier, Throttle>>,
+        overflow: Throttle,
+        /// Milliseconds on a monotonic clock (the process clock; tests step a fake).
+        clock: fn() -> u64,
+    }
+
+    impl Gate {
+        /// The service's gate, on the process clock.
+        #[cfg(windows)]
+        pub fn new() -> Self {
+            Self::with_clock(blue_onyx_prism::logthrottle::process_ms)
+        }
+
+        pub fn with_clock(clock: fn() -> u64) -> Self {
+            Self {
+                targets: Targets::new()
+                    .with_default(LevelFilter::INFO)
+                    .with_target(EXPORT_CHILD_TARGET, LevelFilter::OFF),
+                sites: Mutex::new(HashMap::new()),
+                overflow: Throttle::new(EVERY),
+                clock,
+            }
+        }
+
+        /// The static part: level and target.
+        pub fn wants(&self, meta: &Metadata<'_>) -> bool {
+            self.targets.would_enable(meta.target(), meta.level())
+        }
+
+        /// Whether this event of `meta`'s call site goes to the event log at `now_ms`.
+        pub fn passes(&self, meta: &Metadata<'_>, now_ms: u64) -> bool {
+            if !self.wants(meta) {
+                return false;
+            }
+            if *meta.level() == Level::ERROR {
+                return true;
+            }
+            let mut sites = self.sites.lock_recover();
+            let full = sites.len() >= MAX_CALLSITES;
+            let id = meta.callsite();
+            if let Some(t) = sites.get(&id) {
+                return t.allow(now_ms).is_some();
+            }
+            if full {
+                return self.overflow.allow(now_ms).is_some();
+            }
+            let t = Throttle::new(EVERY);
+            let pass = t.allow(now_ms).is_some();
+            sites.insert(id, t);
+            pass
+        }
+    }
+
+    impl<S> tracing_subscriber::layer::Filter<S> for Gate {
+        fn enabled(&self, meta: &Metadata<'_>, _: &Context<'_, S>) -> bool {
+            self.wants(meta)
+        }
+
+        fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
+            // `sometimes`, not `always`: the throttle decides per event in `event_enabled`, and
+            // tracing-subscriber expects a per-layer filter's `enabled` pass before it (with
+            // `always` it skips that pass and its filter state check fails).
+            if self.wants(meta) {
+                Interest::sometimes()
+            } else {
+                Interest::never()
+            }
+        }
+
+        fn event_enabled(&self, event: &Event<'_>, _: &Context<'_, S>) -> bool {
+            self.passes(event.metadata(), (self.clock)())
+        }
+
+        fn max_level_hint(&self) -> Option<LevelFilter> {
+            Some(LevelFilter::INFO)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -121,7 +239,6 @@ mod service {
     use tokio_util::sync::CancellationToken;
     use tracing::{debug, error, info, warn};
     use tracing_subscriber::Layer;
-    use tracing_subscriber::filter::LevelFilter;
     use windows_service::service::{
         ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
         ServiceType,
@@ -268,7 +385,9 @@ mod service {
     /// stays empty).
     fn event_log_layer() -> Result<ExtraLogLayer, String> {
         match tracing_layer_win_eventlog::EventLogLayer::new(EVENT_SOURCE) {
-            Ok(layer) => Ok(Box::new(layer.with_filter(LevelFilter::INFO))),
+            Ok(layer) => Ok(Box::new(
+                layer.with_filter(crate::event_log_gate::Gate::new()),
+            )),
             Err(e) => Err(format!(
                 "could not open the event log source {EVENT_SOURCE}: {e}; the Application event \
                  log gets nothing from this service (reinstall with the MSI or run \
@@ -663,5 +782,79 @@ mod service {
         // Blocking tasks get a bounded grace period (CO-12).
         rt.shutdown_timeout(runner::RUNTIME_SHUTDOWN_GRACE);
         exit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_log_gate::{EVERY, EXPORT_CHILD_TARGET, Gate};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    static NOW_MS: AtomicU64 = AtomicU64::new(1_000);
+
+    fn fake_now() -> u64 {
+        NOW_MS.load(Ordering::SeqCst)
+    }
+
+    /// Counts what reaches it, standing in for the event log layer.
+    struct Counter(Arc<AtomicUsize>);
+
+    impl<S: tracing::Subscriber> Layer<S> for Counter {
+        fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// One call site twice within [`EVERY`]: the second is held back, then one passes again
+    /// once the interval is over; ERROR always passes; DEBUG and the export child target never;
+    /// another call site has its own throttle.
+    #[test]
+    fn event_log_gate_throttles_per_call_site() {
+        let n = Arc::new(AtomicUsize::new(0));
+        // Beside an unfiltered layer, as the file log is: it still gets every line.
+        let all = Arc::new(AtomicUsize::new(0));
+        let sub = tracing_subscriber::registry()
+            .with(Counter(n.clone()).with_filter(Gate::with_clock(fake_now)))
+            .with(Counter(all.clone()));
+        let every = u64::try_from(EVERY.as_millis()).unwrap();
+        tracing::subscriber::with_default(sub, || {
+            let warn_site = || tracing::warn!("the same warning");
+            let got = |want: usize| assert_eq!(n.swap(0, Ordering::SeqCst), want);
+            warn_site();
+            warn_site();
+            got(1);
+            NOW_MS.fetch_add(every - 1, Ordering::SeqCst);
+            warn_site();
+            got(0);
+            NOW_MS.fetch_add(1, Ordering::SeqCst);
+            warn_site();
+            got(1);
+            // Another call site is not held back by the first.
+            tracing::info!("another line");
+            got(1);
+            for _ in 0..3 {
+                tracing::error!("a failure");
+            }
+            got(3);
+            tracing::debug!("debug never");
+            tracing::info!(target: "blue_onyx_prism::resources::export::child", "Collecting torch");
+            tracing::error!(target: "blue_onyx_prism::resources::export::child", "child error");
+            got(0);
+        });
+        assert_eq!(
+            all.load(Ordering::SeqCst),
+            11,
+            "the other layer saw every line"
+        );
+    }
+
+    /// The exporter still logs its child lines under the target the gate turns off.
+    #[test]
+    fn the_export_child_target_matches_the_exporter() {
+        let src = include_str!("../resources/export/exporter.rs");
+        assert!(src.contains(&format!("target: \"{EXPORT_CHILD_TARGET}\"")));
     }
 }

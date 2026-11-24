@@ -21,19 +21,23 @@
 //!   disabled at 100; names without an account get the same answers ([`crate::accounts::Auth`]
 //!   `unknown`). A browser with a device cookie of that account skips the delay (never the
 //!   per-address limit, never `disabled`). Every refusal reads like a wrong password (the 429s
-//!   say how long to wait); the log says which it was.
+//!   say how long to wait); the log says which it was. Refusals decided before any hashing
+//!   (these limits, busy hashing, wrong or unreadable API tokens, closed sign-in) log at most one
+//!   line a minute per kind ([`WARN_EVERY`], with the `dropped` count); a checked password logs
+//!   every attempt.
 //! - **Hashing** takes a permit of the process's semaphore ([`Logins::hashing`]) within
 //!   [`HASH_WAIT`], else 503 with `Retry-After`, and runs on the blocking pool.
 //!
 //! No password, hash, token, session or device id or setup code is in a log line, an answer or an
 //! error; an unknown name that was typed is never logged or repeated.
 
-use super::guard::{self, WarnThrottle};
+use super::guard;
 use super::{AppState, blocking, encode_uri_component, render, wants_html};
 use crate::accounts::lockout::Decision;
 use crate::accounts::sessions::{Activity, SessionId};
 use crate::accounts::{self, Snapshot, cookies, lockout, password};
 use crate::admin_token::{self, AdminToken};
+use crate::logthrottle::Throttle;
 use crate::sync::LockExt;
 use askama::Template;
 use axum::Json;
@@ -76,8 +80,9 @@ pub(crate) const POLL_COOKIE: &str = "__Host-bop_poll";
 const WRONG: &str = "Wrong username or password.";
 /// What [`SignedIn::user`] holds for the API token.
 pub(crate) const TOKEN_USER: &str = "api-token";
-/// At most one log line per this long for refused tokens: a guessing client would write one per
-/// request.
+/// At most one log line per this long for each kind of refusal logged before any hashing
+/// (refused tokens, sign-ins refused by a limit, sign-in closed): a guessing client would write
+/// one per request.
 const WARN_EVERY: Duration = Duration::from_secs(60);
 /// The place in `templates/base.html` where the signed-in name goes ([`personalize`]).
 pub(super) const USER_MARKER: &str = "<!--bop:user-->";
@@ -87,10 +92,18 @@ pub(super) const TZ_MARKER: &str = "<!--bop:tz-->";
 /// Largest page [`personalize`] rewrites (every page of the UI is far smaller).
 const PERSONALIZE_LIMIT: usize = 8 * 1024 * 1024;
 
-/// The refused-token warnings of this process.
-static WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
+/// The wrong-token warnings of this process.
+static TOKEN_WARNS: Throttle = Throttle::new(WARN_EVERY);
+/// The "the API token cannot be checked" warnings of this process: apart from
+/// [`TOKEN_WARNS`], so a scraper's wrong tokens never hide that the token file is unusable.
+static UNAVAILABLE_WARNS: Throttle = Throttle::new(WARN_EVERY);
 /// The "sign-in is closed" warnings of this process.
-static CLOSED_WARNS: Mutex<WarnThrottle> = Mutex::new(WarnThrottle::new());
+static CLOSED_WARNS: Throttle = Throttle::new(WARN_EVERY);
+/// Sign-in and setup attempts refused before any hashing (a limit of the address, the account
+/// or the name, a disabled account, every hashing slot busy): each costs microseconds, so a
+/// locked-out client could log thousands a second. The warnings after a password was checked
+/// stay one per attempt: hashing and the per-address limit already pace them.
+static REFUSED_WARNS: Throttle = Throttle::new(WARN_EVERY);
 
 /// The prefix key of `ip`: an IPv4 address (also one mapped into IPv6) as it is, an IPv6 address
 /// by its /64. One host can pick any of the 2^64 addresses of its prefix (privacy addresses), so
@@ -415,8 +428,7 @@ async fn token_attempt(
     let stored = match stored {
         Ok(t) => t,
         Err(e) => {
-            let dropped = WARNS.lock_recover().allow_at(Instant::now(), WARN_EVERY);
-            if let Some(dropped) = dropped {
+            if let Some(dropped) = UNAVAILABLE_WARNS.allow_now() {
                 warn!(
                     dropped,
                     "the API token cannot be checked, so nobody passes with it: {e:#}"
@@ -433,11 +445,10 @@ async fn token_attempt(
         &stored,
         presented,
     );
-    if verdict != Verdict::Valid {
-        let dropped = WARNS.lock_recover().allow_at(Instant::now(), WARN_EVERY);
-        if let Some(dropped) = dropped {
-            warn!(peer = %who(peer), ?verdict, dropped, "wrong API token");
-        }
+    if verdict != Verdict::Valid
+        && let Some(dropped) = TOKEN_WARNS.allow_now()
+    {
+        warn!(peer = %who(peer), ?verdict, dropped, "wrong API token");
     }
     verdict
 }
@@ -558,10 +569,7 @@ fn with_bearer_challenge(mut resp: Response) -> Response {
 
 /// Log that sign-in is closed (throttled), with the reason the operator needs.
 pub(super) fn note_closed(why: &str) {
-    let dropped = CLOSED_WARNS
-        .lock_recover()
-        .allow_at(Instant::now(), WARN_EVERY);
-    if let Some(dropped) = dropped {
+    if let Some(dropped) = CLOSED_WARNS.allow_now() {
         warn!(dropped, "web UI sign-in is closed: {why}");
     }
 }
@@ -943,7 +951,9 @@ pub(super) async fn login_submit(
     let reserved = match reserve(&state, peer) {
         Ok(r) => r,
         Err(wait) => {
-            warn!(peer = %who(peer), wait, "sign-in refused: too many wrong attempts from this address");
+            if let Some(dropped) = REFUSED_WARNS.allow_now() {
+                warn!(peer = %who(peer), wait, dropped, "sign-in refused: too many wrong attempts from this address");
+            }
             return answer.wait(wait);
         }
     };
@@ -972,19 +982,27 @@ pub(super) async fn login_submit(
     let slot = match (slot, &account) {
         (Ok(slot), _) => slot,
         (Err(Decision::Wait(secs)), Some(u)) => {
-            warn!(peer = %who(peer), user = %u.name, failures = u.failures, wait = secs, "sign-in refused: the account waits after failures in a row");
+            if let Some(dropped) = REFUSED_WARNS.allow_now() {
+                warn!(peer = %who(peer), user = %u.name, failures = u.failures, wait = secs, dropped, "sign-in refused: the account waits after failures in a row");
+            }
             return answer.wait(secs);
         }
         (Err(Decision::Wait(secs)), None) => {
-            warn!(peer = %who(peer), wait = secs, "sign-in refused: an unknown username waits after failures in a row");
+            if let Some(dropped) = REFUSED_WARNS.allow_now() {
+                warn!(peer = %who(peer), wait = secs, dropped, "sign-in refused: an unknown username waits after failures in a row");
+            }
             return answer.wait(secs);
         }
         (Err(_), Some(u)) => {
-            warn!(peer = %who(peer), user = %u.name, "sign-in refused: the account is disabled after too many wrong passwords; run `blue-onyx-prism user unlock <name>` on the server");
+            if let Some(dropped) = REFUSED_WARNS.allow_now() {
+                warn!(peer = %who(peer), user = %u.name, dropped, "sign-in refused: the account is disabled after too many wrong passwords; run `blue-onyx-prism user unlock <name>` on the server");
+            }
             return answer.fail(StatusCode::UNAUTHORIZED, WRONG);
         }
         (Err(_), None) => {
-            warn!(peer = %who(peer), "sign-in refused: an unknown username, disabled after too many attempts");
+            if let Some(dropped) = REFUSED_WARNS.allow_now() {
+                warn!(peer = %who(peer), dropped, "sign-in refused: an unknown username, disabled after too many attempts");
+            }
             return answer.fail(StatusCode::UNAUTHORIZED, WRONG);
         }
     };
@@ -1002,7 +1020,9 @@ pub(super) async fn login_submit(
     let Some(verified) = verified else {
         refund(&state, reserved);
         drop(slot);
-        warn!(peer = %who(peer), "sign-in not checked: every password-hashing slot stayed busy; answered 503");
+        if let Some(dropped) = REFUSED_WARNS.allow_now() {
+            warn!(peer = %who(peer), dropped, "sign-in not checked: every password-hashing slot stayed busy; answered 503");
+        }
         return answer.busy();
     };
     let good = match verified {
@@ -1211,7 +1231,9 @@ pub(super) async fn setup_submit(
     let reserved = match reserve(&state, peer) {
         Ok(r) => r,
         Err(wait) => {
-            warn!(peer = %who(peer), wait, "setup refused: too many wrong attempts from this address");
+            if let Some(dropped) = REFUSED_WARNS.allow_now() {
+                warn!(peer = %who(peer), wait, dropped, "setup refused: too many wrong attempts from this address");
+            }
             let resp = setup_refusal(
                 &state,
                 html,

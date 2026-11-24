@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::{
     EnvFilter, Layer, Registry,
     layer::{Layered, SubscriberExt},
@@ -1027,8 +1028,23 @@ pub const MAX_LOG_FILES: usize = 14;
 /// All log files under `log_path` together: past it the oldest go (never today's).
 pub const MAX_LOG_TOTAL_BYTES: u64 = 500 * 1000 * 1000;
 /// Most bytes written to one day's file. Past it the rest of the day's lines are dropped, after one
-/// line saying so: today's log is never deleted, so this is what bounds it.
+/// line saying so (ERROR lines still go in, up to [`MAX_LOG_ERROR_RESERVE_BYTES`]): today's log is
+/// never deleted, so this is what bounds it.
 pub const MAX_LOG_FILE_BYTES: u64 = 200 * 1000 * 1000;
+/// Bytes past [`MAX_LOG_FILE_BYTES`] a day's file still takes for ERROR lines: a flood of warnings
+/// that fills the file must not hide the error that follows it (a model going Failed, a panic,
+/// the stop sequence). Small next to the cap, so the total stays bounded; about 50,000 lines.
+pub const MAX_LOG_ERROR_RESERVE_BYTES: u64 = 10 * 1000 * 1000;
+
+/// Whether today's log file reached its cap ([`MAX_LOG_FILE_BYTES`]) and lines are dropped; set
+/// and cleared by the file log's writer ([`log_files`]), read by [`file_log_capped`].
+static FILE_LOG_CAPPED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process logs to files and today's file reached its cap, so lines below ERROR are
+/// being dropped until the next day (`GET /v1/status` `fileLogCapped`, the Logs page).
+pub fn file_log_capped() -> bool {
+    FILE_LOG_CAPPED.load(Ordering::Relaxed)
+}
 
 /// Initialize global tracing. Logs to stdout, or to a daily file in `log_path` when given (see
 /// [`log_files`]: [`MAX_LOG_FILES`] days, [`MAX_LOG_TOTAL_BYTES`] in all, [`MAX_LOG_FILE_BYTES`]
@@ -1046,7 +1062,8 @@ pub fn init_logging_with(
     init_logging_opts(level, log_path, LogFormat::Text, extra)
 }
 
-/// The daily log files under `dir` (created when missing), lines in `format`.
+/// The daily log files under `dir` (created when missing), lines in `format`; their cap state is
+/// [`file_log_capped`].
 fn file_appender(dir: &Path, format: LogFormat) -> Result<log_files::LogFiles> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("could not create the log directory {}", dir.display()))?;
@@ -1057,6 +1074,7 @@ fn file_appender(dir: &Path, format: LogFormat) -> Result<log_files::LogFiles> {
         Box::new(std::time::SystemTime::now),
         Box::new(crate::clock::zone),
     )
+    .map(|f| f.reporting_to(&FILE_LOG_CAPPED))
     .with_context(|| format!("could not open a log file in {}", dir.display()))
 }
 
@@ -1068,10 +1086,25 @@ fn file_appender(dir: &Path, format: LogFormat) -> Result<log_files::LogFiles> {
 /// [`MAX_LOG_TOTAL_BYTES`], and one day's file stops at [`MAX_LOG_FILE_BYTES`] with a line saying
 /// so. Today's file is never deleted. Runs on the `non_blocking` writer's thread, so it cannot log
 /// its own failures; a file it cannot write is skipped, like a full disk.
+///
+/// Past the cap (a lasting fault that logs far more than usual):
+/// - ERROR lines still go to the file, up to [`MAX_LOG_ERROR_RESERVE_BYTES`] more (the level is
+///   read from the line: the word after the time stamp in text, `"level":"ERROR"` in JSON);
+/// - the lines dropped are counted, and the file ends with one line saying how many, written when
+///   the day changes or the writer closes (a restart, a stop);
+/// - [`super::file_log_capped`] is true until a day's file has room again (`GET /v1/status`, the
+///   Logs page).
+///
+/// The total's pruning keeps the day such a fault began: while today's file is capped, the
+/// oldest of the capped files that run back from today without an uncapped one between them (a
+/// file within 1% of the cap counts as capped) is kept before the newer ones, as long as it fits
+/// beside today's. The days in between go first, so the file with the first lines of the fault,
+/// usually its cause, outlives two days of its repeats.
 pub(crate) mod log_files {
     use std::fs::File;
     use std::io::Write;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::SystemTime;
 
     use chrono::NaiveDate;
@@ -1081,12 +1114,19 @@ pub(crate) mod log_files {
     /// Bytes written between two checks of the folder's total.
     const CHECK_EVERY: u64 = 16 * 1000 * 1000;
 
+    /// How many bytes under a file's cap still count as a capped file when pruning (1/this of
+    /// the cap): the line that met the cap was not written, so a capped file ends a little short
+    /// of it, by up to one line (a few KiB, or hundreds for a hostile request header).
+    const CAPPED_SLACK_DIV: u64 = 100;
+
     /// The bounds (tests shrink them).
     #[derive(Debug, Clone, Copy)]
     pub(crate) struct Limits {
         pub files: usize,
         pub total: u64,
         pub per_file: u64,
+        /// Bytes past `per_file` taken by ERROR lines only.
+        pub error_reserve: u64,
     }
 
     impl Default for Limits {
@@ -1095,8 +1135,37 @@ pub(crate) mod log_files {
                 files: super::MAX_LOG_FILES,
                 total: super::MAX_LOG_TOTAL_BYTES,
                 per_file: super::MAX_LOG_FILE_BYTES,
+                error_reserve: super::MAX_LOG_ERROR_RESERVE_BYTES,
             }
         }
+    }
+
+    impl Limits {
+        /// Whether a past day's file of `len` bytes reached its cap (see [`CAPPED_SLACK_DIV`]).
+        fn hit_cap(&self, len: u64) -> bool {
+            len >= self
+                .per_file
+                .saturating_sub(self.per_file / CAPPED_SLACK_DIV)
+        }
+    }
+
+    /// Whether `line` (one formatted event) is at ERROR level: the token after the time stamp in
+    /// the text format (`<stamp> ERROR target: ...`), `"level":"ERROR"` near the start in JSON.
+    pub(crate) fn is_error(line: &[u8], json: bool) -> bool {
+        /// Where the level is looked for in a JSON line: after the time stamp, which is first.
+        const JSON_HEAD: usize = 128;
+        if json {
+            let head = line.get(..line.len().min(JSON_HEAD)).unwrap_or_default();
+            return head
+                .windows(b"\"level\":\"ERROR\"".len())
+                .any(|w| w == b"\"level\":\"ERROR\"");
+        }
+        let Some(space) = line.iter().position(|&b| b == b' ') else {
+            return false;
+        };
+        let rest = line.get(space..).unwrap_or_default();
+        let level = rest.trim_ascii_start();
+        level.starts_with(b"ERROR ")
     }
 
     /// The clock (tests pass their own).
@@ -1116,8 +1185,12 @@ pub(crate) mod log_files {
         file: Option<File>,
         /// Bytes in the open file.
         size: u64,
-        /// Today's file reached its cap: lines are dropped until tomorrow.
+        /// Today's file reached its cap: lines below ERROR are dropped until tomorrow.
         capped: bool,
+        /// Lines dropped since the cap (said in the file at the day change or when closed).
+        dropped: u64,
+        /// Where the cap state is published ([`super::file_log_capped`]; None in tests).
+        flag: Option<&'static AtomicBool>,
         since_check: u64,
     }
 
@@ -1146,13 +1219,61 @@ pub(crate) mod log_files {
                 file: None,
                 size: 0,
                 capped: false,
+                dropped: 0,
+                flag: None,
                 since_check: 0,
             };
             me.open_day(day)?;
             Ok(me)
         }
 
+        /// Publish the cap state in `flag` (now and on every change).
+        pub(crate) fn reporting_to(mut self, flag: &'static AtomicBool) -> Self {
+            flag.store(self.capped, Ordering::Relaxed);
+            self.flag = Some(flag);
+            self
+        }
+
+        /// Whether today's file reached its cap.
+        #[cfg(test)]
+        pub(crate) fn capped(&self) -> bool {
+            self.capped
+        }
+
+        fn set_capped(&mut self, capped: bool) {
+            self.capped = capped;
+            if let Some(flag) = self.flag {
+                flag.store(capped, Ordering::Relaxed);
+            }
+        }
+
+        /// End the open file's record of dropped lines: one line saying how many (nothing when
+        /// none was dropped).
+        fn note_dropped(&mut self) {
+            let dropped = std::mem::take(&mut self.dropped);
+            if dropped == 0 {
+                return;
+            }
+            let line = self.line(
+                "WARN",
+                &format!(
+                    "{dropped} lines were dropped after this file reached its cap of {} MB \
+                     (ERROR lines were kept, up to {} MB more)",
+                    self.limits.per_file / 1_000_000,
+                    self.limits.error_reserve / 1_000_000
+                ),
+            );
+            if let Some(file) = self.file.as_mut()
+                && file.write_all(line.as_bytes()).is_ok()
+            {
+                self.size = self.size.saturating_add(line.len() as u64);
+            }
+        }
+
         fn open_day(&mut self, day: NaiveDate) -> std::io::Result<()> {
+            if day != self.day {
+                self.note_dropped();
+            }
             self.day = day;
             self.file = None;
             self.since_check = 0;
@@ -1163,7 +1284,7 @@ pub(crate) mod log_files {
                 .open(&path)?;
             self.size = file.metadata().map(|m| m.len()).unwrap_or(0);
             // A restart on a day whose file is already full keeps it full.
-            self.capped = self.size >= self.limits.per_file;
+            self.set_capped(self.size >= self.limits.per_file);
             self.file = Some(file);
             self.prune();
             Ok(())
@@ -1171,24 +1292,31 @@ pub(crate) mod log_files {
 
         /// The line written once when today's file reaches its cap.
         fn cap_line(&self) -> String {
+            self.line(
+                "WARN",
+                &format!(
+                    "this log file reached {} MB, so the rest of today's lines are dropped, \
+                     except errors; logging goes on in tomorrow's file. Something logs far more \
+                     than usual: look at the lines above, or lower log_level",
+                    self.limits.per_file / 1_000_000
+                ),
+            )
+        }
+
+        /// A line of this writer's own at `level` (`WARN`), in the file's format.
+        fn line(&self, level: &str, text: &str) -> String {
             let at = crate::clock::log_stamp(chrono::Utc::now());
-            let text = format!(
-                "this log file reached {} MB, so the rest of today's lines are dropped; logging \
-                 goes on in tomorrow's file. Something logs far more than usual: look at the lines \
-                 above, or lower log_level",
-                self.limits.per_file / 1_000_000
-            );
             if self.json {
                 serde_json::json!({
                     "timestamp": at,
-                    "level": "WARN",
+                    "level": level,
                     "fields": { "message": text },
                     "target": "blue_onyx_prism::cli::log_files",
                 })
                 .to_string()
                     + "\n"
             } else {
-                format!("{at}  WARN blue_onyx_prism::cli::log_files: {text}\n")
+                format!("{at} {level:>5} blue_onyx_prism::cli::log_files: {text}\n")
             }
         }
 
@@ -1217,7 +1345,29 @@ pub(crate) mod log_files {
             let today_bytes = files.iter().find(|f| f.1 == today).map_or(0, |f| f.2);
             let mut kept = 1usize;
             let mut total = today_bytes;
-            for (_, path, len) in files.into_iter().filter(|f| f.1 != today) {
+            // The day a fault that lasts until today began (module doc): kept first.
+            let onset = if self.capped {
+                files
+                    .iter()
+                    .filter(|f| f.1 != today)
+                    .take_while(|f| self.limits.hit_cap(f.2))
+                    .last()
+                    .map(|f| (f.1.clone(), f.2))
+            } else {
+                None
+            };
+            let onset = onset.filter(|&(_, len)| {
+                kept < self.limits.files && total.saturating_add(len) <= self.limits.total
+            });
+            if let Some((_, len)) = &onset {
+                kept += 1;
+                total = total.saturating_add(*len);
+            }
+            let keep_first = onset.map(|(path, _)| path);
+            for (_, path, len) in files
+                .into_iter()
+                .filter(|f| f.1 != today && Some(&f.1) != keep_first.as_ref())
+            {
                 if kept < self.limits.files && total.saturating_add(len) <= self.limits.total {
                     kept += 1;
                     total = total.saturating_add(len);
@@ -1237,21 +1387,29 @@ pub(crate) mod log_files {
                     return Ok(buf.len());
                 }
             }
-            if self.capped {
-                return Ok(buf.len());
-            }
             let len = buf.len() as u64;
+            if !self.capped && self.size.saturating_add(len) > self.limits.per_file {
+                self.set_capped(true);
+                let line = self.cap_line();
+                if let Some(file) = self.file.as_mut()
+                    && file.write_all(line.as_bytes()).is_ok()
+                {
+                    self.size = self.size.saturating_add(line.len() as u64);
+                }
+            }
+            if self.capped {
+                let room = self
+                    .limits
+                    .per_file
+                    .saturating_add(self.limits.error_reserve);
+                if !is_error(buf, self.json) || self.size.saturating_add(len) > room {
+                    self.dropped = self.dropped.saturating_add(1);
+                    return Ok(buf.len());
+                }
+            }
             let Some(file) = self.file.as_mut() else {
                 return Ok(buf.len());
             };
-            if self.size.saturating_add(len) > self.limits.per_file {
-                self.capped = true;
-                let line = self.cap_line();
-                if let Some(file) = self.file.as_mut() {
-                    let _ = file.write_all(line.as_bytes());
-                }
-                return Ok(buf.len());
-            }
             file.write_all(buf)?;
             self.size = self.size.saturating_add(len);
             self.since_check = self.since_check.saturating_add(len);
@@ -1264,6 +1422,13 @@ pub(crate) mod log_files {
 
         fn flush(&mut self) -> std::io::Result<()> {
             self.file.as_mut().map_or(Ok(()), File::flush)
+        }
+    }
+
+    impl Drop for LogFiles {
+        /// A stop or restart ends the file with its count of dropped lines.
+        fn drop(&mut self) {
+            self.note_dropped();
         }
     }
 }
@@ -2375,6 +2540,7 @@ mod tests {
                 files,
                 total,
                 per_file,
+                error_reserve: 0,
             }
         }
 
@@ -2468,12 +2634,143 @@ mod tests {
             again.write_all(&line).unwrap();
             assert_eq!(std::fs::read(path_of(&d.0, day(0))).unwrap().len(), size);
 
-            // Tomorrow: a new file, yesterday's untouched.
+            // Tomorrow: a new file; yesterday's ends with the count of lines it dropped.
             offset.store(DAY + 60, Ordering::Relaxed);
             f.write_all(&line).unwrap();
             f.flush().unwrap();
             assert_eq!(std::fs::read(path_of(&d.0, day(1))).unwrap(), line);
-            assert_eq!(std::fs::read(path_of(&d.0, day(0))).unwrap().len(), size);
+            let yesterday = std::fs::read_to_string(path_of(&d.0, day(0))).unwrap();
+            assert_eq!(yesterday.get(..size), Some(today.as_str()));
+            let tail: Vec<&str> = yesterday.get(size..).unwrap().lines().collect();
+            assert_eq!(tail.len(), 1, "{yesterday}");
+            assert!(tail[0].contains("WARN") && tail[0].contains("2 lines were dropped"));
+            assert!(!f.capped(), "a new day has room");
+        }
+
+        /// A text line as the fmt layer writes it.
+        fn text_line(level: &str, n: usize) -> Vec<u8> {
+            format!(
+                "2026-11-07T01:00:00.000Z {level:>5} blue_onyx_prism::x: {}\n",
+                "m".repeat(n)
+            )
+            .into_bytes()
+        }
+
+        #[test]
+        fn the_level_is_read_from_text_and_json_lines() {
+            assert!(log_files::is_error(&text_line("ERROR", 3), false));
+            assert!(!log_files::is_error(&text_line("WARN", 3), false));
+            assert!(!log_files::is_error(&text_line("INFO", 3), false));
+            assert!(!log_files::is_error(
+                b"2026-11-07T01:00:00.000Z  WARN x: ERROR in text\n",
+                false
+            ));
+            assert!(!log_files::is_error(b"", false));
+            let json = |level: &str| {
+                format!(
+                    "{{\"timestamp\":\"2026-11-07T01:00:00.000+08:00\",\"level\":\"{level}\",\
+                     \"fields\":{{\"message\":\"\\\"level\\\":\\\"ERROR\\\"\"}}}}\n"
+                )
+            };
+            assert!(log_files::is_error(json("ERROR").as_bytes(), true));
+            assert!(!log_files::is_error(json("WARN").as_bytes(), true));
+        }
+
+        /// RA-117: past the cap, ERROR lines still go in (up to the reserve), others are dropped
+        /// and counted, the flag says so, and a stop ends the file with the count.
+        #[test]
+        fn errors_pass_the_cap_up_to_the_reserve_and_the_drops_are_counted() {
+            for json in [false, true] {
+                let d = dir();
+                let flag: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+                let (c, _) = clock();
+                let lim = log_files::Limits {
+                    error_reserve: 1000,
+                    ..limits(14, 1_000_000, 300)
+                };
+                let mut f = LogFiles::open(&d.0, lim, json, c, utc())
+                    .unwrap()
+                    .reporting_to(flag);
+                let (warn, error) = if json {
+                    let l = |level: &str| {
+                        format!(
+                            "{{\"timestamp\":\"t\",\"level\":\"{level}\",\"fields\":{{\"m\":\"{}\"}}}}\n",
+                            "m".repeat(40)
+                        )
+                        .into_bytes()
+                    };
+                    (l("WARN"), l("ERROR"))
+                } else {
+                    (text_line("WARN", 40), text_line("ERROR", 40))
+                };
+                while !f.capped() {
+                    f.write_all(&warn).unwrap();
+                }
+                assert!(flag.load(Ordering::Relaxed), "capped is published");
+                let at_cap = std::fs::read(path_of(&d.0, day(0))).unwrap().len();
+                f.write_all(&warn).unwrap();
+                f.write_all(&error).unwrap();
+                f.flush().unwrap();
+                let body = std::fs::read(path_of(&d.0, day(0))).unwrap();
+                assert_eq!(
+                    body.len(),
+                    at_cap + error.len(),
+                    "the error went in, the warning not"
+                );
+                assert!(body.ends_with(&error));
+                // Errors stop at the reserve too.
+                for _ in 0..100 {
+                    f.write_all(&error).unwrap();
+                }
+                f.flush().unwrap();
+                let full = std::fs::read(path_of(&d.0, day(0))).unwrap().len() as u64;
+                assert!(full <= 300 + 1000, "{full}");
+                assert!(
+                    full + error.len() as u64 > 300 + 1000,
+                    "the reserve was used: {full}"
+                );
+                drop(f);
+                let text = std::fs::read_to_string(path_of(&d.0, day(0))).unwrap();
+                let last = text.lines().last().unwrap();
+                assert!(last.contains("lines were dropped"), "{last}");
+                if json {
+                    let v: serde_json::Value = serde_json::from_str(last).unwrap();
+                    assert_eq!(v["level"], "WARN");
+                }
+            }
+        }
+
+        /// RA-117: on day 3 of a fault that caps every day, the total keeps the day it began and
+        /// drops the day between, not the reverse; with no fault, the newest days stay.
+        #[test]
+        fn the_day_a_lasting_fault_began_outlives_its_repeats() {
+            let d = dir();
+            // Cap 100, total 250: today + one more capped day fit, not two.
+            let lim = limits(14, 250, 100);
+            std::fs::write(path_of(&d.0, day(-3)), [b'x'; 10]).unwrap();
+            std::fs::write(path_of(&d.0, day(-2)), [b'x'; 100]).unwrap(); // the fault began
+            std::fs::write(path_of(&d.0, day(-1)), [b'x'; 99]).unwrap(); // within 1% counts
+            std::fs::write(path_of(&d.0, day(0)), [b'x'; 100]).unwrap();
+            let (c, _) = clock();
+            let f = LogFiles::open(&d.0, lim, false, c, utc()).unwrap();
+            assert!(f.capped());
+            assert!(path_of(&d.0, day(-2)).exists(), "the onset stays");
+            assert!(!path_of(&d.0, day(-1)).exists(), "a repeat goes");
+            assert!(
+                path_of(&d.0, day(-3)).exists(),
+                "a small older day still fits"
+            );
+            drop(f);
+
+            // Today not capped: newest first as before.
+            let d = dir();
+            std::fs::write(path_of(&d.0, day(-2)), [b'x'; 100]).unwrap();
+            std::fs::write(path_of(&d.0, day(-1)), [b'x'; 100]).unwrap();
+            std::fs::write(path_of(&d.0, day(0)), [b'x'; 10]).unwrap();
+            let (c, _) = clock();
+            let _f = LogFiles::open(&d.0, limits(14, 150, 100), false, c, utc()).unwrap();
+            assert!(path_of(&d.0, day(-1)).exists());
+            assert!(!path_of(&d.0, day(-2)).exists());
         }
 
         /// The file's date is the zone's: 22:00 UTC is already tomorrow in +08:00, and a change of

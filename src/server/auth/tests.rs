@@ -1045,9 +1045,12 @@ async fn account_lockout_device_cookies_and_disabling() {
     .await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{}", text(&b));
     let wait: u64 = h[header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
-    assert_eq!(
-        wait,
-        crate::accounts::lockout::delay(crate::accounts::lockout::DELAY_AFTER + 5)
+    // `last_failure` and the handler's clock are whole seconds read at two moments: when the
+    // second ticks between them (a loaded machine), the wait left is one less.
+    let delay = crate::accounts::lockout::delay(crate::accounts::lockout::DELAY_AFTER + 5);
+    assert!(
+        (delay.saturating_sub(1)..=delay).contains(&wait),
+        "{wait} vs {delay}"
     );
     assert!(text(&b).contains("Too many attempts"));
     assert_eq!(hashed(&state), before, "refused without hashing");
@@ -2153,4 +2156,40 @@ async fn a_reload_made_by_a_poll_does_not_count_as_activity() {
             .all(|c| !c.starts_with("__Host-bop_poll"))
     );
     assert!(state.auth.sessions.record(&sid).unwrap().last_active >= now);
+}
+
+/// RA-107: a locked-out address that keeps posting gets its 429s at once, and the refusal is
+/// logged at most once a minute (before, one line per request).
+#[tokio::test]
+async fn refused_sign_ins_are_logged_at_most_once_a_minute() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let state = test_state();
+    let ip: IpAddr = REMOTE.parse::<std::net::SocketAddr>().unwrap().ip();
+    for _ in 0..MAX_FAILURES {
+        state
+            .login
+            .failures
+            .lock()
+            .unwrap()
+            .fail(ip, Instant::now());
+    }
+    let buf = crate::logbuf::LogBuffer::new(1000);
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(buf.clone()));
+    tracing::callsite::rebuild_interest_cache();
+    for _ in 0..20 {
+        let (s, _, _) = call(&state, login(REMOTE, creds(TEST_USER, "wrong"), false)).await;
+        assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    }
+    assert_eq!(hashed(&state), 0, "nothing was hashed");
+    let lines = buf
+        .since(0, None, 1000)
+        .entries
+        .into_iter()
+        .filter(|e| {
+            e.message
+                .contains("too many wrong attempts from this address")
+        })
+        .count();
+    // Another test may have taken this minute's line; either way, not one per request.
+    assert!(lines <= 1, "{lines} lines");
 }

@@ -255,18 +255,25 @@ fn cos_dist(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Generic k-center greedy (Gonzalez): start from `first`, then repeatedly take the point
-/// farthest from everything taken (ties: the lowest index). Exact: every distance is computed.
+/// farthest from everything taken (ties: the lowest index). Exact: every distance from an untaken
+/// point to the newest pick is computed. O(n*k): taken points are marked in `taken` (a lookup
+/// in the picks list made it O(n*k^2), minutes for 20,000 candidates and 5,000 frames) and left
+/// out of both loops (their distance is never read again).
 fn k_center_by(n: usize, k: usize, first: usize, dist: impl Fn(usize, usize) -> f64) -> Vec<usize> {
     if n == 0 || k == 0 {
         return Vec::new();
     }
     let first = first.min(n - 1);
     let mut chosen = vec![first];
+    let mut taken = vec![false; n];
+    if let Some(t) = taken.get_mut(first) {
+        *t = true;
+    }
     let mut near: Vec<f64> = (0..n).map(|i| dist(i, first)).collect();
     while chosen.len() < k.min(n) {
         let mut best: Option<(usize, f64)> = None;
-        for (i, d) in near.iter().enumerate() {
-            if chosen.contains(&i) {
+        for ((i, d), t) in near.iter().enumerate().zip(&taken) {
+            if *t {
                 continue;
             }
             if best.is_none_or(|(_, b)| *d > b) {
@@ -275,7 +282,13 @@ fn k_center_by(n: usize, k: usize, first: usize, dist: impl Fn(usize, usize) -> 
         }
         let Some((pick, _)) = best else { break };
         chosen.push(pick);
-        for (i, d) in near.iter_mut().enumerate() {
+        if let Some(t) = taken.get_mut(pick) {
+            *t = true;
+        }
+        for ((i, d), t) in near.iter_mut().enumerate().zip(&taken) {
+            if *t {
+                continue;
+            }
             let x = dist(i, pick);
             if x < *d {
                 *d = x;
@@ -539,6 +552,50 @@ mod tests {
             unbalanced
         );
         assert_eq!(pick(&groups, &hashes, Some((&[], 0)), 2, false), unbalanced);
+    }
+
+    /// Audit 2026-11 (QA-109): exact duplicates (distance 0 to everything) are taken in index
+    /// order, each once: the tie rule of the picks list holds with the `taken` marks.
+    #[test]
+    fn k_center_takes_identical_points_in_index_order() {
+        assert_eq!(
+            k_center_hamming(&[7u64; 50], 10),
+            (0..10).collect::<Vec<_>>()
+        );
+        assert_eq!(k_center_hamming(&[7u64; 5], 10), (0..5).collect::<Vec<_>>());
+        // NaN distances (a broken embedding): every point is still taken exactly once.
+        let nan = [f32::NAN, f32::NAN];
+        let (a, b) = (unit(&[1.0, 0.0]), unit(&[0.0, 1.0]));
+        let refs: Vec<&[f32]> = vec![&a, &nan, &b, &nan];
+        let mut p = k_center(&refs, 4);
+        assert_eq!(p.len(), 4);
+        p.sort_unstable();
+        assert_eq!(p, [0, 1, 2, 3]);
+    }
+
+    /// Audit 2026-11 (QA-109): an import's largest selection (20,000 candidates, thousands of
+    /// frames) is O(n*k) distance work, seconds even unoptimized; the picks list lookup it had
+    /// made it O(n*k^2), minutes.
+    #[test]
+    fn k_center_of_a_large_import_is_fast() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let hashes: Vec<u64> = (0..20_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let p = k_center_hamming(&hashes, 3_000);
+        let took = start.elapsed();
+        assert_eq!(p.len(), 3_000);
+        let mut d = p.clone();
+        d.sort_unstable();
+        d.dedup();
+        assert_eq!(d.len(), 3_000, "every pick distinct");
+        assert!(took < std::time::Duration::from_secs(30), "{took:?}");
     }
 
     #[test]

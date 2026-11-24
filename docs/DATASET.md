@@ -349,9 +349,16 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
 - **Caps:** `collect.max_gb` (default 5) and `collect.max_age_days` (default 90, 0 = keep) are applied
   by `retention::prune_dataset`, oldest first.
   - It runs on the collector thread, which writes frames; an import (a job thread or a `train import`
-    process) writes frames and index lines too, under the index lock above. It runs every 10 minutes (asked by the retention sweeper,
-    also while collection is off, as long as the folder exists) and right after a write that crossed
-    the size cap.
+    process) writes frames and index lines too, under the index lock above.
+  - The retention sweeper asks every 10 minutes (also while collection is off, as long as the folder
+    exists). That check reads only what the collector keeps in memory; the folder is walked when the
+    frames that count toward the cap exceed it by more than max(1% of the cap, 64 MiB), when the
+    oldest deletable frame is past `max_age_days`, or once a day; with collection off and both caps
+    0 never. A write that takes the folder past the cap by that margin starts a pass at once (at most
+    every 30 s). A pass still trims to exactly the cap and never deletes a frame earlier than the
+    limits say.
+  - A pass re-reads only the day folders that changed since the last one (the folder's time and its
+    `index.jsonl`'s size and time); every day folder is read again at least hourly while passes run.
   - It deletes only frames in the layout above: the image, the sidecar and the frame's `.labels.json`.
     It never deletes `review-queue.jsonl`, `spots/` or anything else. A frame in the review queue is
     pruned like any other.
@@ -368,7 +375,7 @@ resolve inside the folder to a regular file (symlinks refused) is a 404.
   - A label file that cannot be read protects its frame, in case it holds a person's work.
   - The size cap applies to the frames that can be deleted. The Collect tab's *Disk used* line shows
     the total, the part that counts toward the cap and the protected reviewed data. The protected
-    figure can lag a review by up to 10 minutes.
+    figure can lag a review until the next pass (a day at most).
 - **Low disk:** if free space under the folder drops below 1 GB (`retention::MIN_FREE_MB`, the same
   threshold as the low-space warning), or a write fails with a full disk or exhausted quota:
   - collection stops with a warning;

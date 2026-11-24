@@ -15,10 +15,19 @@
 //! stops on low free space or a full disk until space is back. [`health`] turns its counts into
 //! what the pages say.
 //!
-//! The thread runs at the normal priority: the per-thread below-normal priority helper would
-//! live in `backend/priority.rs` (the only place `unsafe` is allowed) and does not exist yet.
-//! Its work is bounded by the rate limits: the luma decode (grayscale JPEG), the dHash, the block
-//! thumbnail and test, and the writes only happen for frames that passed them.
+//! The thread runs below normal priority ([`crate::backend::priority::lower_this_thread`],
+//! audit 2026-11 RA-116): frames are best effort (a starved thread shows as
+//! `dataset_dropped_total{reason="queue_full"}`), and its work is bounded by the rate limits: the
+//! luma decode (grayscale JPEG), the dHash, the block thumbnail and test, and the writes only
+//! happen for frames that passed them. It takes the process-wide label write lock only for one
+//! frame's read and unlinks at a time in a prune, so a Review save waits at most that long.
+//!
+//! Idle (audit 2026-11 phase 6): between messages the thread blocks on its channel, waking only for
+//! the disk re-arm check while collection is stopped ([`store::FREE_CHECK_INTERVAL`]) and for its
+//! own prune timer while collection is on ([`PRUNE_INTERVAL`]); with neither it waits for the next
+//! message. A prune request walks the folder only when a cap may have work
+//! ([`store::Store::prune_if_due`]), and with collection off and both caps 0 no thread is started
+//! for one.
 //!
 //! Panics and stops (audit 2026-11 phase 1): every step of the thread (a frame, a prune, a
 //! resume, a rescan, the disk re-arm check) runs under `catch_unwind`; a panic is the Collect
@@ -371,8 +380,12 @@ impl Collector {
         let flag = stop.clone();
         match std::thread::Builder::new()
             .name("dataset-collector".into())
-            .spawn(move || run(&rx, status, flag))
-        {
+            .spawn(move || {
+                crate::backend::priority::lower_this_thread(
+                    crate::backend::priority::ThreadRole::Background,
+                );
+                run(&rx, status, flag);
+            }) {
             Ok(join) => Some(Running {
                 tx,
                 stop,
@@ -431,10 +444,12 @@ impl Collector {
         }
     }
 
-    /// Apply the caps to `settings.dir` on the collector thread (the retention sweeper's tick).
-    /// Started only when the folder exists.
+    /// Apply the caps to `settings.dir` on the collector thread (the retention sweeper's tick; the
+    /// thread walks the folder only when a cap may have work, [`store::Store::prune_if_due`]).
+    /// Sent only when the folder exists and something could ever be deleted in it
+    /// ([`store::never_prunes`]).
     pub fn request_prune(&self, settings: CollectSettings) {
-        if !settings.dir.is_dir() {
+        if store::never_prunes(&settings) || !settings.dir.is_dir() {
             return;
         }
         if let Some(tx) = self.sender()
@@ -584,7 +599,7 @@ fn dispatch(
                         hook(&dir);
                     }
                 }
-                st.prune(&s);
+                st.prune_if_due(&s);
             });
             *last_prune = Instant::now();
         }
@@ -612,10 +627,21 @@ fn run(rx: &Receiver<Msg>, status: Arc<Mutex<Status>>, stop: Arc<AtomicBool>) {
         while PAUSE.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(2));
         }
-        let msg = match rx.recv_timeout(store::FREE_CHECK_INTERVAL) {
-            Ok(m) => Some(m),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => return,
+        let wait = next_wake(
+            st.is_disabled(),
+            last.as_ref()
+                .map(|_| PRUNE_INTERVAL.saturating_sub(last_prune.elapsed())),
+        );
+        let msg = match wait {
+            Some(wait) => match rx.recv_timeout(wait) {
+                Ok(m) => Some(m),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+            None => match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => return,
+            },
         };
         if stop.load(Ordering::SeqCst) {
             // What is still queued is dropped: the process is stopping.
@@ -635,10 +661,22 @@ fn run(rx: &Receiver<Msg>, status: Arc<Mutex<Status>>, stop: Arc<AtomicBool>) {
             && let Some(s) = last.clone()
         {
             guarded(&mut st, "applying the dataset's size and age caps", |st| {
-                st.prune(&s);
+                st.prune_if_due(&s);
             });
             last_prune = Instant::now();
         }
+    }
+}
+
+/// How long the collector thread may wait for the next message before it has work of its own:
+/// the disk re-arm check while collection is stopped (`disabled`, every
+/// [`store::FREE_CHECK_INTERVAL`]), the prune timer's time left (`prune_in`, while collection is
+/// on), the sooner of the two; None = nothing to do until a message comes (it blocks).
+fn next_wake(disabled: bool, prune_in: Option<Duration>) -> Option<Duration> {
+    let rearm = disabled.then_some(store::FREE_CHECK_INTERVAL);
+    match (rearm, prune_in) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -1005,5 +1043,33 @@ mod tests {
         c.status.lock().unwrap().summary.frames = 7;
         assert_eq!(c.brief_of(&dir).summary.frames, 7);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit 2026-11 phase 6: an idle collector thread blocks on its channel; it wakes on its own
+    /// only for the disk re-arm check while collection is stopped and for its prune timer.
+    #[test]
+    fn an_idle_collector_waits_for_a_message() {
+        let five = Duration::from_secs(5);
+        assert_eq!(next_wake(false, None), None);
+        assert_eq!(next_wake(true, None), Some(store::FREE_CHECK_INTERVAL));
+        assert_eq!(next_wake(false, Some(five)), Some(five));
+        assert_eq!(next_wake(true, Some(five)), Some(five));
+        assert_eq!(
+            next_wake(true, Some(PRUNE_INTERVAL)),
+            Some(store::FREE_CHECK_INTERVAL)
+        );
+    }
+
+    /// RA-111: with collection off and both caps 0 the sweeper's request starts no thread.
+    #[test]
+    fn a_prune_request_with_nothing_to_delete_starts_no_thread() {
+        let tmp = Tmp::new();
+        let c = Collector::new();
+        let mut s = settings_for(&tmp.0);
+        s.enabled = false;
+        s.max_bytes = 0;
+        s.max_age_days = 0;
+        c.request_prune(s);
+        assert!(matches!(*c.thread.lock().unwrap(), Thread::Idle));
     }
 }

@@ -376,6 +376,12 @@ fn open_cached_in(
         let spawned = std::thread::Builder::new()
             .name("refine-open".into())
             .spawn(move || {
+                // This walk starts from a poll nobody waits for: yield to detection like the
+                // other background walks. Only here, never in `open_counts_in`, which the
+                // Refine tab also runs on pooled blocking threads.
+                crate::backend::priority::lower_this_thread(
+                    crate::backend::priority::ThreadRole::Background,
+                );
                 let _done = done;
                 open_counts_in(store, &dir, &classes, &hidden, &stamp);
             });

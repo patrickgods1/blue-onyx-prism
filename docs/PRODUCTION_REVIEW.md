@@ -4203,7 +4203,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 
 | ID | audit item | kind | severity | phase | status | title |
 |---|---|---|---|---|---|---|
-| RA-001 | `platform-storage/platform-6` | processes | medium | 0 | fixed (phase 0): see QA-003; the 30 s repeat is RA in phase 6 | On Windows, port_holder never reads netstat's piped stdout until it exits, so `netstat -ano` blocks on a full pipe, is killed after 5 s, and this repeats every 30 s while the HTTPS port is taken |
+| RA-001 | `platform-storage/platform-6` | processes | medium | 0 | fixed (phase 0): see QA-003; the 30 s repeat: RA-033, fixed (phase 6) | On Windows, port_holder never reads netstat's piped stdout until it exits, so `netstat -ano` blocks on a full pipe, is killed after 5 s, and this repeats every 30 s while the HTTPS port is taken |
 | RA-002 | `backend/backend-9` | crash-recovery | low | 0 | fixed (phase 0): both JPEGs written atomically | save_annotated writes saved images in place: a crash or full disk leaves truncated <stem>_od.jpg / <stem>.jpg |
 | RA-003 | `gap-how-memory-returns/memgap-1` | memory | low | 0 | partial (phase 0): `backend::memory::trim` for Linux glibc, macOS and Windows (process heap only); call sites in phase 5 | No trim helper on Windows or macOS: the seven proposed `backend::memory::trim()` fixes are glibc-only. Below is one spec that covers every OS (Windows-first corrections included). |
 | RA-004 | `platform-storage/platform-5` | crash-recovery | low | 0 | fixed (phase 0): see QA-009 | CO-02 fix incomplete: `Config::save` uses one fixed `<config>.tmp` name, so a CLI save and a service save at the same moment can rename a mixed, corrupt file over the config |
@@ -4234,8 +4234,8 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | RA-029 | `platform-storage/platform-4` | processes | low | 1 | fixed (phase 1): forced exits kill this process's recorded child trees (`runner::before_forced_exit`) and flush the log | The CLI server's `process::exit` paths (second Ctrl-C, 60 s deadline) skip every child kill. On Unix the training/export children sit in their own process group, survive, and the next start's sweep deletes their work folder under them |
 | RA-030 | `platform-storage/platform-7` | shutdown | low | 1 | fixed (phase 1): the sweep stops between items; the sweeper join is bounded (2 s) | The storage sweep cannot be cancelled, and shutdown joins its thread, so a stop during a large deletion or auto-label recovery waits until it finishes |
 | RA-031 | `resources/resources-8` | threads | low | 1 | fixed (phase 1): 2 s for helpers holding the pipes, then the group is killed; 5 s more, then the readers are left; a cancel ends it | The runner's post-exit drain has no deadline and ignores cancel: a helper outside the group or job that holds the pipes hangs the export thread forever |
-| RA-032 | `server-core/server-core-2` | threads | low | 6 | open | Once the request head is read, nothing bounds a slow request body (outside detection) or a client that stops reading the response; such connections and their tasks are held for ever, and a few LAN hosts can fill MAX_CONNECTIONS and lock Blue Iris out |
-| RA-033 | `server-core/server-core-3` | processes | low | 6 | open | HTTPS retry loop spawns the port-holder tools (netstat -ano + tasklist on Windows, lsof/ss elsewhere) every 30 s for as long as https_port stays taken, although repeats are only logged at debug |
+| RA-032 | `server-core/server-core-2` | threads | low | 6 | fixed (phase 6) | Once the request head is read, nothing bounds a slow request body (outside detection) or a client that stops reading the response; such connections and their tasks are held for ever, and a few LAN hosts can fill MAX_CONNECTIONS and lock Blue Iris out |
+| RA-033 | `server-core/server-core-3` | processes | low | 6 | fixed (phase 6) | HTTPS retry loop spawns the port-holder tools (netstat -ano + tasklist on Windows, lsof/ss elsewhere) every 30 s for as long as https_port stays taken, although repeats are only logged at debug |
 | RA-034 | `server-handlers/server-handlers-1` | shutdown | low | 1 | fixed (phase 1): resettable queue slot; `stop_for_exit` at t0 of the stop | The process-wide training queue sits in a static OnceLock and is never shut down, so a stop leaves the running training / auto-label / import / refine child running |
 | RA-035 | `server-handlers/server-handlers-4` | processes | low | 1 | fixed (phase 1): the dialog gets a Windows Job and a `.children.json` entry | The native file-dialog child is not tied to the service's lifetime: a crash, kill or tray kill leaves a TopMost dialog process on the desktop |
 | RA-036 | `server-handlers/server-handlers-5` | processes | low | 1 | fixed (phase 1): phase 0 runner: group KILL after the grace, bounded join | `pick::stop` escalates to SIGKILL only for the direct child, so a surviving grandchild keeps the pipes open and the dialog BUSY flag is held for the life of the process |
@@ -4306,31 +4306,31 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | RA-101 | `training-jobs/training-jobs-8` | memory | low | 5 | fixed (phase 5): embeddings read flat in chunks; `select::pick` takes a slice | Job-time heap spikes in the service are never trimmed back to the OS (Linux glibc) |
 | RA-102 | `workers-registry/workers-registry-5` | memory | low | 5 | fixed (phase 5): see RA-077 | Freed backends are never trimmed: after a reload, retire, reaper drop or generation swap, the old model's host memory stays in the allocator's arenas |
 | RA-103 | `workers-registry/workers-registry-8` | memory | low | 5 | fixed (phase 5): sweep every 64 calls, deque never past its cap | Static-box memory keeps an idle camera's expired tracks until 256 other keys evict it, and the per-track VecDeque doubles to 128 slots to hold 64 |
-| RA-104 | `collect/collect-1` | cpu | medium | 6 | open | Retention prune looks up each doomed file by linear search: O(doomed x entries), minutes to hours of one core |
-| RA-105 | `collect/collect-2` | cpu | medium | 6 | open | Every dataset prune is a full walk that reads every label file. At the size cap it repeats every 30 s, and it runs every 10 min while idle |
-| RA-106 | `gap-log-lines-with/logs-1` | storage | medium | 6 | open | The cross-site refusal warning has no throttle and logs the client's Origin header in full, so one unauthenticated LAN client can wipe the Windows Application log and fill today's log file in seconds |
-| RA-107 | `gap-log-lines-with/logs-2` | storage | medium | 6 | open | Refused sign-ins log one unthrottled WARN per request before any password hashing, so a locked-out guessing client writes thousands of Event Log records a second |
-| RA-108 | `gap-log-lines-with/logs-4` | storage | medium | 6 | open | The unknown-model warning has no throttle: a camera still calling a removed or renamed model writes one WARN (and one Event Log record) per image |
-| RA-109 | `gap-log-lines-with/logs-5` | cpu | medium | 6 | open | Queue timeouts log one WARN per request on the worker's inference thread (run.rs:657, detect.rs:932, run.rs:880), so a slowed GPU logs at the camera rate and each line runs ReportEventW inside the loop that is already behind |
-| RA-110 | `gap-log-lines-with/logs-6` | storage | medium | 6 | open | Per-frame failures that never mark the model broken log one WARN each: bad or oversized images (run.rs:680) and failed annotated-image saves (save.rs:171) |
-| RA-111 | `platform-storage/platform-3` | cpu | medium | 6 | open | Every 10 minutes the sweeper thread has the collector walk the whole dataset and read and parse every label file, even with collection off and both caps at 0 |
-| RA-112 | `training-jobs/training-jobs-5` | cpu | medium | 6 | open | Import analysis and dataset downscale run on all cores but one at normal priority inside the service, competing with Blue Iris detections |
-| RA-113 | `backend/backend-6` | cpu | low | 6 | open | ort:cpu with ort_sessions > 1 gives every session the full intra-op pool: sessions x (cores-1) busy threads |
-| RA-114 | `benchmark/benchmark-8` | cpu | low | 6 | open | load_dir matches files to manifest.json entries in O(N^2) and reads every image header before max_images trims the set |
-| RA-115 | `collect/collect-11` | cpu | low | 6 | open | The retention sweeper wakes every 500 ms forever to poll the cancellation token |
-| RA-116 | `collect/collect-7` | cpu | low | 6 | open | The collector thread runs at normal priority although the per-thread lowering helper now exists |
-| RA-117 | `gap-log-lines-with/logs-3` | storage | low | 6 | open | When today's log file reaches 200 MB, every later line that day is dropped, errors included, and nothing outside the file reports it. On day 3 of a lasting fault, the total cap deletes the day the fault began |
-| RA-118 | `gap-log-lines-with/logs-7` | storage | low | 6 | open | The Event Log layer takes every INFO+ line from every target, including each output line of a model-export child (each \r redraw counts as a line), and has no rate limit of its own |
-| RA-119 | `gap-log-lines-with/logs-8` | storage | low | 6 | open | A lasting accept() failure (for example out of file descriptors) logs an ERROR every second on each listener, with no throttle |
-| RA-120 | `platform-storage/platform-15` | cpu | low | 6 | open | Idle background threads wake 4x/s (config-watch) and 2x/s (retention) only to poll a cancellation flag |
-| RA-121 | `platform-storage/platform-9` | cpu | low | 6 | open | The macOS menu bar app spawns `/bin/launchctl print` every 3 s, forever, for every logged-in user |
+| RA-104 | `collect/collect-1` | cpu | medium | 6 | fixed (phase 6) | Retention prune looks up each doomed file by linear search: O(doomed x entries), minutes to hours of one core |
+| RA-105 | `collect/collect-2` | cpu | medium | 6 | partial (phase 6): margin, triggers and day cache; `adopt` still rescans every index after a deleting prune | Every dataset prune is a full walk that reads every label file. At the size cap it repeats every 30 s, and it runs every 10 min while idle |
+| RA-106 | `gap-log-lines-with/logs-1` | storage | medium | 6 | fixed (phase 6) | The cross-site refusal warning has no throttle and logs the client's Origin header in full, so one unauthenticated LAN client can wipe the Windows Application log and fill today's log file in seconds |
+| RA-107 | `gap-log-lines-with/logs-2` | storage | medium | 6 | fixed (phase 6) | Refused sign-ins log one unthrottled WARN per request before any password hashing, so a locked-out guessing client writes thousands of Event Log records a second |
+| RA-108 | `gap-log-lines-with/logs-4` | storage | medium | 6 | fixed (phase 6) | The unknown-model warning has no throttle: a camera still calling a removed or renamed model writes one WARN (and one Event Log record) per image |
+| RA-109 | `gap-log-lines-with/logs-5` | cpu | medium | 6 | fixed (phase 6) | Queue timeouts log one WARN per request on the worker's inference thread (run.rs:657, detect.rs:932, run.rs:880), so a slowed GPU logs at the camera rate and each line runs ReportEventW inside the loop that is already behind |
+| RA-110 | `gap-log-lines-with/logs-6` | storage | medium | 6 | fixed (phase 6) | Per-frame failures that never mark the model broken log one WARN each: bad or oversized images (run.rs:680) and failed annotated-image saves (save.rs:171) |
+| RA-111 | `platform-storage/platform-3` | cpu | medium | 6 | fixed (phase 6) | Every 10 minutes the sweeper thread has the collector walk the whole dataset and read and parse every label file, even with collection off and both caps at 0 |
+| RA-112 | `training-jobs/training-jobs-5` | cpu | medium | 6 | fixed (phase 6) | Import analysis and dataset downscale run on all cores but one at normal priority inside the service, competing with Blue Iris detections |
+| RA-113 | `backend/backend-6` | cpu | low | 6 | fixed (phase 6) | ort:cpu with ort_sessions > 1 gives every session the full intra-op pool: sessions x (cores-1) busy threads |
+| RA-114 | `benchmark/benchmark-8` | cpu | low | 6 | fixed (phase 6) | load_dir matches files to manifest.json entries in O(N^2) and reads every image header before max_images trims the set |
+| RA-115 | `collect/collect-11` | cpu | low | 6 | fixed (phase 6) | The retention sweeper wakes every 500 ms forever to poll the cancellation token |
+| RA-116 | `collect/collect-7` | cpu | low | 6 | fixed (phase 6) | The collector thread runs at normal priority although the per-thread lowering helper now exists |
+| RA-117 | `gap-log-lines-with/logs-3` | storage | low | 6 | fixed (phase 6): errors past the cap, dropped-line marker, `fileLogCapped`, fault-onset day kept; no retention-tick warning | When today's log file reaches 200 MB, every later line that day is dropped, errors included, and nothing outside the file reports it. On day 3 of a lasting fault, the total cap deletes the day the fault began |
+| RA-118 | `gap-log-lines-with/logs-7` | storage | low | 6 | fixed (phase 6) | The Event Log layer takes every INFO+ line from every target, including each output line of a model-export child (each \r redraw counts as a line), and has no rate limit of its own |
+| RA-119 | `gap-log-lines-with/logs-8` | storage | low | 6 | fixed (phase 6) | A lasting accept() failure (for example out of file descriptors) logs an ERROR every second on each listener, with no throttle |
+| RA-120 | `platform-storage/platform-15` | cpu | low | 6 | fixed (phase 6) | Idle background threads wake 4x/s (config-watch) and 2x/s (retention) only to poll a cancellation flag |
+| RA-121 | `platform-storage/platform-9` | cpu | low | 6 | fixed (phase 6) | The macOS menu bar app spawns `/bin/launchctl print` every 3 s, forever, for every logged-in user |
 | RA-122 | `resources/resources-7` | cpu | low | 6 | fixed (phase 2): only download destinations are walked, names tested before metadata, off the Provisioner mutex (download thread / storage sweep) | The stale-download cleanup stats every entry of the whole data root to depth 4 (dataset day folders, site-packages) synchronously, while holding the Provisioner's manager mutex |
-| RA-123 | `server-core/server-core-6` | cpu | low | 6 | open | Idle wake-ups only to notice cancellation: auth flusher every 200 ms, sd-watchdog every 100 ms, resources watcher every 250 ms |
-| RA-124 | `server-handlers/server-handlers-10` | cpu | low | 6 | open | Benchmark status poll (every 1.5 s during a run) rebuilds the whole devices snapshot each time, including detect_installed's manifest reads and a stat of every runtime file |
-| RA-125 | `server-handlers/server-handlers-6` | cpu | low | 6 | open | Every 3 s Train-tab poll deep-clones every run's whole epoch history and re-digests all of it |
-| RA-126 | `server-handlers/server-handlers-9` | cpu | low | 6 | open | The Train strip's background count of open suggestions (`refine-open` thread) walks the label files at normal priority, unlike its sibling background walks |
-| RA-127 | `training-core/training-core-7` | cpu | low | 6 | open | Cancel is not honored during dataset assembly: the run keeps writing and resizing every image, and shutdown()/Drop join waits for it |
-| RA-128 | `training-jobs/training-jobs-9` | cpu | low | 6 | open | Import's already-imported check re-reads whole day folders for every frame (quadratic) |
+| RA-123 | `server-core/server-core-6` | cpu | low | 6 | fixed (phase 6) | Idle wake-ups only to notice cancellation: auth flusher every 200 ms, sd-watchdog every 100 ms, resources watcher every 250 ms |
+| RA-124 | `server-handlers/server-handlers-10` | cpu | low | 6 | fixed (phase 6) | Benchmark status poll (every 1.5 s during a run) rebuilds the whole devices snapshot each time, including detect_installed's manifest reads and a stat of every runtime file |
+| RA-125 | `server-handlers/server-handlers-6` | cpu | low | 6 | fixed (phases 5, 6): shared histories (5), cached digests and no serialized fields that are dropped (6) | Every 3 s Train-tab poll deep-clones every run's whole epoch history and re-digests all of it |
+| RA-126 | `server-handlers/server-handlers-9` | cpu | low | 6 | fixed (phase 6), no test (thread priority not observable without a seam) | The Train strip's background count of open suggestions (`refine-open` thread) walks the label files at normal priority, unlike its sibling background walks |
+| RA-127 | `training-core/training-core-7` | cpu | low | 6 | fixed (phase 6) | Cancel is not honored during dataset assembly: the run keeps writing and resizing every image, and shutdown()/Drop join waits for it |
+| RA-128 | `training-jobs/training-jobs-9` | cpu | low | 6 | fixed (phase 6) | Import's already-imported check re-reads whole day folders for every frame (quadratic) |
 | QA-001 | `gap-helpers-duplicated-across/gap-1` | refactor | medium | 0 | fixed (phase 0): `crate::command::run_within` / `run_capped`; pick, port_holder, service_ctl, system_info, tls hostname use it | Six hand-built child-process runners; pick.rs already has the correct bounded runner, the others copy a weaker one or have none |
 | QA-002 | `gap-helpers-duplicated-across/gap-12` | test-gap | medium | 0 | fixed (phase 0): big output, timeout group kill, grandchild holding the pipe, abandon, port_holder::run tests | No test of a bounded runner with large output, a grandchild holding the pipe, or port_holder::run at all |
 | QA-003 | `platform-config/platform-2` | bug | medium | 0 | fixed (phase 0): output drained while waiting; netstat/tasklist started from System32 | port_holder::run waits for exit before reading a piped stdout: `netstat -ano` fills the pipe and the Windows lookup always times out |
@@ -4361,7 +4361,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-028 | `benchmark/bench-2` | bug | medium | 4 | fixed (phase 4): see RA-063 | forget_model leaves a removed model's `+served` / variant results, predictions and history |
 | QA-029 | `benchmark/bench-3` | bug | medium | 7 | open | The confidence search's 'configured now' ignores the per-device profiles that --apply-threshold writes |
 | QA-030 | `benchmark/bench-4` | bug | medium | 7 | open | apply_yolo turns an unreadable YOLO label file into 'no objects' silently |
-| QA-031 | `collect/collect-2` | bug | medium | 6 | open | Pruning looks up each deleted file's size with a linear scan, so a large prune stalls the collector thread for seconds or more |
+| QA-031 | `collect/collect-2` | bug | medium | 6 | fixed (phase 6) | Pruning looks up each deleted file's size with a linear scan, so a large prune stalls the collector thread for seconds or more |
 | QA-032 | `gap-helpers-duplicated-across/gap-4` | bug | medium | 7 | open | Benchmark move-aside treats a failed read as a damaged file: a good benchmark.json is renamed away, or a held file fails the whole save |
 | QA-033 | `gap-helpers-duplicated-across/gap-5` | bug | medium | 7 | open | Benchmark lenient loads drop entries they cannot read, and the next save erases them for good (training keeps such records aside) |
 | QA-034 | `gap-most-of-the/benchgap-1` | bug | medium | 7 | open | Compare cannot map `--variants` results (`<model>+filters`, `+pre:clahe`, ...) back to their model, so on Your cameras they show as partial and trained-frame exclusion is skipped |
@@ -4416,7 +4416,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-083 | `resources/resources-7` | bug | low | 1 | fixed (phase 1): tickets; a cancelled export queued again runs once; a cancel during pickup is not lost | Cancel then re-Export of a queued model runs the export twice |
 | QA-084 | `resources/resources-8` | bug | low | 8 | open | Training-environment setup failures are worded for the export ('export again', 'Remove export toolchain'); the outer explain is dead |
 | QA-085 | `server-core/srvcore-2` | bug | low | 8 | open | A failure stamped while the clock ran ahead locks the account (and unknown names) until the wall clock catches up |
-| QA-086 | `server-core/srvcore-4` | bug | low | 6 | open | Prometheus scrape and /stats.json run blocking process/GPU probes on the 2-thread async runtime |
+| QA-086 | `server-core/srvcore-4` | bug | low | 6 | fixed (phase 6) | Prometheus scrape and /stats.json run blocking process/GPU probes on the 2-thread async runtime |
 | QA-087 | `server-core/srvcore-5` | bug | low | 8 | open | LogBuffer::since overflows on after=u64::MAX (panic in debug builds, 500 from /logs.json) |
 | QA-088 | `server-core/srvcore-6` | bug | low | 8 | open | Logs page shows log-crate bridge fields (log.target/log.module_path/log.file) as noise and target "log" for bridged events |
 | QA-089 | `server-core/srvcore-7` | bug | low | 8 | open | bind_address "::" (web-editable) serves IPv6 only on Windows; no IPv4 companion socket is bound |
@@ -4429,7 +4429,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-096 | `server-handlers/handlers-8` | bug | low | 8 | open | History pin/delete check that the run exists outside the update lock; a concurrent delete answers 500 'check that the file is writable' |
 | QA-097 | `server-handlers/handlers-9` | bug | low | 8 | open | Per-model `requests` counter counts bad uploads only when the model was not Ready |
 | QA-098 | `training-core/tcore-19` | bug | low | 7 | open | valid_model_name accepts Windows reserved device names (con, nul, aux, com1...) |
-| QA-099 | `training-core/tcore-2` | bug | low | 6 | open | bench::run cannot tell its own benchmark from one started after it, so it can read another run's results and cancel another run |
+| QA-099 | `training-core/tcore-2` | bug | low | 6 | fixed (phase 6) | bench::run cannot tell its own benchmark from one started after it, so it can read another run's results and cancel another run |
 | QA-100 | `training-core/tcore-4` | bug | low | 8 | open | The CLI's `dataset: balanced:` line can never print: the job writes it only to train.log, never to the record's log |
 | QA-101 | `training-core/tcore-5` | bug | low | 8 | open | Queue duplicate-name check is case-sensitive, but registering compares names by normalize_name: on Linux the second run trains for hours, then is refused |
 | QA-102 | `training-core/tcore-6` | bug | low | 8 | open | Auto-label/overlap/import GPU-out-of-memory detection drifted from training's: two CUDA OOM patterns are missing |
@@ -4439,7 +4439,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-106 | `training-jobs/training-jobs-4` | bug | low | 8 | open | OverlapsRequest::parse decides 'no limit given' with a substring test, so `limit = 7` or `LIMIT=7` is replaced by 20,000 |
 | QA-107 | `training-jobs/training-jobs-5` | bug | low | 8 | open | A URL import names its camera folder after the URL's user name (ad-hoc host parsing instead of source::host_of) |
 | QA-108 | `training-jobs/training-jobs-6` | bug | low | 8 | open | record_written matches written frames by substring of stamp and camera, so imports.jsonl scenes and cameras can count frames that were never written |
-| QA-109 | `training-jobs/training-jobs-7` | bug | low | 6 | open | k-center greedy checks `chosen.contains(&i)` inside its inner loop: O(n*k^2) for a large import |
+| QA-109 | `training-jobs/training-jobs-7` | bug | low | 6 | fixed (phase 6) | k-center greedy checks `chosen.contains(&i)` inside its inner loop: O(n*k^2) for a large import |
 | QA-110 | `training-jobs/training-jobs-8` | bug | low | 8 | open | The labelers' merge path has no MAX_BOXES cap, while the Review save refuses a file over 500 boxes |
 | QA-111 | `web-assets/web-1` | bug | low | 8 | open | PrismTime.when labels drift from Zone::display for most non-US zones; the parity test slices the label away |
 | QA-112 | `web-assets/web-2` | bug | low | 8 | open | Hidden classes compared exactly in pickers/shortcuts but case-insensitively when drawing: a hidden class stays on a shortcut key while its boxes vanish |
@@ -4550,7 +4550,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-217 | `server-core/srvcore-10` | refactor | low | 10 | open | render_prometheus is a 310-line function with ~20 hand-written HELP/TYPE blocks; Metrics keeps six parallel rejected_* fields with two mirrored matches |
 | QA-218 | `server-core/srvcore-11` | refactor | low | 10 | open | sessions.rs and devices.rs duplicate the whole hash-file store (Head/FileRepr/parse/load warnings/flush) |
 | QA-219 | `server-core/srvcore-12` | refactor | low | 10 | open | Router admin_routes is a 280-line flat list with the same body-limit layer copied 20+ times |
-| QA-220 | `server-core/srvcore-13` | refactor | low | 6 | open | Three implementations of the warning throttle (and one throttle shared by two unrelated warnings) |
+| QA-220 | `server-core/srvcore-13` | refactor | low | 6 | fixed (phase 6) | Three implementations of the warning throttle (and one throttle shared by two unrelated warnings) |
 | QA-221 | `server-core/srvcore-14` | refactor | low | 10 | open | JSON error bodies built ad hoc in ~10 places in this area with inconsistent keys |
 | QA-222 | `server-core/srvcore-15` | refactor | low | 10 | open | Small duplicated helpers: panic payload text (3x), unix-seconds display (3x), constant-time digest compare (2x), User literal (2x) |
 | QA-223 | `server-core/srvcore-16` | refactor | low | 10 | open | Dead or test-only pub items and stale docs in accounts/ and body_budget |
@@ -4912,3 +4912,53 @@ the `backend_*` ignored suites, a 16384x16384 model refused at load on `ort:cpu`
 
 Not verified here: Linux glibc trim and allocator settings (CI only), Windows private bytes and `HeapCompact`
 (the i5-8500 box, `measure_resources.ps1`), TensorRT loading by path, the i5-8500 `BOP_ORT_CPU_ARENA` comparison.
+
+### Audit 2026-11, phase 6 notes
+
+CPU, GPU and idle cost, and log volume under lasting faults. Two shared helpers: `sync::nap(total, &token)` parks a
+thread for its whole interval and wakes at once on a cancel of the token or any parent (the waker of
+`token.cancelled()` unparks it; no runtime, no polling), and `logthrottle::Throttle` (lock-free, `const`, counts what
+it held back) is the one log throttle; `metrics::LogThrottle` is its alias and `guard::WarnThrottle` is gone. One
+throttle per kind of line, never a map keyed by client text.
+
+| what cost CPU or log volume | now | IDs |
+|---|---|---|
+| auth flusher (200 ms), sd-watchdog (100 ms), config watch (250 ms), retention (500 ms), resources watcher (250 ms) waking only to look at a token | `sync::nap` / a cancel wake channel: one wake per documented interval, a cancel ends them at once | RA-123, RA-120, RA-115 |
+| a reload's swap thread polling the replacement every 50 ms | waits on the replacement's `LoadGate` (1 s recheck), 250 ms only during a download wait | +extra |
+| the tray asking launchd and `/v1/status` every 3 s forever | launchd every 30 s while the service runs and answers (at once after an action or a failed probe); status every 15 s while unchanged, 3 s for 30 s after an action or change | RA-121, +extra |
+| the 10-min dataset walk reading every label file, also with collection off and no caps; the size cap walking every 30 s; the collector waking every 30 s | walk only when due (first look, over cap + max(1%, 64 MiB), oldest deletable frame past its age, a day since the last); a day cache keyed by folder mtime + index len/mtime; never with collection off and caps 0; the collector blocks until a message | RA-111, RA-105 (partial) |
+| a linear size lookup per doomed file (O(doomed x entries)) | the plan returns the entries; a saved-image prune stops between deletions on a cancel | RA-104, QA-031 |
+| collector, import analysis, dataset downscale, refine-open and stray walks at normal priority | below normal (`parallel::Spawned::Background`; the calling thread keeps its priority) | RA-116, RA-112, RA-126 |
+| quadratic import duplicate check, k-center `contains`, benchmark `load_dir` | each day folder listed once per write; a `taken` table; a by-file map | RA-128, QA-109, RA-114 |
+| `ort:cpu` with `ort_sessions > 1`: every session the full intra-op pool | sessions share the budget (`max(1, threads / sessions)`) | RA-113 |
+| the benchmark poll rebuilding the devices snapshot every 1.5 s | one-entry cache by registry / config identity, generation, revision, 5 s TTL | RA-124 |
+| the Train poll re-digesting every run's history every 3 s | digests cached per (run, history `Arc`); dropped fields not serialized | RA-125 |
+| a cancel during dataset assembly writing every image; a training benchmark reading or cancelling a later run | stops between frames and removes `<run>/data`; benchmark run ids (`start_run`, `status_of`, `cancel_run`) | RA-127, QA-099 |
+| the HTTPS retry spawning port-holder tools every 30 s | looked up when the bind error changes or after 10 min | RA-033 |
+| a client that stops reading, a web UI body that stops sending: held forever | 30 s write-stall deadline below TLS; 30 s body idle deadline on signed-in and login routes (detection keeps its 10 s) | RA-032 |
+| Prometheus and `/stats.json` probes on the 2-thread runtime | in `server::blocking` | QA-086 |
+| unthrottled per-request warnings: cross-site refusals (with the full Origin, also in the 403 body), refused sign-ins, unknown models, queue timeouts, worker gone, bad images, failed saves, verifier spawn retries, accept failures | one throttle each; Origin/Scheme cut for display only; unknown models counted in `requests_rejected_total{reason="unknown_model"}`; verifier spawn backs off 10 s; "API token cannot be checked" has its own throttle | RA-106..110, RA-119, QA-220, +extras |
+| the Event Log taking every INFO+ line, export child output included | export child lines at debug; the Event Log layer: ERROR always, INFO/WARN once per call site per 10 s | RA-118 |
+| a capped day file dropping errors silently; the total cap deleting the day a fault began | errors written 10 MB past the cap, a dropped-lines marker, `fileLogCapped` on `/v1/status` and the Logs page; the first capped day of a run that reaches today is kept first | RA-117 |
+
+What a user notices: the dataset's deletable part can exceed `collect.max_gb` by max(1%, 64 MiB) before a pass trims
+it back to the cap; the Collect tab's protected figure can lag a review by up to a day; crash repair of the dataset runs
+on triggered or daily passes; the tray shows changes made elsewhere within 15 s; export child output is in the file log
+only at `log_level: debug`; a client reading under about 20 KB/s during a long answer can hit the 30 s write deadline
+(macOS loopback reports a full socket writable again only after ~340 KB drained); a training benchmark that loses the
+race to a Benchmark-page run says so instead of reading that run.
+
+Left open: `adopt` rescans every `index.jsonl` after a deleting prune (needs a remove on `layout::Summary`);
+`is_protected` still classifies every frame (the cap counts deletable bytes only); `server/accounts.rs` re-auth warnings
+(signed-in users only) unthrottled; the retention tick does not warn about a capped log file (status and Logs page do);
+no thread cap for import analysis (only lower priority).
+
+Tests: every fix has one. Shown failing without the fix in a private copy (one copy, one mutation per fix): retention
+size lookup (quadratic), prune trigger, swap gate wait, `nap` stepping, Event Log gate, dataset cancel (two), the job's
+Dataset-stage cancel, import day listing, write-stall deadline (adapter and real socket), devices snapshot cache;
+by the agents in private copies: cross-site throttle, Origin cut, refused sign-ins, log cap errors and fault-onset day,
+k-center. A pre-existing race in `account_lockout_device_cookies_and_disabling` (`Retry-After` read across a second
+boundary) is fixed in the test.
+
+Not verified here: the Windows Event Log gate on a real service, the Windows `BELOW_NORMAL` thread priority of the new
+background threads, the i5-8500 idle CPU (`measure_resources.ps1`).

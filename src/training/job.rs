@@ -6,7 +6,8 @@
 //! runtime; shared code with the export, under its lock) -> self-check (`train_model.py
 //! --self-check`: PyTorch imports and sees the GPU; skipped when nothing it checks changed since
 //! the last one passed, [`super::self_check`]) -> weights (the pinned base weights, and the
-//! public subset when asked) -> dataset (assembled in Rust, [`super::dataset`]) -> train (the
+//! public subset when asked) -> dataset (assembled in Rust, [`super::dataset`]; a cancel stops it
+//! between frames and removes the half-written `<run>/data`) -> train (the
 //! script trains and exports a static ONNX, checked against PyTorch with ONNX Runtime; progress
 //! from its `@train` events) -> install (`<name>.onnx`, `.yaml` and `<name>.provenance.json`
 //! in the models folder or the request's `install_dir`, [`TrainJob::install_dir`]) -> register
@@ -693,6 +694,21 @@ fn run_training_with(
         if cancelled && !job.keep_work && job.export_only.is_none() && unregistered.is_none() {
             let _ = manager::remove_any(&work);
         }
+        // Cancelled while the dataset was written: the half-written `<run>/data` serves nothing
+        // (no trainer read it, no later run links from it: its prepared-files record is written
+        // last). Only the run's own folder; the exports it was read from are never touched.
+        if cancelled && job.export_only.is_none() && stage == Some(TrainStage::Dataset) {
+            let data = job.run_dir.join("data");
+            if let Err(e) = manager::remove_any(&data) {
+                tracing::warn!(
+                    run = %job.id,
+                    "could not remove the cancelled run's half-written dataset {} ({e:#}); \
+                     another program may hold a file in it. The run's Remove on the Jobs tab \
+                     deletes it, or delete it by hand",
+                    data.display()
+                );
+            }
+        }
         // A failure: the runner has reaped the trainer, so nothing writes `work` any more. What
         // a Retry export never reads goes; the checkpoints and the trainer's logs stay. Not on
         // the way out of the process (a stop must not wait on deleting GBs).
@@ -1231,7 +1247,7 @@ fn stages(
         tracing::warn!("training {}: {w}", job.name);
     }
     let (prepared, reused) =
-        dataset::write_reusing(&sources, &plan, &opts, &data_dir, &job.reuse_from)
+        dataset::write_reusing(&sources, &plan, &opts, &data_dir, &job.reuse_from, cancel)
             .map_err(|e| explain_full_disk(e, &job.run_dir))?;
     if let Some(l) = reused.describe() {
         log.line(&format!("dataset: {l}"));

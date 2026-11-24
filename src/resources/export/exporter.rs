@@ -552,7 +552,7 @@ fn run_one(
             );
         }
         Progress::Line { line, .. } => {
-            tracing::info!(target: "blue_onyx_prism::resources::export::child", model = %res.model_name().unwrap_or(id), "{line}");
+            tracing::debug!(target: "blue_onyx_prism::resources::export::child", model = %res.model_name().unwrap_or(id), "{line}");
             shared.update(id, |s| {
                 if s.log.len() == LOG_TAIL {
                     s.log.remove(0);

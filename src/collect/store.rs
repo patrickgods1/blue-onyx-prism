@@ -1,6 +1,7 @@
 //! The collector thread's state: bucket selection with per-camera rate limits and sampling,
 //! near-duplicate dedup per camera, the atomic writes of image + sidecar + index line, the size /
-//! age caps (through [`crate::retention::prune_dataset`]) and the disk guard that stops collection
+//! age caps (through [`crate::retention::prune_dataset_with`], walking only when [`pass_due`] says
+//! a cap may have work) and the disk guard that stops collection
 //! on low free space or a full disk and re-arms it once space is back. Single-threaded: only the
 //! collector thread owns a [`Store`], and it runs both the collector's writes and retention, so
 //! those two never meet. It is not the only writer of the dataset folder: an import
@@ -73,6 +74,25 @@ pub const FREE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 pub const REARM_MARGIN_MB: u64 = 256;
 /// A size-cap prune after a write runs at most this often.
 pub const PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// The size cap starts a pass only once the deletable frames exceed it by [`prune_slack`]: a pass
+/// trims to exactly the cap, so without a margin the next saved frame would start the next full
+/// walk (every [`PRUNE_MIN_INTERVAL`] under steady traffic, audit 2026-11 RA-105). The pass still
+/// deletes only what is over the cap, never earlier than the user's limit. This is the least
+/// margin: 64 MiB is about 200 frames of 300 kB.
+pub const PRUNE_SLACK_FLOOR: u64 = 64 * 1024 * 1024;
+/// ... and the margin is at least 1 / this of the cap (1%), so a large cap is not walked every
+/// 64 MiB.
+pub const PRUNE_SLACK_DIVISOR: u64 = 100;
+/// A pass walks the dataset at least this often even when no cap looks due ([`pass_due`]): it
+/// corrects what the incremental figures cannot see (frames another process wrote, a review that
+/// was undone) and does the walk's crash repair (stale temporary files, orphan sidecars, day
+/// folders out of step).
+pub const FULL_PASS_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// The day-folder cache of the walk ([`crate::retention::DayCache`]) is dropped when a pass
+/// starts and it is older than this, so on a file system whose folder times do not move (FAT,
+/// some network shares) a stale day is read again within the hour. The review index walks
+/// everything every 30 minutes for the same reason.
+pub const DAY_CACHE_TRUST: Duration = Duration::from_secs(60 * 60);
 /// An I/O failure is warned about at most this often.
 const WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// A camera that sent no frame for this long is forgotten (its rate limits and recent hashes),
@@ -108,6 +128,75 @@ pub type FreeProbe = Box<dyn Fn(&Path) -> Option<u64> + Send>;
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
+/// How far the deletable frames may exceed the size cap `max_bytes` before a pass is due:
+/// max(1% of the cap, [`PRUNE_SLACK_FLOOR`]).
+pub fn prune_slack(max_bytes: u64) -> u64 {
+    (max_bytes / PRUNE_SLACK_DIVISOR).max(PRUNE_SLACK_FLOOR)
+}
+
+/// Whether no cap can ever delete anything in this folder and nothing is written to it: collection
+/// off and both caps 0. Then retention never walks it.
+pub fn never_prunes(settings: &CollectSettings) -> bool {
+    !settings.enabled && settings.max_bytes == 0 && settings.max_age_days == 0
+}
+
+/// Why a retention pass walks the dataset now ([`pass_due`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassReason {
+    /// The store has no figures for this folder yet.
+    FirstLook,
+    /// [`FULL_PASS_INTERVAL`] since the last pass.
+    Daily,
+    /// The deletable frames exceed the size cap by more than [`prune_slack`].
+    OverCap,
+    /// The oldest deletable frame is past `max_age_days`.
+    PastAge,
+}
+
+/// What the store knows of its folder without walking it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassState {
+    /// The store's figures describe the settings' folder.
+    pub knows_dir: bool,
+    /// The deletable frames' bytes, kept up to date by every write.
+    pub prunable_bytes: u64,
+    /// How far they may exceed the size cap before a pass is due ([`prune_slack`]).
+    pub slack: u64,
+    /// The oldest deletable frame at the last walk.
+    pub oldest_prunable: Option<SystemTime>,
+    /// Time since the last pass walked the folder (None: never).
+    pub since_pass: Option<Duration>,
+}
+
+/// Whether the retention tick should walk the dataset (audit 2026-11 RA-105 / RA-111): the tick
+/// itself is this check on in-memory figures, and the walk happens only when a cap may have work
+/// or the daily pass is due; with collection off and both caps 0, never. The figures can only be
+/// off in the safe direction between walks: a review makes `prunable_bytes` too high (an extra
+/// walk), and what another process wrote is caught by the daily pass.
+pub fn pass_due(settings: &CollectSettings, st: &PassState, now: SystemTime) -> Option<PassReason> {
+    if never_prunes(settings) {
+        return None;
+    }
+    if !st.knows_dir {
+        return Some(PassReason::FirstLook);
+    }
+    if st.since_pass.is_none_or(|d| d >= FULL_PASS_INTERVAL) {
+        return Some(PassReason::Daily);
+    }
+    if settings.max_bytes > 0 && st.prunable_bytes > settings.max_bytes.saturating_add(st.slack) {
+        return Some(PassReason::OverCap);
+    }
+    let age = Duration::from_secs(u64::from(settings.max_age_days) * 24 * 60 * 60);
+    if settings.max_age_days > 0
+        && st
+            .oldest_prunable
+            .is_some_and(|t| now.duration_since(t).is_ok_and(|d| d > age))
+    {
+        return Some(PassReason::PastAge);
+    }
+    None
+}
+
 /// The free space at which a disk stop re-arms.
 fn rearm_bytes() -> u64 {
     (crate::retention::MIN_FREE_MB + REARM_MARGIN_MB) * BYTES_PER_MB
@@ -128,8 +217,16 @@ pub struct Store {
     dir: Option<PathBuf>,
     summary: Summary,
     /// How the folder divides up; `prunable_bytes` is what the size cap is compared with. A review
-    /// meanwhile makes it too high until the next prune (10 minutes at most), never too low.
+    /// meanwhile makes it too high until the next walk, never too low (but for frames another
+    /// process wrote, which the daily pass counts).
     usage: DatasetUsage,
+    /// The oldest deletable frame at the last walk: the age cap has no work before it is
+    /// `max_age_days` old ([`pass_due`]).
+    oldest_prunable: Option<SystemTime>,
+    /// The walks' day-folder cache ([`crate::retention::DayCache`]) and when it was last dropped
+    /// ([`DAY_CACHE_TRUST`]).
+    days: crate::retention::DayCache,
+    days_since: Option<Instant>,
     /// (camera, bucket) -> when its last frame was saved.
     last: HashMap<(String, Bucket), SystemTime>,
     /// camera -> its references, oldest first.
@@ -149,9 +246,15 @@ pub struct Store {
     last_error: Option<LastError>,
     disabled: Option<Disabled>,
     free_checked: Option<Instant>,
+    /// When the last retention pass walked the folder.
     last_prune: Option<Instant>,
     last_warn: Option<Instant>,
     free_probe: FreeProbe,
+    /// Least size-cap overshoot that starts a pass ([`PRUNE_SLACK_FLOOR`]; tests lower it).
+    slack_floor: u64,
+    /// Tests: retention passes run (each one walks the folder).
+    #[cfg(test)]
+    pub(super) passes: usize,
     /// Tests: make the next writes fail with this error kind.
     #[cfg(test)]
     pub(super) fail_writes: Option<std::io::ErrorKind>,
@@ -338,6 +441,9 @@ impl Store {
             dir: None,
             summary: Summary::default(),
             usage: DatasetUsage::default(),
+            oldest_prunable: None,
+            days: crate::retention::DayCache::default(),
+            days_since: None,
             last: HashMap::new(),
             recent: HashMap::new(),
             thumb_cap: DEDUP_THUMB_BYTES,
@@ -351,6 +457,9 @@ impl Store {
             last_prune: None,
             last_warn: None,
             free_probe,
+            slack_floor: PRUNE_SLACK_FLOOR,
+            #[cfg(test)]
+            passes: 0,
             #[cfg(test)]
             fail_writes: None,
             #[cfg(test)]
@@ -363,7 +472,9 @@ impl Store {
         if self.dir.as_deref() == Some(dir) {
             return;
         }
-        self.adopt(dir, crate::retention::dataset_usage(dir));
+        let survey = crate::retention::dataset_survey(dir, &mut self.days);
+        self.oldest_prunable = survey.oldest_prunable;
+        self.adopt(dir, survey.usage);
     }
 
     /// `dir` is the folder in use, of `usage`: scan its summary and publish.
@@ -420,6 +531,12 @@ impl Store {
             settings: settings.clone(),
         });
         self.publish();
+    }
+
+    /// Whether collection is stopped for low disk space (the thread then checks for space every
+    /// [`FREE_CHECK_INTERVAL`]).
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.is_some()
     }
 
     /// Re-arm after a disk stop (the Collect tab's Resume).
@@ -630,7 +747,12 @@ impl Store {
         }
         self.last_saved = Some(at);
         METRICS.record_frame(&passing);
-        if self.usage.prunable_bytes > settings.max_bytes {
+        let over = settings.max_bytes > 0
+            && self.usage.prunable_bytes
+                > settings
+                    .max_bytes
+                    .saturating_add(self.slack(settings.max_bytes));
+        if over {
             let due = self
                 .last_prune
                 .is_none_or(|t| t.elapsed() >= PRUNE_MIN_INTERVAL);
@@ -811,13 +933,58 @@ impl Store {
         Ok(rel.jpg())
     }
 
-    /// Apply the age and size caps to `settings.dir` and rescan when something went.
+    /// [`prune_slack`] with this store's floor.
+    fn slack(&self, max_bytes: u64) -> u64 {
+        (max_bytes / PRUNE_SLACK_DIVISOR).max(self.slack_floor)
+    }
+
+    /// What the store knows of `settings.dir` without walking it.
+    fn pass_state(&self, settings: &CollectSettings) -> PassState {
+        PassState {
+            knows_dir: self.dir.as_deref() == Some(settings.dir.as_path()),
+            prunable_bytes: self.usage.prunable_bytes,
+            slack: self.slack(settings.max_bytes),
+            oldest_prunable: self.oldest_prunable,
+            since_pass: self.last_prune.map(|t| t.elapsed()),
+        }
+    }
+
+    /// The retention tick: walk and apply the caps ([`Self::prune`]) only when [`pass_due`] says a
+    /// cap may have work or the daily pass is due. True when it walked.
+    pub fn prune_if_due(&mut self, settings: &CollectSettings) -> bool {
+        let Some(why) = pass_due(settings, &self.pass_state(settings), SystemTime::now()) else {
+            return false;
+        };
+        debug!(
+            "dataset retention pass over {} ({why:?})",
+            settings.dir.display()
+        );
+        self.prune(settings);
+        true
+    }
+
+    /// Apply the age and size caps to `settings.dir` (a walk of the folder, unchanged day folders
+    /// from the cache) and rescan when something went.
     pub fn prune(&mut self, settings: &CollectSettings) {
-        self.last_prune = Some(Instant::now());
-        match crate::retention::prune_dataset(
+        let now = Instant::now();
+        self.last_prune = Some(now);
+        #[cfg(test)]
+        {
+            self.passes += 1;
+        }
+        if self
+            .days_since
+            .is_none_or(|t| now.saturating_duration_since(t) >= DAY_CACHE_TRUST)
+        {
+            self.days.clear();
+            self.days_since = Some(now);
+        }
+        match crate::retention::prune_dataset_with(
             &settings.dir,
             settings.max_age_days,
             settings.max_bytes,
+            &super::stop_requested,
+            &mut self.days,
         ) {
             Ok(r)
                 if r.deleted > 0
@@ -825,10 +992,12 @@ impl Store {
                     || r.repaired_days > 0
                     || self.dir.as_deref() != Some(&settings.dir) =>
             {
+                self.oldest_prunable = r.oldest_prunable;
                 self.adopt(&settings.dir, r.usage);
             }
             Ok(r) => {
                 self.usage = r.usage;
+                self.oldest_prunable = r.oldest_prunable;
                 self.publish();
             }
             Err(e) => self.note_error(&format!(
@@ -2070,6 +2239,8 @@ mod tests {
             c.max_gb = 1e-9; // ~1 byte: everything but the newest goes.
         });
         let mut st = store();
+        // No overshoot margin: each write past the cap starts a pass.
+        st.slack_floor = 0;
         for i in 0..3u32 {
             let out = st.handle(frame(
                 &s,
@@ -2122,5 +2293,121 @@ mod tests {
         let side: Record =
             serde_json::from_slice(&std::fs::read(jpg.with_extension("json")).unwrap()).unwrap();
         assert!(!side.image.original);
+    }
+
+    /// RA-105 / RA-111: the retention tick walks only when a cap may have work.
+    #[test]
+    fn a_pass_is_due_only_when_a_cap_may_have_work() {
+        let tmp = Tmp::new();
+        let now = SystemTime::now();
+        let day = Duration::from_secs(24 * 60 * 60);
+        let off = settings(&tmp.0, |c| {
+            c.enabled = false;
+            c.max_gb = 0.0;
+            c.max_age_days = 0;
+        });
+        let fresh = PassState {
+            knows_dir: false,
+            prunable_bytes: u64::MAX,
+            slack: 0,
+            oldest_prunable: Some(SystemTime::UNIX_EPOCH),
+            since_pass: None,
+        };
+        assert!(never_prunes(&off));
+        assert_eq!(pass_due(&off, &fresh, now), None, "nothing can go: never");
+        let on = settings(&tmp.0, |c| {
+            c.max_gb = 1.0;
+            c.max_age_days = 30;
+        });
+        assert_eq!(pass_due(&on, &fresh, now), Some(PassReason::FirstLook));
+        let cap = on.max_bytes;
+        let slack = prune_slack(cap);
+        assert_eq!(slack, PRUNE_SLACK_FLOOR, "1% of 1 GiB is under the floor");
+        assert_eq!(prune_slack(100 * cap), cap, "1% of 100 GiB");
+        let known = PassState {
+            knows_dir: true,
+            prunable_bytes: cap,
+            slack,
+            oldest_prunable: Some(now - 29 * day),
+            since_pass: Some(Duration::from_secs(600)),
+        };
+        assert_eq!(pass_due(&on, &known, now), None, "at the cap, nothing old");
+        let within = PassState {
+            prunable_bytes: cap + slack,
+            ..known
+        };
+        assert_eq!(pass_due(&on, &within, now), None, "inside the margin");
+        let over = PassState {
+            prunable_bytes: cap + slack + 1,
+            ..known
+        };
+        assert_eq!(pass_due(&on, &over, now), Some(PassReason::OverCap));
+        let old = PassState {
+            oldest_prunable: Some(now - 31 * day),
+            ..known
+        };
+        assert_eq!(pass_due(&on, &old, now), Some(PassReason::PastAge));
+        let none_left = PassState {
+            oldest_prunable: None,
+            ..known
+        };
+        assert_eq!(pass_due(&on, &none_left, now), None);
+        let stale = PassState {
+            since_pass: Some(FULL_PASS_INTERVAL),
+            ..known
+        };
+        assert_eq!(pass_due(&on, &stale, now), Some(PassReason::Daily));
+        // Collection off with caps set: the caps still apply to the folder.
+        let off_capped = settings(&tmp.0, |c| {
+            c.enabled = false;
+            c.max_gb = 1.0;
+        });
+        assert_eq!(pass_due(&off_capped, &over, now), Some(PassReason::OverCap));
+        assert_eq!(pass_due(&off_capped, &known, now), None);
+    }
+
+    /// RA-105 / RA-111 through the store: no walk with nothing to delete, none inside the margin
+    /// (after a write or at the tick), one past it and one a day after the last.
+    #[test]
+    fn the_retention_tick_walks_only_when_due() {
+        let tmp = Tmp::new();
+        let mut st = store();
+        let off = settings(&tmp.0, |c| {
+            c.enabled = false;
+            c.max_gb = 0.0;
+            c.max_age_days = 0;
+        });
+        for _ in 0..3 {
+            assert!(!st.prune_if_due(&off));
+        }
+        assert_eq!(
+            st.passes, 0,
+            "collection off and both caps 0: no walk at all"
+        );
+
+        let s = settings(&tmp.0, |c| {
+            c.buckets.positive.per_camera_min_interval_s = 0;
+            c.max_gb = 1e-9; // ~1 byte
+        });
+        st.slack_floor = 1 << 40;
+        assert!(st.prune_if_due(&s), "the first tick learns the folder");
+        assert_eq!(st.passes, 1);
+        assert!(!st.prune_if_due(&s));
+        let out = st.handle(frame(&s, positive("a", "r1", t(0)), 1));
+        assert!(matches!(out, Handled::Saved { .. }), "{out:?}");
+        assert!(st.usage.prunable_bytes > s.max_bytes);
+        assert!(!st.prune_if_due(&s));
+        assert_eq!(st.passes, 1, "over the cap, inside the margin: no walk");
+
+        st.slack_floor = 0;
+        assert!(st.prune_if_due(&s));
+        assert_eq!(st.passes, 2, "past the margin: a walk");
+        assert_eq!(st.usage.prunable_bytes, 0, "trimmed to the cap");
+        assert!(!st.prune_if_due(&s));
+        if let Some(long_ago) = Instant::now().checked_sub(FULL_PASS_INTERVAL) {
+            st.last_prune = Some(long_ago);
+            assert!(st.prune_if_due(&s));
+            assert_eq!(st.passes, 3, "a day since the last walk");
+        }
     }
 }

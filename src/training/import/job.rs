@@ -3,9 +3,9 @@
 //! SigLIP selection need it) -> download (the URL with yt-dlp, pinned footage and the SigLIP 2
 //! checkpoint through the download manager) -> extract frames (`import_footage.py extract`, one
 //! run per video, several at a time, each video's share of the candidate budget as its
-//! `--max-frames`) -> analyse (decode, dHash, scene on all cores but one, then the dedup; in
-//! Rust) -> select (SigLIP embeddings
-//! from `import_footage.py embed`, k-center per scene) -> write (the kept video frames again at
+//! `--max-frames`) -> analyse (decode, dHash, scene on all cores but one below normal priority,
+//! then the dedup; in Rust) -> select (SigLIP embeddings from `import_footage.py embed`, k-center
+//! per scene) -> write (the kept video frames again at
 //! full resolution with `import_footage.py frames`, then the dataset layout, the review queue,
 //! `imports.jsonl`).
 //!
@@ -691,6 +691,7 @@ impl ImportJob {
         let analysed = parallel::map(
             files.len(),
             threads,
+            crate::parallel::Spawned::Background,
             &|k| {
                 files
                     .get(k)
@@ -1230,6 +1231,7 @@ impl ImportJob {
         let analysed = parallel::map(
             n,
             threads,
+            crate::parallel::Spawned::Background,
             &analyse,
             &mut |done| {
                 let pct = u8::try_from(done * 100 / n.max(1)).unwrap_or(100);

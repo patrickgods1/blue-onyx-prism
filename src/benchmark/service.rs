@@ -11,6 +11,11 @@
 //! Before each device starts the run writes a [`breadcrumb`]; a file left from a run that never
 //! ended is logged at the next start and shown once on the Benchmark page.
 //!
+//! Each run has an id ([`BenchmarkService::start_run`] / [`BenchmarkService::start_job_run`]): a
+//! caller that waits on its own run (a training run's benchmark stage) reads and cancels it by id
+//! ([`BenchmarkService::status_of`], [`BenchmarkService::cancel_run`]), so a run the Benchmark page
+//! starts right after it is neither read nor stopped.
+//!
 //! The run uses the registry's shared [`Runtimes`] when there is one (same OpenVINO `Core`,
 //! same ONNX Runtime library: a process can load only one ONNX Runtime flavor), compiling under
 //! its lock like the workers do and running inference on the benchmark thread. Without shared
@@ -411,7 +416,37 @@ impl BenchmarkService {
     }
 
     pub fn status(&self) -> Status {
+        Self::status_in(&self.lock())
+    }
+
+    /// [`Self::status`] of the run [`Self::start_job_run`] / [`Self::start_run`] answered `id`
+    /// for, while it is the latest one (running or ended); None once another run started (its
+    /// results are then in `benchmark.json`, not here). A caller that waits on its own run
+    /// (training's benchmark stage) never reads a later run's results this way.
+    pub fn status_of(&self, id: u64) -> Option<Status> {
         let g = self.lock();
+        (g.run_id == id).then(|| Self::status_in(&g))
+    }
+
+    /// Whether the run `id` is the one in progress (cheap: no results cloned).
+    pub fn is_run_running(&self, id: u64) -> bool {
+        let g = self.lock();
+        g.run_id == id && g.state == RunState::Running
+    }
+
+    /// [`Self::cancel`] of the run `id` only: a later run (started from the Benchmark page right
+    /// after it ended) is never stopped by it. Returns whether `id` was running.
+    pub fn cancel_run(&self, id: u64) -> bool {
+        // Under the state lock, as `cancel`.
+        let g = self.lock();
+        let running = g.run_id == id && g.state == RunState::Running;
+        if running {
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+        running
+    }
+
+    fn status_in(g: &Inner) -> Status {
         let mut models = g.done.clone();
         models.extend(g.current.clone());
         Status {
@@ -465,6 +500,15 @@ impl BenchmarkService {
     /// Start `job` on a new thread unless a run is in progress. `job` returns the final message
     /// (an error ending in [`super::Cancelled`] marks the run cancelled).
     pub fn start_job<F>(self: &Arc<Self>, request: RunRequest, job: F) -> Result<(), Busy>
+    where
+        F: FnOnce(&RunHandle) -> Result<String> + Send + 'static,
+    {
+        self.start_job_run(request, job).map(|_| ())
+    }
+
+    /// [`Self::start_job`] answering the run's id, for [`Self::status_of`],
+    /// [`Self::is_run_running`] and [`Self::cancel_run`].
+    pub fn start_job_run<F>(self: &Arc<Self>, request: RunRequest, job: F) -> Result<u64, Busy>
     where
         F: FnOnce(&RunHandle) -> Result<String> + Send + 'static,
     {
@@ -537,7 +581,7 @@ impl BenchmarkService {
             g.state = RunState::Failed;
             g.error = Some(format!("could not start the benchmark thread: {e}"));
         }
-        Ok(())
+        Ok(run_id)
     }
 
     /// Look for a breadcrumb left by a run that never ended ([`breadcrumb`]) and log it at warn,
@@ -570,9 +614,14 @@ impl BenchmarkService {
 
     /// Start a real benchmark of `request` (see [`run`]).
     pub fn start(self: &Arc<Self>, ctx: RunContext, request: RunRequest) -> Result<(), Busy> {
+        self.start_run(ctx, request).map(|_| ())
+    }
+
+    /// [`Self::start`] answering the run's id ([`Self::start_job_run`]).
+    pub fn start_run(self: &Arc<Self>, ctx: RunContext, request: RunRequest) -> Result<u64, Busy> {
         self.claim_breadcrumb(&ctx.config.data_root());
         let req = request.clone();
-        self.start_job(request, move |h| run(&ctx, &req, h))
+        self.start_job_run(request, move |h| run(&ctx, &req, h))
     }
 
     /// The process is stopping: cancel a running benchmark and wait for it until `deadline`.

@@ -599,8 +599,9 @@ impl OrtRuntime {
         // them, so the EP compiles once, already with the pinned shapes.
         let original = ModelSource::File(path.clone());
         let no_cache = req.no_cache;
+        let threads = session_threads(target, self.intra_threads, sessions);
         let session = if target == Target::Cpu {
-            Some(self.build_session(target, index, &original, &[], no_cache)?)
+            Some(self.build_session(target, index, &original, &[], no_cache, threads)?)
         } else {
             None
         };
@@ -659,7 +660,8 @@ impl OrtRuntime {
         let session = match session {
             Some(s) if overrides.is_empty() => s,
             _ => {
-                let s = self.build_session(target, index, &source, &overrides, no_cache)?;
+                let s =
+                    self.build_session(target, index, &source, &overrides, no_cache, threads)?;
                 inputs = ports(s.inputs()).0;
                 s
             }
@@ -700,7 +702,7 @@ impl OrtRuntime {
         let (outputs, _) = ports(session.outputs());
         let mut all = vec![session];
         for _ in 1..sessions.max(1) {
-            all.push(self.build_session(target, index, &source, &overrides, no_cache)?);
+            all.push(self.build_session(target, index, &source, &overrides, no_cache, threads)?);
         }
         let compile_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
         let device = DeviceInfo {
@@ -891,17 +893,18 @@ impl OrtRuntime {
         source: &ModelSource,
         overrides: &[(String, i64)],
         no_cache: bool,
+        threads: usize,
     ) -> Result<Session> {
         let path = source.path();
         let mut b: SessionBuilder = Self::session_builder()?;
         // Every session, GPU EPs included (their CPU fallback ops run on this pool).
-        b = b.with_intra_threads(self.intra_threads).map_err(ort_err)?;
+        b = b.with_intra_threads(threads).map_err(ort_err)?;
         let spin = ort_spinning_enabled(std::env::var(ENV_ORT_SPINNING).ok().as_deref());
         tracing::debug!(
             "ONNX Runtime {} session for {}: {} intra-op threads, spinning {}",
             target.display_name(),
             path.display(),
-            self.intra_threads,
+            threads,
             if spin { "on" } else { "off" }
         );
         b = b
@@ -1225,6 +1228,18 @@ pub(crate) fn ort_spinning_enabled(env: Option<&str>) -> bool {
         env.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "on" | "yes")
     )
+}
+
+/// Intra-op threads for each of `sessions` sessions on `target`. Every session runs one
+/// inference at a time on its own thread, so on the CPU `sessions` of them compute at once and
+/// must share the budget (`intra_threads`, physical cores minus one) instead of each taking all
+/// of it; an accelerator's pool only runs its CPU-fallback ops, so it keeps the full count.
+fn session_threads(target: Target, intra_threads: usize, sessions: usize) -> usize {
+    if target == Target::Cpu && sessions > 1 {
+        (intra_threads / sessions).max(1)
+    } else {
+        intra_threads
+    }
 }
 
 /// Environment variable that turns the CPU arena of `ort:cpu` sessions off (`0`, `false`, `off`,
@@ -2555,6 +2570,16 @@ mod tests {
         )
         .unwrap();
         assert!(r.contains("install it"), "{r}");
+    }
+
+    #[test]
+    fn cpu_sessions_share_the_thread_budget() {
+        assert_eq!(session_threads(Target::Cpu, 5, 1), 5);
+        assert_eq!(session_threads(Target::Cpu, 5, 2), 2);
+        assert_eq!(session_threads(Target::Cpu, 5, 4), 1);
+        assert_eq!(session_threads(Target::Cpu, 1, 4), 1);
+        assert_eq!(session_threads(Target::Cpu, 5, 0), 5);
+        assert_eq!(session_threads(Target::Cuda, 5, 2), 5);
     }
 
     #[test]

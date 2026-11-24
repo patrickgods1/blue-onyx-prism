@@ -68,26 +68,21 @@ pub const DISK_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 pub const SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Run `tick` every `interval` on a thread named `config-watch` until `cancel` is cancelled or
-/// `tick` returns false (its state is gone). The runner passes `server::sync_config` of the
+/// `tick` returns false (its state is gone). The thread sleeps the whole interval between ticks
+/// and wakes at once on a cancel. The runner passes `server::sync_config` of the
 /// generation, so a file edited on disk applies without any page open.
 pub fn spawn_disk_watch(
     interval: std::time::Duration,
     cancel: tokio_util::sync::CancellationToken,
     mut tick: impl FnMut() -> bool + Send + 'static,
 ) -> Option<std::thread::JoinHandle<()>> {
-    let step = interval.min(std::time::Duration::from_millis(250));
     std::thread::Builder::new()
         .name("config-watch".into())
         .spawn(move || {
-            loop {
-                let next = std::time::Instant::now() + interval;
-                while std::time::Instant::now() < next {
-                    if cancel.is_cancelled() {
-                        return;
-                    }
-                    std::thread::sleep(step);
-                }
-                if cancel.is_cancelled() || !tick() {
+            // Parked for the whole interval (`sync::nap`): one wake-up per check, and a cancel
+            // (of the generation or the whole process) ends the thread at once.
+            while crate::sync::nap(interval, &cancel) {
+                if !tick() {
                     return;
                 }
             }
@@ -1463,6 +1458,47 @@ mod tests {
         // A tick returning false (its state is gone) ends the thread.
         let h =
             spawn_disk_watch(ms(1), tokio_util::sync::CancellationToken::new(), || false).unwrap();
+        h.join().unwrap();
+    }
+
+    /// One tick per interval over a known time, and a cancel ends a long interval within 1 s.
+    #[test]
+    fn disk_watch_wakes_per_interval_and_stops_at_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let ms = std::time::Duration::from_millis;
+        let n = Arc::new(AtomicU32::new(0));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let counter = n.clone();
+        let h = spawn_disk_watch(ms(50), cancel.clone(), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            true
+        })
+        .unwrap();
+        std::thread::sleep(ms(525));
+        cancel.cancel();
+        h.join().unwrap();
+        let ticks = n.load(Ordering::SeqCst);
+        assert!(
+            (3..=11).contains(&ticks),
+            "{ticks} ticks in ~525 ms at 50 ms"
+        );
+
+        // Through the parent token, as at a process stop.
+        let parent = tokio_util::sync::CancellationToken::new();
+        let h = spawn_disk_watch(
+            std::time::Duration::from_secs(600),
+            parent.child_token(),
+            || true,
+        )
+        .unwrap();
+        std::thread::sleep(ms(30));
+        let t = std::time::Instant::now();
+        parent.cancel();
+        while !h.is_finished() {
+            assert!(t.elapsed() < ms(1000), "the watch did not stop within 1 s");
+            std::thread::sleep(ms(5));
+        }
         h.join().unwrap();
     }
 }
