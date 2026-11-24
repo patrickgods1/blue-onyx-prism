@@ -50,6 +50,9 @@ struct Engine {
     family: Box<dyn Family>,
     /// Geometry the prep pool preprocesses this model's images for.
     spec: PrepSpec,
+    /// This model's use of its tensor length in the shared prep pool: when the last engine of
+    /// that length drops, the pool frees those buffers ([`crate::prep::TensorPool::hold_length`]).
+    _tensors: Option<crate::prep::LengthHold>,
     provider: String,
     /// Canonical spec of the device it loaded on ("openvino:gpu"), for logs.
     device: String,
@@ -356,7 +359,7 @@ impl WorkerCtx {
     /// Hand `engine` to a reaper thread (see [`Abandoned`]).
     fn abandon(&self, engine: Option<Engine>) {
         if let Some(e) = engine {
-            reap(&self.cfg.name, Abandoned(e.backend));
+            reap(&self.cfg.name, &e.device, Abandoned(e.backend));
         }
     }
 
@@ -1046,6 +1049,9 @@ impl WorkerCtx {
         match self.load() {
             Ok(engine) => {
                 self.state.set(ModelState::Ready);
+                // The compile's transients (the read model, rewrites, throwaway sessions, the
+                // copies of failed candidates) are free now (RA-077).
+                crate::backend::memory::trim_soon("model loaded");
                 Some(engine)
             }
             Err(e) if self.shutdown.is_cancelled() => {
@@ -1096,6 +1102,16 @@ impl WorkerCtx {
             // A stopped worker tries no further candidate, and never makes the previous
             // generation give up its serving copy for a load that is not wanted any more.
             self.check_stopped()?;
+            // A device a reaper still waits on is hung: another compile there only adds a
+            // backend that cannot be freed (RA-082). Skipped as a lost device, so it stays the
+            // better one to try again once the reaper is done.
+            if let Some(hung) = self.hung(cand) {
+                let e = anyhow::Error::new(hung);
+                if better.is_none() {
+                    better = Better::of(cand, &e);
+                }
+                return Err(e);
+            }
             let mut attempt = self.load_on(cand);
             if Some(cand.device) == first
                 && let Err(e) = &attempt
@@ -1160,6 +1176,16 @@ impl WorkerCtx {
             "model ready"
         );
         Ok(engine)
+    }
+
+    /// Why `cand` must not be tried now: a reaper still waits on its device
+    /// ([`super::reap::hung_device`]).
+    fn hung(&self, cand: &Candidate) -> Option<super::reap::Hung> {
+        #[cfg(test)]
+        if let Some(r) = self.cfg.faults.reapers {
+            return r.hung(&cand.device, Instant::now());
+        }
+        super::reap::reapers().hung(&cand.device, Instant::now())
     }
 
     /// The candidates to walk: the one [`WorkerConfig::only`] names, else the plan
@@ -1264,11 +1290,11 @@ impl WorkerCtx {
                     // ONNX Runtime waits `ABORT_TIMEOUT`): a reaper does, so this thread goes
                     // on to the next candidate (CPU last) and the model still serves.
                     error!(model = %self.cfg.name, "{e:#}; abandoning the device");
-                    reap(&self.cfg.name, Abandoned(backend));
+                    reap(&self.cfg.name, &device, Abandoned(backend));
                 } else if e.is::<LoadStopped>() {
                     // Stopped with the warm-up in flight: a reaper stops and frees it, so the
                     // worker thread never waits for the device.
-                    reap(&self.cfg.name, Abandoned(backend));
+                    reap(&self.cfg.name, &device, Abandoned(backend));
                 }
                 return Err(e);
             }
@@ -1293,6 +1319,11 @@ impl WorkerCtx {
             Engine {
                 backend,
                 family,
+                _tensors: self
+                    .cfg
+                    .prep
+                    .as_ref()
+                    .map(|p| p.tensors().hold_length(spec.tensor_len())),
                 spec,
                 provider,
                 device,

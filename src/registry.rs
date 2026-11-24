@@ -721,6 +721,10 @@ fn retire_worker_with(slot: WorkerSlot, how: Stop, spawn: SpawnHelper) -> Option
             } else {
                 info!(model = %name, "previous worker stopped");
             }
+            // Its engine, requests and buffers are freed now (a reload, a replacement taking
+            // over, a retire for room, a disable): give that memory back (RA-102). Never
+            // under the slots lock: this helper holds none.
+            crate::backend::memory::trim_soon("previous worker stopped");
         }),
     );
     match spawned {
@@ -1588,12 +1592,19 @@ impl ModelRegistry {
 
     /// Try `better` again for `name`, beside the worker serving it: a replacement on that device
     /// only, which takes over if it loads; else nothing changes. True when one started (not
-    /// while another reload of the model is under way, or the model does not serve).
+    /// while another reload of the model is under way, the model does not serve, or a reaper
+    /// still waits on that device, `crate::worker::hung_device`).
     pub fn retry_better(&self, name: &str, config: &Config, better: &Better) -> Result<bool> {
         let Some(sp) = &self.spawner else {
             bail!("this registry cannot reload models");
         };
         let _one = sp.reload.lock_recover();
+        // The supervisor holds tries of a hung device already; this keeps any other caller from
+        // compiling there while a reaper still waits on it (RA-082).
+        if let Some(hung) = crate::worker::hung_device(&better.candidate.device) {
+            info!(model = %name, "not trying the better device: {hung}");
+            return Ok(false);
+        }
         let key = normalize_name(name);
         let Some(m) = config
             .models

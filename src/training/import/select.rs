@@ -340,12 +340,13 @@ pub fn k_center_hamming(hashes: &[u64], k: usize) -> Vec<usize> {
 
 /// Pick `total` of the candidates, balanced by `group` (the scene): each group's quota
 /// ([`quotas`]; or one group with everything when `balance` is off) filled by k-center within the
-/// group, using `embedding(i)` when every candidate has one, else the dHash. Returns candidate
-/// indices sorted ascending.
+/// group, using the embeddings when every candidate has one, else the dHash. `embeddings` is
+/// one flat slice of rows and the row length (row `i` at `i * dim ..`, as the import reads them,
+/// with no `Vec` per row). Returns candidate indices sorted ascending.
 pub fn pick(
     groups: &[&str],
     hashes: &[u64],
-    embeddings: Option<&[Vec<f32>]>,
+    embeddings: Option<(&[f32], usize)>,
     total: usize,
     balance: bool,
 ) -> Vec<usize> {
@@ -365,10 +366,10 @@ pub fn pick(
     for (g, idx) in &members {
         let k = q.get(g).copied().unwrap_or(0);
         let picked: Vec<usize> = match embeddings {
-            Some(e) if e.len() == hashes.len() => {
+            Some((e, dim)) if dim > 0 && Some(e.len()) == hashes.len().checked_mul(dim) => {
                 let vs: Vec<&[f32]> = idx
                     .iter()
-                    .filter_map(|i| e.get(*i).map(Vec::as_slice))
+                    .filter_map(|i| e.get(i.checked_mul(dim)?..(i + 1).checked_mul(dim)?))
                     .collect();
                 k_center(&vs, k)
             }
@@ -529,8 +530,15 @@ mod tests {
         let e: Vec<Vec<f32>> = (0..6)
             .map(|i| unit(&[1.0, if i == 2 { 5.0 } else { 0.01 * i as f32 }]))
             .collect();
-        let picked = pick(&groups, &hashes, Some(&e), 3, false);
+        let flat: Vec<f32> = e.concat();
+        let picked = pick(&groups, &hashes, Some((&flat, 2)), 3, false);
         assert!(picked.contains(&2), "the outlier is covered: {picked:?}");
+        // Rows that do not cover every candidate: the dHash.
+        assert_eq!(
+            pick(&groups, &hashes, Some((&flat[..10], 2)), 2, false),
+            unbalanced
+        );
+        assert_eq!(pick(&groups, &hashes, Some((&[], 0)), 2, false), unbalanced);
     }
 
     #[test]

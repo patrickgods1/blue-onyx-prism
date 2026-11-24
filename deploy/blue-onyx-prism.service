@@ -38,7 +38,13 @@ RestartSec=5
 # worker, collector and runtime threads all touch image-sized buffers, so a long run leaves many
 # fragmented arenas that are rarely returned to the system and resident memory creeps up for
 # days. Two arenas keep that bounded, for some allocator contention between threads.
+# glibc's mmap threshold climbs to 32 MiB after the first large free, so big one-off buffers (a
+# kept 4K frame) then stay in the heap after a burst; a fixed 8 MiB (above every per-request
+# buffer of a 640 model) sends them to mmap, back to the system when freed.
+# The binary sets both itself when they are not in its environment (so tarball runs and CLI
+# commands get them too); these lines make the values visible here, and an edit to them wins.
 Environment=MALLOC_ARENA_MAX=2
+Environment=MALLOC_MMAP_THRESHOLD_=8388608
 User=blueonyx
 Group=blueonyx
 # Needed for Intel GPU inference via /dev/dri (install intel-opencl-icd on the host).

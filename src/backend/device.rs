@@ -175,8 +175,131 @@ pub(crate) fn apply_core_properties(
     Ok(())
 }
 
+/// The `ov_core_t` behind an `openvino::Core`.
+fn raw_core(core: &openvino::Core) -> *mut openvino_sys::ov_core_t {
+    // `openvino::Core` (0.11) is a struct whose only field is this pointer and has no public
+    // getter for it (`libs::core_set_property_variadic` reads it the same way). Cargo.toml pins
+    // `openvino` exactly (`=0.11.0`), so the layout cannot change under a `cargo update`; the
+    // asserts catch a deliberate bump (BE-11).
+    const _: () = assert!(
+        std::mem::size_of::<openvino::Core>()
+            == std::mem::size_of::<*mut openvino_sys::ov_core_t>()
+            && std::mem::align_of::<openvino::Core>()
+                == std::mem::align_of::<*mut openvino_sys::ov_core_t>()
+    );
+    // SAFETY: same size and alignment (asserted above) and the single field is the pointer;
+    // reading it does not transfer ownership (`core` still frees it).
+    unsafe { std::mem::transmute_copy(core) }
+}
+
+/// The `ov_compiled_model_t` behind an `openvino::CompiledModel`.
+fn raw_compiled(compiled: &openvino::CompiledModel) -> *mut openvino_sys::ov_compiled_model_t {
+    // As `raw_core`: a single-pointer struct in the exact `=0.11.0` pin.
+    const _: () = assert!(
+        std::mem::size_of::<openvino::CompiledModel>()
+            == std::mem::size_of::<*mut openvino_sys::ov_compiled_model_t>()
+            && std::mem::align_of::<openvino::CompiledModel>()
+                == std::mem::align_of::<*mut openvino_sys::ov_compiled_model_t>()
+    );
+    // SAFETY: same size and alignment (asserted above) and the single field is the pointer;
+    // reading it does not transfer ownership (`compiled` still frees it).
+    unsafe { std::mem::transmute_copy(compiled) }
+}
+
+/// A NUL-terminated C string copied into a `String`, invalid UTF-8 replaced (the crate's
+/// `Core::get_property` panics on it).
+///
+/// # Safety
+/// `p` must be null or point at a NUL-terminated string alive for the call.
+unsafe fn copy_c_string(p: *const std::ffi::c_char) -> Option<String> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: non-null and NUL-terminated per the caller's contract.
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// Copies the string a `*_get_property` call wrote and frees it with `ov_free` (null: nothing
+/// to free). `status` is the call's result.
+///
+/// # Safety
+/// `value` must be null or a string OpenVINO allocated for the caller, not freed elsewhere.
+unsafe fn take_property(
+    status: openvino_sys::ov_status_e,
+    value: *mut std::ffi::c_char,
+    what: impl FnOnce() -> String,
+) -> Result<String> {
+    // Read before anything else calls into OpenVINO.
+    let failed = (status != openvino_sys::ov_status_e::OK).then(last_error);
+    // SAFETY: per this function's contract.
+    let copied = unsafe { copy_c_string(value) };
+    if !value.is_null() {
+        // SAFETY: allocated by OpenVINO for the caller (`str_to_char_array`); freed once, here.
+        unsafe { openvino_sys::ov_free(value) };
+    }
+    if let Some(msg) = failed {
+        anyhow::bail!("reading {}: status {status:?}: {msg}", what());
+    }
+    copied.with_context(|| format!("reading {}: OpenVINO returned no value", what()))
+}
+
+/// `Core::get_property` without its leak: `openvino` 0.11 copies the value and never frees the
+/// C string OpenVINO allocated for it (a few hundred bytes per compile, for the life of the
+/// process, RA-085). Calls `ov_core_get_property` and frees the value with `ov_free`.
+pub(crate) fn core_property(
+    core: &openvino::Core,
+    device: &str,
+    key: &PropertyKey,
+) -> Result<String> {
+    let c_device = std::ffi::CString::new(device)
+        .with_context(|| format!("device name {device:?} contains a NUL byte"))?;
+    let c_key = std::ffi::CString::new(key.as_ref())
+        .with_context(|| format!("property key {:?} contains a NUL byte", key.as_ref()))?;
+    let mut value: *mut std::ffi::c_char = std::ptr::null_mut();
+    // SAFETY: `raw_core` is the live core (borrowed for the call); the C strings are
+    // NUL-terminated and outlive the call; on success OpenVINO writes a string allocated for
+    // the caller, which `take_property` copies and frees once.
+    unsafe {
+        let status = openvino_sys::ov_core_get_property(
+            raw_core(core),
+            c_device.as_ptr(),
+            c_key.as_ptr(),
+            &mut value,
+        );
+        take_property(status, value, || {
+            format!("OpenVINO {device} property {}", key.as_ref())
+        })
+    }
+}
+
+/// `CompiledModel::get_property` without its leak (its `Cow` borrows the C string, which is
+/// never freed; RA-085). Calls `ov_compiled_model_get_property` and frees the value.
+pub(crate) fn compiled_property(
+    compiled: &openvino::CompiledModel,
+    key: &PropertyKey,
+) -> Result<String> {
+    let c_key = std::ffi::CString::new(key.as_ref())
+        .with_context(|| format!("property key {:?} contains a NUL byte", key.as_ref()))?;
+    let mut value: *mut std::ffi::c_char = std::ptr::null_mut();
+    // SAFETY: as in `core_property`, on the live compiled model borrowed for the call.
+    unsafe {
+        let status = openvino_sys::ov_compiled_model_get_property(
+            raw_compiled(compiled),
+            c_key.as_ptr(),
+            &mut value,
+        );
+        take_property(status, value, || {
+            format!("compiled model property {}", key.as_ref())
+        })
+    }
+}
+
 pub(crate) fn full_device_name(core: &openvino::Core, device: &str) -> String {
-    core.get_property(&DeviceType::from(device), &PropertyKey::DeviceFullName)
+    core_property(core, device, &PropertyKey::DeviceFullName)
         .map(|s| s.trim().to_string())
         .ok()
         .filter(|s| !s.is_empty())
@@ -313,6 +436,50 @@ pub(crate) fn find_image_input(inputs: &[PortSpec]) -> Option<usize> {
         .or_else(|| inputs.iter().position(|p| p.shape.len() == 4))
 }
 
+/// The `(w, h)` of the image input `port` (`[N, C, H, W]`, every dim static and positive),
+/// checked against [`crate::model::preprocess::check_input_size`]. Both backends call it at
+/// load, so every [`ModelInfo::input_size`] is one the preprocessor accepts and a model whose
+/// file asks for a huge input fails to load with this error before a warm-up frame, a pooled
+/// tensor or an inference buffer is allocated for it (QA-026, PL-04).
+pub(crate) fn image_input_size(path: &std::path::Path, port: &PortSpec) -> Result<(u32, u32)> {
+    let [_, _, h, w] = port.shape.as_slice() else {
+        anyhow::bail!(
+            "model {}: image input '{}' has shape {:?}, not 4-D NCHW; export the model with \
+             an [N, 3, H, W] image input",
+            path.display(),
+            port.name,
+            port.shape
+        );
+    };
+    if port.shape.iter().any(|&d| d <= 0) {
+        anyhow::bail!(
+            "model {}: image input '{}' has non-static shape {:?} (a dynamic or zero \
+             dimension that could not be pinned); export the model with a static input size \
+             such as [1, 3, 640, 640]",
+            path.display(),
+            port.name,
+            port.shape
+        );
+    }
+    let (Ok(w), Ok(h)) = (u32::try_from(*w), u32::try_from(*h)) else {
+        anyhow::bail!(
+            "model {}: image input '{}' size {w}x{h} is out of range; export the model at a \
+             smaller input size such as 640x640",
+            path.display(),
+            port.name
+        );
+    };
+    crate::model::preprocess::check_input_size(w, h).map_err(|e| {
+        anyhow::anyhow!(
+            "model {}: image input '{}': {e}; the model cannot be served: export it at a \
+             smaller input size such as 640x640",
+            path.display(),
+            port.name
+        )
+    })?;
+    Ok((w, h))
+}
+
 fn read_model(core: &mut openvino::Core, path: &std::path::Path) -> Result<Model> {
     let p = path
         .to_str()
@@ -442,8 +609,12 @@ fn set_cpu_precision(core: &mut openvino::Core, dt: &DeviceType, needs_f32: bool
         return;
     }
     let default = CPU_DEFAULT_PRECISION.get_or_init(|| {
-        core.get_property(dt, &PropertyKey::Rw(RwPropertyKey::HintInferencePrecision))
-            .unwrap_or_else(|_| "f32".to_string())
+        core_property(
+            core,
+            dt.as_ref(),
+            &PropertyKey::Rw(RwPropertyKey::HintInferencePrecision),
+        )
+        .unwrap_or_else(|_| "f32".to_string())
     });
     let want = if needs_f32 { "f32" } else { default.as_str() };
     match core_set_property(core, dt, &RwPropertyKey::HintInferencePrecision, want) {
@@ -541,15 +712,15 @@ fn select_cache_dir(
     let Some(root) = cache_root else { return };
     let class_name = device_class(device);
     let class = DeviceType::from(class_name.as_str());
-    let precision = core
-        .get_property(
-            &class,
-            &PropertyKey::Rw(RwPropertyKey::HintInferencePrecision),
-        )
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| wanted.to_string());
+    let precision = core_property(
+        core,
+        class.as_ref(),
+        &PropertyKey::Rw(RwPropertyKey::HintInferencePrecision),
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| wanted.to_string());
     let dir = ov_cache_dir(root, device, &precision);
     // `model_cache_dir` records the use of the subfolder and the folder (the storage sweep
     // deletes those no load used for 60 days).
@@ -749,21 +920,8 @@ pub(crate) fn load_model(
             path.display()
         )
     })?;
-    let input_size = match img.shape.as_slice() {
-        [_, _, h, w] if img.shape.iter().all(|&d| d > 0) => {
-            (u32::try_from(*w).ok(), u32::try_from(*h).ok())
-        }
-        _ => (None, None),
-    };
-    let (Some(w), Some(h)) = input_size else {
-        anyhow::bail!(
-            "model {}: image input '{}' has non-static shape {:?} after reshape",
-            path.display(),
-            img.name,
-            img.shape
-        );
-    };
-    let input_size = (w, h);
+    // Checked before the compile, so an oversized input fails here rather than in a plugin.
+    let input_size = image_input_size(path, img)?;
     let image_input = img.name.clone();
 
     if let Some(intel) = prefer_intel_gpu(core, &primary, available) {
@@ -799,8 +957,7 @@ pub(crate) fn load_model(
     let compile_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
     // Streams the plugin created for the hint (THROUGHPUT: several); bounds `inflight`.
     let read_count = |key: PropertyKey| {
-        compiled
-            .get_property(&key)
+        compiled_property(&compiled, &key)
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
     };
@@ -1360,6 +1517,70 @@ pub(crate) fn abort(slots: &mut [OvSlot]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_port(shape: &[i64]) -> PortSpec {
+        PortSpec {
+            name: "images".into(),
+            shape: shape.to_vec(),
+            elem: PortElem::F32,
+        }
+    }
+
+    /// QA-026: the load-time check rejects what the preprocessor could not serve, naming the
+    /// model, the port and the limit, before anything is allocated for it.
+    #[test]
+    fn image_input_size_rejects_what_cannot_be_served() {
+        let path = std::path::Path::new("models/huge.onnx");
+        let size = |shape: &[i64]| image_input_size(path, &image_port(shape));
+        assert_eq!(size(&[1, 3, 640, 640]).unwrap(), (640, 640));
+        assert_eq!(size(&[1, 3, 384, 640]).unwrap(), (640, 384), "(w, h)");
+        assert_eq!(size(&[1, 3, 4096, 4096]).unwrap(), (4096, 4096));
+        let err = |shape: &[i64]| format!("{:#}", size(shape).unwrap_err());
+        // Over the side limit.
+        let e = err(&[1, 3, 16384, 16384]);
+        assert!(
+            e.contains("16384x16384") && e.contains("8192") && e.contains("huge.onnx"),
+            "{e}"
+        );
+        assert!(e.contains("'images'"), "{e}");
+        // Within the side limit, over the tensor bytes limit.
+        let e = err(&[1, 3, 8192, 8192]);
+        assert!(e.contains("byte"), "{e}");
+        // The worker's 60000x60000 warm-up frame of PL-04.
+        let e = err(&[1, 3, 60000, 60000]);
+        assert!(e.contains("8192"), "{e}");
+        // Dynamic, zero and negative dims.
+        for shape in [
+            [1, 3, -1, 640],
+            [1, 3, 640, -1],
+            [-1, 3, 640, 640],
+            [1, 3, 0, 640],
+            [1, 0, 640, 640],
+            [1, 3, -7, -7],
+        ] {
+            let e = err(&shape);
+            assert!(e.contains("non-static shape"), "{shape:?}: {e}");
+        }
+        // Too large for u32.
+        let e = err(&[1, 3, 1 << 33, 640]);
+        assert!(e.contains("out of range"), "{e}");
+        // Not NCHW.
+        for shape in [&[][..], &[3, 640, 640][..], &[1, 1, 3, 640, 640][..]] {
+            let e = err(shape);
+            assert!(e.contains("not 4-D"), "{shape:?}: {e}");
+        }
+    }
+
+    /// RA-085: a property value is copied without the crate's `unwrap` on non-UTF-8 text.
+    #[test]
+    fn property_strings_are_copied_lossily() {
+        let s = std::ffi::CString::new(b"Intel(R) UHD \xff 630".to_vec()).unwrap();
+        // SAFETY: a live NUL-terminated string.
+        let copied = unsafe { copy_c_string(s.as_ptr()) }.unwrap();
+        assert_eq!(copied, "Intel(R) UHD \u{fffd} 630");
+        // SAFETY: null is allowed.
+        assert_eq!(unsafe { copy_c_string(std::ptr::null()) }, None);
+    }
 
     #[test]
     fn hint_properties_set_only_the_hint() {

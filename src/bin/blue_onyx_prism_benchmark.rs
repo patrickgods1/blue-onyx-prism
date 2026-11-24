@@ -43,5 +43,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     blue_onyx_prism::panic::install();
+    // Before any thread starts (Linux glibc: arena cap, fixed mmap threshold).
+    blue_onyx_prism::backend::memory::tune_allocator();
     bench_main(Cli::parse().args, None)
 }

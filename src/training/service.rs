@@ -483,6 +483,15 @@ pub fn load_records(path: &Path) -> Vec<RunRecord> {
     runs
 }
 
+/// [`load_bare_records`] with each run's epochs shared ([`history::share`]): the page's poll
+/// before the queue starts.
+pub fn load_shown(path: &Path) -> Vec<Shown> {
+    load_bare_records(path)
+        .into_iter()
+        .map(|r| share_with(r, None))
+        .collect()
+}
+
 /// The run records of `path` as stored, for a reader that never saves (the Jobs list, the
 /// storage card, a dataset check's plan, the Review queue's steer, a guest queue): the records
 /// that parse ([`task::read_records`]: a damaged file is no records and stays where it is, nothing
@@ -883,6 +892,16 @@ impl Drop for ClearCurrent<'_> {
         // when the file could not be written).
         self.0.set_live("", None);
     }
+}
+
+/// A run record without its epochs and the epochs, shared ([`TrainingService::shown`]).
+pub type Shown = (RunRecord, Arc<Vec<EpochPoint>>);
+
+/// `r` and its epochs, shared: `live`'s when it is that run's ([`history::share`]).
+fn share_with(mut r: RunRecord, live: Option<&(String, Arc<Vec<EpochPoint>>)>) -> Shown {
+    let live = live.filter(|(id, _)| *id == r.id).map(|(_, h)| h);
+    let h = history::share(&mut r, live);
+    (r, h)
 }
 
 /// `r` with its epochs: `live`'s when it is that run's ([`history::attach`]).
@@ -1534,6 +1553,25 @@ impl TrainingService {
         self.inner.runs.lock_recover().clone()
     }
 
+    /// Every run as stored, each with its epochs shared rather than copied ([`history::share`]:
+    /// the running job's live `Arc`, else the history file's cached one, the same `Arc` while the
+    /// file is unchanged): for readers that only serialize the epochs (the page's poll). The
+    /// records hold no history of their own.
+    pub fn shown(&self) -> Vec<Shown> {
+        let runs = self.inner.runs.lock_recover().clone();
+        let live = self.inner.live.lock_recover().clone();
+        runs.into_iter()
+            .map(|r| share_with(r, live.as_ref()))
+            .collect()
+    }
+
+    /// The epochs of run `id`, shared ([`Self::shown`]); None for no such run.
+    pub fn history(&self, id: &str) -> Option<Arc<Vec<EpochPoint>>> {
+        let r = self.get_bare(id)?;
+        let live = self.inner.live.lock_recover().clone();
+        Some(share_with(r, live.as_ref()).1)
+    }
+
     /// How long job `id` has run and how long its step should still take; None unless it is the
     /// job on the queue's thread.
     pub fn timing(&self, id: &str) -> Option<JobTiming> {
@@ -1545,6 +1583,11 @@ impl TrainingService {
     /// Run `id`, with its epochs ([`history::attach`]).
     pub fn get(&self, id: &str) -> Option<RunRecord> {
         self.get_bare(id).map(|r| self.inner.with_history(r))
+    }
+
+    /// Run `id` as stored, without its epochs ([`Self::records`]).
+    pub fn record(&self, id: &str) -> Option<RunRecord> {
+        self.get_bare(id)
     }
 
     /// Run `id` as stored (no epochs): for the checks that read its state.
@@ -1661,9 +1704,10 @@ impl TrainingService {
                 Err("the run is queued or running; cancel it first".into())
             }
             Some(i) => {
-                runs.remove(i);
+                let gone = runs.remove(i);
                 drop(runs);
                 self.inner.persist();
+                history::forget(&history::history_path(&gone.run_dir));
                 Ok(())
             }
             None => Err(format!("no run {id}")),
@@ -1803,10 +1847,10 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
         if inner.stop.load(Ordering::SeqCst) {
             return;
         }
-        let (id, is_task) = match &msg {
+        let (id, is_task, finished) = match &msg {
             Msg::Stop => return,
-            Msg::Job(j) => (j.id.clone(), false),
-            Msg::Task(t) => (t.id().to_string(), true),
+            Msg::Job(j) => (j.id.clone(), false, "training run finished"),
+            Msg::Task(t) => (t.id().to_string(), true, finished_reason(t.kind())),
         };
         // A panic anywhere in a job ends that job, never the queue.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
@@ -1821,9 +1865,22 @@ fn worker_loop(inner: &Inner, rx: &Receiver<Msg>) {
         if let Err(p) = outcome {
             contain_panic(inner, &id, is_task, &panic_text(p.as_ref()));
         }
+        // The job and what it held are dropped: give the freed heap back (audit 2026-11, phase
+        // 5; coalesced, off this thread).
+        crate::backend::memory::trim_soon(finished);
         if inner.stop.load(Ordering::SeqCst) {
             return;
         }
+    }
+}
+
+/// The trim reason ([`crate::backend::memory::trim_soon`]) of a finished task of `kind`.
+fn finished_reason(kind: task::TaskKind) -> &'static str {
+    match kind {
+        task::TaskKind::Import => "import finished",
+        task::TaskKind::Autolabel => "auto-label finished",
+        task::TaskKind::Overlaps => "overlaps finished",
+        task::TaskKind::Refine => "dataset check finished",
     }
 }
 

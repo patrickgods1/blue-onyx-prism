@@ -322,7 +322,24 @@ fn load_sets(args: &BenchArgs, config: &Config) -> Result<LoadedSets> {
                 .push(format!("downloading datasets failed: {e:#}")),
         }
     }
+    cap_run(
+        &mut r.sets,
+        &mut r.warnings,
+        crate::benchmark::service::MAX_IMAGES_PER_RUN,
+        args.no_image_cap,
+    );
     Ok((r.sets, r.warnings, r.cameras))
+}
+
+/// Cut the run to the service's image cap (RA-078: the CLI holds every result in memory until the
+/// run ends) and add its warning, unless `--no-image-cap` was given.
+fn cap_run(sets: &mut [ImageSet], warnings: &mut Vec<String>, cap: usize, no_cap: bool) {
+    if no_cap {
+        return;
+    }
+    if let Some(w) = crate::benchmark::service::cap_images(sets, cap) {
+        warnings.push(w);
+    }
 }
 
 /// `--list-datasets`.
@@ -2340,5 +2357,33 @@ mod tests {
         assert!(parse(&["x", "--warmup", "101"]).is_err());
         let a = parse(&["x", "--repeat", "1000", "--warmup", "0"]).unwrap();
         assert_eq!((a.repeat, a.warmup), (Some(1000), Some(0)));
+    }
+
+    /// RA-078: a CLI run over the service's cap is cut with a warning; `--no-image-cap` keeps all.
+    #[test]
+    fn cli_runs_are_capped_unless_told_not_to() {
+        let set = |n: usize| {
+            let mut s = ImageSet::sample();
+            let img = s.images[0].clone();
+            s.images = (0..n)
+                .map(|i| {
+                    let mut x = img.clone();
+                    x.file = format!("{i}.jpg");
+                    x
+                })
+                .collect();
+            s
+        };
+        let cap = crate::benchmark::service::MAX_IMAGES_PER_RUN;
+        let (mut sets, mut warnings) = (vec![set(cap + 500)], Vec::new());
+        cap_run(&mut sets, &mut warnings, cap, false);
+        assert!(sets[0].images.len() <= cap);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let (mut sets, mut warnings) = (vec![set(cap + 500)], Vec::new());
+        cap_run(&mut sets, &mut warnings, cap, true);
+        assert_eq!(sets[0].images.len(), cap + 500);
+        assert!(warnings.is_empty());
+        let a = parse(&["x", "--no-image-cap"]).unwrap();
+        assert!(a.no_image_cap && !parse(&["x"]).unwrap().no_image_cap);
     }
 }

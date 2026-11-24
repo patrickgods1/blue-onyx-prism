@@ -749,6 +749,11 @@ def embed(a) -> int:
     model = AutoModel.from_pretrained(str(a.model)).eval()
     cap = torch.cuda.get_device_capability(dev) if dev.startswith("cuda") else None
     dtype = getattr(torch, embed_dtype(dev, cap))
+    # Only the vision tower embeds frames (`get_image_features`); the text tower (about 1 GB of
+    # SigLIP 2's 1.4 GB) would otherwise sit in RAM for the whole pass (audit RA-081).
+    model.text_model = None
+    import gc
+    gc.collect()
     model.vision_model.to(dev, dtype=dtype)
     event("start", images=len(paths), device=dev, dtype=str(dtype).replace("torch.", ""),
           load_s=round(time.time() - t0, 1))

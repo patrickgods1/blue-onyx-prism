@@ -9,8 +9,11 @@
 //! key to stay static. Boxes older than the window are forgotten.
 //!
 //! Bounded: at most [`MAX_KEYS`] keys (least recently used evicted), [`MAX_TRACKS_PER_KEY`]
-//! tracks per key and [`MAX_BOXES_PER_TRACK`] boxes per track. The clock is the `now` passed
-//! to [`StaticMemory::apply`] (tests pass synthetic instants). Single-threaded: the worker owns
+//! tracks per key and [`MAX_BOXES_PER_TRACK`] boxes per track (a track's deque never grows past
+//! that capacity). Every [`SWEEP_EVERY`] requests, keys whose newest box is past the window are
+//! dropped: they can never suppress anything (their next request would forget them anyway), so
+//! a camera that went quiet or was renamed holds no memory (audit 2026-11, RA-103). The clock is
+//! the `now` passed to [`StaticMemory::apply`] (tests pass synthetic instants). Single-threaded: the worker owns
 //! one per model; it survives live-settings swaps and starts empty with a new worker.
 //!
 //! Risk: a person standing perfectly still for `hits` requests is suppressed too; the feature
@@ -28,6 +31,10 @@ pub const MAX_KEYS: usize = 256;
 pub const MAX_TRACKS_PER_KEY: usize = 64;
 /// Most boxes kept per track (also the largest accepted `hits`).
 pub const MAX_BOXES_PER_TRACK: usize = 64;
+/// Every this many [`StaticMemory::apply`] calls, keys whose boxes are all past the window are
+/// dropped. A walk over every key's tracks (at most [`MAX_KEYS`] x [`MAX_TRACKS_PER_KEY`]), so
+/// not per request; 64 requests are seconds on a busy service and the memory is bounded anyway.
+pub const SWEEP_EVERY: u64 = 64;
 /// Longest client-chosen name kept, in bytes: an upload's `image_name` (cut at the request edge)
 /// and a [`camera_key`]. Both land in every dataset sidecar and in memory per camera; 255 bytes is
 /// what most file systems take as one file name.
@@ -191,6 +198,15 @@ impl StaticMemory {
         self.keys.len()
     }
 
+    /// The deque capacity of each track under `key` (tests).
+    #[cfg(test)]
+    fn track_capacities(&self, key: &str) -> Vec<usize> {
+        self.keys
+            .get(key)
+            .map(|k| k.tracks.iter().map(|t| t.seen.capacity()).collect())
+            .unwrap_or_default()
+    }
+
     /// Tracks remembered under `key`.
     pub fn tracks(&self, key: &str) -> usize {
         self.keys.get(key).map_or(0, |k| k.tracks.len())
@@ -214,6 +230,15 @@ impl StaticMemory {
             return (dets, 0);
         }
         self.counter = self.counter.wrapping_add(1);
+        let window = cfg.window();
+        if self.counter.is_multiple_of(SWEEP_EVERY) {
+            self.keys.retain(|_, s| {
+                s.tracks.iter().any(|t| {
+                    t.last_at()
+                        .is_some_and(|at| now.saturating_duration_since(at) <= window)
+                })
+            });
+        }
         if !self.keys.contains_key(key)
             && self.keys.len() >= MAX_KEYS
             && let Some(oldest) = self
@@ -226,7 +251,6 @@ impl StaticMemory {
         }
         let state = self.keys.entry(key.to_string()).or_default();
         state.used = self.counter;
-        let window = cfg.window();
         for t in &mut state.tracks {
             while t
                 .seen
@@ -277,10 +301,12 @@ impl StaticMemory {
                     } else {
                         keep.push(d);
                     }
-                    t.seen.push_back(seen);
-                    while t.seen.len() > MAX_BOXES_PER_TRACK {
+                    // Pop before the push: pushing first grows a full deque's capacity to
+                    // twice the cap for one box.
+                    while t.seen.len() >= MAX_BOXES_PER_TRACK {
                         t.seen.pop_front();
                     }
+                    t.seen.push_back(seen);
                 }
                 None => {
                     keep.push(d);
@@ -558,5 +584,53 @@ mod tests {
         assert!(bad(|s| s.hits = 1000).contains("hits"));
         assert!(bad(|s| s.window_minutes = 0).contains("window_minutes"));
         assert!(bad(|s| s.labels = vec![" ".into()]).contains("labels"));
+    }
+
+    /// RA-103: a camera that went quiet is forgotten within [`SWEEP_EVERY`] requests of other
+    /// cameras once its boxes are past the window, not only when [`MAX_KEYS`] keys exist.
+    #[test]
+    fn an_idle_cameras_expired_tracks_are_swept() {
+        let mut m = StaticMemory::new();
+        let cfg = on();
+        let t0 = Instant::now();
+        m.apply("idle", vec![det(10.0, 0)], &names(), &cfg, t0);
+        assert_eq!(m.tracks("idle"), 1);
+        // Inside the window it stays, however many other requests come.
+        let inside = t0 + cfg.window();
+        for _ in 0..SWEEP_EVERY {
+            m.apply("busy", vec![det(10.0, 0)], &names(), &cfg, inside);
+        }
+        assert_eq!(m.tracks("idle"), 1);
+        let late = inside + Duration::from_secs(1);
+        let before = m.counter;
+        let mut calls = 0;
+        while m.tracks("idle") > 0 {
+            m.apply("busy", vec![det(10.0, 0)], &names(), &cfg, late);
+            calls += 1;
+            assert!(calls <= SWEEP_EVERY, "not swept within {SWEEP_EVERY} calls");
+        }
+        assert!((before + calls).is_multiple_of(SWEEP_EVERY));
+        assert_eq!(m.keys(), 1, "only the busy camera is left");
+        assert_eq!(m.tracks("busy"), 1, "a key in use keeps its track");
+    }
+
+    /// RA-103: a track that holds [`MAX_BOXES_PER_TRACK`] boxes never grows its deque past that.
+    #[test]
+    fn a_full_track_never_doubles_its_deque() {
+        let mut m = StaticMemory::new();
+        let cfg = on();
+        let t0 = Instant::now();
+        for i in 0..(3 * MAX_BOXES_PER_TRACK) {
+            let at = t0 + Duration::from_millis(u64::try_from(i).unwrap());
+            m.apply("cam", vec![det(10.0, 0)], &names(), &cfg, at);
+        }
+        let caps = m.track_capacities("cam");
+        assert_eq!(caps.len(), 1);
+        assert!(
+            caps.iter().all(|&c| c <= MAX_BOXES_PER_TRACK),
+            "{caps:?} > {MAX_BOXES_PER_TRACK}"
+        );
+        let k = m.keys.get("cam").unwrap();
+        assert_eq!(k.tracks[0].seen.len(), MAX_BOXES_PER_TRACK);
     }
 }

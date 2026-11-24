@@ -22,6 +22,11 @@
 //! [`Permit`] of the process-wide semaphore ([`acquire`]: `max(1, min(4, physical cores / 2))`
 //! permits); a caller that gets none within its wait answers "busy" (the web UI: 503 with
 //! `Retry-After`). Taking it is the caller's job, so the type system makes sure it happens.
+//!
+//! **Memory:** when the last permit of a burst comes back (every permit free again), the
+//! process-wide semaphore asks for an allocator trim ([`crate::backend::memory::trim_soon`],
+//! coalesced and off the calling thread): glibc otherwise keeps the freed 19 MiB buffers in its
+//! arenas (RA-096). Never per hash: a burst of sign-ins ends in one trim.
 
 use anyhow::{Context, Result, anyhow, bail};
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
@@ -239,6 +244,8 @@ pub struct Semaphore {
     free: Mutex<usize>,
     freed: Condvar,
     total: usize,
+    /// Called (outside the lock) when a release makes every permit free: the end of a burst.
+    on_idle: Option<fn()>,
 }
 
 /// One permit to hash, given back on drop.
@@ -249,20 +256,33 @@ pub struct Permit<'a> {
 
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
-        let mut free = self.sem.free.lock().unwrap_or_else(|e| e.into_inner());
-        *free = free.saturating_add(1).min(self.sem.total);
-        self.sem.freed.notify_one();
+        let idle = {
+            let mut free = self.sem.free.lock().unwrap_or_else(|e| e.into_inner());
+            *free = free.saturating_add(1).min(self.sem.total);
+            self.sem.freed.notify_one();
+            *free == self.sem.total
+        };
+        if idle && let Some(hook) = self.sem.on_idle {
+            hook();
+        }
     }
 }
 
 impl Semaphore {
     /// `total` permits (at least one).
     pub fn new(total: usize) -> Self {
+        Self::with_idle_hook(total, None)
+    }
+
+    /// [`Semaphore::new`] that calls `on_idle` each time a release leaves every permit free
+    /// (outside the semaphore's lock; it must return quickly).
+    pub fn with_idle_hook(total: usize, on_idle: Option<fn()>) -> Self {
         let total = total.max(1);
         Self {
             free: Mutex::new(total),
             freed: Condvar::new(),
             total,
+            on_idle,
         }
     }
 
@@ -303,7 +323,14 @@ pub fn permits_for(physical: usize) -> usize {
 /// The process-wide hashing semaphore.
 pub fn semaphore() -> &'static Semaphore {
     static SEM: OnceLock<Semaphore> = OnceLock::new();
-    SEM.get_or_init(|| Semaphore::new(permits_for(num_cpus::get_physical())))
+    SEM.get_or_init(|| {
+        Semaphore::with_idle_hook(permits_for(num_cpus::get_physical()), Some(burst_ended))
+    })
+}
+
+/// The last hash of a burst finished: give the freed Argon2 buffers back to the OS soon.
+fn burst_ended() {
+    crate::backend::memory::trim_soon("sign-in burst");
 }
 
 /// A permit of the process-wide semaphore, waiting at most `timeout`; `None`: busy, answer so.
@@ -476,6 +503,43 @@ mod tests {
         let p = permit();
         assert!(!dummy_verify("correct horse battery staple violet", &p));
         assert!(!dummy_verify("", &p));
+    }
+
+    /// RA-096: the idle hook runs once per burst, when the last permit comes back, never while
+    /// another hash still holds one.
+    #[test]
+    fn the_end_of_a_burst_calls_the_idle_hook_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ENDED: AtomicUsize = AtomicUsize::new(0);
+        fn ended() {
+            ENDED.fetch_add(1, Ordering::SeqCst);
+        }
+        let sem = Semaphore::with_idle_hook(3, Some(ended));
+        let a = sem.acquire(Duration::ZERO).unwrap();
+        let b = sem.acquire(Duration::ZERO).unwrap();
+        drop(a);
+        assert_eq!(ENDED.load(Ordering::SeqCst), 0, "b still hashes");
+        let c = sem.acquire(Duration::ZERO).unwrap();
+        drop(b);
+        assert_eq!(ENDED.load(Ordering::SeqCst), 0, "c still hashes");
+        drop(c);
+        assert_eq!(ENDED.load(Ordering::SeqCst), 1, "the burst ended");
+        drop(sem.acquire(Duration::ZERO).unwrap());
+        assert_eq!(
+            ENDED.load(Ordering::SeqCst),
+            2,
+            "a lone hash is a burst too"
+        );
+        // Without a hook nothing is called (and nothing breaks).
+        let plain = Semaphore::new(1);
+        drop(plain.acquire(Duration::ZERO).unwrap());
+        assert_eq!(ENDED.load(Ordering::SeqCst), 2);
+    }
+
+    /// The process-wide semaphore asks for a trim at the end of a burst.
+    #[test]
+    fn the_process_semaphore_trims_after_a_burst() {
+        assert!(semaphore().on_idle.is_some());
     }
 
     #[test]

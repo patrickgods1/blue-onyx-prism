@@ -25,13 +25,28 @@ pub const MAX_PAGE: usize = 2000;
 pub const MAX_MESSAGE_BYTES: usize = 4096;
 /// Longest `target` stored per entry.
 pub const MAX_TARGET_BYTES: usize = 256;
-/// Byte budget of the whole ring (messages + targets); the oldest entries are evicted beyond it,
-/// in addition to the entry cap.
+/// Byte budget of the whole ring, counted in allocated bytes (the capacity of each entry's
+/// message, target and timestamp, `entry_bytes`); the oldest entries are evicted beyond it, in
+/// addition to the entry cap.
 pub const MAX_RING_BYTES: usize = 8 * 1024 * 1024;
+/// Room for the truncation marker (`… [truncated N bytes]`, at most 39 bytes for a `usize` N),
+/// allocated with the cut text so appending it never reallocates.
+const MARKER_ROOM: usize = 48;
+/// Spare capacity an entry's string may keep before it is shrunk to its length: a quarter of the
+/// length, and at least this much, so a short line is not reallocated for a few bytes (a message
+/// built by `write!` and `push_str` typically holds up to twice its length).
+const SLACK_FLOOR: usize = 64;
 
-/// `s` cut to at most `max` bytes on a char boundary, with a truncation marker when cut.
+/// `s` cut to at most `max` bytes on a char boundary, with a truncation marker when cut, and
+/// holding no more memory than its text needs (RA-079): a cut copies the kept text into a string
+/// sized for it (`String::truncate` keeps the whole allocation), and a string with much spare
+/// capacity ([`SLACK_FLOOR`]) is shrunk.
 fn truncate_text(mut s: String, max: usize) -> String {
     if s.len() <= max {
+        let slack = s.capacity() - s.len();
+        if slack > SLACK_FLOOR && slack > s.len() / 4 {
+            s.shrink_to_fit();
+        }
         return s;
     }
     let mut cut = max;
@@ -39,13 +54,15 @@ fn truncate_text(mut s: String, max: usize) -> String {
         cut -= 1;
     }
     let dropped = s.len() - cut;
-    s.truncate(cut);
-    let _ = write!(s, "… [truncated {dropped} bytes]");
-    s
+    let mut out = String::with_capacity(cut + MARKER_ROOM);
+    out.push_str(s.get(..cut).unwrap_or_default());
+    let _ = write!(out, "… [truncated {dropped} bytes]");
+    out
 }
 
+/// What an entry holds in memory: the capacity (not the length) of its strings.
 fn entry_bytes(e: &LogEntry) -> usize {
-    e.message.len() + e.target.len()
+    e.message.capacity() + e.target.capacity() + e.ts.capacity()
 }
 
 /// One captured event.
@@ -408,6 +425,53 @@ mod tests {
         // Short messages are untouched.
         b.push(Level::INFO, "t", "ok".into());
         assert_eq!(b.since(1, None, 10).entries[0].message, "ok");
+    }
+
+    /// RA-079: a cut message keeps only the cut text's memory, and a short one with much spare
+    /// capacity is shrunk.
+    #[test]
+    fn a_cut_message_holds_only_the_cut_text() {
+        let b = LogBuffer::new(10);
+        let huge = "x".repeat(1 << 20);
+        assert!(huge.capacity() >= 1 << 20);
+        b.push(Level::WARN, "t", huge);
+        let mut slack = String::with_capacity(1 << 20);
+        slack.push_str("short line");
+        b.push(Level::INFO, "t", slack);
+        let r = b.lock();
+        let cut = &r.entries[0].message;
+        assert!(cut.contains("… [truncated "));
+        assert!(
+            cut.capacity() <= MAX_MESSAGE_BYTES + MARKER_ROOM,
+            "{} bytes held",
+            cut.capacity()
+        );
+        let short = &r.entries[1].message;
+        assert_eq!(short, "short line");
+        assert!(short.capacity() <= SLACK_FLOOR, "{}", short.capacity());
+        let held: usize = r.entries.iter().map(entry_bytes).sum();
+        assert_eq!(r.bytes, held, "the ring counts what the entries hold");
+    }
+
+    /// RA-079: the byte budget bounds the memory held (capacities), not only the text lengths:
+    /// 2500 cut messages of 16 KiB each would hold 40 MiB without the copy.
+    #[test]
+    fn the_byte_budget_bounds_the_allocated_bytes() {
+        let b = LogBuffer::new(4000);
+        for _ in 0..2500 {
+            b.push(Level::INFO, "t", "y".repeat(16 * 1024));
+        }
+        let r = b.lock();
+        let held: usize = r.entries.iter().map(entry_bytes).sum();
+        assert_eq!(r.bytes, held);
+        assert!(held <= MAX_RING_BYTES, "{held} bytes held");
+        assert!(r.entries.len() < 2500, "evicted by bytes");
+        let capacities: usize = r
+            .entries
+            .iter()
+            .map(|e| e.message.capacity() + e.target.capacity() + e.ts.capacity())
+            .sum();
+        assert!(capacities <= MAX_RING_BYTES, "{capacities}");
     }
 
     #[test]

@@ -53,7 +53,10 @@ USER openvino
 # glibc gives each thread that allocates its own malloc arena (up to 8 per core); the HTTP,
 # worker, collector and runtime threads all touch image-sized buffers, so a long run leaves many
 # fragmented arenas that are rarely returned and resident memory creeps up. Two keep it bounded.
-ENV MALLOC_ARENA_MAX=2
+# A fixed 8 MiB mmap threshold (glibc's own climbs to 32 MiB) returns big one-off buffers to the
+# system when freed. The binary sets both itself when unset; `docker run -e` values win.
+ENV MALLOC_ARENA_MAX=2 \
+    MALLOC_MMAP_THRESHOLD_=8388608
 # 32168: plain HTTP (Blue Iris, detection API); 32169: HTTPS (web UI, self-signed certificate in
 # the data volume, `tls-fingerprint` prints its fingerprint).
 EXPOSE 32168 32169

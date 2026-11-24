@@ -4,7 +4,8 @@
 use super::*;
 use crate::training::progress::TrainEvent;
 use crate::training::service::{
-    PROGRESS_SAVE_EVERY, RUNS_FILE, RunState, TrainingService, load_records, progress_save_due,
+    PROGRESS_SAVE_EVERY, RUNS_FILE, RunState, TrainingService, load_records, load_shown,
+    progress_save_due,
 };
 use std::time::Duration;
 
@@ -441,4 +442,108 @@ fn an_interrupted_run_takes_its_best_epoch_from_the_file() {
     assert_eq!(p.history.len(), 6);
     let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
     assert_eq!(saved[0]["progress"]["history"], serde_json::json!([]));
+}
+
+/// `n` rows of `metrics` values each.
+fn rows(n: u32, metrics: usize) -> Arc<Vec<EpochPoint>> {
+    Arc::new(
+        (1..=n)
+            .map(|epoch| EpochPoint {
+                epoch,
+                elapsed_s: f64::from(epoch),
+                metrics: (0..metrics).map(|i| (format!("m{i}"), 0.5)).collect(),
+            })
+            .collect(),
+    )
+}
+
+/// The cache is bounded by the rows and values it holds, not only by its entries: the least
+/// recently used go first, a read keeps an entry, and the entry just read stays even alone over
+/// the bound (audit 2026-11, RA-080).
+#[test]
+fn the_cache_drops_the_least_recently_used_past_its_weight() {
+    let mut c = Cache::default();
+    let caps = (10, 100);
+    let path = |i: u32| PathBuf::from(format!("run-{i}")).join(HISTORY_FILE);
+    // 3 rows of 9 values: 30 each.
+    let h = rows(3, 9);
+    assert_eq!(weight(&h), 30);
+    for i in 0..3 {
+        c.insert(&path(i), 1, None, &h, caps);
+    }
+    assert_eq!((c.entries.len(), c.weight), (3, 90));
+    // A read of the oldest makes run-1 the least recently used.
+    assert!(c.get(&path(0), 1, None).is_some());
+    c.insert(&path(3), 1, None, &h, caps);
+    assert_eq!(
+        (c.entries.len(), c.weight),
+        (3, 90),
+        "one dropped for the fourth"
+    );
+    assert!(c.entries.contains_key(&path(0)), "read, so kept");
+    assert!(!c.entries.contains_key(&path(1)), "the least recently used");
+    // A file that changed is no hit, and replacing its entry counts once.
+    assert!(c.get(&path(0), 2, None).is_none());
+    c.insert(&path(0), 2, None, &rows(1, 0), caps);
+    assert_eq!((c.entries.len(), c.weight), (3, 61));
+    // One history over the whole bound stays alone: its reader holds it anyway.
+    c.insert(&path(9), 1, None, &rows(20, 9), caps);
+    assert_eq!(c.entries.len(), 1);
+    assert_eq!(c.weight, 200);
+    // The entry count still bounds small histories.
+    let mut c = Cache::default();
+    for i in 0..15 {
+        c.insert(&path(i), 1, None, &rows(1, 0), caps);
+    }
+    assert_eq!((c.entries.len(), c.weight), (10, 10));
+    c.remove(&path(14));
+    assert_eq!((c.entries.len(), c.weight), (9, 9));
+    // The process-wide bound holds the largest history a run makes more than twice.
+    assert!(weight(&rows(u32::try_from(MAX_HISTORY).unwrap(), 96)) * 2 < CACHE_WEIGHT);
+}
+
+/// A reader that only serializes the epochs gets the same `Arc` while the file is unchanged:
+/// nothing is copied per poll (audit 2026-11, RA-080). A removed run leaves the cache.
+#[test]
+fn an_unchanged_history_is_shared_not_copied() {
+    let t = Scratch::new("shared");
+    let run_dir = t.0.join("20261028-011025-3bf3");
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let store = t.0.join(RUNS_FILE);
+    std::fs::write(&store, old_runs_json(&run_dir)).unwrap();
+    let svc = service(&store);
+    let id = "20261028-011025-3bf3";
+    let shown = svc.shown();
+    let again = svc.shown();
+    let (r, h) = &shown[0];
+    assert_eq!(**h, fixture_history());
+    assert!(
+        r.progress.as_ref().unwrap().history.is_empty(),
+        "the record holds none"
+    );
+    assert!(Arc::ptr_eq(h, &again[0].1), "the same Arc, not a copy");
+    let one = svc.history(id).unwrap();
+    assert!(Arc::ptr_eq(h, &one));
+    assert!(svc.history("nope").is_none());
+    // A changed file is read again.
+    let path = history_path(&run_dir);
+    layout::append_line(
+        &path,
+        r#"{"epoch":6,"elapsed_s":60.0,"metrics":{"map":0.5}}"#,
+    )
+    .unwrap();
+    let next = svc.history(id).unwrap();
+    assert!(!Arc::ptr_eq(h, &next));
+    assert_eq!(next.len(), 6);
+    // The reader before the queue started shares the same way.
+    drop(svc);
+    let before = load_shown(&store);
+    assert!(Arc::ptr_eq(&before[0].1, &next));
+    let svc = service(&store);
+    assert!(is_cached(&path));
+    svc.remove(id).unwrap();
+    assert!(
+        !is_cached(&path),
+        "a removed run's history leaves the cache"
+    );
 }

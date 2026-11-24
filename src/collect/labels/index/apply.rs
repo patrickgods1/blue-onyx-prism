@@ -285,7 +285,7 @@ impl Index {
     /// Over the ceiling, say so once and stop: the route walks from now on.
     pub(super) fn check_ceiling(self: &Arc<Self>) {
         let bytes = self.bytes();
-        if bytes > self.timing.ceiling {
+        if bytes > self.ceiling() {
             self.over_ceiling(bytes);
         }
     }
@@ -306,7 +306,7 @@ impl Index {
             bytes / (1024 * 1024),
             self.done.load(Ordering::Acquire),
             self.total.load(Ordering::Acquire),
-            self.timing.ceiling / (1024 * 1024),
+            self.ceiling() / (1024 * 1024),
         );
     }
 }

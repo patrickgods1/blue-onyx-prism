@@ -32,7 +32,6 @@
 
 use super::train_area::{REFINE, tab_title};
 use super::{AppState, Shared, blocking, render, training};
-use crate::backend::Runtimes;
 use crate::collect::labels::LabelFile;
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::queue::{self, Filters};
@@ -1105,7 +1104,7 @@ fn conflict(message: String) -> Refusal {
 }
 
 /// Plan `request` and queue it through `enqueue`, which gets the job with its predictor set
-/// (`runtimes`: the registry's). Refuses, before anything is queued, when a check is already
+/// (`runtimes`: resolves the current generation's at each prediction). Refuses, before anything is queued, when a check is already
 /// queued or running, the folder under review is unplugged, the frames could not be checked
 /// ([`check::preview`]'s `refused`: too few reviewed frames, ...), the check would replace open
 /// suggestions without `replace_open` (409 with `needs_confirm`: the preview's count, so no
@@ -1122,7 +1121,7 @@ fn start_check(
     replace_open: bool,
     cap: &Capability,
     tasks: &[TaskRecord],
-    runtimes: Option<Arc<Mutex<Runtimes>>>,
+    runtimes: Option<crate::training::autolabel::relabel::RuntimesResolver>,
     enqueue: Enqueue<'_>,
 ) -> Result<(String, String), Refusal> {
     if let Some(m) = busy_message(tasks) {
@@ -1154,7 +1153,10 @@ fn start_check(
     }
     let mut job = check::plan_refine(config, request, cap)
         .map_err(|e| Refusal::bad(format!("Not queued: {}", for_the_page(&format!("{e:#}")))))?;
-    job.predictor = Some(Arc::new(LocalPredictor::new(config.clone(), runtimes)));
+    job.predictor = Some(Arc::new(match runtimes {
+        Some(r) => LocalPredictor::resolving(config.clone(), r),
+        None => LocalPredictor::new(config.clone(), None),
+    }));
     let title = Task::title(&job);
     let id = enqueue(job, &busy_message).map_err(|e| match e {
         NotQueued::Refused(m) => conflict(m),
@@ -1204,7 +1206,11 @@ pub(super) async fn start(
         let cap = crate::training::capability_now();
         let tasks = training::tasks(&state);
         let queue = training::service(&shared);
-        let runtimes = state.registry.runtimes().cloned();
+        // Resolved at each prediction: a queued check pins no retired generation's runtimes.
+        let runtimes: Option<crate::training::autolabel::relabel::RuntimesResolver> = Some({
+            let s = shared.clone();
+            Arc::new(move || s.current().registry.runtimes().cloned())
+        });
         match start_check(
             &config,
             request,

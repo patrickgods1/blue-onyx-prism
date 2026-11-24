@@ -964,6 +964,8 @@ impl RefineJob {
                     model.onnx.display()
                 )
             })?;
+        // The fold model was compiled, run and dropped: give the freed heap back.
+        crate::backend::memory::trim_soon("dataset check fold finished");
         if found.cancelled || cancel.load(Ordering::Relaxed) {
             return Err(anyhow!(Cancelled));
         }

@@ -153,16 +153,15 @@ fn resume_at(rows: &[EpochPoint], d: &[u64], have: Option<&Have>) -> Option<(usi
     }
 }
 
-/// `r` as the poll answers it ([`answer`]).
-fn run_value(mut r: RunRecord, have: Option<&Have>) -> Value {
-    let rows = r
-        .progress
-        .as_mut()
-        .map(|p| {
-            p.losses.clear();
-            std::mem::take(&mut p.history)
-        })
-        .unwrap_or_default();
+/// `r` with its epochs `rows` as the poll answers it ([`answer`]). `rows` is borrowed (the
+/// history cache's or the running job's shared copy): only the rows sent are serialized.
+fn run_value(mut r: RunRecord, rows: &[EpochPoint], have: Option<&Have>) -> Value {
+    if let Some(p) = r.progress.as_mut() {
+        p.losses.clear();
+        // A record that still holds epochs of its own was handed `rows` from them
+        // ([`crate::training::service::history::share`]); none is serialized from the record.
+        p.history.clear();
+    }
     let busy = r.state.is_busy();
     if busy {
         let skip = r.log.len().saturating_sub(POLL_LOG_LINES);
@@ -183,8 +182,8 @@ fn run_value(mut r: RunRecord, have: Option<&Have>) -> Value {
     }
     if let Some(p) = obj.get_mut("progress").and_then(Value::as_object_mut) {
         p.remove("losses");
-        let d = digests(&rows);
-        let (from, since) = match resume_at(&rows, &d, have) {
+        let d = digests(rows);
+        let (from, since) = match resume_at(rows, &d, have) {
             Some((i, since)) => (i, Some(since)),
             None => (0, None),
         };
@@ -208,27 +207,89 @@ fn run_value(mut r: RunRecord, have: Option<&Have>) -> Value {
     v
 }
 
+/// A task as the poll answers it ([`task_value`]): every field of a [`TaskRecord`] borrowed, but
+/// no `result` and a `log` only while it is busy (its tail), so neither is serialized only to be
+/// dropped again (audit 2026-11, phase 5).
+#[derive(serde::Serialize)]
+struct TaskPoll<'a> {
+    id: &'a str,
+    kind: crate::training::task::TaskKind,
+    title: &'a str,
+    created: &'a str,
+    state: crate::training::service::RunState,
+    stage: Option<&'a str>,
+    step: usize,
+    steps: usize,
+    percent: u8,
+    detail: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log: Option<&'a [String]>,
+    summary: Option<&'a str>,
+    error: Option<&'a str>,
+    finished: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<&'a str>,
+    #[serde(skip_serializing_if = "no_uses")]
+    uses: &'a [String],
+}
+
+/// `TaskRecord::uses`'s own `skip_serializing_if`, through the borrow.
+fn no_uses(u: &&[String]) -> bool {
+    u.is_empty()
+}
+
 /// `t` as the poll answers it: no `result`, a `log` only while it is busy (its tail).
 fn task_value(t: &TaskRecord) -> Value {
-    let mut v = serde_json::to_value(t).unwrap_or(Value::Null);
-    if let Some(obj) = v.as_object_mut() {
-        obj.remove("result");
-        if t.state.is_busy() {
-            let skip = t.log.len().saturating_sub(POLL_LOG_LINES);
-            let tail = t.log.get(skip..).unwrap_or_default();
-            obj.insert("log".into(), Value::from(tail.to_vec()));
-        } else {
-            obj.remove("log");
-        }
-    }
-    v
+    // Every field named, so a field added to the record fails to compile here until it is listed.
+    let TaskRecord {
+        id,
+        kind,
+        title,
+        created,
+        state,
+        stage,
+        step,
+        steps,
+        percent,
+        detail,
+        log,
+        summary,
+        result: _,
+        error,
+        finished,
+        after,
+        uses,
+    } = t;
+    let log = state.is_busy().then(|| {
+        let skip = log.len().saturating_sub(POLL_LOG_LINES);
+        log.get(skip..).unwrap_or_default()
+    });
+    serde_json::to_value(TaskPoll {
+        id,
+        kind: *kind,
+        title,
+        created,
+        state: *state,
+        stage: stage.as_deref(),
+        step: *step,
+        steps: *steps,
+        percent: *percent,
+        detail,
+        log,
+        summary: summary.as_deref(),
+        error: error.as_deref(),
+        finished: finished.as_deref(),
+        after: after.as_deref(),
+        uses,
+    })
+    .unwrap_or(Value::Null)
 }
 
 /// The poll answer (see the module docs) of `runs` and `tasks` for a page holding `have`; None =
 /// the query had no `have` (the page's first poll), so the answer carries the `metrics` catalog,
 /// which the page keeps.
 pub(super) fn answer(
-    runs: Vec<RunRecord>,
+    runs: Vec<crate::training::service::Shown>,
     tasks: &[TaskRecord],
     busy: bool,
     metric_columns: Value,
@@ -243,9 +304,9 @@ pub(super) fn answer(
         "runs".into(),
         Value::from(
             runs.into_iter()
-                .map(|r| {
+                .map(|(r, rows)| {
                     let h = held.get(&r.id);
-                    run_value(r, h)
+                    run_value(r, &rows, h)
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -296,9 +357,19 @@ mod tests {
         r
     }
 
+    /// `runs` (each holding its epochs) as the service shares them: the epochs moved out.
+    fn shared(runs: Vec<RunRecord>) -> Vec<crate::training::service::Shown> {
+        runs.into_iter()
+            .map(|mut r| {
+                let h = crate::training::service::history::share(&mut r, None);
+                (r, h)
+            })
+            .collect()
+    }
+
     fn poll(runs: Vec<RunRecord>, have: &str) -> Value {
         answer(
-            runs,
+            shared(runs),
             &[],
             true,
             Value::Null,
@@ -438,6 +509,149 @@ mod tests {
         assert!(task_value(&t).get("log").is_none());
     }
 
+    /// The answer of a task before the projection (`to_value`, then `result` and `log` taken out):
+    /// what [`task_value`] must still answer, byte for byte.
+    fn task_value_before(t: &TaskRecord) -> Value {
+        let mut v = serde_json::to_value(t).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("result");
+        if t.state.is_busy() {
+            let skip = t.log.len().saturating_sub(POLL_LOG_LINES);
+            obj.insert("log".into(), Value::from(t.log[skip..].to_vec()));
+        } else {
+            obj.remove("log");
+        }
+        v
+    }
+
+    #[test]
+    fn the_task_projection_answers_what_the_full_record_did() {
+        use crate::training::task::TaskKind;
+        for (state, after, uses, opt) in [
+            (RunState::Running, None, vec![], None),
+            (
+                RunState::Paused,
+                Some("t0"),
+                vec!["gpu".to_string()],
+                Some("x"),
+            ),
+            (RunState::Queued, Some("t0"), vec![], None),
+            (
+                RunState::Done,
+                None,
+                vec!["gpu".into(), "dataset".into()],
+                Some("y"),
+            ),
+            (RunState::Failed, None, vec![], Some("z")),
+        ] {
+            let t = TaskRecord {
+                id: "t".into(),
+                kind: TaskKind::Refine,
+                title: "Check \"x\"".into(),
+                created: "2026-11-23T10:00:00Z".into(),
+                state,
+                stage: opt.map(str::to_string),
+                step: 3,
+                steps: 7,
+                percent: 42,
+                detail: "d".into(),
+                log: (0..55).map(|i| format!("l{i}")).collect(),
+                summary: opt.map(|o| format!("s {o}")),
+                result: Some(serde_json::json!({ "frames": [1, 2, 3] })),
+                error: opt.map(|o| format!("e {o}")),
+                finished: opt.map(str::to_string),
+                after: after.map(str::to_string),
+                uses,
+            };
+            let (now, before) = (task_value(&t), task_value_before(&t));
+            assert_eq!(now, before, "{state:?}");
+            assert_eq!(now.to_string(), before.to_string(), "byte for byte");
+        }
+    }
+
+    /// The answer of a run before its epochs were shared: taken out of the record it held them,
+    /// what [`run_value`] must still answer, byte for byte.
+    fn run_value_before(mut r: RunRecord, have: Option<&Have>) -> Value {
+        let rows = r
+            .progress
+            .as_mut()
+            .map(|p| {
+                p.losses.clear();
+                std::mem::take(&mut p.history)
+            })
+            .unwrap_or_default();
+        let busy = r.state.is_busy();
+        if busy {
+            let skip = r.log.len().saturating_sub(POLL_LOG_LINES);
+            r.log.drain(..skip);
+        }
+        let mut v = serde_json::to_value(&r).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        if !busy {
+            obj.remove("log");
+        }
+        for k in UNREAD_RUN_FIELDS {
+            obj.remove(*k);
+        }
+        if let Some(d) = obj.get_mut("dataset").and_then(Value::as_object_mut) {
+            d.retain(|k, _| k == "warnings");
+        }
+        if let Some(p) = obj.get_mut("progress").and_then(Value::as_object_mut) {
+            p.remove("losses");
+            let d = digests(&rows);
+            let (from, since) = match resume_at(&rows, &d, have) {
+                Some((i, since)) => (i, Some(since)),
+                None => (0, None),
+            };
+            p.insert(
+                "history".into(),
+                serde_json::to_value(&rows[from..]).unwrap(),
+            );
+            if let Some(s) = since {
+                p.insert("history_since".into(), Value::from(s));
+            }
+            if let [.., prefix, full] = d.as_slice()
+                && !rows.is_empty()
+            {
+                p.insert(
+                    "history_keys".into(),
+                    Value::from(vec![hex(*prefix), hex(*full)]),
+                );
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn a_shared_history_answers_what_the_copied_one_did() {
+        let rows = vec![row(1, 0.1), row(2, 0.2), row(3, 0.3)];
+        let first = poll(vec![run_with("r", rows.clone())], "");
+        let held = parse_have(&have_of("r", &first));
+        let mut done = run_with("d", rows.clone());
+        done.state = RunState::Done;
+        for have in [None, held.get("r")] {
+            for r in [
+                run_with("r", rows.clone()),
+                run_with("r", vec![]),
+                done.clone(),
+            ] {
+                let before = run_value_before(r.clone(), have);
+                // From the record's own epochs (an older runs.json) and from a shared copy.
+                let mut own = r.clone();
+                let h = crate::training::service::history::share(&mut own, None);
+                let now = run_value(own, &h, have);
+                assert_eq!(now.to_string(), before.to_string());
+                let mut bare = r.clone();
+                let rows = bare
+                    .progress
+                    .as_mut()
+                    .map(|p| std::sync::Arc::new(std::mem::take(&mut p.history)))
+                    .unwrap_or_default();
+                assert_eq!(run_value(bare, &rows, have).to_string(), before.to_string());
+            }
+        }
+    }
+
     /// Whether `node` runs here; missing, a skip, or with `BOP_REQUIRE_NODE=1` (CI) a failure.
     fn have_node() -> bool {
         let ok = std::process::Command::new("node")
@@ -539,7 +753,7 @@ process.stdout.write(JSON.stringify({ store: input.store, have: P.have(input.sto
                 .map(|r| (r.id.clone(), r.progress.as_ref().unwrap().history.clone()))
                 .collect();
             let ans = answer(
-                runs,
+                shared(runs),
                 &[],
                 true,
                 Value::Null,

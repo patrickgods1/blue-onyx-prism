@@ -17,7 +17,9 @@ pub const MAX_INPUT_TENSOR_BYTES: u64 = 256 << 20;
 
 /// Reject a model input size that is zero, wider/taller than [`MAX_INPUT_SIDE`] or whose f32
 /// CHW tensor would exceed [`MAX_INPUT_TENSOR_BYTES`]. The size comes from the model file, so a
-/// broken or hostile export must fail the model instead of aborting the process on allocation.
+/// broken or hostile export must fail the model instead of aborting the process on allocation:
+/// both backends call it at load (`backend::device::image_input_size`), and
+/// [`Preprocessor::run_into`] again before it allocates.
 pub fn check_input_size(input_w: u32, input_h: u32) -> Result<()> {
     if input_w == 0 || input_h == 0 {
         bail!("invalid model input size {input_w}x{input_h}");
@@ -38,7 +40,8 @@ pub fn check_input_size(input_w: u32, input_h: u32) -> Result<()> {
 /// Reusable preprocessor. Buffers (resized image, output tensor, resizer scratch) are kept
 /// across calls so steady-state operation does not allocate. Nothing is allocated until the
 /// first [`Self::run`]; an input size that fails [`check_input_size`] makes `run` return an
-/// error (use [`Self::try_new`] / [`Self::try_for_family`] to reject it at load time).
+/// error. Model loads reject such a size before this is built
+/// (`backend::device::image_input_size`, called by both backends).
 pub struct Preprocessor {
     input_w: u32,
     input_h: u32,
@@ -108,21 +111,9 @@ impl Preprocessor {
         }
     }
 
-    /// [`Self::new`] after [`check_input_size`].
-    pub fn try_new(input_w: u32, input_h: u32, mode: ResizeMode) -> Result<Self> {
-        check_input_size(input_w, input_h)?;
-        Ok(Self::new(input_w, input_h, mode))
-    }
-
     /// Preprocessor for `family`: its resize mode and normalization.
     pub fn for_family(input_w: u32, input_h: u32, family: &dyn Family) -> Self {
         Self::new(input_w, input_h, family.resize_mode()).with_normalization(family.normalization())
-    }
-
-    /// [`Self::for_family`] after [`check_input_size`].
-    pub fn try_for_family(input_w: u32, input_h: u32, family: &dyn Family) -> Result<Self> {
-        check_input_size(input_w, input_h)?;
-        Ok(Self::for_family(input_w, input_h, family))
     }
 
     /// Normalize each channel as `(v / 255 - mean) / std` (None = plain `0..1`).
@@ -405,8 +396,6 @@ mod tests {
         assert!(e.contains("8193x32") && e.contains("8192"), "{e}");
         let e = check_input_size(8192, 8192).unwrap_err().to_string();
         assert!(e.contains("byte"), "{e}");
-        assert!(Preprocessor::try_new(16384, 16384, ResizeMode::Letterbox).is_err());
-        assert!(Preprocessor::try_new(640, 640, ResizeMode::Letterbox).is_ok());
         // `new` never allocates; the oversize is rejected by `run` instead of aborting.
         let mut p = Preprocessor::new(16384, 16384, ResizeMode::Letterbox);
         let img = solid(4, 4, [0, 0, 0]);

@@ -1377,7 +1377,7 @@ impl ImportJob {
         let picked = select::pick(
             &group_refs,
             &hashes,
-            embeddings.as_deref(),
+            embeddings.as_ref().map(|(e, d)| (e.as_slice(), *d)),
             r.frames,
             r.balance,
         );
@@ -1585,30 +1585,54 @@ impl ImportJob {
     }
 }
 
-/// Read `n` L2-normalized float32 rows (little endian) of `dim` values from `path`.
-pub fn read_embeddings(path: &Path, n: usize, dim: Option<u64>) -> Result<Vec<Vec<f32>>> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+/// Bytes read at a time by [`read_embeddings`] (a multiple of 4: whole floats).
+const EMBED_READ_CHUNK: usize = 1 << 16;
+
+/// Read `n` L2-normalized float32 rows (little endian) of `dim` values from `path`: all of them in
+/// one flat `Vec<f32>` (row `i` at `i * dim ..`) and the row length. The file is decoded as it is
+/// read, a chunk at a time, so the floats are the only full copy held (audit 2026-11, RA-101: the
+/// bytes, a flat copy and a `Vec` per row used to be alive at once, about 3 x 61 MB for 20,000
+/// rows of 768).
+pub fn read_embeddings(path: &Path, n: usize, dim: Option<u64>) -> Result<(Vec<f32>, usize)> {
+    use std::io::Read as _;
+    let reading = || format!("reading {}", path.display());
+    let mut file = std::fs::File::open(path).with_context(reading)?;
+    let len = file.metadata().with_context(reading)?.len();
     if n == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
-    let floats = bytes.len() / 4;
+    let bytes = usize::try_from(len).unwrap_or(usize::MAX);
+    let floats = bytes / 4;
     let d = dim
         .and_then(|d| usize::try_from(d).ok())
         .unwrap_or(floats / n);
-    if d == 0 || floats != n * d || bytes.len() % 4 != 0 {
+    if d == 0 || n.checked_mul(d) != Some(floats) || bytes % 4 != 0 {
         bail!(
-            "{}: {} bytes are not {n} embeddings of {d} floats",
-            path.display(),
-            bytes.len()
+            "{}: {len} bytes are not {n} embeddings of {d} floats",
+            path.display()
         );
     }
-    let all: Vec<f32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| f32::from_le_bytes(*c))
-        .collect();
-    Ok(all.chunks(d).map(<[f32]>::to_vec).collect())
+    let mut all: Vec<f32> = Vec::with_capacity(floats);
+    let mut buf = vec![0u8; EMBED_READ_CHUNK];
+    while all.len() < floats {
+        let want = (floats - all.len()).saturating_mul(4).min(EMBED_READ_CHUNK);
+        let chunk = buf.get_mut(..want).unwrap_or_default();
+        file.read_exact(chunk).with_context(|| {
+            format!(
+                "reading {}: it ended before its {n} embeddings of {d} floats (did \
+                 something change it while it was read?); run the import again",
+                path.display()
+            )
+        })?;
+        all.extend(
+            chunk
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c)),
+        );
+    }
+    Ok((all, d))
 }
 
 /// Sets its flag when dropped (also when the stages panic).

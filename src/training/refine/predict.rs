@@ -8,12 +8,14 @@
 //! paths are unchanged. A quick check ([`super::quick`]) runs its configured model the same way,
 //! with that model's own entry ([`FoldModel::entry`]) instead of a built one.
 
-use crate::backend::{CoreOptions, Runtimes};
+use crate::backend::Runtimes;
 use crate::benchmark::images::SetImage;
 use crate::config::{Config, ModelConfig};
 use crate::model::ModelFamilyKind;
 use crate::sync::LockExt;
-use crate::training::autolabel::relabel::{Detections, Detector, Image, LocalDetector};
+use crate::training::autolabel::relabel::{
+    Detections, Detector, Image, LocalDetector, RuntimesResolver, own_runtimes,
+};
 use anyhow::{Context as _, Result};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -66,10 +68,13 @@ pub fn model_entry(m: &FoldModel) -> ModelConfig {
     }
 }
 
-/// The real [`FoldPredictor`]: the registry's runtimes when given (the service: no second
-/// OpenVINO / ONNX Runtime instance), else its own, made once for the whole check (the CLI).
+/// The real [`FoldPredictor`]: the current registry generation's runtimes when it has a resolver
+/// (the service: asked at each prediction, never kept past it, so a check queued before a
+/// generation restart uses the new generation's; audit 2026-11, RA-100), else the runtimes given,
+/// else its own, made once for the whole check (the CLI).
 pub struct LocalPredictor {
     config: Config,
+    resolve: Option<RuntimesResolver>,
     runtimes: Mutex<Option<Arc<Mutex<Runtimes>>>>,
 }
 
@@ -91,27 +96,30 @@ impl LocalPredictor {
     pub fn new(config: Config, runtimes: Option<Arc<Mutex<Runtimes>>>) -> Self {
         Self {
             config,
+            resolve: None,
             runtimes: Mutex::new(runtimes),
         }
     }
 
+    /// A predictor on `config` that asks `resolve` for the runtimes at each prediction (a queued
+    /// job of the service); when it answers none, its own are made once.
+    pub fn resolving(config: Config, resolve: RuntimesResolver) -> Self {
+        Self {
+            config,
+            resolve: Some(resolve),
+            runtimes: Mutex::new(None),
+        }
+    }
+
     fn runtimes(&self) -> Result<Arc<Mutex<Runtimes>>> {
+        if let Some(rt) = self.resolve.as_ref().and_then(|r| r()) {
+            return Ok(rt);
+        }
         let mut slot = self.runtimes.lock_recover();
         if let Some(rt) = slot.as_ref() {
             return Ok(rt.clone());
         }
-        let c = &self.config;
-        crate::backend::libs::prepare_environment(c.openvino_dir_effective().as_deref());
-        let rt = Runtimes::new_with(
-            &CoreOptions {
-                cache_dir: c.cache_dir_path(),
-                intra_threads: c.intra_threads,
-                openvino_dir: c.openvino_dir_effective(),
-            },
-            &c.ort_options(),
-        );
-        rt.require_any()?;
-        let rt = Arc::new(Mutex::new(rt));
+        let rt = own_runtimes(&self.config)?;
         *slot = Some(rt.clone());
         Ok(rt)
     }
@@ -254,6 +262,50 @@ mod tests {
             ..m
         };
         assert_eq!(model_entry(&q), own);
+    }
+
+    /// A queued check asks for the runtimes when it predicts, not when it was queued: after a
+    /// generation restart it gets the new generation's, and it keeps none of them in between
+    /// (audit 2026-11, RA-100).
+    #[test]
+    fn a_queued_check_uses_the_current_generations_runtimes() {
+        let fake = || {
+            Arc::new(Mutex::new(Runtimes::fake(
+                crate::backend::fake::FakeScript::new(1, (64, 64)),
+            )))
+        };
+        let current = Arc::new(Mutex::new(fake()));
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (c, n) = (current.clone(), asked.clone());
+        let resolve: RuntimesResolver = Arc::new(move || {
+            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(c.lock().unwrap().clone())
+        });
+        let p = LocalPredictor::resolving(Config::default(), resolve);
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing at queue time"
+        );
+        let first = current.lock().unwrap().clone();
+        let got = p.runtimes().unwrap();
+        assert!(Arc::ptr_eq(&got, &first));
+        drop(got);
+        // A generation restart: the old runtimes are only the test's now.
+        let second = fake();
+        *current.lock().unwrap() = second.clone();
+        assert_eq!(Arc::strong_count(&first), 1, "the predictor keeps none");
+        assert!(Arc::ptr_eq(&p.runtimes().unwrap(), &second));
+        assert_eq!(
+            Arc::strong_count(&second),
+            2,
+            "the resolver's and the test's only"
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // Given runtimes (no resolver) stay those.
+        let given = fake();
+        let q = LocalPredictor::new(Config::default(), Some(given.clone()));
+        assert!(Arc::ptr_eq(&q.runtimes().unwrap(), &given));
     }
 
     fn image(frame: &str, path: PathBuf) -> Image {

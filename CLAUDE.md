@@ -177,7 +177,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   - Health: inference that never returns -> Failed("inference stuck ...") (`worker::watch::collect_watched`); repeated
     errors or all-zero/NaN outputs (a reset GPU) -> Failed("inference broken ...") (`note_health` in `worker/run.rs`);
     the generation's `supervisor` reloads models that failed while serving, with a doubling backoff. A warm-up past
-    `worker::run::WARMUP_TIMEOUT` abandons that device (backend leaked, next candidate tried).
+    `worker::run::WARMUP_TIMEOUT` abandons that device (backend leaked, next candidate tried); a device a reaper
+    still waits on is skipped and its upgrade tries held until the reaper ends (`worker::reap::hung_device`).
   - Logs: per-request debug line (`model/device/request_id/inference_ms/process_ms/round_trip_ms`) and an
     `X-Request-Id` header; `log_format: text|json` (file appender only); `cli::log_files` caps size and age, today's
     file never deleted. Error messages state what happened, the likely cause and the next action.
@@ -418,8 +419,11 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   by exact name only: atomic-write temps after 1 h, review-export `.building-*`, export staging, download leftovers
   under a try of the download / export lock, `manager::leftovers`, `export::leftovers`). Never labels, datasets, exports, models, runs, a failed run's `work` (the retry
   checkpoint) or logs. GPU memory: jobs warn, never refuse, on short free memory (except a labeler that cannot fit the
-  card at all, `autolabel::memory::too_big`); loaded models register as holders (`vram::hold`). `MALLOC_ARENA_MAX=2` in
-  the systemd unit and the Docker image.
+  card at all, `autolabel::memory::too_big`); loaded models register as holders (`vram::hold`). Freed host memory goes back through
+  `backend::memory::trim_soon` (one coalescing `bop-trim` thread; called after loads, retires, reaps, jobs, benchmarks,
+  exports, sign-in bursts), never per request; the prep pool drops a tensor size with its last model (`LengthHold`) or
+  after 10 min. Linux glibc: `memory::tune_allocator` (arena max 2, 8 MiB mmap threshold) first in every binary unless
+  the environment sets them; the systemd unit and Docker image set them too.
 
 - **Benchmark** (`src/benchmark/`, `server/benchmark/`): grades models x devices into `benchmark.json` next to the config
   (preds in `benchmark-preds.json`).

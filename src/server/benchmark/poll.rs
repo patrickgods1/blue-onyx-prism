@@ -53,37 +53,35 @@ pub(super) fn ask(query: Option<&str>) -> Ask {
     a
 }
 
-/// The run's models as last serialized: the models as the service had them (before the
-/// rebase), the view tag (which covers what the rebase reads, the config now), their JSON and
-/// its tag. Their progress ticks every second, they change once per device run, so most polls
-/// of a run reuse the JSON (equal models, compared, never guessed). Kept only while a run goes.
+/// The run's models as last serialized, under the view tag (which covers what the rebase reads,
+/// the config now): the models as the service had them (before the rebase), their JSON and its
+/// tag. Their progress ticks every second, they change once per device run, so most polls of a
+/// run reuse the JSON (equal models, compared, never guessed). Kept only while a run goes: a
+/// poll after the run drops it, and so does the cache's idle thread when no page polls any more
+/// (a tab closed mid-run), after [`crate::benchmark::search::CACHE_IDLE`] (RA-098).
 struct RunModels {
-    view_tag: String,
     models: Vec<crate::benchmark::ModelResult>,
     json: std::sync::Arc<RawValue>,
     tag: String,
 }
 
-type RunModelsSlot = std::sync::Mutex<Option<RunModels>>;
+type RunModelsSlot = crate::benchmark::search::IdleCache<String, std::sync::Arc<RunModels>>;
 
 /// The service's slot (one benchmark per process).
-static RUN_MODELS: RunModelsSlot = std::sync::Mutex::new(None);
+static RUN_MODELS: RunModelsSlot =
+    crate::benchmark::search::IdleCache::new(crate::benchmark::search::CACHE_IDLE);
 
 /// `models` shown against the config now (as the saved results are), serialized, and the tag
 /// of that JSON; `slot` keeps the last one ([`RunModels`]).
 fn models_json(
-    slot: &RunModelsSlot,
+    slot: &'static RunModelsSlot,
     view_tag: &str,
     models: Vec<crate::benchmark::ModelResult>,
     now: &std::collections::HashMap<String, crate::benchmark::current::ModelNow>,
     running: bool,
 ) -> (std::sync::Arc<RawValue>, String) {
-    use crate::sync::LockExt;
-    let mut cache = slot.lock_recover();
-    if let Some(c) = cache
-        .as_ref()
-        .filter(|c| running && c.view_tag == view_tag && c.models == models)
-    {
+    let key = view_tag.to_string();
+    if running && let Some(c) = slot.get(&key).filter(|c| c.models == models) {
         return (c.json.clone(), c.tag.clone());
     }
     let mut rebased = models.clone();
@@ -96,12 +94,18 @@ fn models_json(
     let mut h = std::collections::hash_map::DefaultHasher::new();
     json.get().hash(&mut h);
     let tag = format!("{:016x}", h.finish());
-    *cache = running.then(|| RunModels {
-        view_tag: view_tag.to_string(),
-        models,
-        json: json.clone(),
-        tag: tag.clone(),
-    });
+    if running {
+        slot.put(
+            key,
+            std::sync::Arc::new(RunModels {
+                models,
+                json: json.clone(),
+                tag: tag.clone(),
+            }),
+        );
+    } else {
+        slot.clear();
+    }
     (json, tag)
 }
 
@@ -744,7 +748,9 @@ mod tests {
     #[test]
     fn the_run_models_follow_the_service() {
         use crate::benchmark::report::test_support::{dev, model, scene};
-        let slot: super::RunModelsSlot = std::sync::Mutex::new(None);
+        let slot: &'static super::RunModelsSlot = Box::leak(Box::new(
+            crate::benchmark::search::IdleCache::new(crate::benchmark::search::CACHE_IDLE),
+        ));
         let now = std::collections::HashMap::new();
         let mk = |devices: &[(&str, f64)]| {
             let mut m = model(
@@ -758,19 +764,19 @@ mod tests {
         let models_of =
             |j: &RawValue| -> serde_json::Value { serde_json::from_str(j.get()).unwrap() };
 
-        let (a, ta) = super::models_json(&slot, "v1", one.clone(), &now, true);
-        let (b, tb) = super::models_json(&slot, "v1", one.clone(), &now, true);
+        let (a, ta) = super::models_json(slot, "v1", one.clone(), &now, true);
+        let (b, tb) = super::models_json(slot, "v1", one.clone(), &now, true);
         assert!(Arc::ptr_eq(&a, &b), "the same models: reused");
         assert_eq!(ta, tb);
 
         // The model moves to its next device.
         let two = vec![mk(&[("openvino:cpu", 10.0), ("ort:cpu", 20.0)])];
-        let (c, tc) = super::models_json(&slot, "v1", two.clone(), &now, true);
+        let (c, tc) = super::models_json(slot, "v1", two.clone(), &now, true);
         assert_ne!(tc, ta);
         assert_eq!(models_of(&c)[0]["devices"].as_array().unwrap().len(), 2);
         // A device's numbers change with the device count the same.
         let changed = vec![mk(&[("openvino:cpu", 10.0), ("ort:cpu", 25.0)])];
-        let (d, td) = super::models_json(&slot, "v1", changed.clone(), &now, true);
+        let (d, td) = super::models_json(slot, "v1", changed.clone(), &now, true);
         assert_ne!(td, tc);
         assert_eq!(models_of(&d), serde_json::to_value(&changed).unwrap());
         // The next model.
@@ -778,13 +784,19 @@ mod tests {
         let mut y = mk(&[("openvino:cpu", 5.0)]);
         y.model = "y".into();
         next.push(y);
-        let (e, _) = super::models_json(&slot, "v1", next.clone(), &now, true);
+        let (e, _) = super::models_json(slot, "v1", next.clone(), &now, true);
         assert_eq!(models_of(&e)[1]["model"], "y");
         // Another view tag (the config now changed): serialized again; not running: not kept.
-        let (f, _) = super::models_json(&slot, "v2", next.clone(), &now, true);
+        let (f, _) = super::models_json(slot, "v2", next.clone(), &now, true);
         assert!(!Arc::ptr_eq(&e, &f));
-        let _ = super::models_json(&slot, "v2", next, &now, false);
-        assert!(slot.lock().unwrap().is_none());
+        let _ = super::models_json(slot, "v2", next.clone(), &now, false);
+        assert!(slot.is_empty());
+        // A run whose page stopped polling: its models go once unread for the idle time.
+        let _ = super::models_json(slot, "v3", next, &now, true);
+        assert_eq!(slot.len(), 1);
+        let later = std::time::Instant::now() + crate::benchmark::search::CACHE_IDLE;
+        assert!(!slot.sweep_at(later));
+        assert!(slot.is_empty());
     }
 
     /// The run poll never rebuilds the saved view while nothing it is made of changes.

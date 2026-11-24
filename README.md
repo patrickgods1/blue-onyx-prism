@@ -48,6 +48,9 @@ build covers compute capability 6.1 (GTX 10-series), 7.5, 8.6, 8.9 and 12.0 on W
 12.0 (10.0 excepted) on Linux; `list-devices` and the device dropdown show the reason, and an installed
 older build that lacks the kernels is offered as an update. TensorRT 10 needs 7.5+ (Turing or newer), and
 a driver that cannot run CUDA 12 (older than R525) skips both. Such a card starts at DirectML on Windows.
+A GPU whose driver stopped answering (a stuck inference or warm-up) is not tried again until the stuck
+work on it has been freed: the model keeps serving on the next device, and a service or machine restart
+recovers the GPU.
 
 When `benchmark.json` (written by `benchmark` next to the config) has results for a model, `auto` orders
 that model's devices by measured speed instead: the devices `benchmark` would recommend (ran, agree with
@@ -1106,6 +1109,7 @@ the most uploads allowed in progress, `body_timeout`: an upload took over 10 s t
 - `blue_onyx_prism_download_bytes_total`: bytes downloaded by the resource manager (runtimes, models, datasets).
 - `blue_onyx_prism_download_failures_total`: downloads that failed (network, size or SHA-256 mismatch).
 - `blue_onyx_prism_process_resident_memory_bytes`: resident memory of the process (the working set on Windows; also `residentMemoryBytes` in `/stats.json`).
+- `blue_onyx_prism_process_private_bytes`: memory the process owns alone: private bytes (the commit) on Windows, which a working-set trim by the OS does not lower, so it is the one to watch for a leak there; the physical footprint on macOS; `RssAnon` on Linux.
 - `blue_onyx_prism_process_memory_footprint_bytes`: macOS only, the process's physical footprint, which also counts compressed and GPU-backed memory the resident size misses (also `memoryFootprintBytes` in `/stats.json`).
 - `blue_onyx_prism_process_open_fds`: open file descriptors (Linux only).
 - `blue_onyx_prism_dataset_requests_total`, `blue_onyx_prism_dataset_offered_total`, `blue_onyx_prism_dataset_saved_total`, `blue_onyx_prism_dataset_no_bucket_total`, `blue_onyx_prism_dataset_frames_total{bucket}`, `blue_onyx_prism_dataset_dropped_total{reason="queue_full|rate|dup|disk|error"}`, `blue_onyx_prism_dataset_bytes` and `blue_onyx_prism_dataset_collect_disabled`: the dataset collector (`collect`).
@@ -1459,6 +1463,9 @@ it into `/var/lib/blue-onyx-prism`. An existing `/opt/blue-onyx-prism/blue_onyx_
 and `models/` are copied over on the first install. Run other commands against that config as the
 service user, e.g. `sudo -u blueonyx /opt/blue-onyx-prism/blue-onyx-prism --config
 /var/lib/blue-onyx-prism/blue_onyx_prism_config.json fetch --for-config`.
+On Linux the program limits glibc to two malloc arenas and fixes its mmap threshold at 8 MiB (so large
+buffers go back to the system when freed) unless `MALLOC_ARENA_MAX`, `MALLOC_MMAP_THRESHOLD_` or
+`GLIBC_TUNABLES` already set them; the unit and the Docker image set the same values, which a change there overrides.
 The unit is sandboxed (`ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `NoNewPrivileges`,
 `DevicePolicy=closed` with only `/dev/dri`, a system-call filter); `deploy/blue-onyx-prism.service`
 explains each line, which ones to relax for NVIDIA (`DeviceAllow` lines to uncomment) and where to
@@ -1536,7 +1543,7 @@ the service's own stop short.
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/v1/vision/detection` | multipart `image`, optional `min_confidence`; default model |
+| POST | `/v1/vision/detection` | multipart `image`, optional `min_confidence`; default model (other text fields are ignored; one over 4 KiB or more than 32 fields is refused) |
 | POST | `/v1/vision/custom/{model}` | same, named model |
 | POST, GET | `/v1/vision/custom/list` | configured model names |
 | POST | `/v1/models/add` | add a custom model by file or directory path to the config (`path`, `name`, `family`, `classes`) |
@@ -1620,12 +1627,15 @@ recommendation, `benchmark.json`). Flags: `--model`, `--family`, `--device`, `--
 `--apply-threshold`, `--threshold-objective`, `--threshold-search` (with `--tag`, `--class`, `--search-model`,
 `--search-device`, `--iou`),
 `--report <file.html|.md>`, `--no-save`, `--force-cpu`, `--image` (one file), `--dataset` (repeatable),
-`--images <dir>`, `--gt`, `--max-images`, `--list-datasets`, `--reference-model`, `--accuracy-weight`,
+`--images <dir>`, `--gt`, `--max-images`, `--no-image-cap`, `--list-datasets`, `--reference-model`, `--accuracy-weight`,
 `--repeat` (timed runs per image; 100 for a single image), `--warmup`, `--compare-cpu` (also runs on CPU
 and diffs detections), `--cache-dir` (`""` disables), `--threads`, `--classes`, `--min-confidence`,
 `--config` (enabled models from the config when no `--model`), `--json`, `-v`.
 If GPU latency is not clearly below CPU latency, the GPU was probably not used (check the log) or
 the FP32 path is active.
+Like a run from the web page, the command line benchmarks at most 2000 images in total (spread over the
+datasets, with a warning when it cuts); `--no-image-cap` lifts that for a deliberate large run, which holds
+every result in memory until it ends.
 
 ## Training
 
@@ -1746,6 +1756,10 @@ for throwaway test servers only).
   whole process, to compare inference time and load memory; the log says so once. Unset (or an unknown
   value, which is warned about) keeps HEURISTIC. On a GTX 1070 Ti, EXHAUSTIVE gave the same inference time
   and memory peak as HEURISTIC for rf-detr-nano and dfine-s (docs/PRODUCTION_REVIEW.md).
+- **ONNX Runtime CPU arena (measurement only):** `ort:cpu` sessions keep ONNX Runtime's CPU memory arena,
+  which can hold up to about twice what a model's run needs. `BOP_ORT_CPU_ARENA=0` turns it off for the whole
+  process (the log says so once), to compare private bytes and inference time; every run then allocates and
+  frees its memory, which can cost time per detection. Unset (or any other value) keeps the arena.
 - **GPU usage stays around 60 % with DirectML or CUDA:** Task Manager's GPU column shows the busiest engine
   and under-reports compute work; look at the *Compute_0* / *3D* engine graphs or `nvidia-smi dmon -s u`.
   The server runs two ONNX Runtime sessions per model on a discrete GPU (`ort_sessions`) so one request's

@@ -5,8 +5,10 @@
 //!
 //! - [`OrtRuntime::new`] loads the library once per process (a process can hold only one ONNX
 //!   Runtime) and probes its execution providers into an [`OrtProbe`]: `is_available()` per EP,
-//!   plus for CUDA/TensorRT whether the provider library, CUDA runtime, cuDNN (and TensorRT) can
-//!   be loaded, so the reason names what is missing.
+//!   plus for CUDA/TensorRT whether the provider library, CUDA runtime and cuDNN can be loaded
+//!   (they stay loaded, BE-02) and whether TensorRT's `nvinfer` exists, so the reason names what
+//!   is missing. `nvinfer`, the largest image, is loaded by path only when a TensorRT session is
+//!   built, just before its provider registers (`DepCheck`, RA-086).
 //! - [`OrtRuntime::compile`] creates a session on exactly one EP (registration errors are
 //!   errors, not a silent CPU fallback; the CPU fallback is the caller's candidate loop):
 //!   CUDA `device_id`; TensorRT fp16 with its engine and timing cache in the model's own
@@ -15,7 +17,11 @@
 //!   names, not weights; CUDA behind it for unsupported nodes); DirectML `device_id`, memory
 //!   pattern off, sequential execution; CoreML MLProgram, compute units ALL, cache in
 //!   `cache/coreml`; `intra_threads` everywhere (see [`super::cpu_threads`]) and thread spinning
-//!   off (`BOP_ORT_SPINNING=1` turns it on).
+//!   off (`BOP_ORT_SPINNING=1` turns it on). CPU sessions keep ONNX Runtime's CPU arena;
+//!   `BOP_ORT_CPU_ARENA=0` turns it off, for measurement only (`ENV_ORT_CPU_ARENA`).
+//! - The image input size is checked at load (`super::device::image_input_size`) on the
+//!   pinned shape before any accelerator session is built, so an oversized model fails to load
+//!   instead of allocating a huge frame later.
 //! - [`LoadRequest::no_cache`] (a throwaway model such as a dataset check's fold model): no
 //!   TensorRT engine or timing cache, no CoreML model cache, and the CoreML rewrite below is kept
 //!   in memory (the session loads from its bytes), so nothing of it reaches `cache/`.
@@ -23,7 +29,8 @@
 //!   that have exact equivalents (HardSigmoid/HardSwish, opset < 13 Split; see
 //!   [`super::onnx_rewrite`]), cached as `cache/coreml/<stem>-<sha256/16>-v<N>.onnx`. YOLOv5 then
 //!   runs as one CoreML partition instead of ~50 (6x faster). `BOP_COREML_REWRITE=0` turns it off.
-//!   [`ModelInfo::path`] stays the original file.
+//!   [`ModelInfo::path`] stays the original file. A CoreML compile ends with
+//!   [`super::memory::trim_soon`] (the rewrite and the conversion free a lot of heap).
 //! - Named dynamic dimensions of the image input and RT-DETR's `orig_target_sizes` are pinned
 //!   to `[1,3,640,640]` / `[1,2]` with free-dimension overrides (the same defaults as the
 //!   OpenVINO reshape), so the ports reported in [`ModelInfo`] are static and `make_family`
@@ -34,13 +41,16 @@
 //!   one inference in flight per session (`Session::run` takes `&mut self`): `submit` copies the
 //!   CHW image into the slot's buffer and hands it over, the thread converts extra inputs to the
 //!   port's element type (i64/i32/f32), runs, copies every output into the slot's reused
-//!   [`NamedOutput`] buffers and signals a [`Completion`].
+//!   [`NamedOutput`] buffers and signals a [`Completion`]. The model's [`vram::Hold`] is shared
+//!   by the backend and every session thread, so a thread detached while hung keeps the model
+//!   listed as a holder of the GPU memory its session still has.
 
 use super::detect::{GpuVendor, HardwareInfo};
 #[cfg(test)]
 use super::device::DEFAULT_IMAGE_SHAPE;
 use super::device::{
     DEFAULT_TARGET_SIZES_SHAPE, dynamic_image_shape, extra_input_index, find_image_input,
+    image_input_size,
 };
 use super::select::{EpStatus, NEEDS_ONNX, OrtProbe, cuda_ordinals, onnx_path_for};
 use super::spec::{Runtime, Target};
@@ -300,7 +310,124 @@ fn any_loadable(names: &[&str], dirs: &[&Path]) -> bool {
         })
 }
 
+/// The directory `LD_LIBRARY_PATH`-style variable [`libs::cuda_search_dirs`] reads (the same
+/// name as `libs`' private `ENV_LIBRARY_PATH`).
+#[cfg(target_os = "windows")]
+const LIBRARY_PATH_VAR: &str = "PATH";
+#[cfg(target_os = "macos")]
+const LIBRARY_PATH_VAR: &str = "DYLD_LIBRARY_PATH";
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const LIBRARY_PATH_VAR: &str = "LD_LIBRARY_PATH";
+
+/// The first of `names` that exists as a file in `dirs` (the ONNX Runtime dir, `cuda-libs`)
+/// or the system CUDA directories ([`libs::cuda_search_dirs`], the directories
+/// [`libs::probe_cuda_library`] loads from), without loading it.
+fn find_cuda_file(names: &[&str], dirs: &[&Path]) -> Option<PathBuf> {
+    let home = std::env::var_os("CUDA_PATH").or_else(|| std::env::var_os("CUDA_HOME"));
+    let lp = std::env::var_os(LIBRARY_PATH_VAR);
+    let search = libs::cuda_search_dirs(
+        dirs,
+        (home.as_deref(), lp.as_deref()),
+        cfg!(windows),
+        cfg!(target_os = "linux"),
+    );
+    names
+        .iter()
+        .flat_map(|n| search.iter().map(move |d| d.join(n)))
+        .find(|p| p.is_file())
+}
+
+/// Whether any of `names` exists ([`find_cuda_file`]); nothing is loaded.
+fn any_present(names: &[&str], dirs: &[&Path]) -> bool {
+    find_cuda_file(names, dirs).is_some()
+}
+
+/// How the probe decides whether a dependency of an NVIDIA execution provider is there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DepCheck {
+    /// Loaded by absolute path and kept loaded ([`any_loadable`]): the CUDA runtime and cuDNN,
+    /// so a missing dependency of theirs shows in the reason (BE-02), and the CUDA provider's
+    /// by-name imports resolve to these copies.
+    Load,
+    /// The file exists ([`any_present`]); loaded only when a session needs it
+    /// ([`preload_for_session`]): TensorRT's `nvinfer`, the largest image by far, which `auto`
+    /// never picks, so a probe must not map it into every process with the cuda flavor (RA-086).
+    Exists,
+}
+
+/// The check each probed dependency gets (pure): TensorRT by file, the rest by loading.
+pub(crate) fn dep_check(names: &[&str]) -> DepCheck {
+    if names == dep_names::NVINFER {
+        DepCheck::Exists
+    } else {
+        DepCheck::Load
+    }
+}
+
+/// The libraries a `target` session loads by path just before its provider registers (pure):
+/// TensorRT's `nvinfer` (probed by file only, [`DepCheck::Exists`]); nothing for the others.
+pub(crate) fn session_preloads(target: Target) -> &'static [&'static str] {
+    match target {
+        Target::TensorRt => dep_names::NVINFER,
+        _ => &[],
+    }
+}
+
+/// Loads the first of [`session_preloads`]`(target)` that loads by absolute path from `dirs`
+/// or the system CUDA directories ([`libs::probe_cuda_library`]; kept loaded, so the
+/// provider's by-name import resolves to that copy). Once one loaded, later sessions skip the
+/// lookup. A failure is the session's error (the probe only saw that the file exists).
+fn preload_for_session(target: Target, dirs: &[&Path]) -> Result<()> {
+    static LOADED_FOR_SESSIONS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let names = session_preloads(target);
+    let mut loaded = LOADED_FOR_SESSIONS.lock_recover();
+    if names.is_empty() || names.iter().any(|n| loaded.contains(n)) {
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    for &n in names {
+        match libs::probe_cuda_library(n, dirs) {
+            Ok(p) => {
+                tracing::info!(
+                    "{} session: loaded {n} from {}",
+                    target.display_name(),
+                    p.display()
+                );
+                loaded.push(n);
+                return Ok(());
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    bail!(
+        "{} needs {} which could not be loaded ({}); reinstall TensorRT 10 or add its \
+         directory to {LIBRARY_PATH_VAR}",
+        target.display_name(),
+        names.join(" / "),
+        errors.join("; ")
+    )
+}
+
 fn nvidia_deps(target: Target, ort_dir: &Path, cuda_libs: Option<&Path>) -> Vec<Dep> {
+    nvidia_deps_with(
+        target,
+        ort_dir,
+        cuda_libs,
+        &|names, dirs| match dep_check(names) {
+            DepCheck::Load => any_loadable(names, dirs),
+            DepCheck::Exists => any_present(names, dirs),
+        },
+    )
+}
+
+/// [`nvidia_deps`] with `check` deciding each library dependency (the provider files are
+/// always checked by existence in the ONNX Runtime dir).
+fn nvidia_deps_with(
+    target: Target,
+    ort_dir: &Path,
+    cuda_libs: Option<&Path>,
+    check: &dyn Fn(&[&str], &[&Path]) -> bool,
+) -> Vec<Dep> {
     let dirs: Vec<&Path> = std::iter::once(ort_dir).chain(cuda_libs).collect();
     let mut deps = vec![
         Dep {
@@ -312,13 +439,13 @@ fn nvidia_deps(target: Target, ort_dir: &Path, cuda_libs: Option<&Path>) -> Vec<
         Dep {
             label: "the CUDA runtime",
             names: dep_names::CUDART,
-            loadable: any_loadable(dep_names::CUDART, &dirs),
+            loadable: check(dep_names::CUDART, &dirs),
             cuda_lib: true,
         },
         Dep {
             label: "cuDNN 9",
             names: dep_names::CUDNN,
-            loadable: any_loadable(dep_names::CUDNN, &dirs),
+            loadable: check(dep_names::CUDNN, &dirs),
             cuda_lib: true,
         },
     ];
@@ -332,7 +459,7 @@ fn nvidia_deps(target: Target, ort_dir: &Path, cuda_libs: Option<&Path>) -> Vec<
         deps.push(Dep {
             label: "TensorRT 10",
             names: dep_names::NVINFER,
-            loadable: any_loadable(dep_names::NVINFER, &dirs),
+            loadable: check(dep_names::NVINFER, &dirs),
             cuda_lib: false,
         });
     }
@@ -348,6 +475,9 @@ pub struct OrtRuntime {
     intra_threads: usize,
     probe: OrtProbe,
     hw: HardwareInfo,
+    /// The `cuda-libs` directory given to [`Self::new`] when it exists: searched again for the
+    /// libraries a session loads just before its provider registers ([`session_preloads`]).
+    cuda_libs: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for OrtRuntime {
@@ -420,6 +550,7 @@ impl OrtRuntime {
             intra_threads: super::cpu_threads::effective(opts.intra_threads),
             probe,
             hw: hw.clone(),
+            cuda_libs: cuda_libs.map(Path::to_path_buf),
         })
     }
 
@@ -496,6 +627,15 @@ impl OrtRuntime {
         })?;
         let extra_idx = extra_input_index(&inputs, image_idx, "orig_target_sizes");
         let image_default = dynamic_image_shape(&path, &meta_outputs);
+        // The input size the sessions will be pinned to, checked before any accelerator session
+        // (or a second CPU session) is built for it (QA-026).
+        if let Some(img) = inputs.get(image_idx) {
+            let pinned = PortSpec {
+                shape: fixed_shape(&img.shape, &image_default),
+                ..img.clone()
+            };
+            image_input_size(&path, &pinned)?;
+        }
         let overrides = dimension_overrides(&inputs, &syms, image_idx, extra_idx, &image_default);
         if let Some(reason) = unsupported_on(target, &inputs, &syms, &overrides) {
             bail!(
@@ -546,19 +686,7 @@ impl OrtRuntime {
                 img.elem
             );
         }
-        let input_size = match img.shape.as_slice() {
-            [_, _, h, w] => (u32::try_from(*w).ok(), u32::try_from(*h).ok()),
-            _ => (None, None),
-        };
-        let (Some(w), Some(h)) = input_size else {
-            bail!(
-                "model {}: image input '{}' has non-static shape {:?}",
-                path.display(),
-                img.name,
-                img.shape
-            );
-        };
-        let input_size = (w, h);
+        let input_size = image_input_size(&path, img)?;
         let image_input = img.name.clone();
         if let Some(i) = extra_idx
             && let Some(p) = inputs.get_mut(i)
@@ -599,6 +727,12 @@ impl OrtRuntime {
                 .collect::<Vec<_>>()
         );
         let vram_hold = probe.finish();
+        if target == Target::CoreMl {
+            // The rewrite (parsed graph, a rewritten copy kept in memory for a `no_cache` load)
+            // and the CoreML conversion leave freed heap behind: hand it back to the OS.
+            drop(source);
+            super::memory::trim_soon("coreml rewrite");
+        }
         Ok(OrtCompiled {
             sessions: all,
             vram_hold,
@@ -786,6 +920,15 @@ impl OrtRuntime {
             )
         })?;
         let eps = match target {
+            Target::Cpu if !cpu_arena_enabled(std::env::var(ENV_ORT_CPU_ARENA).ok().as_deref()) => {
+                log_cpu_arena_off();
+                vec![
+                    ep::CPU::default()
+                        .with_arena_allocator(false)
+                        .build()
+                        .error_on_failure(),
+                ]
+            }
             Target::Cpu => Vec::new(),
             Target::Cuda => vec![
                 cuda_provider(device_id, vram::ort_session_limit_mb())
@@ -793,6 +936,13 @@ impl OrtRuntime {
                     .error_on_failure(),
             ],
             Target::TensorRt => {
+                // TensorRT is probed by file only (RA-086): load it now, by path, so the
+                // provider's import resolves to this copy and a broken install fails here.
+                let ort_dir = self.lib.path.parent().unwrap_or(Path::new("."));
+                let dirs: Vec<&Path> = std::iter::once(ort_dir)
+                    .chain(self.cuda_libs.as_deref())
+                    .collect();
+                preload_for_session(target, &dirs)?;
                 let mut trt = ep::TensorRT::default()
                     .with_device_id(device_id)
                     .with_fp16(true);
@@ -1075,6 +1225,35 @@ pub(crate) fn ort_spinning_enabled(env: Option<&str>) -> bool {
         env.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("1" | "true" | "on" | "yes")
     )
+}
+
+/// Environment variable that turns the CPU arena of `ort:cpu` sessions off (`0`, `false`, `off`,
+/// `no`), for measurement only (RA-094). ONNX Runtime's default CPU arena (kept by default)
+/// grows by powers of two, so a session can hold up to about twice its plan for its whole
+/// life; with the arena off every run allocates and frees its plan instead (on Windows
+/// VirtualAlloc, on glibc mmap above the mmap threshold), which can add page-fault time to
+/// every detection. Compare private bytes and p50/p99 `inference_ms` with it on and off before
+/// changing the default. Only `Target::Cpu` sessions are affected.
+pub(crate) const ENV_ORT_CPU_ARENA: &str = "BOP_ORT_CPU_ARENA";
+
+/// Whether `ort:cpu` sessions keep ONNX Runtime's CPU arena, given the value of
+/// [`ENV_ORT_CPU_ARENA`] (default on).
+pub(crate) fn cpu_arena_enabled(env: Option<&str>) -> bool {
+    !matches!(
+        env.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
+/// One info line per process when [`ENV_ORT_CPU_ARENA`] turned the CPU arena off.
+fn log_cpu_arena_off() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            "{ENV_ORT_CPU_ARENA} is set: ort:cpu sessions run without ONNX Runtime's CPU arena \
+             (a measurement setting; unset it to restore the default)"
+        );
+    });
 }
 
 /// Environment variable that turns the CoreML graph rewrite off (`0`, `false`, `off`, `no`).
@@ -1361,15 +1540,16 @@ impl OrtCompiled {
             image_shape,
         });
         let (done_tx, done_rx) = crossbeam_channel::unbounded();
+        let hold = self.vram_hold.map(Arc::new);
         let mut slots = Vec::with_capacity(self.sessions.len());
         for (slot, session) in self.sessions.into_iter().enumerate() {
             let (job_tx, job_rx) = crossbeam_channel::bounded::<OrtJob>(1);
             let (res_tx, res_rx) = crossbeam_channel::bounded::<OrtResult>(1);
             let (ctx, done) = (run.clone(), done_tx.clone());
-            let thread = std::thread::Builder::new()
-                .name(format!("ort-session-{slot}"))
-                .spawn(move || session_thread(session, &ctx, slot, &job_rx, &res_tx, &done))
-                .context("spawning an ONNX Runtime session thread")?;
+            let thread = spawn_session(slot, hold.clone(), move || {
+                session_thread(session, &ctx, slot, &job_rx, &res_tx, &done);
+            })
+            .context("spawning an ONNX Runtime session thread")?;
             slots.push(OrtSlot {
                 jobs: Some(job_tx),
                 results: res_rx,
@@ -1384,7 +1564,7 @@ impl OrtCompiled {
         Ok(OrtBackend {
             info: self.info,
             slots,
-            _vram_hold: self.vram_hold,
+            _vram_hold: hold,
             done_rx,
             abort_timeout: ABORT_TIMEOUT,
         })
@@ -1465,9 +1645,11 @@ pub(crate) const ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 pub struct OrtBackend {
     info: ModelInfo,
     slots: Vec<OrtSlot>,
-    /// [`OrtCompiled`]'s registration; dropped with the backend, after the sessions' threads
-    /// were told to stop.
-    _vram_hold: Option<vram::Hold>,
+    /// [`OrtCompiled`]'s registration, shared with every session thread ([`spawn_session`]):
+    /// it ends when the backend and every session thread are gone, so a thread detached while
+    /// hung in `Session::run` (whose session keeps its GPU memory) still names the model in
+    /// [`vram::holders`].
+    _vram_hold: Option<Arc<vram::Hold>>,
     done_rx: crossbeam_channel::Receiver<Completion>,
     /// [`ABORT_TIMEOUT`]; shorter in tests.
     abort_timeout: std::time::Duration,
@@ -1480,6 +1662,23 @@ impl std::fmt::Debug for OrtBackend {
             .field("slots", &self.slots.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Spawns session thread `slot` running `body`. `hold` (the model's [`vram::Hold`]) is dropped
+/// only after `body` returned, that is after the session it owns was dropped: a thread that
+/// `Drop` detaches while hung in the driver keeps the registration for exactly as long as the
+/// session's GPU memory stays in use (RA-084).
+fn spawn_session(
+    slot: usize,
+    hold: Option<Arc<vram::Hold>>,
+    body: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("ort-session-{slot}"))
+        .spawn(move || {
+            body();
+            drop(hold);
+        })
 }
 
 fn session_thread(
@@ -1948,7 +2147,8 @@ impl Drop for OrtBackend {
                 tracing::warn!(
                     "model {}: ONNX Runtime session thread {slot} did not stop within {} ms \
                      (probably hung in the driver); detaching it, its memory stays in use \
-                     until it returns; restart the service if GPU memory runs short",
+                     (and the model stays listed as holding it) until it returns; restart the \
+                     service if GPU memory runs short",
                     self.info.path.display(),
                     JOIN_GRACE.as_millis()
                 );
@@ -2182,6 +2382,71 @@ mod tests {
         }
     }
 
+    /// RA-094: the CPU arena stays on unless the measurement switch turns it off.
+    #[test]
+    fn cpu_arena_switch() {
+        assert_eq!(ENV_ORT_CPU_ARENA, "BOP_ORT_CPU_ARENA");
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("on"),
+            Some("yes"),
+            Some("2"),
+        ] {
+            assert!(cpu_arena_enabled(on), "{on:?}");
+        }
+        for off in [Some("0"), Some("false"), Some(" OFF "), Some("no")] {
+            assert!(!cpu_arena_enabled(off), "{off:?}");
+        }
+    }
+
+    /// RA-086: the probe loads the CUDA runtime and cuDNN (BE-02) but only looks for TensorRT's
+    /// `nvinfer`, which a TensorRT session loads by path right before its provider registers.
+    #[test]
+    fn tensorrt_is_probed_by_file_and_loaded_by_its_session() {
+        assert_eq!(dep_check(dep_names::CUDART), DepCheck::Load);
+        assert_eq!(dep_check(dep_names::CUDNN), DepCheck::Load);
+        assert_eq!(dep_check(dep_names::NVINFER), DepCheck::Exists);
+        assert_eq!(session_preloads(Target::TensorRt), dep_names::NVINFER);
+        for t in [Target::Cpu, Target::Cuda, Target::DirectMl, Target::CoreMl] {
+            assert!(session_preloads(t).is_empty(), "{t:?}");
+        }
+        // What `nvidia_deps` asks its check for, and how: nvinfer only for TensorRT.
+        let asked = Mutex::new(Vec::new());
+        let check = |names: &[&str], _: &[&Path]| {
+            asked
+                .lock()
+                .unwrap()
+                .push((names[0].to_string(), dep_check(names)));
+            names != dep_names::NVINFER
+        };
+        let dir = Path::new("ort-dir");
+        let cuda = nvidia_deps_with(Target::Cuda, dir, None, &check);
+        assert_eq!(cuda.len(), 3);
+        let trt = nvidia_deps_with(Target::TensorRt, dir, None, &check);
+        let nv = trt.iter().find(|d| d.label == "TensorRT 10").unwrap();
+        assert!(!nv.loadable && !nv.cuda_lib);
+        let asked = asked.into_inner().unwrap();
+        let loaded: Vec<&str> = asked
+            .iter()
+            .filter(|(_, c)| *c == DepCheck::Load)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert!(!loaded.contains(&dep_names::NVINFER[0]), "{asked:?}");
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|(n, _)| n == dep_names::NVINFER[0])
+                .count(),
+            1,
+            "{asked:?}"
+        );
+        // A TensorRT install that is not there: the reason names it, nothing was loaded.
+        let empty = std::env::temp_dir().join(format!("bop-no-trt-{}", uuid::Uuid::new_v4()));
+        assert!(!any_present(&["bop-not-a-library.so.10"], &[&empty]));
+    }
+
     #[test]
     fn rtdetr_on_coreml_needs_pinned_dims() {
         let inputs = [
@@ -2372,15 +2637,26 @@ mod tests {
         slots: usize,
         run: impl Fn(&mut OrtJob) -> Result<()> + Send + Sync + Clone + 'static,
     ) -> OrtBackend {
+        fake_backend_holding(slots, None, run)
+    }
+
+    /// [`fake_backend`] whose threads share `hold` as [`OrtCompiled::into_backend`]'s do.
+    fn fake_backend_holding(
+        slots: usize,
+        hold: Option<vram::Hold>,
+        run: impl Fn(&mut OrtJob) -> Result<()> + Send + Sync + Clone + 'static,
+    ) -> OrtBackend {
         let (done_tx, done_rx) = crossbeam_channel::unbounded();
+        let hold = hold.map(Arc::new);
         let slots = (0..slots)
             .map(|slot| {
                 let (job_tx, job_rx) = crossbeam_channel::bounded::<OrtJob>(1);
                 let (res_tx, res_rx) = crossbeam_channel::bounded::<OrtResult>(1);
                 let (done, run) = (done_tx.clone(), run.clone());
-                let thread = std::thread::spawn(move || {
+                let thread = spawn_session(slot, hold.clone(), move || {
                     serve_jobs(slot, &job_rx, &res_tx, &done, run);
-                });
+                })
+                .unwrap();
                 OrtSlot {
                     jobs: Some(job_tx),
                     results: res_rx,
@@ -2411,7 +2687,7 @@ mod tests {
                 compile_ms: 0,
             },
             slots,
-            _vram_hold: None,
+            _vram_hold: hold,
             done_rx,
             abort_timeout: std::time::Duration::from_millis(100),
         }
@@ -2491,6 +2767,50 @@ mod tests {
         // Bounded: abort (nothing busy any more) + JOIN_GRACE, then detached.
         assert!(t0.elapsed() < JOIN_GRACE + std::time::Duration::from_secs(2));
         drop(release_tx);
+    }
+
+    /// RA-084: a session thread detached while hung keeps the model registered as a holder of
+    /// its GPU memory until the call returns; a backend whose threads stopped drops it at once.
+    #[test]
+    fn detached_session_keeps_its_vram_hold() {
+        let held = |model: &str| vram::holders().iter().any(|h| h.model == model);
+        let holder = |model: &str| vram::Holder {
+            model: model.to_string(),
+            device: "ort:cuda:0".into(),
+            adapter: 0,
+            held_mb: Some(1),
+        };
+        // A healthy backend: the registration ends with it.
+        let quiet = format!("bop-quiet-{}", uuid::Uuid::new_v4());
+        let mut b = fake_backend_holding(2, Some(vram::hold(holder(&quiet))), |_| Ok(()));
+        b.submit(0, &[1.0], &[]).unwrap();
+        b.collect(0).unwrap();
+        assert!(held(&quiet));
+        drop(b);
+        assert!(
+            !held(&quiet),
+            "every thread joined: nothing holds the memory any more"
+        );
+
+        // A hung one: still listed after the drop, gone once the call returns.
+        let hung = format!("bop-hung-{}", uuid::Uuid::new_v4());
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(0);
+        let mut b = fake_backend_holding(2, Some(vram::hold(holder(&hung))), move |_job| {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
+            Ok(())
+        });
+        b.submit(1, &[1.0], &[]).unwrap();
+        drop(b);
+        assert!(
+            held(&hung),
+            "the detached thread's session still holds its memory"
+        );
+        drop(release_tx);
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while held(&hung) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!held(&hung), "released with the thread");
     }
 
     /// A `no_cache` CoreML load (a fold model) leaves nothing in `cache/` and nothing beside the

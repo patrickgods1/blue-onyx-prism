@@ -20,6 +20,15 @@
 //!
 //! Frames another worker already decoded ([`PrepInput::Decoded`]: the night model switch and
 //! verifier checks) are prepared here too, never on the receiving model's inference thread.
+//!
+//! Nothing here is held for a model that is gone (audit 2026-11, backend-3 / backend-4): the pool
+//! drops a tensor length's free buffers once no request took one for [`IDLE_DROP`] (a model
+//! switched or reloaded to another input size), keeps at most [`MAX_POOLED_BYTES`] of free
+//! tensors in all (or [`MIN_POOLED_FRAMES`] of the largest live length, if more), and each pool
+//! thread drops a geometry's [`Preprocessor`] unused for [`IDLE_DROP`]. Both run when the pool is
+//! used (a take, a give-back, a job), never on a timer; a dropped entry is rebuilt on demand.
+//! [`PooledBuf`] holds the pool weakly, so a buffer that outlives its pool (a detached ONNX
+//! Runtime session thread) is freed on drop and pins only itself.
 
 use crate::image::RgbImage;
 use crate::image_stats::ImageStats;
@@ -31,13 +40,27 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 /// Buffers kept per tensor length; more are freed on return.
 const MAX_POOLED_PER_LEN: usize = 32;
+/// A tensor length nobody took for this long loses its free buffers, and a pool thread drops a
+/// [`Preprocessor`] unused this long. Blue Iris sends frames every few seconds per camera, so a
+/// model in use never gets near it; a model that was replaced (another input size after a live
+/// reload or a default-model switch) stops pinning its tensors and resize buffers 10 minutes
+/// later, and coming back costs one allocation.
+pub const IDLE_DROP: Duration = Duration::from_secs(10 * 60);
+/// Free tensor bytes the pool keeps in all (64 MiB): 13 tensors of a 640x640 model (4.9 MB each),
+/// above what the target box keeps in flight (each worker's slots plus its look-ahead of up to 4:
+/// 4 to 8 tensors for a LATENCY integrated GPU), or three of a 1280x1280 model (19.7 MB). A
+/// buffer returned above the cap evicts one of the length taken longest ago, else is freed.
+pub const MAX_POOLED_BYTES: usize = 64 << 20;
+/// The cap is at least this many tensors of the largest length in use, so a model with a huge
+/// input (up to the 256 MiB tensor `check_input_size` allows) still reuses its buffers.
+pub const MIN_POOLED_FRAMES: usize = 2;
 /// Queued jobs per pool thread before `submit` blocks (workers keep their own look-ahead far
 /// below this).
 const QUEUE_PER_THREAD: usize = 16;
@@ -167,53 +190,273 @@ impl PrepSpec {
     }
 }
 
-/// Reusable `f32` tensor buffers keyed by length.
+/// The time source of a [`TensorPool`] (a fake one in tests).
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// Bytes a tensor buffer holds.
+fn bytes_of(buf: &Vec<f32>) -> usize {
+    buf.capacity().saturating_mul(std::mem::size_of::<f32>())
+}
+
+/// The free buffers of one tensor length.
+#[derive(Debug)]
+struct LenList {
+    bufs: Vec<Vec<f32>>,
+    /// The latest [`TensorPool::take`] of this length.
+    last_take: Instant,
+}
+
+/// Every length's free buffers and their byte total.
 #[derive(Debug, Default)]
+struct FreeLists {
+    lists: HashMap<usize, LenList>,
+    /// Sum of [`bytes_of`] over every list's buffers.
+    bytes: usize,
+    /// Live [`LengthHold`]s per length.
+    users: HashMap<usize, usize>,
+}
+
+impl FreeLists {
+    /// Remove every length not taken for [`IDLE_DROP`] at `now` (but `keep`), with its buffers,
+    /// which are moved to `out`. True when a buffer was among them.
+    fn drop_idle(&mut self, now: Instant, keep: Option<usize>, out: &mut Vec<Vec<f32>>) -> bool {
+        let before = out.len();
+        let idle: Vec<usize> = self
+            .lists
+            .iter()
+            .filter(|(len, l)| {
+                Some(**len) != keep && now.saturating_duration_since(l.last_take) >= IDLE_DROP
+            })
+            .map(|(len, _)| *len)
+            .collect();
+        for len in idle {
+            if let Some(l) = self.lists.remove(&len) {
+                self.remove_all(l.bufs, out);
+            }
+        }
+        out.len() > before
+    }
+
+    /// Move `bufs` to `out`, uncounted.
+    fn remove_all(&mut self, bufs: Vec<Vec<f32>>, out: &mut Vec<Vec<f32>>) {
+        for b in bufs {
+            self.bytes = self.bytes.saturating_sub(bytes_of(&b));
+            out.push(b);
+        }
+    }
+
+    /// The byte cap: [`MAX_POOLED_BYTES`], or [`MIN_POOLED_FRAMES`] tensors of the largest length
+    /// with a list (taken in the last [`IDLE_DROP`]), if more.
+    fn cap(&self) -> usize {
+        let largest = self.lists.keys().copied().max().unwrap_or(0);
+        MAX_POOLED_BYTES.max(
+            largest
+                .saturating_mul(std::mem::size_of::<f32>())
+                .saturating_mul(MIN_POOLED_FRAMES),
+        )
+    }
+}
+
+/// Reusable `f32` tensor buffers keyed by length, bounded by idle time and total bytes (see the
+/// module docs).
 pub struct TensorPool {
-    free: Mutex<HashMap<usize, Vec<Vec<f32>>>>,
+    free: Mutex<FreeLists>,
+    clock: Clock,
+}
+
+impl std::fmt::Debug for TensorPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let free = self.free.lock_recover();
+        f.debug_struct("TensorPool")
+            .field("lengths", &free.lists.len())
+            .field("bytes", &free.bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TensorPool {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::with_clock(Instant::now)
+    }
+
+    /// A pool that reads the time from `clock` (tests: a fake clock for exact idle times).
+    pub fn with_clock(clock: impl Fn() -> Instant + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            free: Mutex::new(FreeLists::default()),
+            clock: Arc::new(clock),
+        })
     }
 
     /// A buffer with capacity for `len` values (contents unspecified, length 0 or `len`),
-    /// returned to the pool when the [`PooledBuf`] drops.
+    /// returned to the pool when the [`PooledBuf`] drops. Drops the lists of other lengths idle
+    /// for [`IDLE_DROP`] first.
     pub fn take(self: &Arc<Self>, len: usize) -> PooledBuf {
-        let buf = self
-            .free
-            .lock_recover()
-            .get_mut(&len)
-            .and_then(Vec::pop)
-            .unwrap_or_else(|| Vec::with_capacity(len));
+        let now = (self.clock)();
+        let mut dropped = Vec::new();
+        let (buf, idle) = {
+            let mut free = self.free.lock_recover();
+            let idle = free.drop_idle(now, Some(len), &mut dropped);
+            let FreeLists { lists, bytes, .. } = &mut *free;
+            let list = lists.entry(len).or_insert_with(|| LenList {
+                bufs: Vec::new(),
+                last_take: now,
+            });
+            list.last_take = now;
+            let buf = list.bufs.pop();
+            if let Some(b) = &buf {
+                *bytes = bytes.saturating_sub(bytes_of(b));
+            }
+            (buf, idle)
+        };
+        released(dropped, idle);
         PooledBuf {
-            buf,
+            buf: buf.unwrap_or_else(|| Vec::with_capacity(len)),
             len,
-            pool: Arc::clone(self),
+            pool: Arc::downgrade(self),
         }
     }
 
     /// Buffers currently free for `len`.
     pub fn free_count(&self, len: usize) -> usize {
-        self.free.lock_recover().get(&len).map_or(0, Vec::len)
+        self.free
+            .lock_recover()
+            .lists
+            .get(&len)
+            .map_or(0, |l| l.bufs.len())
     }
 
-    fn give_back(&self, len: usize, buf: Vec<f32>) {
+    /// Bytes of free buffers the pool holds now.
+    pub fn pooled_bytes(&self) -> usize {
+        self.free.lock_recover().bytes
+    }
+
+    /// Tensor lengths the pool tracks now (taken in the last [`IDLE_DROP`]).
+    pub fn lengths(&self) -> usize {
+        self.free.lock_recover().lists.len()
+    }
+
+    /// Mark `len` as used by a loaded model until the returned hold drops (the worker's engine
+    /// keeps one). When the last hold of a length drops (the model was retired, reloaded at
+    /// another size, or its generation ended), that length's free buffers are freed at once,
+    /// instead of [`IDLE_DROP`] after its last take, and a trim is asked for.
+    pub fn hold_length(self: &Arc<Self>, len: usize) -> LengthHold {
         let mut free = self.free.lock_recover();
-        let list = free.entry(len).or_default();
-        if list.len() < MAX_POOLED_PER_LEN {
-            list.push(buf);
+        let n = free.users.entry(len).or_insert(0);
+        *n = n.saturating_add(1);
+        LengthHold {
+            pool: Arc::downgrade(self),
+            len,
+        }
+    }
+
+    /// The last hold of `len` dropped: free its list.
+    fn release_length(&self, len: usize) {
+        let mut dropped = Vec::new();
+        {
+            let mut free = self.free.lock_recover();
+            let last = match free.users.get_mut(&len) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            };
+            if !last {
+                return;
+            }
+            free.users.remove(&len);
+            if let Some(l) = free.lists.remove(&len) {
+                free.remove_all(l.bufs, &mut dropped);
+            }
+        }
+        let any = !dropped.is_empty();
+        released(dropped, any);
+    }
+
+    /// Keep `buf` for the next [`Self::take`] of `len` when that length is still tracked (taken
+    /// in the last [`IDLE_DROP`]), has fewer than [`MAX_POOLED_PER_LEN`] free and the byte cap
+    /// allows (evicting buffers of lengths taken longer ago first); else free it.
+    fn give_back(&self, len: usize, buf: Vec<f32>) {
+        let now = (self.clock)();
+        let mut dropped = Vec::new();
+        let idle = {
+            let mut free = self.free.lock_recover();
+            let idle = free.drop_idle(now, None, &mut dropped);
+            let cap = free.cap();
+            let size = bytes_of(&buf);
+            match free.lists.get(&len).map(|l| (l.bufs.len(), l.last_take)) {
+                Some((n, last_take)) if n < MAX_POOLED_PER_LEN => {
+                    // Make room from lengths taken longest ago (before this one), one buffer at a
+                    // time.
+                    while free.bytes.saturating_add(size) > cap {
+                        let older = free
+                            .lists
+                            .iter()
+                            .filter(|(l, list)| {
+                                **l != len && list.last_take < last_take && !list.bufs.is_empty()
+                            })
+                            .min_by_key(|(_, list)| list.last_take)
+                            .map(|(l, _)| *l);
+                        let Some(b) = older
+                            .and_then(|l| free.lists.get_mut(&l))
+                            .and_then(|list| list.bufs.pop())
+                        else {
+                            break;
+                        };
+                        free.bytes = free.bytes.saturating_sub(bytes_of(&b));
+                        dropped.push(b);
+                    }
+                    if free.bytes.saturating_add(size) <= cap {
+                        free.bytes = free.bytes.saturating_add(size);
+                        if let Some(list) = free.lists.get_mut(&len) {
+                            list.bufs.push(buf);
+                        }
+                    } else {
+                        dropped.push(buf);
+                    }
+                }
+                // Full, or the length went idle while this buffer was out.
+                _ => dropped.push(buf),
+            }
+            idle
+        };
+        released(dropped, idle);
+    }
+}
+
+/// Free `dropped` (outside the pool's lock) and, when a length went idle with buffers (`trim`),
+/// ask for an allocator trim: that memory is otherwise kept by the heap.
+fn released(dropped: Vec<Vec<f32>>, trim: bool) {
+    drop(dropped);
+    if trim {
+        crate::backend::memory::trim_soon("prep pool: tensors of an unused input size");
+    }
+}
+
+/// A loaded model's use of one tensor length ([`TensorPool::hold_length`]); holds the pool
+/// weakly, like [`PooledBuf`].
+#[derive(Debug)]
+pub struct LengthHold {
+    pool: std::sync::Weak<TensorPool>,
+    len: usize,
+}
+
+impl Drop for LengthHold {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.upgrade() {
+            pool.release_length(self.len);
         }
     }
 }
 
-/// A tensor buffer from a [`TensorPool`]; goes back to it on drop.
+/// A tensor buffer from a [`TensorPool`]; goes back to it on drop while the pool lives (it holds
+/// the pool weakly: a buffer kept by a detached session thread pins only itself).
 #[derive(Debug)]
 pub struct PooledBuf {
     buf: Vec<f32>,
     len: usize,
-    pool: Arc<TensorPool>,
+    pool: Weak<TensorPool>,
 }
 
 impl PooledBuf {
@@ -236,8 +479,10 @@ impl std::ops::Deref for PooledBuf {
 impl Drop for PooledBuf {
     fn drop(&mut self) {
         let buf = std::mem::take(&mut self.buf);
-        if buf.capacity() >= self.len {
-            self.pool.give_back(self.len, buf);
+        if buf.capacity() >= self.len
+            && let Some(pool) = self.pool.upgrade()
+        {
+            pool.give_back(self.len, buf);
         }
     }
 }
@@ -531,8 +776,43 @@ impl Drop for PrepPool {
     }
 }
 
+/// One pool thread's [`Preprocessor`]s, one per geometry, each dropped once unused for
+/// [`IDLE_DROP`] (checked when the next job arrives).
+#[derive(Debug, Default)]
+struct Preprocessors {
+    map: HashMap<PrepSpec, (Preprocessor, Instant)>,
+}
+
+impl Preprocessors {
+    /// The preprocessor of `spec`, used at `now` (made when missing); the others unused for
+    /// [`IDLE_DROP`] are dropped first (an allocator trim is asked for when any was).
+    fn get(&mut self, spec: PrepSpec, now: Instant) -> &mut Preprocessor {
+        let before = self.map.len();
+        self.map
+            .retain(|s, (_, used)| *s == spec || now.saturating_duration_since(*used) < IDLE_DROP);
+        if self.map.len() < before {
+            crate::backend::memory::trim_soon("prep pool: preprocessor of an unused input size");
+        }
+        let entry = self
+            .map
+            .entry(spec)
+            .or_insert_with(|| (spec.preprocessor(), now));
+        entry.1 = now;
+        &mut entry.0
+    }
+
+    fn remove(&mut self, spec: &PrepSpec) {
+        self.map.remove(spec);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
 fn pool_thread(rx: Receiver<PrepJob>, tensors: Arc<TensorPool>, done: Arc<AtomicU64>) {
-    let mut pres: HashMap<PrepSpec, Preprocessor> = HashMap::new();
+    let mut pres = Preprocessors::default();
     let mut scratch = Scratch::default();
     while let Ok(job) = rx.recv() {
         let PrepJob {
@@ -543,7 +823,7 @@ fn pool_thread(rx: Receiver<PrepJob>, tensors: Arc<TensorPool>, done: Arc<Atomic
             reply,
         } = job;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let pre = pres.entry(spec).or_insert_with(|| spec.preprocessor());
+            let pre = pres.get(spec, Instant::now());
             PrepPool::prepare(
                 pre,
                 &tensors,
@@ -820,6 +1100,211 @@ mod tests {
             assert_eq!(p.stats, stats);
             assert_eq!(p.img.as_ref(), keep.then_some(&img));
         }
+    }
+
+    /// A clock tests move by hand.
+    #[derive(Clone)]
+    struct FakeClock(Arc<Mutex<Instant>>);
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Instant::now())))
+        }
+        fn now(&self) -> Instant {
+            *self.0.lock().unwrap()
+        }
+        fn advance(&self, by: Duration) {
+            *self.0.lock().unwrap() += by;
+        }
+    }
+
+    fn fake_pool() -> (Arc<TensorPool>, FakeClock) {
+        let clock = FakeClock::new();
+        let c = clock.clone();
+        (TensorPool::with_clock(move || c.now()), clock)
+    }
+
+    /// Take `n` buffers of `len` at once, then give them all back.
+    fn cycle(pool: &Arc<TensorPool>, len: usize, n: usize) {
+        let bufs: Vec<PooledBuf> = (0..n).map(|_| pool.take(len)).collect();
+        drop(bufs);
+    }
+
+    const F32: usize = std::mem::size_of::<f32>();
+
+    #[test]
+    fn a_length_nobody_takes_for_the_idle_time_loses_its_buffers() {
+        let (pool, clock) = fake_pool();
+        let (a, b) = (100, 200);
+        cycle(&pool, a, 3);
+        cycle(&pool, b, 2);
+        assert_eq!((pool.free_count(a), pool.free_count(b)), (3, 2));
+        assert_eq!(pool.pooled_bytes(), (3 * a + 2 * b) * F32);
+        assert_eq!(pool.lengths(), 2);
+
+        // Just under the idle time: `a` stays, while `b` is in use.
+        clock.advance(IDLE_DROP - Duration::from_secs(1));
+        cycle(&pool, b, 1);
+        assert_eq!(pool.free_count(a), 3);
+        // The idle time reached: the next use of the pool drops `a`'s list.
+        clock.advance(Duration::from_secs(1));
+        cycle(&pool, b, 1);
+        assert_eq!((pool.free_count(a), pool.free_count(b)), (0, 2));
+        assert_eq!(pool.pooled_bytes(), 2 * b * F32);
+        assert_eq!(pool.lengths(), 1);
+
+        // A give-back alone drops idle lengths too (no take of another length needed).
+        let held = pool.take(b);
+        clock.advance(IDLE_DROP);
+        drop(held);
+        assert_eq!(
+            (pool.free_count(b), pool.pooled_bytes(), pool.lengths()),
+            (0, 0, 0)
+        );
+
+        // A buffer that was out while its length went idle is freed, not pooled again.
+        let out = pool.take(a);
+        clock.advance(IDLE_DROP + Duration::from_secs(5));
+        cycle(&pool, b, 1);
+        drop(out);
+        assert_eq!(pool.free_count(a), 0);
+        assert_eq!(pool.pooled_bytes(), b * F32);
+
+        // Coming back costs one allocation; the length is pooled again.
+        cycle(&pool, a, 1);
+        assert_eq!(pool.free_count(a), 1);
+    }
+
+    #[test]
+    fn the_byte_cap_holds_and_evicts_the_length_taken_longest_ago() {
+        let (pool, clock) = fake_pool();
+        // 4 MiB tensors (capacity only: nothing is touched): the 64 MiB cap holds 16.
+        let l = (4 << 20) / F32;
+        cycle(&pool, l, 20);
+        assert_eq!(pool.free_count(l), MAX_POOLED_BYTES / (l * F32));
+        assert_eq!(pool.pooled_bytes(), MAX_POOLED_BYTES);
+        // A length taken later takes the room of the older one, one buffer each.
+        clock.advance(Duration::from_secs(1));
+        let m = l - 3;
+        cycle(&pool, m, 4);
+        assert_eq!(pool.free_count(m), 4);
+        assert_eq!(pool.free_count(l), 16 - 4);
+        assert!(
+            pool.pooled_bytes() <= MAX_POOLED_BYTES,
+            "{}",
+            pool.pooled_bytes()
+        );
+        // Lengths taken at the same time never evict each other: `l` (taken again now) fills the
+        // room left and its 13th return is freed, `m` keeps its 4.
+        let held: Vec<PooledBuf> = (0..13).map(|_| pool.take(l)).collect();
+        assert_eq!(pool.free_count(l), 0);
+        drop(held);
+        assert_eq!((pool.free_count(l), pool.free_count(m)), (12, 4));
+        assert!(
+            pool.pooled_bytes() <= MAX_POOLED_BYTES,
+            "{}",
+            pool.pooled_bytes()
+        );
+        assert_eq!(
+            pool.pooled_bytes(),
+            pool.free_count(l) * l * F32 + pool.free_count(m) * m * F32
+        );
+
+        // A model with a huge input still keeps two of its tensors (36 MiB each, cap 72 MiB).
+        let (big, _clock) = fake_pool();
+        let h = (36 << 20) / F32;
+        cycle(&big, h, 3);
+        assert_eq!(big.free_count(h), MIN_POOLED_FRAMES);
+        assert_eq!(big.pooled_bytes(), MIN_POOLED_FRAMES * h * F32);
+    }
+
+    /// The last hold of a length frees its buffers at once; a second holder (a replacement
+    /// loading beside the old worker) keeps them; other lengths stay.
+    #[test]
+    fn the_last_hold_of_a_length_frees_its_buffers_at_once() {
+        let (pool, _clock) = fake_pool();
+        let old = pool.hold_length(10);
+        let other = pool.hold_length(20);
+        cycle(&pool, 10, 2);
+        cycle(&pool, 20, 3);
+        let replacement = pool.hold_length(10);
+        drop(old);
+        assert_eq!((pool.free_count(10), pool.free_count(20)), (2, 3));
+        drop(replacement);
+        assert_eq!((pool.free_count(10), pool.free_count(20)), (0, 3));
+        assert_eq!(pool.pooled_bytes(), 3 * 20 * F32);
+        // A buffer of the released length still out is freed on return, not pooled.
+        let out = pool.take(20);
+        drop(other);
+        assert_eq!(pool.free_count(20), 0);
+        drop(out);
+        assert_eq!((pool.pooled_bytes(), pool.free_count(20)), (0, 0));
+        // A hold that outlives its pool is harmless.
+        let late = pool.hold_length(30);
+        drop(pool);
+        drop(late);
+    }
+
+    /// The buffer holds the pool weakly: returned while the pool lives, freed (no panic, nothing
+    /// kept) once it is gone.
+    #[test]
+    fn a_buffer_outliving_its_pool_is_freed_and_pins_nothing() {
+        let pool = TensorPool::new();
+        let b = pool.take(10);
+        assert_eq!(
+            Arc::strong_count(&pool),
+            1,
+            "a buffer keeps no strong reference"
+        );
+        drop(b);
+        assert_eq!(pool.free_count(10), 1, "returned while the pool lives");
+        let kept = pool.take(10);
+        let weak = Arc::downgrade(&pool);
+        drop(pool);
+        assert!(
+            weak.upgrade().is_none(),
+            "the pool is gone with a buffer still out"
+        );
+        assert_eq!(kept.as_slice().len(), 0);
+        drop(kept);
+    }
+
+    #[test]
+    fn preprocessors_unused_for_the_idle_time_are_dropped() {
+        let mut pres = Preprocessors::default();
+        let a = PrepSpec::new(32, 32, ResizeMode::Letterbox, None);
+        let b = PrepSpec::new(64, 48, ResizeMode::Stretch, None);
+        let t0 = Instant::now();
+        pres.get(a, t0);
+        pres.get(b, t0 + Duration::from_secs(5 * 60));
+        assert_eq!(pres.len(), 2);
+        // `b` 5 minutes unused, `a` in use: both stay.
+        pres.get(a, t0 + IDLE_DROP);
+        assert_eq!(pres.len(), 2);
+        // `b` unused for the idle time when the next job comes: dropped.
+        pres.get(a, t0 + Duration::from_secs(5 * 60) + IDLE_DROP);
+        assert_eq!(pres.len(), 1);
+        assert!(pres.map.contains_key(&a));
+        // The spec asked for is never the one dropped, however long it was unused.
+        pres.get(a, t0 + 10 * IDLE_DROP);
+        assert_eq!(pres.len(), 1);
+        // A dropped geometry is rebuilt on demand and prepares as before.
+        let img = RgbImage {
+            width: 80,
+            height: 60,
+            rgb: vec![90; 80 * 60 * 3],
+        };
+        let want = b.preprocessor().run(&img.rgb, 80, 60).unwrap().0.to_vec();
+        let got = pres
+            .get(b, t0 + 10 * IDLE_DROP)
+            .run(&img.rgb, 80, 60)
+            .unwrap()
+            .0
+            .to_vec();
+        assert_eq!(got, want);
+        assert_eq!(pres.len(), 2);
+        pres.remove(&b);
+        assert_eq!(pres.len(), 1);
     }
 
     #[test]

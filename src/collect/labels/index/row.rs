@@ -156,6 +156,18 @@ impl<K: ?Sized + Hash + Eq> Table<K> {
         self.items.iter().map(|i| &**i)
     }
 
+    /// Bytes of the entries `used` (by id) does not mark: what each takes behind its [`Arc`], its
+    /// slot in `items` and its map slot, as [`Self::bytes`] counts them.
+    fn unused_bytes(&self, used: &[bool]) -> usize {
+        let slots = size_of::<Arc<K>>() + (size_of::<(Arc<K>, u32)>() + 1) * 8 / 7;
+        self.items
+            .iter()
+            .zip(used.iter().copied().chain(std::iter::repeat(false)))
+            .filter(|(_, used)| !used)
+            .map(|(item, _)| size_of_val(&**item) + 2 * size_of::<usize>() + slots)
+            .sum()
+    }
+
     /// Heap bytes, from capacities (a map slot is its entry and a control byte, at most 8/7 full).
     fn bytes(&self) -> usize {
         self.items.capacity() * size_of::<Arc<K>>()
@@ -164,7 +176,9 @@ impl<K: ?Sized + Hash + Eq> Table<K> {
     }
 }
 
-/// Everything interned, for one index: it only grows, and goes with the index. Rows hold ids.
+/// Everything interned, for one index: it only grows, and goes with the index. Rows hold ids. A
+/// walk of everything that leaves too much of it unused ([`Self::unused_bytes`]) drops the index
+/// for a fresh one ([`super::COMPACT_UNUSED_BYTES`]).
 #[derive(Debug, Default)]
 pub(super) struct Names {
     names: Table<str>,
@@ -238,6 +252,62 @@ impl Names {
                     .map_or((0, 0), |&(n, s)| (u32::from(n), u32::from(s)))
             })
             .collect()
+    }
+
+    /// Bytes of the entries no row of `rows` refers to, directly or through an entry it uses
+    /// (the names in a class set, a training set or a proposed list): what relabelled frames left
+    /// behind. Rows of a frame that went still count: they keep their camera.
+    pub(super) fn unused_bytes<'a>(&self, rows: impl IntoIterator<Item = &'a Row>) -> usize {
+        fn mark(used: &mut [bool], id: u32) {
+            if let Some(u) = used.get_mut(id as usize) {
+                *u = true;
+            }
+        }
+        let mut names = vec![false; self.names.len()];
+        let mut buckets = vec![false; self.buckets.len()];
+        let mut classes = vec![false; self.classes.len()];
+        let mut training = vec![false; self.training.len()];
+        let mut refine = vec![false; self.refine.len()];
+        let mut proposed = vec![false; self.proposed.len()];
+        for r in rows {
+            mark(&mut names, r.cand.scene);
+            mark(&mut names, r.cand.camera);
+            mark(&mut buckets, r.cand.buckets);
+            mark(&mut names, r.side.model);
+            mark(&mut classes, r.side.reply);
+            mark(&mut classes, r.part.classes);
+            mark(&mut training, r.part.training);
+            if let Some(id) = r.part.refine.checked_sub(1) {
+                mark(&mut refine, id);
+            }
+            if let Some(id) = r.part.proposed.checked_sub(1) {
+                mark(&mut proposed, id);
+            }
+        }
+        fn live(used: &[bool]) -> impl Iterator<Item = bool> + '_ {
+            used.iter().copied().chain(std::iter::repeat(false))
+        }
+        for (set, used) in self.classes.items.iter().zip(live(&classes)) {
+            if used {
+                set.iter().for_each(|(name, _)| mark(&mut names, *name));
+            }
+        }
+        for (set, used) in self.training.items.iter().zip(live(&training)) {
+            if used {
+                set.iter().for_each(|(name, _)| mark(&mut names, *name));
+            }
+        }
+        for (set, used) in self.proposed.items.iter().zip(live(&proposed)) {
+            if used {
+                set.iter().for_each(|name| mark(&mut names, *name));
+            }
+        }
+        self.names.unused_bytes(&names)
+            + self.buckets.unused_bytes(&buckets)
+            + self.classes.unused_bytes(&classes)
+            + self.training.unused_bytes(&training)
+            + self.refine.unused_bytes(&refine)
+            + self.proposed.unused_bytes(&proposed)
     }
 
     pub(super) fn bytes(&self) -> usize {

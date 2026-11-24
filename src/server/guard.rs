@@ -220,6 +220,28 @@ pub(super) fn proxy_header(headers: &HeaderMap) -> Option<&'static str> {
 /// Most characters of a client's `Host` repeated in a refusal or in the log.
 const MAX_HOST_SHOWN: usize = 100;
 
+/// Most characters of a request path written to the log by a refusal: a client may send a
+/// path of tens of KiB, and each refused request would format all of it (audit RA-079).
+pub(super) const MAX_PATH_LOGGED: usize = 200;
+
+/// `path` cut to [`MAX_PATH_LOGGED`] characters (control characters dropped) for a log line.
+pub(super) fn path_for_log(path: &str) -> String {
+    let mut out: String = path
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PATH_LOGGED)
+        .collect();
+    if path
+        .chars()
+        .filter(|c| !c.is_control())
+        .nth(MAX_PATH_LOGGED)
+        .is_some()
+    {
+        out.push_str("...");
+    }
+    out
+}
+
 /// At most one log line per this long for refused `Host` names: every request of a hostile
 /// page would otherwise write one.
 const HOST_WARN_EVERY: Duration = Duration::from_secs(60);
@@ -375,7 +397,7 @@ pub(super) async fn network_rule(
         };
         warn!(
             peer = %who,
-            path = %req.uri().path(),
+            path = %path_for_log(req.uri().path()),
             header,
             ?problem,
             dropped,
@@ -398,7 +420,8 @@ pub(super) fn host_refused(headers: &HeaderMap, path: &str, host: &str) -> Respo
         .lock_recover()
         .allow_at(Instant::now(), HOST_WARN_EVERY);
     if let Some(dropped) = dropped {
-        warn!(%host, path, dropped, "admin route refused for an unknown host name (DNS rebinding?)");
+        let path = path_for_log(path);
+        warn!(%host, %path, dropped, "admin route refused for an unknown host name (DNS rebinding?)");
     }
     forbidden(
         headers,
@@ -823,6 +846,18 @@ mod tests {
         // Short and without control characters, whatever the client sent.
         let shown = foreign_host(&host(&"a".repeat(300)), &uri("/x"), allowed).unwrap();
         assert_eq!(shown.chars().count(), MAX_HOST_SHOWN);
+    }
+
+    #[test]
+    fn logged_paths_are_cut() {
+        assert_eq!(path_for_log("/v1/status"), "/v1/status");
+        let long = format!("/{}", "a".repeat(64 << 10));
+        let shown = path_for_log(&long);
+        assert_eq!(shown.chars().count(), MAX_PATH_LOGGED + 3);
+        assert!(shown.ends_with("..."));
+        assert_eq!(path_for_log("/a\nb"), "/ab");
+        let exact = "b".repeat(MAX_PATH_LOGGED);
+        assert_eq!(path_for_log(&exact), exact);
     }
 
     #[test]

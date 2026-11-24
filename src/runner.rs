@@ -310,6 +310,10 @@ impl Generation {
             );
         }
         registry.shutdown();
+        drop(registry);
+        // The generation's workers, prep pool and (once the last holder lets go) runtimes are
+        // freed: give that memory back (RA-077).
+        crate::backend::memory::trim_soon("previous generation retired");
     }
 }
 

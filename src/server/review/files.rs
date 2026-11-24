@@ -310,6 +310,7 @@ pub(in crate::server) async fn export(
             Some(&pending),
         );
         drop(job);
+        crate::backend::memory::trim_soon("review export built");
         match result {
             Ok(r) => {
                 tracing::info!(out = %r.out_dir.display(), frames = r.frames, "review export written");

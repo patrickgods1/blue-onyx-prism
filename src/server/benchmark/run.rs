@@ -11,7 +11,6 @@ use crate::benchmark::service::{RunContext, RunRequest, SEVERAL_GPUS_WARNING, pa
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::DatasetRef;
 use crate::server::{AppState, save_config};
-use crate::sync::LockExt;
 use crate::training::service::RunRecord;
 use crate::training::task::{TaskKind, TaskRecord};
 use axum::Json;
@@ -157,7 +156,8 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
         );
     }
     let job = running_job(
-        &crate::server::training::runs(state),
+        // Run states only: no epoch history read or copied.
+        &crate::server::training::records(state),
         &crate::server::training::tasks(state),
     );
     if let Some(job) = job {
@@ -603,11 +603,12 @@ pub(in crate::server) async fn image_file(
 /// ([`crate::benchmark::report::ImageSetInfo::image_path`]).
 type ImagePaths = HashMap<(String, String), std::path::PathBuf>;
 
-/// The last [`ImagePaths`] and the results file stamp it was built from: the drill-down asks
-/// for every image of a run, which must not parse `benchmark.json` (tens of MB) per image
-/// (SV-06).
-type ImagePathsCache = Option<(String, Arc<ImagePaths>)>;
-static IMAGE_PATHS: std::sync::Mutex<ImagePathsCache> = std::sync::Mutex::new(None);
+/// The last [`ImagePaths`], keyed by the results file and the stamps it was built from: the
+/// drill-down asks for every image of a run, which must not parse `benchmark.json` (tens of MB)
+/// per image (SV-06). Dropped after [`crate::benchmark::search::CACHE_IDLE`] unread (RA-098).
+type ImagePathsCache = crate::benchmark::search::IdleCache<String, Arc<ImagePaths>>;
+static IMAGE_PATHS: ImagePathsCache =
+    crate::benchmark::search::IdleCache::new(crate::benchmark::search::CACHE_IDLE);
 
 /// The servable images of the results at `path`, cached by the file's stamp.
 fn image_paths(path: &std::path::Path) -> Arc<ImagePaths> {
@@ -615,10 +616,7 @@ fn image_paths(path: &std::path::Path) -> Arc<ImagePaths> {
 }
 
 /// [`image_paths`] with the cache given (tests).
-fn image_paths_in(
-    cache: &std::sync::Mutex<ImagePathsCache>,
-    path: &std::path::Path,
-) -> Arc<ImagePaths> {
+fn image_paths_in(cache: &'static ImagePathsCache, path: &std::path::Path) -> Arc<ImagePaths> {
     use crate::benchmark::cameras::{self, snapshot};
     let gt = snapshot::path_beside(path);
     let key = format!(
@@ -627,10 +625,8 @@ fn image_paths_in(
         file_stamp(path),
         file_stamp(&gt)
     );
-    if let Some((k, v)) = cache.lock_recover().as_ref()
-        && *k == key
-    {
-        return v.clone();
+    if let Some(v) = cache.get(&key) {
+        return v;
     }
     let mut map = ImagePaths::new();
     if let Some(r) = BenchmarkResults::load_or_warn(path) {
@@ -656,7 +652,7 @@ fn image_paths_in(
         }
     }
     let map = Arc::new(map);
-    *cache.lock_recover() = Some((key, map.clone()));
+    cache.put(key, map.clone());
     map
 }
 
@@ -1331,19 +1327,26 @@ mod tests {
         }
 
         // The index is built once per results file version.
-        let cache = std::sync::Mutex::new(None);
-        let a = image_paths_in(&cache, &path);
+        let cache: &'static super::ImagePathsCache = Box::leak(Box::new(
+            crate::benchmark::search::IdleCache::new(crate::benchmark::search::CACHE_IDLE),
+        ));
+        let a = image_paths_in(cache, &path);
         assert_eq!(
             a.get(&("night-set".to_string(), "a.jpg".to_string())),
             Some(&dir.join("a.jpg"))
         );
         // No directory (pseudo-set): nothing servable.
         assert!(!a.keys().any(|(set, _)| set == "pseudo-set"));
-        assert!(Arc::ptr_eq(&a, &image_paths_in(&cache, &path)));
+        assert!(Arc::ptr_eq(&a, &image_paths_in(cache, &path)));
         results.image_sets[0].images.truncate(1);
         results.save(&path).unwrap();
-        let b = image_paths_in(&cache, &path);
+        let b = image_paths_in(cache, &path);
         assert!(!Arc::ptr_eq(&a, &b));
         assert_eq!(b.len(), 1);
+        assert_eq!(Arc::strong_count(&a), 1, "the old index was replaced");
+        // Unread for the idle time: dropped (RA-098).
+        assert!(!cache.sweep_at(std::time::Instant::now() + crate::benchmark::search::CACHE_IDLE));
+        assert!(cache.is_empty());
+        assert_eq!(Arc::strong_count(&b), 1);
     }
 }

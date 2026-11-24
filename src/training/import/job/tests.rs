@@ -1361,3 +1361,98 @@ fn extract_events_parse_with_and_without_the_source_fields() {
     assert!(f.full && (f.width, f.height) == (48, 32) && f.pts.is_none());
     assert!(Found::parse(&serde_json::json!({"file": "f.jpg"})).is_none());
 }
+
+/// The embeddings file is read into one flat `Vec<f32>` (no copy of the bytes or a `Vec` per row
+/// left alive, audit 2026-11, RA-101), and the selection picks what it picked from the rows.
+#[test]
+fn embeddings_read_flat_and_pick_the_same_frames() {
+    let t = tmp("embeddings");
+    let (n, dim) = (40usize, 5usize);
+    // Unit rows on a few clusters, one far off.
+    let rows: Vec<Vec<f32>> = (0..n)
+        .map(|i| {
+            let mut v: Vec<f32> = (0..dim)
+                .map(|j| ((i % 4 + j) as f32 * 0.7).sin() + if i == 17 { 3.0 } else { 0.0 })
+                .collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter_mut().for_each(|x| *x /= norm);
+            v
+        })
+        .collect();
+    let path = t.0.join("emb.f32");
+    // Over two read chunks.
+    let big = EMBED_READ_CHUNK / 4 / dim + 3;
+    let many: Vec<Vec<f32>> = (0..big).map(|i| rows[i % n].clone()).collect();
+    let bytes: Vec<u8> = many
+        .iter()
+        .flatten()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let (flat, d) = read_embeddings(&path, big, Some(dim as u64)).unwrap();
+    assert_eq!(d, dim);
+    assert_eq!(flat, many.concat(), "every float, in order");
+    assert_eq!(
+        flat.capacity(),
+        flat.len(),
+        "one allocation of the exact size"
+    );
+    assert_eq!(
+        read_embeddings(&path, big, None).unwrap().1,
+        dim,
+        "dim from the size"
+    );
+    // The rows of the fixture: the picks equal k-center over the rows themselves.
+    let bytes: Vec<u8> = rows
+        .iter()
+        .flatten()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let (flat, d) = read_embeddings(&path, n, Some(dim as u64)).unwrap();
+    let hashes: Vec<u64> = (0..n as u64).collect();
+    let groups: Vec<&str> = (0..n)
+        .map(|i| if i % 3 == 0 { "ir" } else { "day" })
+        .collect();
+    for (total, balance) in [(7, false), (9, true), (n, true), (3, true)] {
+        let picked = select::pick(&groups, &hashes, Some((&flat, d)), total, balance);
+        assert_eq!(
+            picked,
+            pick_rows(&groups, &rows, total, balance),
+            "total {total} balance {balance}"
+        );
+    }
+    assert!(select::pick(&groups, &hashes, Some((&flat, d)), 7, false).contains(&17));
+    // A file of another size is refused, naming it.
+    std::fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
+    let e = read_embeddings(&path, n, Some(dim as u64)).unwrap_err();
+    assert!(
+        e.to_string().contains("are not 40 embeddings of 5 floats"),
+        "{e:#}"
+    );
+    assert_eq!(read_embeddings(&path, 0, None).unwrap(), (Vec::new(), 0));
+}
+
+/// The selection as it was over one `Vec` per row (before RA-101): per group's quota, k-center
+/// over the group's rows.
+fn pick_rows(groups: &[&str], rows: &[Vec<f32>], total: usize, balance: bool) -> Vec<usize> {
+    let mut members: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    for (i, g) in groups.iter().enumerate() {
+        let key = if balance {
+            g.to_string()
+        } else {
+            String::new()
+        };
+        members.entry(key).or_default().push(i);
+    }
+    let avail = members.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+    let q = select::quotas(&avail, total);
+    let mut out = Vec::new();
+    for (g, idx) in &members {
+        let vs: Vec<&[f32]> = idx.iter().map(|i| rows[*i].as_slice()).collect();
+        let k = q.get(g).copied().unwrap_or(0);
+        out.extend(select::k_center(&vs, k).into_iter().map(|p| idx[p]));
+    }
+    out.sort_unstable();
+    out
+}

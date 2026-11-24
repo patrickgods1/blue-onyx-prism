@@ -13,10 +13,15 @@
 //!
 //! Readers ([`attach`]) put the file's epochs back on the copies of the records they hand out,
 //! through a cache checked by file size and time ([`cached`]), so the page's poll reads a file
-//! again only when it changed. A record of an older `runs.json` that still holds its history is
-//! moved to the file once ([`migrate`]), never losing an epoch: the file is written (merged with
-//! one already there) before the record drops it, and a record whose file cannot be written keeps
-//! its history in `runs.json`.
+//! again only when it changed. Readers that only serialize them (the page's poll) share the
+//! cached `Arc` instead of copying it ([`share`]). The cache keeps at most `CACHE_ENTRIES`
+//! histories and `CACHE_WEIGHT` rows plus values, least recently used dropped first; a removed
+//! run's entry goes with it ([`forget`]).
+//!
+//! A record of an older `runs.json` that still holds its history is moved to the file once
+//! ([`migrate`]), never losing an epoch: the file is written (merged with one already there)
+//! before the record drops it, and a record whose file cannot be written keeps its history in
+//! `runs.json`.
 
 use super::RunRecord;
 use crate::collect::layout;
@@ -30,8 +35,14 @@ use std::time::SystemTime;
 /// File of a run's history in its run folder.
 pub const HISTORY_FILE: &str = "history.jsonl";
 
-/// Histories kept by [`cached`] (least recently used dropped first).
+/// Most histories kept by [`cached`] (least recently used dropped first).
 const CACHE_ENTRIES: usize = 256;
+/// Most rows plus metric values ([`weight`]) kept by [`cached`] over all its histories (least
+/// recently used dropped first), about 16 MB at about 60 bytes a value (audit 2026-11, RA-080: a
+/// count of entries alone let 256 histories of up to [`MAX_HISTORY`] rows of up to 96 metrics
+/// stay for the life of the process). The largest history a run makes (1,000 rows of 96
+/// metrics, 97,000) fits two and a half times; a typical one (100 rows of 20) is 2,100.
+const CACHE_WEIGHT: usize = 1 << 18;
 
 /// `<run dir>/history.jsonl`.
 pub fn history_path(run_dir: &Path) -> PathBuf {
@@ -80,39 +91,108 @@ struct Cached {
     len: u64,
     modified: Option<SystemTime>,
     points: Arc<Vec<EpochPoint>>,
+    /// [`weight`] of `points`.
+    weight: usize,
     used: u64,
 }
 
+/// What a history costs [`CACHE`]: one per row plus one per metric value, the count that grows
+/// with a run's size (exact; at about 60 bytes a value on the heap, the String key, the f64 and
+/// the BTreeMap node's share).
+fn weight(points: &[EpochPoint]) -> usize {
+    points.iter().map(|p| 1 + p.metrics.len()).sum()
+}
+
+/// The histories [`cached`] keeps, least recently used dropped first once there are more than
+/// `max_entries` of them or their [`weight`] passes `max_weight`. The entry just read always
+/// stays (a reader holds it anyway).
 #[derive(Default)]
 struct Cache {
     entries: HashMap<PathBuf, Cached>,
     tick: u64,
+    /// Sum of the entries' [`weight`].
+    weight: usize,
+}
+
+impl Cache {
+    /// The entry of `path` when the file still has that size and time.
+    fn get(
+        &mut self,
+        path: &Path,
+        len: u64,
+        modified: Option<SystemTime>,
+    ) -> Option<Arc<Vec<EpochPoint>>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let e = self.entries.get_mut(path)?;
+        if e.len != len || e.modified != modified {
+            return None;
+        }
+        e.used = tick;
+        Some(Arc::clone(&e.points))
+    }
+
+    fn insert(
+        &mut self,
+        path: &Path,
+        len: u64,
+        modified: Option<SystemTime>,
+        points: &Arc<Vec<EpochPoint>>,
+        (max_entries, max_weight): (usize, usize),
+    ) {
+        self.tick += 1;
+        let weight = weight(points);
+        let old = self.entries.insert(
+            path.to_path_buf(),
+            Cached {
+                len,
+                modified,
+                points: Arc::clone(points),
+                weight,
+                used: self.tick,
+            },
+        );
+        self.weight = (self.weight + weight).saturating_sub(old.map_or(0, |o| o.weight));
+        while self.entries.len() > max_entries.max(1)
+            || (self.weight > max_weight && self.entries.len() > 1)
+        {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .filter(|(k, _)| k.as_path() != path)
+                .min_by_key(|(_, e)| e.used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, path: &Path) {
+        if let Some(e) = self.entries.remove(path) {
+            self.weight = self.weight.saturating_sub(e.weight);
+        }
+    }
 }
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
 /// [`read`] through a process-wide cache: the file is parsed again only when its size or time
-/// changed since the last read (every append changes the size).
+/// changed since the last read (every append changes the size). An unchanged file answers the
+/// same `Arc` every time: readers share it, nothing is copied.
 pub fn cached(path: &Path) -> Arc<Vec<EpochPoint>> {
     let Ok(meta) = std::fs::metadata(path) else {
-        if let Some(c) = CACHE.lock_recover().as_mut() {
-            c.entries.remove(path);
-        }
+        forget(path);
         return Arc::default();
     };
     let (len, modified) = (meta.len(), meta.modified().ok());
+    if let Some(p) = CACHE
+        .lock_recover()
+        .get_or_insert_with(Cache::default)
+        .get(path, len, modified)
     {
-        let mut guard = CACHE.lock_recover();
-        let c = guard.get_or_insert_with(Cache::default);
-        c.tick += 1;
-        let tick = c.tick;
-        if let Some(e) = c.entries.get_mut(path)
-            && e.len == len
-            && e.modified == modified
-        {
-            e.used = tick;
-            return Arc::clone(&e.points);
-        }
+        return p;
     }
     // Parsed outside the lock. A file that changes meanwhile has another size next time, so a
     // stale parse is read again then.
@@ -123,31 +203,44 @@ pub fn cached(path: &Path) -> Arc<Vec<EpochPoint>> {
             return Arc::default();
         }
     };
-    let mut guard = CACHE.lock_recover();
-    let c = guard.get_or_insert_with(Cache::default);
-    c.tick += 1;
-    let used = c.tick;
-    c.entries.insert(
-        path.to_path_buf(),
-        Cached {
-            len,
-            modified,
-            points: Arc::clone(&points),
-            used,
-        },
-    );
-    while c.entries.len() > CACHE_ENTRIES {
-        let Some(oldest) = c
-            .entries
-            .iter()
-            .min_by_key(|(_, e)| e.used)
-            .map(|(k, _)| k.clone())
-        else {
-            break;
-        };
-        c.entries.remove(&oldest);
-    }
+    CACHE
+        .lock_recover()
+        .get_or_insert_with(Cache::default)
+        .insert(path, len, modified, &points, (CACHE_ENTRIES, CACHE_WEIGHT));
     points
+}
+
+/// The cache holds an entry for `path`.
+#[cfg(test)]
+fn is_cached(path: &Path) -> bool {
+    CACHE
+        .lock_recover()
+        .as_ref()
+        .is_some_and(|c| c.entries.contains_key(path))
+}
+
+/// Drop the cached history of the file `path` (its run was removed, or the file is gone).
+pub fn forget(path: &Path) {
+    if let Some(c) = CACHE.lock_recover().as_mut() {
+        c.remove(path);
+    }
+}
+
+/// The epochs of `r` for a reader that shares them instead of copying them: the record's own
+/// (an older `runs.json` not migrated yet, or a file that could not be written; moved out of the
+/// record, never copied), else `live` (the running job's) when given, else its history file
+/// ([`cached`]). The record keeps its other fields; `losses` is left as it is.
+pub fn share(r: &mut RunRecord, live: Option<&Arc<Vec<EpochPoint>>>) -> Arc<Vec<EpochPoint>> {
+    let Some(p) = r.progress.as_mut() else {
+        return Arc::default();
+    };
+    if !p.history.is_empty() {
+        return Arc::new(std::mem::take(&mut p.history));
+    }
+    match live {
+        Some(h) => Arc::clone(h),
+        None => cached(&history_path(&r.run_dir)),
+    }
 }
 
 /// Put the history back on `r`, a reader's copy of a stored record: `live` (the running job's

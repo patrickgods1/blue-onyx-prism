@@ -13,7 +13,10 @@
 //!   `layout::rewrite_index` mark the queue and a day folder the same way.
 //! - **Other processes and the collector**: the thread stats the folders every minute and walks what
 //!   changed; every 30 minutes it reads everything again, which is what heals a file system with
-//!   unreliable folder times. Rows keep serving meanwhile.
+//!   unreliable folder times. Rows keep serving meanwhile. A walk that passes
+//!   [`INDEX_CEILING_BYTES`] stops there and drops the index; one that leaves more than
+//!   `COMPACT_UNUSED_BYTES` of interned names no row uses (relabelled frames) drops it too, not
+//!   refused, and the next query builds a fresh one.
 //! - **A rescan** (the Review tab's Rescan folder, [`rescan`]): the thread reads everything again
 //!   now, and answers say [`Answer::indexing`] from the request until that walk's swap, so a page
 //!   never takes the old counts for the new ones. A request during a walk is one more walk after
@@ -75,6 +78,15 @@ const STALE_PAUSE: Duration = Duration::from_millis(250);
 const AFTER_PANIC: Duration = Duration::from_secs(10 * 60);
 /// How often a query goes round when the frames it would show are gone.
 const RESOLVE_TRIES: usize = 8;
+/// Interned names no row uses any more, in bytes, past which a walk of everything drops the index
+/// (not refused) so that the next query builds a fresh one (audit 2026-11, RA-089). The interner
+/// only grows while an index lives, and relabelling (auto-label, overlap and refine runs, a
+/// reviewer's saves) leaves the old class sets behind; renumbering them in place would have to
+/// change every id the rows and the need cache hold. A sixteenth of [`INDEX_CEILING_BYTES`]: dead
+/// entries never take more than that of the ceiling past a walk of everything, and it takes
+/// relabelling on the scale of a hundred thousand frames to get there, so the rebuild (one more
+/// walk of the folder, with `indexing` shown meanwhile) is rare.
+const COMPACT_UNUSED_BYTES: usize = INDEX_CEILING_BYTES / 16;
 
 /// The times and limit of an index, apart so tests can shorten them.
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +97,8 @@ struct Timing {
     wait: Duration,
     pause: Duration,
     ceiling: usize,
+    /// [`COMPACT_UNUSED_BYTES`].
+    compact: usize,
 }
 
 impl Timing {
@@ -95,6 +109,7 @@ impl Timing {
         wait: BUILD_WAIT,
         pause: STALE_PAUSE,
         ceiling: INDEX_CEILING_BYTES,
+        compact: COMPACT_UNUSED_BYTES,
     };
 }
 
@@ -221,6 +236,16 @@ impl Index {
 
     fn cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// The most bytes the index may take ([`Timing::ceiling`]; a test can lower it for a running
+    /// index, [`tests::set_ceiling_now`]).
+    fn ceiling(&self) -> usize {
+        #[cfg(test)]
+        if let Some(ceiling) = tests::ceiling_now(&self.dir) {
+            return ceiling;
+        }
+        self.timing.ceiling
     }
 
     fn touch(&self) {

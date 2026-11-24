@@ -17,6 +17,12 @@
 //! file replaced by a rename moves the folder's time; one edited in place does not, and neither
 //! does anything on a file system with unreliable folder times: the walk of everything is for that.
 //!
+//! A walk after the first build adds up its new shards as each finishes ([`Budget`]): past the
+//! ceiling the index is dropped there, so the walk never holds the rows that serve plus a whole
+//! new set of them only to drop both at the swap (audit 2026-11, RA-090). A walk of everything
+//! then looks at the interned names ([`Index::compact_names`], RA-089), and an index that ends
+//! for any reason asks for an allocator trim ([`crate::backend::memory::trim_soon`]).
+//!
 //! [`crate::backend::priority`] has no way to lower one thread, only a process (and that means
 //! `unsafe`, kept to `backend`), so the walks run at normal priority, on at most
 //! [`crate::parallel::WALK_THREADS_MAX`] threads.
@@ -31,7 +37,7 @@ use crate::parallel;
 use crate::sync::{LockExt as _, RwLockExt as _};
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 /// What a pass does.
@@ -75,6 +81,45 @@ impl Drop for ThreadDone {
         }
         index.cancelled.store(true, Ordering::Release);
         CHANGED.notify_all();
+        // Up to the ceiling's worth of rows and names go with the last handle, a moment after.
+        crate::backend::memory::trim_soon("review index ended");
+    }
+}
+
+/// What the new shards of a walk add up to as each finishes, against the ceiling. `kept`: the
+/// bytes of the rows the swap keeps (none for a walk of everything; the days a scan does not walk
+/// for a scan); the interned names, which every swap keeps, are read as they grow. The query's
+/// need cache is left out, and so are the maps' slots: the count stays under what
+/// [`Index::check_ceiling`] would find after the swap, so it only stops a walk that swap would
+/// have dropped anyway.
+struct Budget<'a> {
+    index: &'a Index,
+    kept: usize,
+    new: AtomicUsize,
+}
+
+impl<'a> Budget<'a> {
+    fn new(index: &'a Index, kept: usize) -> Self {
+        Self {
+            index,
+            kept,
+            new: AtomicUsize::new(0),
+        }
+    }
+
+    /// `shard` is finished: over the ceiling with it, the index is dropped ([`Index::over_ceiling`],
+    /// which cancels it, so the walk takes no further day).
+    fn add(&self, shard: &Shard) {
+        let bytes = shard.bytes();
+        let new = self
+            .new
+            .fetch_add(bytes, Ordering::AcqRel)
+            .saturating_add(bytes);
+        let names = self.index.names.read_recover().bytes();
+        let total = self.kept.saturating_add(new).saturating_add(names);
+        if total > self.index.ceiling() {
+            self.index.over_ceiling(total);
+        }
     }
 }
 
@@ -183,7 +228,7 @@ impl Index {
                 encoder.cand(c),
                 encoder.walked(&mut walker, c),
             );
-            if shard.used() > self.timing.ceiling {
+            if shard.used() > self.ceiling() {
                 self.over_ceiling(shard.used());
                 break;
             }
@@ -282,13 +327,21 @@ impl Index {
         let threads = parallel::walk_threads_over(candidates.len());
         let days = days_of(candidates);
         let walker = Walker::new(&self.dir);
+        // None of the rows serving now stays past the swap.
+        let budget = Budget::new(self, 0);
         let shards =
             parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
                 let (key, day) = days.get(i).filter(|_| !self.cancelled())?;
                 let shard = self.walk_shard(walker.clone(), key.clone(), day);
                 self.done.fetch_add(day.len() as u64, Ordering::AcqRel);
+                budget.add(&shard);
                 Some(shard)
             });
+        if self.cancelled() {
+            // Over the ceiling, or no longer current: no query reads this index again.
+            self.end_walk();
+            return;
+        }
         before_swap();
         self.swap(Swap {
             whole: true,
@@ -300,6 +353,34 @@ impl Index {
             ..Swap::default()
         });
         self.end_walk();
+        self.compact_names();
+    }
+
+    /// After a walk of everything: with more than [`super::Timing::compact`] bytes of interned
+    /// names no row uses any more ([`super::COMPACT_UNUSED_BYTES`]), the index goes, not refused,
+    /// and the next query builds a fresh one from the folder.
+    fn compact_names(&self) {
+        if self.cancelled() {
+            return;
+        }
+        let (unused, all) = {
+            let state = self.state.read_recover();
+            let names = self.names.read_recover();
+            let rows = state.shards.values().flat_map(|s| &s.rows);
+            (names.unused_bytes(rows), names.bytes())
+        };
+        if unused < self.timing.compact {
+            return;
+        }
+        tracing::info!(
+            "review index of {}: {} MB of its {} MB of class sets and names are of labels no \
+             frame has any more (relabelled frames), so it is built again from the folder at the \
+             next query; Review shows indexing until that walk is done",
+            self.dir.display(),
+            unused / (1024 * 1024),
+            all / (1024 * 1024),
+        );
+        HUB.lock_recover().remove(self);
     }
 
     /// The days whose folder looks different from when they were walked, and those gone.
@@ -375,13 +456,29 @@ impl Index {
         self.show_progress(days.iter().map(|(_, d)| d.len() as u64).sum());
         let threads = parallel::walk_threads_over(days.iter().map(|(_, d)| d.len()).sum());
         let walker = Walker::new(&self.dir);
+        // The rows of the days walked, or emptied, go at the swap; the others stay.
+        let kept = {
+            let state = self.state.read_recover();
+            let replaced: usize = walking
+                .iter()
+                .filter_map(|day| state.shards.get(day))
+                .map(Shard::bytes)
+                .sum();
+            state.bytes().saturating_sub(replaced)
+        };
+        let budget = Budget::new(self, kept);
         let shards =
             parallel::map_all_at(days.len(), threads, parallel::Spawned::Background, &|i| {
                 let (key, day) = days.get(i).filter(|_| !self.cancelled())?;
                 let shard = self.walk_shard(walker.clone(), key.clone(), day);
                 self.done.fetch_add(day.len() as u64, Ordering::AcqRel);
+                budget.add(&shard);
                 Some(shard)
             });
+        if self.cancelled() {
+            self.end_walk();
+            return;
+        }
         swap.shards = shards.into_iter().flatten().collect();
         before_swap();
         self.swap(swap);
