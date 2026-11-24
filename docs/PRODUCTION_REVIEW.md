@@ -4256,29 +4256,29 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | RA-051 | `gap-startup-recovery-as/recovery-2` | crash-recovery | medium | 3 | fixed (phase 3): runs hold `<run dir>.busy`; the owner's open tells Live / crashed / ended; Remove with files, Retry export and Remove export refuse a Live run | open_records marks every queued or running record "interrupted" without checking that its process is dead, so the service's lazy queue start turns a live CLI `train` run into a failed one, and Remove (with files) and Remove export then delete that run's folder or export |
 | RA-052 | `resources/resources-12` | storage | medium | 3 | fixed (phase 3): toolchain / train-env removal holds `.train.lock` + `.model-export.lock` (409 while held, any process); lock files kept; Tool row blocked by a lock probe | 'Remove export toolchain' and 'Remove training environment' do not take the export lock, so they can delete uv, Python and uv-cache under a running training-env build |
 | RA-053 | `training-core/training-core-4` | storage | medium | 3 | fixed (phase 3): `.queue.lock` owner; guests read only; CLI job commands refuse beside the service; orphaned run folders listed by `train list` (Storage card row: phase 4) | runs.json / tasks.json have no owner across processes: a CLI `train` run beside the service drops records and leaves run folders nothing lists or cleans |
-| RA-054 | `backend/backend-1` | storage | medium | 4 | open | OpenVINO compiled blobs and TensorRT engines of removed or replaced models are never deleted while their cache folder is in use |
+| RA-054 | `backend/backend-1` | storage | medium | 4 | fixed (phase 4): one cache subfolder per model file (`<stem>-<key16>/` + `model.txt`, key over path, size, mtime); `caches::sweep_compiled` removes gone or changed ones inside folders in use; Storage card lists them | OpenVINO compiled blobs and TensorRT engines of removed or replaced models are never deleted while their cache folder is in use |
 | RA-055 | `collect/collect-5` | storage | medium | 4 | fixed (phase 2): see RA-060 | A crashed or killed export leaves its hidden `.building-<uuid>` staging folder forever, and no sweeper knows the name |
 | RA-056 | `platform-storage/platform-1` | storage | medium | 4 | fixed (phase 2): review-export scratch (RA-060), model-export staging (RA-041) and install-dir staging (RA-071) | Storage sweep never removes three kinds of crash-orphaned staging: review-export `.building-*` folders, model-export `.export-staging` folders, and training staging under a custom install_dir |
-| RA-057 | `platform-storage/platform-2` | storage | medium | 4 | open | Stale compiled blobs inside an in-use OpenVINO/TensorRT cache folder are never deleted; the cache grows with every retrained model, OpenVINO pin bump and driver update |
-| RA-058 | `resources/resources-5` | storage | medium | 4 | open | tools/uv-cache (GBs of wheels) stays after a failed, timed-out or cancelled environment install, and 'Remove training environment' never deletes it |
+| RA-057 | `platform-storage/platform-2` | storage | medium | 4 | fixed (phase 4): see RA-054; legacy flat blobs/engines go once a day old; subfolders expire by their own `.last-used` | Stale compiled blobs inside an in-use OpenVINO/TensorRT cache folder are never deleted; the cache grows with every retrained model, OpenVINO pin bump and driver update |
+| RA-058 | `resources/resources-5` | storage | medium | 4 | fixed (phase 4): Remove training environment deletes `tools/uv-cache`; the sweep removes a day-old one and Clear at once, under a try of the export lock; Storage card row | tools/uv-cache (GBs of wheels) stays after a failed, timed-out or cancelled environment install, and 'Remove training environment' never deletes it |
 | RA-059 | `resources/resources-6` | storage | medium | 4 | fixed (phase 2): the storage sweep runs the download cleanup under a try of the download lock, model folders included; superseded archives go after 7 days, `--keep-archive` ones (`.keep` marker) stay | Download leftovers are cleaned only when a Manager starts. In the service that is lazy, it misses model dirs outside the data root and verified archives, and it runs without the download lock. |
 | RA-060 | `server-handlers/server-handlers-2` | storage | medium | 4 | fixed (phase 2): the scratch folder is held busy; crashed `.building-<hex>` folders go (exports outside the training folder through `exports-pending/` records); unmarked ones are listed on the Storage card | A dataset export cut off by a stop or crash leaves a hidden `.building-<uuid>` copy of the export that nothing ever removes |
 | RA-061 | `training-jobs/training-jobs-2` | storage | medium | 4 | fixed (phase 2): `Busy::finish_removing`; a failed removal leaves the marker unlocked for the sweep (an auto-label only once its proposals are gone) | A failed work-folder removal deletes the busy marker, so the folder is never swept |
-| RA-062 | `training-jobs/training-jobs-4` | storage | medium | 4 | open | Throwaway fold models still write ONNX Runtime TensorRT engines and CoreML compiled models into the shared cache; TensorRT ones are never swept |
-| RA-063 | `benchmark/benchmark-5` | storage | low | 4 | open | forget_model leaves a removed model's As-served (`<model>+served`) and CLI variant (`<model>+<variant>`) results, stored predictions and history behind |
-| RA-064 | `collect/collect-3` | storage | low | 4 | open | The collector's own prune timer uses the settings of the last frame, not the current config, and can delete frames the user chose to keep |
+| RA-062 | `training-jobs/training-jobs-4` | storage | medium | 4 | fixed (phase 4): `no_cache` reaches ORT (no TensorRT engine/timing cache, no CoreML model cache, rewrite kept in memory); TensorRT keyed per model file, so a retrained file never reuses a stale engine | Throwaway fold models still write ONNX Runtime TensorRT engines and CoreML compiled models into the shared cache; TensorRT ones are never swept |
+| RA-063 | `benchmark/benchmark-5` | storage | low | 4 | fixed (phase 4): `forget_model` drops `<model>+served` always and `<model>+<variant>` unless that name is a configured model | forget_model leaves a removed model's As-served (`<model>+served`) and CLI variant (`<model>+<variant>`) results, stored predictions and history behind |
+| RA-064 | `collect/collect-3` | storage | low | 4 | fixed (phase 4): a Prune message replaces the remembered limits; collection off clears them | The collector's own prune timer uses the settings of the last frame, not the current config, and can delete frames the user chose to keep |
 | RA-065 | `collect/collect-6` | storage | low | 4 | fixed (phase 2): exact temp shape in the prune; `spots/`, `refine/` and a separate review folder's days in the temp sweep | Atomic-write temp files outside the dataset's day folders are never cleaned after a crash |
 | RA-066 | `platform-storage/platform-8` | storage | low | 4 | fixed (phase 0 + 2): see RA-065 | Atomic-write temp files orphaned by a crash are only cleaned in dataset day folders; those beside the config, in the training dir, in the review folder, in auth/ and in tools/hf stay forever |
 | RA-067 | `resources/resources-11` | storage | low | 4 | fixed (phase 2): a pending update is applied at start for runtimes this generation loads; others are reported with their size and Remove deletes them | A staged runtime update (.<name>.pending) is applied only when that runtime is loaded again. If it never is, both the old install and the pending copy stay on disk forever. |
 | RA-068 | `resources/resources-3` | storage | low | 4 | fixed (phase 2): see RA-041 (staging and work guards) | A Cancel that arrives after the export child exits successfully leaves the whole staging folder behind |
-| RA-069 | `server-core/server-core-7` | storage | low | 4 | open | Device cookies of accounts removed with the CLI are never pruned: Auth::flush prunes sessions of removed accounts but not devices, which stay in devices.json for up to 180 days and are trusted again if the name is re-created |
-| RA-070 | `training-core/training-core-10` | storage | low | 4 | open | Runs are never dropped (by design), and each record keeps a 60-line log tail that duplicates train.log: runs.json and the in-memory list grow without bound and are fully rewritten with fsync on every save |
+| RA-069 | `server-core/server-core-7` | storage | low | 4 | fixed (phase 4): `Devices::prune_users` in `Auth::flush` and at load | Device cookies of accounts removed with the CLI are never pruned: Auth::flush prunes sessions of removed accounts but not devices, which stay in devices.json for up to 180 days and are trusted again if the name is re-created |
+| RA-070 | `training-core/training-core-10` | storage | low | 4 | fixed (phase 4): Done / Cancelled runs keep 15 log lines (`FINISHED_LOG_TAIL`), Failed 60; no record dropped | Runs are never dropped (by design), and each record keeps a 60-line log tail that duplicates train.log: runs.json and the in-memory list grow without bound and are fully rewritten with fsync on every save |
 | RA-071 | `training-core/training-core-5` | storage | low | 4 | fixed (phase 2): the staging sweep and Clear cover every `install_dir` in runs.json (read-only) | A crashed run's `.<name>.train-staging` folder in a custom install_dir is never swept |
-| RA-072 | `training-core/training-core-6` | storage | low | 4 | open | A failed or interrupted run keeps all of work/, even when no retry checkpoint exists or the folder is mostly scratch |
+| RA-072 | `training-core/training-core-6` | storage | low | 4 | fixed (phase 4): a failed run (not cancelled, not a shutdown) deletes `job::FAILED_RUN_SCRATCH` once the trainer is reaped; checkpoints, `hf-best.tmp`, config and logs stay | A failed or interrupted run keeps all of work/, even when no retry checkpoint exists or the folder is mostly scratch |
 | RA-073 | `training-core/training-core-8` | storage | low | 4 | fixed (phase 2): `hf-best` renamed aside before the new one moves in; Retry export falls back to `hf-best.old`, then `hf-best.tmp` | save_hf_best deletes the previous best before the rename: a crash or parent-exit in that window loses the only retry checkpoint |
 | RA-074 | `training-jobs/training-jobs-10` | storage | low | 4 | fixed (phase 2): probes made in `<training dir>/runs` or the near-dataset base and swept after 1 h | Hard-link probe file is left behind if the process dies between link and unlink |
-| RA-075 | `workers-registry/workers-registry-7` | storage | low | 4 | open | The image-save thread is detached and never drained, and saves are written in place, so a stop or crash mid-write leaves a truncated JPEG in save_image_path |
-| RA-076 | `workers-registry/workers-registry-9` | storage | low | 4 | open | registry/plan.rs unit tests create temp directories and never remove them |
+| RA-075 | `workers-registry/workers-registry-7` | storage | low | 4 | fixed (phase 1): `image::save_annotated` writes through `fsx::write_atomic`; `worker::save::flush` drains at shutdown (registry shutdown); phase 4 added the saved-image folder's temp sweep test | The image-save thread is detached and never drained, and saves are written in place, so a stop or crash mid-write leaves a truncated JPEG in save_image_path |
+| RA-076 | `workers-registry/workers-registry-9` | storage | low | 4 | fixed (phase 4): `crate::test_dirs::TempDir` guard in plan.rs, run_tests.rs and save.rs tests | registry/plan.rs unit tests create temp directories and never remove them |
 | RA-077 | `backend/backend-2` | memory | medium | 5 | open | No allocator trim anywhere: freed compile/load and job transients stay in the glibc heap after a spike |
 | RA-078 | `benchmark/benchmark-3` | memory | medium | 5 | open | CLI benchmark has no image cap and keeps 4-5 full copies of every model x device x image result until it ends (the BM-11 fix covers the service only) |
 | RA-079 | `server-core/server-core-1` | memory | medium | 5 | open | Log ring keeps the full allocation of every truncated message, so the 8 MiB budget can be exceeded about 16x through request paths that unauthenticated LAN clients control (the SV-08 fix is incomplete) |
@@ -4358,7 +4358,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-025 | `resources/resources-1` | bug | high | 7 | open | A second install into a user --dir/--dest swaps the whole directory and deletes the user's other files |
 | QA-026 | `backend/backend-1` | bug | medium | 5 | open | PL-04 is only half fixed: the model input size is never checked at load, and the worker allocates its warm-up frame before any check |
 | QA-027 | `benchmark/bench-1` | bug | medium | 7 | open | The 'never scored on its own labels' rule (B10) misses As served and variant results of the reference model |
-| QA-028 | `benchmark/bench-2` | bug | medium | 4 | open | forget_model leaves a removed model's `+served` / variant results, predictions and history |
+| QA-028 | `benchmark/bench-2` | bug | medium | 4 | fixed (phase 4): see RA-063 | forget_model leaves a removed model's `+served` / variant results, predictions and history |
 | QA-029 | `benchmark/bench-3` | bug | medium | 7 | open | The confidence search's 'configured now' ignores the per-device profiles that --apply-threshold writes |
 | QA-030 | `benchmark/bench-4` | bug | medium | 7 | open | apply_yolo turns an unreadable YOLO label file into 'no objects' silently |
 | QA-031 | `collect/collect-2` | bug | medium | 6 | open | Pruning looks up each deleted file's size with a linear scan, so a large prune stalls the collector thread for seconds or more |
@@ -4368,7 +4368,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-035 | `resources/resources-3` | bug | medium | 2 | fixed (phase 2): only `.<n>.staging` and `.<n>.old-<digits>` match | Download cleanup deletes any hidden dir containing `.old-`/`.staging` under the data root, including a live training staging folder |
 | QA-036 | `resources/resources-4` | bug | medium | 7 | open | `download-models --add-to-config` stores model paths relative to the exe dir, but the service resolves them against the data root |
 | QA-037 | `resources/resources-5` | bug | medium | 7 | open | ManagerFetcher fails an export on the first transient download error although the service manager keeps retrying |
-| QA-038 | `server-core/srvcore-1` | bug | medium | 4 | open | A session of a removed account becomes valid again for a new account of the same name (CLI remove + add, or across a service restart) |
+| QA-038 | `server-core/srvcore-1` | bug | medium | 4 | fixed (phase 4): a new account starts at a random generation (`User::new`); devices store the account's `created`, compared by equality | A session of a removed account becomes valid again for a new account of the same name (CLI remove + add, or across a service restart) |
 | QA-039 | `training-core/tcore-3` | bug | medium | 7 | open | `--verbose` CLI output stops after the first 60 log lines (the log-tail cursor never moves once the tail is full) |
 | QA-040 | `training-jobs/training-jobs-1` | bug | medium | 7 | open | Prepared dataset image names are cut at 120 bytes, which drops the image extension, so YOLO trainers silently skip those frames |
 | QA-041 | `web-assets/web-5` | bug | medium | 7 | open | SAM 3 download progress stops for good after one failed poll, and the hand-rolled poll keeps running while the tab is hidden |
@@ -4476,7 +4476,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-143 | `benchmark/bench-25` | test-gap | medium | 10 | open | No test of B10 (own labels) for As served / variant result names |
 | QA-144 | `gap-helpers-duplicated-across/gap-13` | test-gap | medium | 10 | open | Benchmark load_or_move_aside has no test for an unreadable file, a second aside, or keeping dropped entries |
 | QA-145 | `resources/resources-20` | test-gap | medium | 10 | open | No tests for put_in_place's merge branch, the cleanup name rules, or under_root escapes |
-| QA-146 | `server-core/srvcore-test-1` | test-gap | medium | 4 | open | No test that a removed-then-re-added account does not inherit old sessions / device trust |
+| QA-146 | `server-core/srvcore-test-1` | test-gap | medium | 4 | fixed (phase 4): sessions, devices and an HTTP test through `accounts::commands` remove + add | No test that a removed-then-re-added account does not inherit old sessions / device trust |
 | QA-147 | `web-assets/web-18` | test-gap | medium | 10 | open | Async node drivers can pass without running their later asserts: most harnesses do not check the final 'ok' |
 | QA-148 | `web-assets/web-19` | test-gap | medium | 10 | open | ClassPicker.util and ModelPicker.util claim node tests that do not exist |
 | QA-149 | `web-assets/web-20` | test-gap | medium | 10 | open | PrismLive.ui refresh rules (whether a server change overwrites a user's unsaved field) and keep/patch have no node test |
@@ -4808,3 +4808,55 @@ On the PR, two new tests failed in CI. On macOS, `remove_toolchain_refuses_a_hel
 Left for later: the Storage card row for run folders no record names (listed by `train list` only; phase 4), and the
 verifier's optional TrainLock check for runs of older binaries without a busy marker. Not verified here: the Windows
 `names_file` (volume serial + file index) was type-checked and linted for `x86_64-pc-windows-msvc` and runs only in CI.
+
+### Audit 2026-11, phase 4 notes
+
+Superseded disk growth and readouts. The scope is the ledger's phase 4 items that phase 2 had not already closed, plus
+the plan's Storage card rows and the phase 3 leftover (run folders no record names). The rule stays: automatic
+deletion only for what is provably superseded or rebuildable; user data and runtimes are report-only.
+
+| what grew | now | IDs |
+|---|---|---|
+| OpenVINO blobs and TensorRT engines of removed, retrained or throwaway models in a cache folder the daily model keeps in use | each model file compiles into `openvino-<dev>-<prec>/<stem>-<key16>/` or `tensorrt/<stem>-<key16>/` with a `model.txt`; the key covers the canonical path, size and mtime, so a retrained file gets a new folder (and TensorRT never reuses a stale engine); `caches::sweep_compiled` removes a subfolder whose file is gone or changed, or unused 60 days by its own marker, even inside a folder in use, never one this process compiled into; flat blobs/engines of earlier versions go once a day old | RA-054, -057 |
+| fold models of a dataset check in the TensorRT / CoreML caches | `LoadRequest::no_cache` reaches ORT: no engine, timing or CoreML model cache; the CoreML rewrite stays in memory | RA-062 |
+| `tools/uv-cache` after a failed or cancelled setup | deleted by Remove training environment (under both tool locks), by the daily sweep once a day old, and by the Storage card's Clear at once, both while the export lock can be taken without waiting (every uv run holds it; the train lock is not taken, so a training start never waits on a multi-GB delete) | RA-058 |
+| a failed run's `work/` | the run's own failure branch deletes `job::FAILED_RUN_SCRATCH` (`rfdetr-data`, `export`, `rfdetr-export-weights`, `rfdetr-out/last.ckpt`) once the trainer is reaped; `hf-best.tmp` stays (a retry reads it last); a cancel, `--keep-work` or a shutdown keeps everything; a run with no checkpoint keeps its folder for the readout and Remove | RA-072 |
+| each record's log tail in `runs.json` | Done and Cancelled keep 15 lines, Failed 60; no record dropped | RA-070 |
+| benchmark results of a removed model's `+served` / variants | `forget_model` drops `<model>+served` always and `<model>+<variant>` unless that full name is a configured model (names may contain `+`) | RA-063, QA-028 |
+| device entries of removed accounts | `Devices::prune_users` at flush and load | RA-069 |
+
+Security fix on the way (QA-038, QA-146): an account removed with the CLI and created again under the same name
+started again at generation 1, so an old browser's session cookie signed in to the new account. A new account now
+starts at a random generation (63 bits, `User::new` is the only constructor), and a device entry stores its
+account's `created` (compared by equality, never order, so a clock that ran ahead locks nobody out). Left open on
+purpose: a device cookie of an account removed and re-created within the same second still skips the lockout wait
+(the new password is still needed; sessions do not depend on it); closing it needs an immutable per-account id.
+
+Storage card (`GET /v1/storage` items gain `parts`): a uv package cache row with Clear (409 while an export or setup
+runs); model-export leftovers counted in the staging row; compiled models listed under the OpenVINO / TensorRT cache
+rows, superseded ones first; report-only rows for `tools/` (export toolchain, training environment), run folders no
+record names, and runtimes this config does not load (another ONNX Runtime flavor, `cuda-libs` beside a non-CUDA
+build, the old flat `onnxruntime/` layout). Checked, not changed: an updated OpenVINO / ORT flavor / `cuda-libs`
+install is already removed right after its swap (`swap_owned`), a failed removal at a later start
+(`settle_set_aside`); an inactive flavor is not superseded (the user may switch back), so it is shown, not deleted.
+
+Smaller: the saved-image folder is in the temp sweep (RA-075 itself was fixed in phase 1: atomic saves and a drained
+saver); tests that made temp folders and kept them use `crate::test_dirs::TempDir` (RA-076); the collector's own
+prune timer takes the limits of the last Prune message and stops when collection is off (RA-064).
+
+What a user notices after upgrading:
+- Every model compiles once more at its first load (into its new subfolder; 20-60 s per model on the UHD 630 GPU).
+  The old flat cache files are removed a day later.
+- Each browser loses its trusted-device status once (old device entries have no account `created`): until its next
+  successful sign-in the account's normal lockout wait applies to it.
+- Removing a model also removes its As served and variant results from the Benchmark page.
+
+Tests: each fix has a test that fails without it, shown in private copies with their own target folders (compiled
+sweep in-use skip and key check; random generation and device prune; forget_model; uv-cache sweep and Clear; unlisted
+run folders; collector Prune; failed-run scratch, finished log tail, uv-cache in Remove training environment). Real
+compiles: OpenVINO CPU (cold 537 ms, warm 162 ms with nothing added, `no_cache` writes nothing; a new mtime makes a
+second subfolder that `compiled_entries` marks superseded), CoreML `no_cache` (leaves `cache/` empty, outputs equal
+to the cached load), and the `backend_cache` / `backend_ort` ignored suites pass.
+
+Not verified here: TensorRT (no NVIDIA GPU on the development Mac; type-checked and linted for Linux and Windows),
+the OpenVINO GPU cache folders (the UHD 630 box), the Windows lock behaviour of the uv-cache sweep (CI only).

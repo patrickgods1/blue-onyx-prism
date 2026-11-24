@@ -9,8 +9,9 @@ use crate::common;
 use blue_onyx_prism::backend::{CoreOptions, LoadRequest, Runtimes, spec};
 use std::path::Path;
 
-/// `(folder name, blob count)` for every folder under `root` holding OpenVINO blobs, plus
-/// `("", n)` for blobs in the root itself.
+/// `(folder name, blob count)` for every folder under `root` holding OpenVINO blobs, directly or
+/// in its per-model subfolders (`openvino-<dev>-<prec>/<stem>-<key16>/`), plus `("", n)` for
+/// blobs in the root itself.
 fn blobs(root: &Path) -> Vec<(String, usize)> {
     let count = |d: &Path| {
         std::fs::read_dir(d).map_or(0, |r| {
@@ -22,10 +23,13 @@ fn blobs(root: &Path) -> Vec<(String, usize)> {
     let mut out = vec![(String::new(), count(root))];
     for e in std::fs::read_dir(root).unwrap().flatten() {
         if e.path().is_dir() {
-            out.push((
-                e.file_name().to_string_lossy().into_owned(),
-                count(&e.path()),
-            ));
+            let mut n = count(&e.path());
+            for sub in std::fs::read_dir(e.path()).unwrap().flatten() {
+                if sub.path().is_dir() {
+                    n += count(&sub.path());
+                }
+            }
+            out.push((e.file_name().to_string_lossy().into_owned(), n));
         }
     }
     out.retain(|(_, n)| *n > 0);
@@ -41,7 +45,9 @@ fn precision_change_never_reuses_a_blob() {
     let dir = common::temp_dir("ov-cache-precision");
     let cache = dir.join("cache");
     // The same graph under an F32_MODELS file name: OpenVINO hashes the graph, not the path, so
-    // without per-precision folders this copy imported the f16 blob of the original.
+    // without per-precision folders this copy imported the f16 blob of the original. Since each
+    // model file compiles into its own subfolder (`storage::caches::model_cache_dir`), the copy's
+    // path keeps it apart too; the precision folders still separate one file's two precisions.
     let f32_copy = dir.join("exdark-rfdetr-nano.onnx");
     std::fs::copy(&ipcam, &f32_copy).unwrap();
 

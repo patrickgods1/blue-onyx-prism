@@ -609,8 +609,16 @@ pub(crate) fn prepare_env(
                 python.display()
             );
         }
-        // The wheels are installed (copied, hard-linked or cloned); the cache is not needed.
-        let _ = std::fs::remove_dir_all(&p.uv_cache);
+        // The wheels are installed (copied, hard-linked or cloned); the cache is not needed. A
+        // failed removal costs only disk, never the environment.
+        if let Err(e) = manager::remove_any(&p.uv_cache) {
+            tracing::debug!(
+                "could not remove the uv cache {} after installing the packages ({e:#}); another \
+                 program (an antivirus scan) may hold one of its files. Remove training \
+                 environment or the export toolchain's Remove deletes it, or delete it by hand",
+                p.uv_cache.display()
+            );
+        }
         let marker = serde_json::to_vec_pretty(&marker_for(lock)).map_err(|e| anyhow!(e))?;
         std::fs::write(p.env.join(ENV_MARKER), marker)
             .with_context(|| format!("writing the marker in {}", p.env.display()))?;

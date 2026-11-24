@@ -21,7 +21,9 @@
 //! `ModelProto.graph` and the replaced `GraphProto.node`s are re-encoded and new initializers are
 //! appended. A model without anything to rewrite is reported as [`Outcome::Unchanged`]; models
 //! with external data are left alone ([`Outcome::ExternalData`]), since a copy elsewhere would
-//! lose the relative data paths. [`rewrite_cached`] writes the result next to other caches.
+//! lose the relative data paths. [`rewrite_cached`] writes the result next to other caches;
+//! [`rewrite_file`] keeps it in memory, for a model that must leave no copy behind
+//! (`LoadRequest::no_cache`: a dataset check's fold model, loaded from the bytes).
 //!
 //! Layout: `proto` (protobuf wire format), `onnx` (the ONNX messages the rewrite reads), `emit`
 //! (graph analysis, replacement nodes, re-serialization); this file holds the options, the
@@ -355,12 +357,19 @@ pub fn rewrite_cached(src: &Path, dir: &Path, opts: &RewriteOptions) -> Result<C
     rewrite_cached_capped(src, dir, opts, MAX_REWRITE_BYTES)
 }
 
-fn rewrite_cached_capped(
+/// Rewrite the model file `src` in memory; nothing is written anywhere. A model larger than
+/// [`MAX_REWRITE_BYTES`] is not read and reported as [`Outcome::Unchanged`].
+pub fn rewrite_file(src: &Path, opts: &RewriteOptions) -> Result<Outcome> {
+    rewrite_file_capped(src, opts, MAX_REWRITE_BYTES).map(|(outcome, _)| outcome)
+}
+
+/// [`rewrite_file`] with the size limit given, plus the SHA-256 (hex) of `src`'s bytes when it
+/// was rewritten (empty otherwise).
+fn rewrite_file_capped(
     src: &Path,
-    dir: &Path,
     opts: &RewriteOptions,
     max_bytes: u64,
-) -> Result<Cached> {
+) -> Result<(Outcome, String)> {
     let Some(bytes) =
         read_capped(src, max_bytes).with_context(|| format!("reading {}", src.display()))?
     else {
@@ -370,17 +379,30 @@ fn rewrite_cached_capped(
              (MAX_REWRITE_BYTES); loading it without the graph rewrite",
             src.display()
         );
-        return Ok(Cached::Original {
-            skipped: Vec::new(),
-        });
+        let skipped = Vec::new();
+        return Ok((Outcome::Unchanged { skipped }, String::new()));
     };
-    let r = match rewrite(&bytes, opts).with_context(|| format!("parsing {}", src.display()))? {
+    let outcome = rewrite(&bytes, opts).with_context(|| format!("parsing {}", src.display()))?;
+    let sha = match outcome {
+        Outcome::Rewritten(_) => sha256_hex(&bytes),
+        _ => String::new(),
+    };
+    Ok((outcome, sha))
+}
+
+fn rewrite_cached_capped(
+    src: &Path,
+    dir: &Path,
+    opts: &RewriteOptions,
+    max_bytes: u64,
+) -> Result<Cached> {
+    let (outcome, sha) = rewrite_file_capped(src, opts, max_bytes)?;
+    let r = match outcome {
         Outcome::Unchanged { skipped } => return Ok(Cached::Original { skipped }),
         Outcome::ExternalData => return Ok(Cached::ExternalData),
         Outcome::Rewritten(r) => r,
     };
-    let path = dir.join(cache_file_name(src, &sha256_hex(&bytes)));
-    drop(bytes);
+    let path = dir.join(cache_file_name(src, &sha));
     // A cache hit is trusted only when its bytes are exactly the rewrite just computed (the
     // rewrite is deterministic): a file somebody else put at this predictable path, or a
     // truncated / stale one, is replaced (BE-04).
@@ -1072,6 +1094,38 @@ mod tests {
             Cached::Original { .. }
         ));
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrite_file_keeps_the_rewrite_in_memory() {
+        let dir =
+            std::env::temp_dir().join(format!("bop-onnx-rewrite-mem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("fold.onnx");
+        let m = single(
+            12,
+            node("HardSwish", "hs", &["x"], &["y"], &[]),
+            &["y"],
+            &[2],
+        );
+        std::fs::write(&src, &m).unwrap();
+        let Outcome::Rewritten(r) = rewrite_file(&src, &RewriteOptions::COREML).unwrap() else {
+            panic!("not rewritten")
+        };
+        let Outcome::Rewritten(want) = rewrite(&m, &RewriteOptions::COREML).unwrap() else {
+            panic!("not rewritten")
+        };
+        assert_eq!(r.bytes, want.bytes, "the same rewrite as the cached one");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(names, ["fold.onnx"], "nothing written beside the model");
+        // Over the limit: the original, unread.
+        let (o, sha) = rewrite_file_capped(&src, &RewriteOptions::COREML, 1).unwrap();
+        assert!(matches!(o, Outcome::Unchanged { .. }) && sha.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

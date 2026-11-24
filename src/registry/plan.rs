@@ -259,10 +259,8 @@ mod tests {
         }
     }
 
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bo_plan_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir() -> crate::test_dirs::TempDir {
+        crate::test_dirs::TempDir::new("plan")
     }
 
     fn config_with(models: Vec<ModelConfig>) -> Config {
@@ -317,7 +315,8 @@ mod tests {
 
     #[test]
     fn missing_file_fails_with_the_path() {
-        let file = temp_dir().join("absent.onnx");
+        let dir = temp_dir();
+        let file = dir.join("absent.onnx");
         let plan = plan_one(&config_with(vec![entry(file.clone())]));
         let PlanOutcome::Failed(msg) = &plan.outcome else {
             panic!("expected Failed");
@@ -329,7 +328,8 @@ mod tests {
 
     #[test]
     fn exportable_model_without_a_file_needs_an_export() {
-        let file = temp_dir().join("yolo26s.onnx");
+        let dir = temp_dir();
+        let file = dir.join("yolo26s.onnx");
         let plan = plan_one(&config_with(vec![entry(file)]));
         let PlanOutcome::Failed(msg) = &plan.outcome else {
             panic!("expected Failed");

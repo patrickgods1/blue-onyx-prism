@@ -179,8 +179,9 @@ pub(super) async fn resources_remove(
                 Ok(msg) => {
                     // Their benchmark results go too (the Benchmark page lists what they hold).
                     let results = crate::benchmark::results_path(&state.config_path);
+                    let keep = crate::benchmark::forget::configured_names(&state.config_read());
                     for n in &dropped {
-                        if let Err(e) = crate::benchmark::forget::forget_model(&results, n) {
+                        if let Err(e) = crate::benchmark::forget::forget_model(&results, n, &keep) {
                             warn!("benchmark results of '{n}' not dropped: {e:#}");
                         }
                     }

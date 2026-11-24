@@ -151,7 +151,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     403, never 401; the API token is refused).
   - Accounts (`src/accounts/`): `auth/users.json` fails closed (only a missing file is setup mode), Argon2id behind a
     hashing semaphore, every `auth/` read-modify-write under `auth/.lock` and never while hashing. Sessions and device
-    cookies (`accounts/sessions.rs`, `devices.rs`, `cookies.rs`) store only SHA-256 of their ids. One `accounts::Auth`
+    cookies (`accounts/sessions.rs`, `devices.rs`, `cookies.rs`) store only SHA-256 of their ids; a new account
+    starts at a random `generation` and a device stores its account's `created` (compared by equality), so a re-created
+    name inherits no session or device trust; `Auth::flush` prunes both for removed accounts. One `accounts::Auth`
     and one `Logins` per process (`runner`), flushed at shutdown.
   - Every auth file (accounts, sessions, devices, setup code, API token) is under `Auth::data_root()`, the start's data
     root, never `running()` (a generation restart that changes `download_dir` only warns).
@@ -183,7 +185,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
 - **Backend** (`src/backend/`, the only place `unsafe` is allowed): runtimes behind a `Backend` enum
   (`OpenVino | Ort`). OpenVINO wrapper (properties CACHE_DIR, f16 on GPU and the GPU hint: the hardware profile's choice
   or `performance_hint`, LATENCY by default on an integrated GPU, THROUGHPUT on Arc; cache dir
-  `<cache>/openvino-<device>-<prec>`, the CPU cache hash ignores precision); `ort.rs` holds all `ort` code; `spec.rs`
+  `<cache>/openvino-<device>-<prec>/<stem>-<key16>/`, one per model file with its `model.txt`, TensorRT likewise in
+  `tensorrt/`, the CPU cache hash ignores precision; `LoadRequest::no_cache` also turns off ORT's TensorRT/CoreML
+  caches); `ort.rs` holds all `ort` code; `spec.rs`
   parses device specs; `detect.rs` finds GPUs (DXGI / sysfs / Apple); `select.rs` builds the ranked, pure `DeviceOption`
   list and the `auto` pick; `plan.rs` turns it into per-model load candidates (compile + warm-up, falling down the list,
   CPU last); `vram.rs` reads free GPU memory live (NVML / DXGI / amdgpu sysfs, never a CUDA context); `memory.rs` the
@@ -380,7 +384,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     training; Remove with files, Retry export and the Storage card's Remove export refuse while it is Live
     (`service::run_in_use`). `TrainingService::while_idle` (holds `admit`, which every enqueue takes first) runs
     remove-env, the training-folder move and SAM 3 Remove with no job queued under them.
-  - Protection: a failed run keeps `work` (`training/retry.rs`, `train retry-export`; training itself does not resume);
+  - Protection: a failed run keeps `work`'s checkpoints (scratch in `job::FAILED_RUN_SCRATCH` goes once the trainer
+    is reaped; a shutdown keeps all) (`training/retry.rs`, `train retry-export`; training itself does not resume);
     an OOM restarts only before 3 finished epochs; an early GPU OOM retries at half the batch, a host OOM halves the
     loader workers, never the batch (`training::workers_for`); `check_disk` refuses up front.
   - Worker count: `training::workers::learned` (pure) adjusts the automatic count from past runs' `RunRecord.resources`.
@@ -406,7 +411,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     `labels::needs_decision` refuses a save that would turn a flagged box into a label.
 
 - **Storage and memory** (`src/storage/`): the sweeper deletes only rebuildable files (caches unused 60 days by a
-  `.last-used` marker, no marker = the clock starts; stale compiled models; staging and job `work` whose `.busy` marker,
+  `.last-used` marker, no marker = the clock starts; per-model compiled subfolders whose model file is gone or
+  changed, also inside a folder in use, `caches::sweep_compiled`; a leftover `tools/uv-cache` a day old under a try of
+  the export lock; staging and job `work` whose `.busy` marker,
   `storage::busy`, is unlocked, `Busy::finish_removing` leaves it unlocked on a failed removal; crash leftovers matched
   by exact name only: atomic-write temps after 1 h, review-export `.building-*`, export staging, download leftovers
   under a try of the download / export lock, `manager::leftovers`, `export::leftovers`). Never labels, datasets, exports, models, runs, a failed run's `work` (the retry

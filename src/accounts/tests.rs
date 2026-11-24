@@ -142,7 +142,7 @@ fn add_and_remove_never_the_last_account() {
     );
     let alice = s.add("Alice", PW, &p, 100).unwrap();
     assert_eq!(alice.name, "alice");
-    assert_eq!(alice.generation, 1);
+    assert!(alice.generation < 1 << 63, "the top bit is clear");
     assert_eq!((alice.created, alice.password_changed), (100, 100));
     assert!(
         !format!("{alice:?}").contains("argon2"),

@@ -870,26 +870,27 @@ pub(super) fn refund(state: &AppState, r: Reserved) {
     state.login.failures.lock_recover().refund(r);
 }
 
-/// The cookies and redirect of a browser that just signed in as `user` (generation `generation`):
-/// a new session (never the one the browser may have sent), the device cookie renewed or issued,
-/// 303 to `next` or home. Written before it returns.
+/// The cookies and redirect of a browser that just signed in to the account `u` (its name,
+/// generation and `created` as read): a new session (never the one the browser may have sent),
+/// the device cookie renewed or issued (a device of an earlier account of the same name is no
+/// device of this one: a new one is issued), 303 to `next` or home. Written before it returns.
 fn signed_in_answer(
     state: &AppState,
     headers: &HeaderMap,
-    user: &str,
-    generation: u64,
+    u: &accounts::User,
     next: &str,
     html: bool,
 ) -> Response {
     let now = accounts::now();
+    let user = u.name.as_str();
     if let Some(old) = cookie(headers, cookies::SESSION).and_then(SessionId::from_presented) {
         state.auth.sessions.end(&old, now);
     }
     let device = cookie(headers, cookies::DEVICE)
-        .filter(|d| state.auth.devices.record_success(d, user, now))
+        .filter(|d| state.auth.devices.record_success(d, user, u.created, now))
         .and_then(accounts::devices::DeviceId::from_presented)
-        .unwrap_or_else(|| state.auth.devices.issue(user, now));
-    let session = state.auth.sessions.create(user, generation, now);
+        .unwrap_or_else(|| state.auth.devices.issue(user, u.created, now));
+    let session = state.auth.sessions.create(user, u.generation, now);
     let target = if next.is_empty() { "/" } else { next };
     let mut resp = if html {
         see_other(target)
@@ -962,7 +963,7 @@ pub(super) async fn login_submit(
             Some(u) => {
                 let trusted = device
                     .as_deref()
-                    .is_some_and(|d| state.auth.devices.trusted(d, &u.name, now));
+                    .is_some_and(|d| state.auth.devices.trusted(d, &u.name, u.created, now));
                 (u.lockout(), trusted)
             }
             None => (state.auth.unknown.lock_recover().state(&key), false),
@@ -1017,7 +1018,7 @@ pub(super) async fn login_submit(
         Some(u) if good => {
             refund(&state, reserved);
             info!(peer = %who(peer), user = %u.name, "signed in to the web UI");
-            let (user, generation) = (u.name.clone(), u.generation);
+            let signed_in = u.clone();
             if u.failures > 0 || u.last_failure.is_some() {
                 record_later(&state, slot, move |st| {
                     if let Err(e) =
@@ -1031,7 +1032,7 @@ pub(super) async fn login_submit(
             }
             let html = answer.html;
             let st = Arc::clone(&state);
-            blocking(move || signed_in_answer(&st, &headers, &user, generation, &next, html)).await
+            blocking(move || signed_in_answer(&st, &headers, &signed_in, &next, html)).await
         }
         Some(u) => {
             // Answered at once; the write follows on its own task, which holds the attempt's slot
@@ -1040,7 +1041,7 @@ pub(super) async fn login_submit(
             let who = who(peer);
             record_later(&state, slot, move |st| {
                 if let Some(d) = &device {
-                    st.auth.devices.record_failure(d, &u.name, now);
+                    st.auth.devices.record_failure(d, &u.name, u.created, now);
                 }
                 match accounts::Store::open(st.auth.data_root()).record_failure(&u.name, now) {
                     Ok(Some(s)) if s.disabled => {
@@ -1273,10 +1274,7 @@ pub(super) async fn setup_submit(
         Ok(user) => {
             refund(&state, reserved);
             info!(peer = %who(peer), user = %user.name, "created the first web UI account with the setup code");
-            blocking(move || {
-                signed_in_answer(&state, &headers, &user.name, user.generation, "", html)
-            })
-            .await
+            blocking(move || signed_in_answer(&state, &headers, &user, "", html)).await
         }
         Err(SetupError::WrongCode | SetupError::NoCode) => {
             warn!(peer = %who(peer), "setup refused: wrong setup code");

@@ -267,12 +267,24 @@ pub(super) struct Sample {
     pub(super) routed: bool,
 }
 
-/// Folder levels below the cache root [`cache_files`] lists: OpenVINO blobs are one level down
-/// (`openvino-<device>-<precision>/<hash>.blob`), ORT's CoreML model cache a few more
+/// Folder levels below the cache root [`cache_files`] lists: OpenVINO blobs and TensorRT engines
+/// are two levels down, in the model's own subfolder
+/// (`openvino-<device>-<precision>/<stem>-<key16>/<hash>.blob`, `tensorrt/<stem>-<key16>/...`,
+/// [`crate::storage::caches::model_cache_dir`]), ORT's CoreML model cache a few more
 /// (`coreml/<COREML_CACHE_KEY>/...`).
 const CACHE_DEPTH: usize = 4;
 
-/// Every file under `dir` (down to [`CACHE_DEPTH`] folders), as paths relative to it.
+/// Whether `name` is a cache's own bookkeeping rather than a compiled file: the last-use
+/// marker, the `model.txt` naming a subfolder's model (written before the compile, so a new
+/// subfolder alone is no miss) and a temporary file of either.
+fn is_cache_bookkeeping(name: &str) -> bool {
+    name == crate::storage::caches::LAST_USED_FILE
+        || name == crate::storage::caches::MODEL_FILE
+        || crate::fsx::is_temp_name(name)
+}
+
+/// Every compiled file under `dir` (down to [`CACHE_DEPTH`] folders; bookkeeping files left
+/// out, [`is_cache_bookkeeping`]), as paths relative to it.
 pub(super) fn cache_files(dir: &Path) -> std::collections::HashSet<PathBuf> {
     fn walk(root: &Path, dir: &Path, depth: usize, out: &mut std::collections::HashSet<PathBuf>) {
         let Ok(rd) = std::fs::read_dir(dir) else {
@@ -287,7 +299,8 @@ pub(super) fn cache_files(dir: &Path) -> std::collections::HashSet<PathBuf> {
                     }
                 }
                 Ok(_) => {
-                    if let Ok(rel) = path.strip_prefix(root) {
+                    let bookkeeping = e.file_name().to_str().is_some_and(is_cache_bookkeeping);
+                    if !bookkeeping && let Ok(rel) = path.strip_prefix(root) {
                         out.insert(rel.to_path_buf());
                     }
                 }
@@ -1887,6 +1900,25 @@ mod tests {
         std::fs::create_dir_all(&gpu).unwrap();
         let ov_cpu = device(Runtime::OpenVino, "CPU", "openvino:cpu");
         let ov_gpu = device(Runtime::OpenVino, "GPU.0", "openvino:gpu.0");
+        // A model's subfolder with only its bookkeeping (made before the compile, markers): no
+        // compiled file, so neither a miss nor a hit.
+        let sub = cpu.join("m-0123456789abcdef");
+        std::fs::create_dir_all(&sub).unwrap();
+        let before = cache_files(&root);
+        std::fs::write(sub.join(crate::storage::caches::MODEL_FILE), b"/m.onnx\n").unwrap();
+        std::fs::write(sub.join(crate::storage::caches::LAST_USED_FILE), b"1\n").unwrap();
+        std::fs::write(cpu.join(crate::storage::caches::LAST_USED_FILE), b"1\n").unwrap();
+        assert!(cache_files(&root).is_empty());
+        assert_eq!(
+            cache_status(&before, &cache_files(&root), &ov_cpu),
+            "unknown"
+        );
+        // Its blob is the compile's: a miss, then a hit.
+        std::fs::write(sub.join("77.blob"), b"x").unwrap();
+        assert_eq!(cache_status(&before, &cache_files(&root), &ov_cpu), "miss");
+        let before = cache_files(&root);
+        assert_eq!(cache_status(&before, &cache_files(&root), &ov_cpu), "hit");
+        std::fs::remove_dir_all(&sub).unwrap();
         assert_eq!(
             cache_scope(&ov_gpu),
             Some(CacheScope::Prefix("openvino-gpu-".into()))

@@ -1339,7 +1339,8 @@ pub(super) async fn config_models_remove(
                 // Its benchmark results go too (the Benchmark page lists what they hold).
                 if let Some(o) = &outcome {
                     let results = crate::benchmark::results_path(&state.config_path);
-                    match crate::benchmark::forget::forget_model(&results, &o.name) {
+                    let keep = crate::benchmark::forget::configured_names(&state.config_read());
+                    match crate::benchmark::forget::forget_model(&results, &o.name, &keep) {
                         Ok(f) if f.any() => done.push_str(" and dropped its benchmark results"),
                         Ok(_) => {}
                         Err(e) => {

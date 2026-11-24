@@ -14,7 +14,8 @@
 //!   ([`super::Cached`]). A session ends when its account is gone or disabled, or when the
 //!   account's `generation` is no longer the one the session was made with: a password change,
 //!   a reset or "sign out everywhere" by the CLI ends the live sessions without ever touching
-//!   this file. A session that fails a check is removed.
+//!   this file, and so does `user remove` (a new account of the same name starts at a random
+//!   generation, [`super::User::new`]). A session that fails a check is removed.
 //! - **Limits:** at most [`MAX_PER_USER`] sessions per account; a new one evicts the oldest.
 //! - **The file** `auth/sessions.json` (format [`FORMAT`]): `{"format": 1, "sessions": [{"hash",
 //!   "user", "generation", "created", "last_active"}]}`, hashes only, so the file signs nobody
@@ -697,6 +698,34 @@ mod tests {
                 .is_none()
         );
         assert!(s.is_empty());
+    }
+
+    /// QA-038: `user remove bob` and `user add bob` (the store, as the CLI does it; neither
+    /// touches this file) with bob's session still held: the new bob starts at another
+    /// generation, so the old session is nobody's, whatever the clock says.
+    #[test]
+    fn a_new_account_of_a_removed_ones_name_inherits_no_session() {
+        let d = scratch();
+        let store = super::super::Store::open(&d.0);
+        store.add_hashed("alice", "$argon2id$x".into(), T).unwrap();
+        let old = store.add_hashed("bob", "$argon2id$x".into(), T).unwrap();
+        let s = Sessions::load(&d.0, T);
+        let id = s.create("bob", old.generation, T);
+        let read = || store.load().unwrap().unwrap();
+        assert!(
+            s.check(id.reveal().as_bytes(), &read(), T, Activity::Poll)
+                .is_some()
+        );
+        store.remove("bob").unwrap();
+        // The same second, so nothing but the generation tells the two apart.
+        let new = store.add_hashed("bob", "$argon2id$x".into(), T).unwrap();
+        assert_ne!(new.generation, old.generation);
+        assert_eq!(new.created, old.created);
+        assert!(
+            s.check(id.reveal().as_bytes(), &read(), T, Activity::User)
+                .is_none()
+        );
+        assert!(s.is_empty(), "the check removed it");
     }
 
     #[test]

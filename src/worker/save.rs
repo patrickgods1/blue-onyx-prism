@@ -281,7 +281,7 @@ mod tests {
     /// A full queue drops the save, counted; only the first drop of an interval warns.
     #[test]
     fn a_full_queue_drops_with_one_warning() {
-        let dir = std::env::temp_dir().join(format!("bo_save_test_{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dirs::TempDir::unmade("save-test");
         let (saver, rx) = Saver::unstarted(1);
         assert_eq!(saver.submit(job(&dir)), Submitted::Queued);
         assert_eq!(saver.submit(job(&dir)), Submitted::Dropped { warned: true });
@@ -307,7 +307,6 @@ mod tests {
         // A writer that is gone drops too.
         drop(rx);
         assert!(matches!(saver.submit(job(&dir)), Submitted::Dropped { .. }));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn files_in(dir: &std::path::Path) -> Vec<String> {
@@ -325,7 +324,7 @@ mod tests {
     /// detached and queued saves were lost without a word).
     #[test]
     fn finish_writes_the_queue_and_ends_the_thread() {
-        let dir = std::env::temp_dir().join(format!("bo_save_flush_{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dirs::TempDir::unmade("save-flush");
         let w = Writer::start(4).unwrap();
         for name in ["a.jpg", "b.jpg", "c.jpg"] {
             let j = SaveJob {
@@ -341,14 +340,13 @@ mod tests {
         );
         assert_eq!(files_in(&dir), ["a_od.jpg", "b_od.jpg", "c_od.jpg"]);
         assert_eq!(queued.load(Ordering::Acquire), 0);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Past the deadline the saves still queued are reported (and logged), and the thread is
     /// left to finish on its own.
     #[test]
     fn finish_past_the_deadline_reports_what_is_left() {
-        let dir = std::env::temp_dir().join(format!("bo_save_late_{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dirs::TempDir::unmade("save-late");
         let w = Writer::start(4).unwrap();
         // Large frames: encoding them takes long enough that none is done at once.
         let big = || RgbImage {
@@ -375,14 +373,13 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(60), "never written");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The process-wide saver starts again after a flush (the Windows service restarts in
     /// process).
     #[test]
     fn the_global_saver_starts_again_after_a_flush() {
-        let dir = std::env::temp_dir().join(format!("bo_save_global_{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dirs::TempDir::unmade("save-global");
         let deadline = || Instant::now() + Duration::from_secs(30);
         // Another test's registry shutdown may flush the global saver at the same time, and
         // then writes this test's save itself: wait for the file rather than for this flush.
@@ -407,6 +404,5 @@ mod tests {
         assert_eq!(submit(None, again), Submitted::Queued, "a new writer");
         assert_eq!(flush(deadline()), Flushed::Drained);
         written(&["cam1_od.jpg", "cam2_od.jpg"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

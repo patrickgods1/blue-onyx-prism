@@ -570,6 +570,9 @@ fn dispatch(
             *last = Some(settings);
         }
         Msg::Prune(s) => {
+            // The timer's fallback prune uses the latest limits the sweeper sent, and nothing
+            // once collection is off (frames no longer flow, so there is nothing to keep up).
+            *last = s.enabled.then(|| s.clone());
             guarded(st, "applying the dataset's size and age caps", |st| {
                 #[cfg(test)]
                 {
@@ -744,6 +747,35 @@ mod tests {
             assert!(Instant::now() < deadline, "no frame was saved");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// RA-064: a Prune message replaces the timer's remembered settings (before, the first
+    /// frame's limits stayed for good), and a Prune with collection off forgets them.
+    #[test]
+    fn a_prune_message_replaces_the_remembered_limits_and_off_clears_them() {
+        let dir = Tmp::new();
+        let mut st =
+            store::Store::with_probe(Arc::new(Mutex::new(Status::default())), Box::new(|_| None));
+        let mut last = Some(Arc::new(settings_for(&dir.0)));
+        let mut last_prune = Instant::now();
+        let mut newer = settings_for(&dir.0);
+        newer.max_bytes = 12345;
+        dispatch(
+            &mut st,
+            Msg::Prune(Arc::new(newer)),
+            &mut last,
+            &mut last_prune,
+        );
+        assert_eq!(last.as_ref().map(|s| s.max_bytes), Some(12345));
+        let mut off = settings_for(&dir.0);
+        off.enabled = false;
+        dispatch(
+            &mut st,
+            Msg::Prune(Arc::new(off)),
+            &mut last,
+            &mut last_prune,
+        );
+        assert!(last.is_none(), "no timer prune with old limits");
     }
 
     fn panics(_: &std::path::Path) {

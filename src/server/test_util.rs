@@ -97,7 +97,7 @@ pub(crate) struct Anonymous;
 
 /// Under `cfg(test)`, `AppState::new` calls this: when `data_root` is a test's temp folder, it
 /// gets `users.json` with [`TEST_USER`] (a cheap test hash of [`TEST_PASSWORD`], through the real
-/// store) and `auth` a live session [`TEST_SESSION`], so the real session check runs on every
+/// store; generation 1) and `auth` a live session [`TEST_SESSION`], so the real session check runs on every
 /// signed-in test request. Any other data root (a state made with `Config::default()`) is left
 /// alone: tests never write outside the temp folder.
 pub(crate) fn seed_tester(data_root: &std::path::Path, auth: &crate::accounts::Auth) {
@@ -117,6 +117,17 @@ pub(crate) fn seed_tester(data_root: &std::path::Path, auth: &crate::accounts::A
     let store = crate::accounts::Store::open(data_root);
     if store.load().ok().flatten().is_none() {
         store.add_hashed(TEST_USER, hash.clone(), now).unwrap();
+        // A new account's generation is random (`accounts::User::new`); the seeded one's is
+        // pinned to 1, so tests can plant sessions of it by hand.
+        store
+            .locked(|_, cur| {
+                let mut users = cur.unwrap();
+                for u in users.users.iter_mut().filter(|u| u.name == TEST_USER) {
+                    u.generation = 1;
+                }
+                Ok((Some(users), ()))
+            })
+            .unwrap();
     }
     auth.sessions.insert_known(TEST_SESSION, TEST_USER, 1, now);
 }

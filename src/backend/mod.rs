@@ -108,9 +108,11 @@ pub struct LoadRequest {
     pub requested: String,
     /// "f16" (default on GPU) or "f32".
     pub gpu_precision: Option<String>,
-    /// Compile without OpenVINO's model cache (CACHE_DIR off for this compile only): a throwaway
-    /// model whose blob would never be read again, the dataset check's fold models
-    /// (`training::refine::predict`). False for everything else. ONNX Runtime ignores it.
+    /// Compile without any model cache: a throwaway model whose compiled form would never be
+    /// read again, the dataset check's fold models (`training::refine::predict`). False for
+    /// everything else. OpenVINO: CACHE_DIR off for this compile only. ONNX Runtime: no
+    /// TensorRT engine or timing cache, no CoreML model cache, and the CoreML graph rewrite kept
+    /// in memory instead of `cache/coreml` (`ort.rs`).
     pub no_cache: bool,
 }
 

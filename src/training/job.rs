@@ -20,7 +20,8 @@
 //! the run owns a file that blocks its name, however it ends. The checkpoints (`<run>/work`) go once
 //! the model is registered, or when the run is cancelled before it installed. A failed or
 //! interrupted run keeps them: training and export share one process, so a late failure would
-//! otherwise cost the whole training. [`TrainJob::export_only`] exports such a run again
+//! otherwise cost the whole training. A failure (not an interruption) deletes only the scratch no
+//! Retry export reads ([`FAILED_RUN_SCRATCH`]) once the trainer is gone. [`TrainJob::export_only`] exports such a run again
 //! ([`super::retry`]): setup, self-check, then only the export and the stages after it. A run out
 //! of memory restarts only while that costs little ([`keeps_checkpoints`]).
 //!
@@ -692,6 +693,12 @@ fn run_training_with(
         if cancelled && !job.keep_work && job.export_only.is_none() && unregistered.is_none() {
             let _ = manager::remove_any(&work);
         }
+        // A failure: the runner has reaped the trainer, so nothing writes `work` any more. What
+        // a Retry export never reads goes; the checkpoints and the trainer's logs stay. Not on
+        // the way out of the process (a stop must not wait on deleting GBs).
+        if !cancelled && !exiting && !job.keep_work && job.export_only.is_none() {
+            remove_failed_scratch(&job.id, &work);
+        }
         TrainError {
             stage,
             message: match &unregistered {
@@ -705,6 +712,48 @@ fn run_training_with(
             cancelled,
         }
     })
+}
+
+/// What a failed run's `work` folder holds that no Retry export reads (paths under `work`, from
+/// `scripts/train_model.py`): RF-DETR's dataset layout with its augmented copies (`rfdetr-data`,
+/// rebuilt from `<run>/data` by any new run), the export's scratch (`export`,
+/// `rfdetr-export-weights`, both recreated by `--export-only`) and RF-DETR's per-epoch
+/// `last.ckpt` (only for resuming the training, which is not offered). Never a checkpoint
+/// [`super::retry::best_checkpoint`] reads: `hf-best.tmp` stays (a crash between the renames of
+/// `save_hf_best` can leave the only whole checkpoint there), as do `training_config.json`,
+/// Ultralytics' `run/` and the trainer's logs.
+pub const FAILED_RUN_SCRATCH: [&[&str]; 4] = [
+    &["rfdetr-data"],
+    &["export"],
+    &["rfdetr-export-weights"],
+    &["rfdetr-out", "last.ckpt"],
+];
+
+/// Delete [`FAILED_RUN_SCRATCH`] under the failed run `id`'s `work`, each logged with what it
+/// freed ([`crate::storage::size_of`]: hard links into `<run>/data` free nothing). One that cannot
+/// be deleted stays for the run's Remove (no sweep touches a run's folder).
+fn remove_failed_scratch(id: &str, work: &Path) {
+    for parts in FAILED_RUN_SCRATCH {
+        let p = parts.iter().fold(work.to_path_buf(), |p, n| p.join(n));
+        if std::fs::symlink_metadata(&p).is_err() {
+            continue;
+        }
+        let bytes = crate::storage::size_of(&p);
+        match manager::remove_any(&p) {
+            Ok(()) => tracing::info!(
+                run = %id,
+                "removed {} ({}): scratch of the failed run that no Retry export reads",
+                p.display(),
+                catalog::format_size(bytes)
+            ),
+            Err(e) => tracing::warn!(
+                run = %id,
+                "could not remove the failed run's scratch {} ({e:#}); another program may hold \
+                 a file in it. The run's Remove on the Jobs tab deletes it, or delete it by hand",
+                p.display()
+            ),
+        }
+    }
 }
 
 /// The failure message's last sentence: the checkpoint that survived and what to do with it.

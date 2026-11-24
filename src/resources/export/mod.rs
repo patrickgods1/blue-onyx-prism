@@ -817,6 +817,6 @@ pub mod train;
 pub mod vc_runtime;
 
 pub use exporter::*;
-pub(crate) use leftovers::sweep_leftovers;
+pub(crate) use leftovers::{export_staging_stem, sweep_leftovers};
 pub use seams::*;
 pub use stages::*;

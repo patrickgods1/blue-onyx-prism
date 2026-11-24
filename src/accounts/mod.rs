@@ -14,9 +14,12 @@
 //! `{"format": 1, "users": [{"name", "hash", "created", "password_changed", "generation",
 //! "failures", "last_failure", "disabled"}]}`. Times are unix seconds (UTC), so lockout
 //! arithmetic needs no parsing; `user list` prints them as RFC 3339. `hash` is the PHC string of
-//! [`password::hash`]. `generation` starts at 1 and is bumped by a password change or reset and
-//! by "sign out everywhere": sessions (a later change) record it, so a change made by the CLI ends
-//! the live sessions of that account without touching them.
+//! [`password::hash`]. `generation` starts at a random value ([`User::new`]) and is bumped by a
+//! password change or reset and by "sign out everywhere": sessions record it, so a change made by
+//! the CLI ends the live sessions of that account without touching them. Random, never 1: a new
+//! account of a removed one's name (`user remove bob`, then `user add bob`) inherits none of the
+//! removed one's sessions, even ones made while the service was stopped. Device cookies record
+//! `created` for the same reason ([`devices`]).
 //!
 //! **Fail closed.** A missing `users.json` is the only state that means "no accounts" (setup
 //! mode). One that cannot be read, does not parse, holds an invalid entry or has a newer format
@@ -181,6 +184,23 @@ impl std::fmt::Debug for User {
 }
 
 impl User {
+    /// A new account `name` with the password hash `hash`, created at `now`: no failures, not
+    /// disabled, and a random starting generation (see the module docs), so no session or
+    /// device cookie of an earlier account of the same name passes for it. The only place a
+    /// [`User`] is made from nothing ([`Store::add_hashed`], [`setup::create_first`]).
+    pub fn new(name: String, hash: String, now: u64) -> Self {
+        Self {
+            name,
+            hash,
+            created: now,
+            password_changed: now,
+            generation: first_generation(),
+            failures: 0,
+            last_failure: None,
+            disabled: false,
+        }
+    }
+
     /// The lockout state of this account.
     pub fn lockout(&self) -> lockout::State {
         lockout::State {
@@ -195,6 +215,16 @@ impl User {
         self.last_failure = s.last_failure;
         self.disabled = s.disabled;
     }
+}
+
+/// A new account's first generation: 63 random bits from the OS ([`crate::secret`]), the top
+/// bit clear so the `saturating_add(1)` of a password change never sticks at `u64::MAX`. Two
+/// accounts of one name share one with a chance of 2^-63; nothing depends on the clock.
+fn first_generation() -> u64 {
+    crate::secret::random_bytes(8)
+        .iter()
+        .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+        >> 1
 }
 
 /// `text` as an accounts file at `path`, checked (see the module docs). The error never quotes
@@ -374,16 +404,7 @@ impl Store {
             if users.get(&name).is_some() {
                 return Err(Refused::NameTaken.into());
             }
-            let user = User {
-                name,
-                hash,
-                created: now,
-                password_changed: now,
-                generation: 1,
-                failures: 0,
-                last_failure: None,
-                disabled: false,
-            };
+            let user = User::new(name, hash, now);
             users.users.push(user.clone());
             if first {
                 // Written before the code goes, so a failure here leaves setup possible.

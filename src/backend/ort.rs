@@ -9,10 +9,16 @@
 //!   be loaded, so the reason names what is missing.
 //! - [`OrtRuntime::compile`] creates a session on exactly one EP (registration errors are
 //!   errors, not a silent CPU fallback; the CPU fallback is the caller's candidate loop):
-//!   CUDA `device_id`; TensorRT fp16 with its engine cache in `cache/tensorrt` (CUDA behind it
-//!   for unsupported nodes); DirectML `device_id`, memory pattern off, sequential execution;
-//!   CoreML MLProgram, compute units ALL, cache in `cache/coreml`; `intra_threads` everywhere
-//!   (see [`super::cpu_threads`]) and thread spinning off (`BOP_ORT_SPINNING=1` turns it on).
+//!   CUDA `device_id`; TensorRT fp16 with its engine and timing cache in the model's own
+//!   `cache/tensorrt/<stem>-<key16>/` ([`crate::storage::caches::model_cache_dir`]: a retrained
+//!   file at the same path gets a new folder, since ONNX Runtime keys an engine by file and graph
+//!   names, not weights; CUDA behind it for unsupported nodes); DirectML `device_id`, memory
+//!   pattern off, sequential execution; CoreML MLProgram, compute units ALL, cache in
+//!   `cache/coreml`; `intra_threads` everywhere (see [`super::cpu_threads`]) and thread spinning
+//!   off (`BOP_ORT_SPINNING=1` turns it on).
+//! - [`LoadRequest::no_cache`] (a throwaway model such as a dataset check's fold model): no
+//!   TensorRT engine or timing cache, no CoreML model cache, and the CoreML rewrite below is kept
+//!   in memory (the session loads from its bytes), so nothing of it reaches `cache/`.
 //! - CoreML loads a rewritten copy of the model when it has ops the CoreML EP cannot take but
 //!   that have exact equivalents (HardSigmoid/HardSwish, opset < 13 Split; see
 //!   [`super::onnx_rewrite`]), cached as `cache/coreml/<stem>-<sha256/16>-v<N>.onnx`. YOLOv5 then
@@ -460,8 +466,10 @@ impl OrtRuntime {
         // Ports first. On the CPU the real session doubles as the metadata source (rebuilt only
         // when dynamic dims need pinning); for accelerators an unoptimized CPU session reads
         // them, so the EP compiles once, already with the pinned shapes.
+        let original = ModelSource::File(path.clone());
+        let no_cache = req.no_cache;
         let session = if target == Target::Cpu {
-            Some(self.build_session(target, index, &path, &[])?)
+            Some(self.build_session(target, index, &original, &[], no_cache)?)
         } else {
             None
         };
@@ -503,15 +511,15 @@ impl OrtRuntime {
             );
         }
         // CoreML: a copy without the ops that would split the graph into many partitions.
-        let session_path = if target == Target::CoreMl {
-            self.coreml_model(&path)
+        let source = if target == Target::CoreMl {
+            self.coreml_model(&path, no_cache)
         } else {
-            path.clone()
+            original
         };
         let session = match session {
             Some(s) if overrides.is_empty() => s,
             _ => {
-                let s = self.build_session(target, index, &session_path, &overrides)?;
+                let s = self.build_session(target, index, &source, &overrides, no_cache)?;
                 inputs = ports(s.inputs()).0;
                 s
             }
@@ -564,7 +572,7 @@ impl OrtRuntime {
         let (outputs, _) = ports(session.outputs());
         let mut all = vec![session];
         for _ in 1..sessions.max(1) {
-            all.push(self.build_session(target, index, &session_path, &overrides)?);
+            all.push(self.build_session(target, index, &source, &overrides, no_cache)?);
         }
         let compile_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
         let device = DeviceInfo {
@@ -611,16 +619,21 @@ impl OrtRuntime {
         gpu_full_name(&self.hw, cand.device.target, cand.device.index.unwrap_or(0))
     }
 
-    /// The model file a CoreML session loads: a cached rewrite of `path` (see
-    /// [`onnx_rewrite::rewrite_cached`]) when it has rewritable ops, else `path`. Failures only
-    /// log a warning and fall back to the original.
-    fn coreml_model(&self, path: &Path) -> PathBuf {
+    /// What a CoreML session loads: a cached rewrite of `path` (see
+    /// [`onnx_rewrite::rewrite_cached`]) when it has rewritable ops, else `path`. With `no_cache`
+    /// the rewrite stays in memory ([`onnx_rewrite::rewrite_file`]). Failures only log a warning
+    /// and fall back to the original.
+    fn coreml_model(&self, path: &Path, no_cache: bool) -> ModelSource {
+        let original = || ModelSource::File(path.to_path_buf());
         if !coreml_rewrite_enabled(std::env::var(ENV_COREML_REWRITE).ok().as_deref()) {
             tracing::info!(
                 "model {}: CoreML graph rewrite disabled ({ENV_COREML_REWRITE})",
                 path.display()
             );
-            return path.to_path_buf();
+            return original();
+        }
+        if no_cache {
+            return coreml_model_in_memory(path);
         }
         // Only the configured cache dir: a predictable path in the shared temp dir could be
         // pre-created by another local user (BE-04).
@@ -630,7 +643,7 @@ impl OrtRuntime {
                  enable the rewritten copy; unsupported ops fall back to the CPU provider)",
                 path.display()
             );
-            return path.to_path_buf();
+            return original();
         };
         let t0 = Instant::now();
         match onnx_rewrite::rewrite_cached(path, &dir, &onnx_rewrite::RewriteOptions::COREML) {
@@ -655,7 +668,7 @@ impl OrtRuntime {
                         skipped.join("; ")
                     );
                 }
-                rewritten
+                ModelSource::File(rewritten)
             }
             Ok(onnx_rewrite::Cached::Original { skipped }) => {
                 if !skipped.is_empty() {
@@ -665,14 +678,14 @@ impl OrtRuntime {
                         skipped.join("; ")
                     );
                 }
-                path.to_path_buf()
+                original()
             }
             Ok(onnx_rewrite::Cached::ExternalData) => {
                 tracing::info!(
                     "model {}: has external data; CoreML loads it without the graph rewrite",
                     path.display()
                 );
-                path.to_path_buf()
+                original()
             }
             Err(e) => {
                 tracing::warn!(
@@ -681,7 +694,26 @@ impl OrtRuntime {
                      delete cache_dir/coreml or set BOP_COREML_REWRITE=0",
                     path.display()
                 );
-                path.to_path_buf()
+                original()
+            }
+        }
+    }
+
+    /// `cache/<name>/<stem>-<key16>/` for the model file `model`
+    /// ([`crate::storage::caches::model_cache_dir`], which records the use); None (logged) when
+    /// there is no cache dir or it cannot be made: the session then builds without a cache.
+    fn model_cache_subdir(&self, name: &str, model: &Path) -> Option<String> {
+        let folder = self.cache_dir.as_ref()?.join(name);
+        match crate::storage::caches::model_cache_dir(&folder, model) {
+            Ok(dir) => dir.to_str().map(str::to_string),
+            Err(e) => {
+                tracing::warn!(
+                    "model {}: could not make its cache folder in {} ({e}); building without a \
+                     cache (check that the cache dir is writable)",
+                    model.display(),
+                    folder.display()
+                );
+                None
             }
         }
     }
@@ -716,13 +748,17 @@ impl OrtRuntime {
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))
     }
 
+    /// A session on `target` for `source`. `no_cache` ([`LoadRequest::no_cache`]): no TensorRT
+    /// engine or timing cache and no CoreML model cache.
     fn build_session(
         &self,
         target: Target,
         index: u32,
-        path: &Path,
+        source: &ModelSource,
         overrides: &[(String, i64)],
+        no_cache: bool,
     ) -> Result<Session> {
+        let path = source.path();
         let mut b: SessionBuilder = Self::session_builder()?;
         // Every session, GPU EPs included (their CPU fallback ops run on this pool).
         b = b.with_intra_threads(self.intra_threads).map_err(ort_err)?;
@@ -760,7 +796,15 @@ impl OrtRuntime {
                 let mut trt = ep::TensorRT::default()
                     .with_device_id(device_id)
                     .with_fp16(true);
-                if let Some(dir) = self.cache_subdir("tensorrt") {
+                // Engines of the model's own file (see the module docs); a bytes source never
+                // reaches TensorRT (only the CoreML rewrite is one).
+                let cached = match source {
+                    ModelSource::File(file) if !no_cache => {
+                        self.model_cache_subdir("tensorrt", file)
+                    }
+                    _ => None,
+                };
+                if let Some(dir) = cached {
                     trt = trt
                         .with_engine_cache(true)
                         .with_engine_cache_path(&dir)
@@ -792,7 +836,7 @@ impl OrtRuntime {
                 let mut coreml = ep::CoreML::default()
                     .with_model_format(ep::coreml::ModelFormat::MLProgram)
                     .with_compute_units(ep::coreml::ComputeUnits::All);
-                if let Some(dir) = self.cache_subdir("coreml") {
+                if !no_cache && let Some(dir) = self.cache_subdir("coreml") {
                     coreml = coreml.with_model_cache_dir(dir);
                 }
                 vec![coreml.build().error_on_failure()]
@@ -810,13 +854,71 @@ impl OrtRuntime {
                 )
             })?;
         }
-        b.commit_from_file(path).map_err(|e| {
+        match source {
+            ModelSource::File(file) => b.commit_from_file(file),
+            ModelSource::Memory { bytes, .. } => b.commit_from_memory(bytes),
+        }
+        .map_err(|e| {
             anyhow::anyhow!(
                 "creating ONNX Runtime {} session for {}: {e}",
                 target.display_name(),
                 path.display()
             )
         })
+    }
+}
+
+/// What a session loads: a model file, or the bytes of a rewrite of one kept in memory
+/// ([`LoadRequest::no_cache`] on CoreML).
+#[derive(Debug)]
+enum ModelSource {
+    File(PathBuf),
+    Memory {
+        bytes: Vec<u8>,
+        /// The model file the bytes are a rewrite of (for messages).
+        of: PathBuf,
+    },
+}
+
+impl ModelSource {
+    /// The model file, for messages.
+    fn path(&self) -> &Path {
+        match self {
+            ModelSource::File(p) => p,
+            ModelSource::Memory { of, .. } => of,
+        }
+    }
+}
+
+/// The CoreML rewrite of `path` kept in memory ([`onnx_rewrite::rewrite_file`]), else the file
+/// itself (nothing to rewrite, external data, too large, or a failure, logged).
+fn coreml_model_in_memory(path: &Path) -> ModelSource {
+    let t0 = Instant::now();
+    match onnx_rewrite::rewrite_file(path, &onnx_rewrite::RewriteOptions::COREML) {
+        Ok(onnx_rewrite::Outcome::Rewritten(r)) => {
+            tracing::info!(
+                "model {}: CoreML loads a rewritten copy from memory ({}; in {} ms; no cache: a \
+                 throwaway model)",
+                path.display(),
+                onnx_rewrite::summary(&r.counts),
+                t0.elapsed().as_millis()
+            );
+            ModelSource::Memory {
+                bytes: r.bytes,
+                of: path.to_path_buf(),
+            }
+        }
+        Ok(onnx_rewrite::Outcome::Unchanged { .. } | onnx_rewrite::Outcome::ExternalData) => {
+            ModelSource::File(path.to_path_buf())
+        }
+        Err(e) => {
+            tracing::warn!(
+                "model {}: CoreML graph rewrite failed, loading the original (ops CoreML cannot \
+                 run fall back to the CPU provider, slower): {e:#}",
+                path.display()
+            );
+            ModelSource::File(path.to_path_buf())
+        }
     }
 }
 
@@ -2389,5 +2491,111 @@ mod tests {
         // Bounded: abort (nothing busy any more) + JOIN_GRACE, then detached.
         assert!(t0.elapsed() < JOIN_GRACE + std::time::Duration::from_secs(2));
         drop(release_tx);
+    }
+
+    /// A `no_cache` CoreML load (a fold model) leaves nothing in `cache/` and nothing beside the
+    /// model (the rewrite loads from memory) and computes what the cached load computes. Needs
+    /// `models/IPcam-general.onnx` and an ONNX Runtime with CoreML in
+    /// `target/release/onnxruntime/coreml` (or `ORT_DYLIB_PATH`):
+    /// `cargo test --lib -- --ignored backend::ort::tests::no_cache_coreml`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs models/IPcam-general.onnx and an ONNX Runtime CoreML library"]
+    fn no_cache_coreml_leaves_nothing_behind() {
+        use super::super::{CoreOptions, OrtOptions, Runtimes, spec};
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let lib_dir = std::env::var_os("ORT_DYLIB_PATH")
+            .map(PathBuf::from)
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| repo.join("target/release/onnxruntime/coreml"));
+        let src = repo.join("models").join("IPcam-general.onnx");
+        assert!(src.is_file() && lib_dir.is_dir(), "fixtures missing");
+        let dir = std::env::temp_dir().join(format!("bop-ort-nocache-{}", uuid::Uuid::new_v4()));
+        let fold = dir.join("fold-0").join("model");
+        std::fs::create_dir_all(&fold).unwrap();
+        let model = fold.join("refine-fold-0.onnx");
+        std::fs::copy(&src, &model).unwrap();
+        let cache = dir.join("cache");
+        let mut rt = Runtimes::new_with(
+            &CoreOptions {
+                cache_dir: Some(cache.clone()),
+                intra_threads: 0,
+                openvino_dir: None,
+            },
+            &OrtOptions {
+                onnxruntime_dir: Some(lib_dir),
+                ..OrtOptions::default()
+            },
+        );
+        assert!(rt.has_ort(), "{:?}", rt.onnxruntime_error());
+        let coreml = spec::parse("ort:coreml").unwrap();
+        let req = |no_cache| LoadRequest {
+            path: model.clone(),
+            requested: "ort:coreml".into(),
+            gpu_precision: None,
+            no_cache,
+        };
+        let chw: Vec<f32> = (0..3 * 640 * 640u64)
+            .map(|i| ((i * 7919) % 1000) as f32 / 1000.0)
+            .collect();
+        let mut run = |no_cache| {
+            let mut b = rt
+                .load(&coreml, &req(no_cache))
+                .expect("load on ort:coreml");
+            let ms = b.info().compile_ms;
+            let out = b.infer(&chw, &[]).expect("infer")[0]
+                .as_f32()
+                .expect("f32 output")
+                .to_vec();
+            (out, ms)
+        };
+        let files = |d: &Path| -> Vec<PathBuf> {
+            let mut v: Vec<PathBuf> = walk(d);
+            v.sort();
+            v
+        };
+        fn walk(d: &Path) -> Vec<PathBuf> {
+            let mut out = Vec::new();
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walk(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+            out
+        }
+        let (thrown, ms) = run(true);
+        println!("no_cache CoreML load {ms} ms; cache {:?}", files(&cache));
+        assert!(
+            files(&cache.join("coreml")).is_empty(),
+            "{:?}",
+            files(&cache)
+        );
+        assert_eq!(
+            files(&fold),
+            std::slice::from_ref(&model),
+            "nothing beside the model"
+        );
+        let (cached, ms) = run(false);
+        println!("cached CoreML load {ms} ms; cache {:?}", files(&cache));
+        assert!(
+            !files(&cache.join("coreml")).is_empty(),
+            "the ordinary load caches"
+        );
+        let diff = thrown
+            .iter()
+            .zip(&cached)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!(
+            "max |no_cache - cached| over {} outputs: {diff}",
+            cached.len()
+        );
+        assert_eq!(thrown.len(), cached.len());
+        assert!(diff < 1e-2, "{diff}");
+        drop(rt);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

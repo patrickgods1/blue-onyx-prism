@@ -13,9 +13,9 @@
 //!   by [`super::prepare_env`] under the export lock, so an export and a training setup never
 //!   run uv at the same time; the training itself holds its own lock (`tools/.train.lock`) so
 //!   one training runs at a time across processes while exports go on. "Remove training
-//!   environment" ([`remove_train_env`]) holds both locks while it deletes and never deletes
-//!   either lock file. An environment whose base Python (`pyvenv.cfg`'s `home`) is gone is not
-//!   ready and is rebuilt.
+//!   environment" ([`remove_train_env`], the uv cache included) holds both locks while it
+//!   deletes and never deletes either lock file. An environment whose base Python
+//!   (`pyvenv.cfg`'s `home`) is gone is not ready and is rebuilt.
 //! - **Extending**: the import / auto-label stages add their packages to
 //!   `scripts/requirements-model-train.txt` and regenerate the locks; the environment marker
 //!   (lock name + SHA-256) makes every existing environment rebuild once.
@@ -166,13 +166,17 @@ impl TrainPaths {
         self.export.tools.join(TRAIN_LOCK_NAME)
     }
 
-    /// What "Remove training environment" deletes (the shared uv / Python stay for the export).
+    /// What "Remove training environment" deletes: the environment, its base weights, settings and
+    /// scripts, and the uv cache it shares with the export (rebuildable: a finished setup deletes
+    /// it, so what is left is a failed or cancelled setup's download, GBs on the CUDA lanes). The
+    /// shared uv and Python stay for the export.
     pub fn removable(&self) -> Vec<PathBuf> {
         vec![
             self.export.env.clone(),
             self.weights.clone(),
             self.config.clone(),
             self.scripts.clone(),
+            self.export.uv_cache.clone(),
         ]
     }
 }
@@ -183,8 +187,9 @@ pub fn train_env_ready(paths: &TrainPaths, platform: Platform, lane: TrainLane) 
         .is_some_and(|l| env_ready(&paths.export, platform, &l))
 }
 
-/// Delete the training environment, its base weights and settings (not uv or Python, which the
-/// export shares, nor the training runs), holding both tool locks (`hold_tools`):
+/// Delete the training environment, its base weights and settings and the uv cache
+/// ([`TrainPaths::removable`]; not uv or Python, which the export shares, nor the training runs),
+/// holding both tool locks (`hold_tools`), so no uv of an export or a setup is writing the cache:
 /// refused with [`super::ToolsBusy`] while a training, import, auto-label, dataset check, an
 /// environment setup or an export (of this process or another) holds one. The lock files stay.
 pub fn remove_train_env(paths: &TrainPaths) -> Result<()> {
@@ -563,6 +568,43 @@ mod train_env_tests {
         );
         assert!(!p.removable().contains(&e.uv_dir));
         assert!(!p.removable().contains(&e.python_installs));
+        assert!(p.removable().contains(&e.uv_cache));
+    }
+
+    /// Audit 2026-11 (RA-058): a failed or cancelled setup leaves `tools/uv-cache` (GBs of wheels
+    /// on the CUDA lanes); "Remove training environment" deletes it, under the tool locks: while
+    /// an export or a setup holds `.model-export.lock` (its uv may be filling the cache) nothing
+    /// goes. uv and Python stay for the export, and so do the lock files.
+    #[test]
+    fn removing_the_env_deletes_a_left_uv_cache_under_the_tool_locks() {
+        let root = tmp("remove-uv-cache");
+        let p = TrainPaths::new(&root, root.join("models"));
+        for d in [
+            &p.export.env,
+            &p.export.uv_cache,
+            &p.export.uv_dir,
+            &p.export.python_installs,
+            &p.weights,
+        ] {
+            std::fs::create_dir_all(d.join("sub")).unwrap();
+            std::fs::write(d.join("sub").join("f"), b"x").unwrap();
+        }
+        let held = ExportLock::try_acquire(&p.export.lock_file())
+            .unwrap()
+            .unwrap();
+        let e = remove_train_env(&p).unwrap_err();
+        assert!(e.is::<ToolsBusy>(), "{e:#}");
+        assert!(p.export.uv_cache.join("sub/f").is_file(), "nothing removed");
+        assert!(p.export.env.join("sub/f").is_file(), "nothing removed");
+        drop(held);
+        // The removal's own lock try has LOCK_GRACE for a lock just dropped.
+        remove_train_env(&p).unwrap();
+        assert!(!p.export.uv_cache.exists(), "the cache is gone");
+        assert!(!p.export.env.exists() && !p.weights.exists());
+        assert!(p.export.uv_dir.join("sub/f").is_file(), "uv stays");
+        assert!(p.export.python_installs.join("sub/f").is_file());
+        assert!(p.export.lock_file().is_file() && p.train_lock_file().is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
