@@ -203,5 +203,48 @@ expect_out 'Could not'
 expect_call 'systemctl enable blue-onyx-prism'
 stub chown 'exit 0'
 
+# QA-024: a config the program wrote ("download_dir": null, "cache_dir": "cache", ...) is merged,
+# not copied: download_dir ends up as the data root and no key repeats (Config::load refuses
+# duplicates). The frozen fixture is only read.
+no_dup_keys() { # no_dup_keys FILE DOWNLOAD_DIR
+  python3 -I - "$1" "$2" <<'PY' || fail "$1 repeats a key or lacks download_dir"
+import json, sys
+def hook(pairs):
+    keys = [k for k, _ in pairs]
+    assert len(keys) == len(set(keys)), "duplicate key: %s" % sorted(k for k in keys if keys.count(k) > 1)
+    return dict(pairs)
+doc = json.load(open(sys.argv[1]), object_pairs_hook=hook)
+assert doc["download_dir"] == sys.argv[2], doc["download_dir"]
+PY
+}
+
+setup "a program-written config (download_dir null) is merged with no repeated key"
+rm -f "$DATA/blue_onyx_prism_config.json"
+cp "$REPO/tests/data/0.2.0/config.json" "$OPT/blue_onyx_prism_config.json"
+cat > "$WORK/seed" <<EOS
+. "$OPT/scripts/systemd_common.sh"
+bop_seed_config "$OPT" "$DATA" "$DATA/blue_onyx_prism_config.json" 1
+EOS
+PATH="$BIN:$PATH" sh "$WORK/seed" > "$OUT" 2>&1 || fail "seeding exited with $?: $(cat "$OUT")"
+no_dup_keys "$DATA/blue_onyx_prism_config.json" "$DATA"
+grep -q '"openvino_dir": "' "$DATA/blue_onyx_prism_config.json" || fail "bundled openvino_dir was not named"
+
+setup "a config that already sets download_dir to a path is copied unchanged"
+rm -f "$DATA/blue_onyx_prism_config.json"
+printf '{\n  "download_dir": "/somewhere",\n  "port": 1\n}\n' > "$OPT/blue_onyx_prism_config.json"
+PATH="$BIN:$PATH" sh "$WORK/seed" > "$OUT" 2>&1 || fail "seeding exited with $?: $(cat "$OUT")"
+cmp -s "$OPT/blue_onyx_prism_config.json" "$DATA/blue_onyx_prism_config.json" || fail "a path-valued download_dir config was changed"
+
+setup "launchd merge of the program-written config has no repeated key and valid JSON"
+cp "$REPO/tests/data/0.2.0/config.json" "$WORK/launchd-src.json"
+bash -c '
+  set -euo pipefail
+  DATA_DIR="$1"; LOG_DIR="$1/log"
+  . "$2/scripts/launchd_common.sh"
+  keys="$(bop_config_keys)"
+  bop_merge_keys "$keys" "$3"
+' _ "$DATA" "$REPO" "$WORK/launchd-src.json" > "$WORK/launchd-out.json" 2> "$OUT" || fail "launchd merge failed: $(cat "$OUT")"
+no_dup_keys "$WORK/launchd-out.json" "$DATA"
+
 [ "$failed" -eq 0 ] || exit 1
 echo "scriptlet checks passed"

@@ -667,8 +667,7 @@ impl<'a> Burst<'a> {
     ) -> (WorkerConfig, usize, Vec<String>) {
         let config = self.config;
         let mut notes = Vec::new();
-        let base = super::variant::base_name(&job.name);
-        let mut model = super::find_model(config, base)
+        let mut model = super::variant::owner(config, &job.name)
             .cloned()
             .unwrap_or_else(|| ModelConfig {
                 path: job.path.clone(),

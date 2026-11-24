@@ -801,9 +801,7 @@ pub fn build(inputs: &Inputs<'_>, req: Request<'_>) -> CompareView {
         }
         let now = inputs
             .now
-            .get(&normalize_name(crate::benchmark::variant::base_name(
-                &c.m.model,
-            )));
+            .get(&crate::benchmark::combos::owner_key(inputs, &c.m.model));
         let too_slow = goal
             .speed_budget_ms
             .zip(speed.burst_p95_ms.or(speed.p95_ms))

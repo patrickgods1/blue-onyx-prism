@@ -548,7 +548,7 @@ pub fn add_to_config(
         )));
     }
     let files: Vec<PathBuf> = res.parts.iter().map(|p| dir.join(p.file_name)).collect();
-    let mut models = crate::download::model_configs(&files, &config.data_root());
+    let mut models = crate::download::model_configs_for(&files, config);
     if models.is_empty()
         && let catalog::Provides::Model { name, family } = res.provides
     {
@@ -709,14 +709,21 @@ fn model_files_in(dir: &Path) -> Vec<(String, PathBuf)> {
 /// Largest class-names YAML "Add a model by path" parses (RS-16: the path is admin input).
 pub const MAX_CLASSES_FILE_BYTES: u64 = 1024 * 1024;
 
-/// Whether `p` is under `root` (either spelling: as given or canonical).
+/// Whether `p` is under `root`. A `..` in either is never under (QA-081: `Path::starts_with`
+/// compares components, and `..` is just one, so `<root>/models/../auth/users.json` would pass a
+/// lexical test). When both exist, only their canonical forms are compared (links resolved);
+/// the lexical test is the fallback for a path that does not exist.
 fn under_root(p: &Path, root: &Path) -> bool {
-    if p.starts_with(root) {
-        return true;
+    let parent = |q: &Path| {
+        q.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    };
+    if parent(p) || parent(root) {
+        return false;
     }
     match (p.canonicalize(), root.canonicalize()) {
         (Ok(a), Ok(b)) => a.starts_with(b),
-        _ => false,
+        _ => p.starts_with(root),
     }
 }
 
@@ -1059,6 +1066,52 @@ mod custom_model_tests {
         assert!(cat.exists());
     }
 
+    /// QA-081: a `..` in an entry's path or classes never reaches outside the models folder:
+    /// `models/../outside/x.onnx` is lexically "under" `models` (`..` is just a component).
+    #[test]
+    fn remove_entry_with_dot_dot_deletes_nothing_outside_models() {
+        let (_d, mut c) = setup();
+        let root = c.data_root();
+        let models = c.data_path(&c.models_dir);
+        let escaped = root.join("outside").join("x.onnx");
+        let escaped_classes = root.join("x.json");
+        let mine = models.join("mine.onnx");
+        for f in [&escaped, &escaped_classes, &mine] {
+            touch(f);
+        }
+        let dotted = Path::new("models")
+            .join("..")
+            .join("outside")
+            .join("x.onnx");
+        assert!(
+            c.data_path(&dotted).starts_with(&models),
+            "the lexical trap"
+        );
+        c.models = vec![
+            entry("esc", &dotted, false),
+            ModelConfig {
+                classes: Some(Path::new("models").join("..").join("x.json")),
+                ..entry("mine", &mine, false)
+            },
+        ];
+
+        let r = remove_config_entry(&mut c, "esc").unwrap();
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert!(r.delete_files().contains("outside the models folder"));
+        assert!(escaped.exists());
+
+        let r = remove_config_entry(&mut c, "mine").unwrap();
+        assert_eq!(r.files, vec![mine.clone()], "the classes file stays");
+        r.delete_files();
+        assert!(escaped_classes.exists() && !mine.exists());
+
+        assert!(!under_root(&models.join(".."), &models));
+        assert!(!under_root(&models, &models.join("sub").join("..")));
+        // A path that does not exist falls back to the lexical test.
+        assert!(under_root(&models.join("gone.onnx"), &models));
+        assert!(!under_root(&root.join("gone.onnx"), &models));
+    }
+
     #[test]
     fn file_path_and_family() {
         let (d, mut c) = setup();
@@ -1110,6 +1163,11 @@ mod custom_model_tests {
         );
         let e = add_custom_model(&mut c, &req(Path::new("custom"))).unwrap_err();
         assert!(e.message().contains("b.onnx"), "{e}");
+        // QA-081: `<root>/../outside` starts with the data root lexically; its names stay hidden.
+        let dotted = c.data_root().join("..").join("outside");
+        let e = add_custom_model(&mut c, &req(&dotted)).unwrap_err();
+        assert!(e.message().contains("2 model files"), "{e}");
+        assert!(!e.message().contains("a.onnx"), "{e}");
     }
 
     #[test]

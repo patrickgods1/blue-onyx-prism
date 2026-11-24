@@ -826,22 +826,18 @@ impl Fetcher for ManagerFetcher {
                 }) => {
                     bail!("download of {} failed: {error}", res.title)
                 }
-                Some(DownloadState::Failed {
-                    error,
-                    retry_at: Some(at),
-                    attempts,
-                }) => {
+                // Not final (QA-037): the manager tries again after its backoff; keep waiting.
+                Some(
+                    state @ DownloadState::Failed {
+                        retry_at: Some(_),
+                        attempts,
+                        ..
+                    },
+                ) => {
                     if told_retry != Some(attempts) {
                         told_retry = Some(attempts);
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_secs());
-                        tracing::info!(
-                            "download of {} failed ({error}); the download manager retries in \
-                             {} s (cancel to stop it)",
-                            res.title,
-                            at.saturating_sub(now)
-                        );
+                        // "download of X failed: ...; retrying in N s", the model-state text.
+                        tracing::info!("{} (cancel to stop it)", state.describe_for(res.title));
                     }
                 }
                 Some(DownloadState::Downloading { bytes, total }) => progress(bytes, total),
@@ -854,6 +850,123 @@ impl Fetcher for ManagerFetcher {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+}
+
+/// [`ManagerFetcher`] on a real download manager and a loopback server.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod fetcher_tests {
+    use super::*;
+    use crate::resources::catalog::{Layout, Part, Provides};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
+
+    const BODY: &[u8] = b"weights of a model that downloads on the second try";
+
+    /// Answers the first request with a 503, every later one with [`BODY`]. Returns the URL and
+    /// the request count.
+    fn fails_once() -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/weights.bin", listener.local_addr().unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if s.read(&mut byte).map_or(true, |n| n == 0) {
+                        break;
+                    }
+                    head.push(byte[0]);
+                }
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
+                         Connection: close\r\n\r\n"
+                    );
+                } else {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        BODY.len()
+                    );
+                    let _ = s.write_all(BODY);
+                }
+                let _ = s.flush();
+            }
+        });
+        (url, count)
+    }
+
+    fn resource(url: &str) -> &'static Resource {
+        use sha2::{Digest, Sha256};
+        let sha: String = Sha256::digest(BODY)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let part = Part {
+            url: Box::leak(url.to_string().into_boxed_str()),
+            sha256: Box::leak(sha.into_boxed_str()),
+            size: BODY.len() as u64,
+            file_name: "weights.bin",
+            archive: None,
+            layout: Layout::File,
+        };
+        Box::leak(Box::new(Resource {
+            id: "model:fetcher-test",
+            kind: ResourceKind::Model,
+            version: "1",
+            platform: None,
+            parts: Box::leak(vec![part].into_boxed_slice()),
+            dest: "models",
+            provides: Provides::Model {
+                name: "fetcher-test",
+                family: crate::model::ModelFamilyKind::Yolo5,
+            },
+            title: "Fetcher test weights",
+            description: "test",
+            license: "MIT",
+        }))
+    }
+
+    /// QA-037: a failed attempt the manager retries (`Failed { retry_at: Some(..) }`, the
+    /// service's manager) is waited out; the fetch succeeds with the retry. The backoff is long
+    /// enough that the fetch's 200 ms poll sees the failed state between the attempts.
+    #[test]
+    fn a_retried_download_failure_does_not_fail_the_fetch() {
+        let (url, requests) = fails_once();
+        let res = resource(&url);
+        let root = crate::test_dirs::TempDir::new("fetch-retry");
+        let manager = Arc::new(Manager::start(manager::ManagerOptions {
+            retry: true,
+            backoff: |_| Duration::from_millis(1500),
+            max_attempts: Some(3),
+            ..manager::ManagerOptions::new(root.to_path_buf())
+        }));
+        let events = manager.subscribe();
+        let fetcher = ManagerFetcher::new(Arc::clone(&manager));
+        let dir = root.join("models");
+        let result = fetcher.fetch(res, &dir, &mut |_, _| {}, &AtomicBool::new(false));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(std::fs::read(dir.join("weights.bin")).unwrap(), BODY);
+        assert_eq!(requests.load(Ordering::SeqCst), 2, "one failure, one retry");
+        let first = events.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            matches!(
+                first,
+                manager::Event::Failed {
+                    retry_at: Some(_),
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        manager.shutdown();
     }
 }
 

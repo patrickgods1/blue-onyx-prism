@@ -14,7 +14,10 @@
 //! held-out frames) as exact as a run on it alone. On other sets a model that trained on some of
 //! the frames (its training record's frame list, else its stored `trained_on_share`) is shown,
 //! never ranked fairly. The reference model of a relative set (another model's detections as
-//! labels) is never on it. Pure except for the inputs handed in.
+//! labels) is never on it, nor are its As served and variant results. A result's training
+//! records, what it saw and its threshold now are those of the configured model that owns it
+//! ([`owner_key`]: `<model>+served` and `<model>+<variant>` are `<model>`'s). Pure except for the
+//! inputs handed in.
 
 pub mod score;
 pub mod sets;
@@ -143,11 +146,27 @@ fn reach<'a>(
     }
 }
 
+/// Normalized name of the configured model the result `model` belongs to
+/// ([`super::variant::owner_candidates`] against [`Inputs::configured`]: `<model>+served` and
+/// `<model>+<variant>` results are their model's), the key of [`Inputs::trained`],
+/// [`Inputs::seen`] and [`Inputs::now`]; a result no configured model owns keys by its own name.
+pub(crate) fn owner_key(inputs: &Inputs<'_>, model: &str) -> String {
+    let configured = |n: &str| {
+        let k = normalize_name(n);
+        inputs
+            .configured
+            .iter()
+            .any(|c| normalize_name(&c.name) == k)
+    };
+    normalize_name(
+        super::variant::owner_candidates(model)
+            .find(|n| configured(n))
+            .unwrap_or(model),
+    )
+}
+
 fn share_on(set: &CompareSet<'_>, m: &ModelResult, inputs: &Inputs<'_>) -> Option<f64> {
-    match inputs
-        .trained
-        .get(&normalize_name(super::variant::base_name(&m.model)))
-    {
+    match inputs.trained.get(&owner_key(inputs, &m.model)) {
         Some(frames) => trained_on::share(set.images.iter().map(|i| i.info.file.as_str()), frames),
         None => m.trained_on_share,
     }
@@ -235,9 +254,7 @@ fn blocked_for(set: &CompareSet<'_>, model: &str, inputs: &Inputs<'_>) -> Option
 }
 
 fn seen_of<'i>(inputs: &Inputs<'i>, model: &str) -> Option<&'i Seen> {
-    inputs
-        .seen
-        .get(&normalize_name(super::variant::base_name(model)))
+    inputs.seen.get(&owner_key(inputs, model))
 }
 
 /// The set's view, or None when no model is on it. On "Your cameras" each model is required to
@@ -280,7 +297,18 @@ pub(crate) struct ComboSet<'a> {
 pub(crate) fn combos_on<'a>(full: &CompareSet<'a>, inputs: &Inputs<'a>) -> Option<ComboSet<'a>> {
     let (relative, reference) = labels_of(full);
     let cams = full.datasets.iter().any(|d| d.id == super::cameras::ID);
-    let seen_by = |model: &str| cams.then(|| seen_of(inputs, model)).flatten();
+    // What each result's model saw, resolved once per result (it is asked per frame below).
+    let seen_of_result: HashMap<&str, &Seen> = if cams {
+        inputs
+            .results
+            .models
+            .iter()
+            .filter_map(|m| Some((m.model.as_str(), seen_of(inputs, &m.model)?)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let seen_by = |model: &str| seen_of_result.get(model).copied();
     let mut entrants: Vec<Entrant<'a>> = Vec::new();
     let mut missing: Vec<(&ModelResult, Reach<'a>)> = Vec::new();
     for m in &inputs.results.models {
@@ -345,7 +373,7 @@ pub(crate) fn combos_on<'a>(full: &CompareSet<'a>, inputs: &Inputs<'a>) -> Optio
             why: why_not(full, m, r, &inputs.results.image_sets),
             device: inputs
                 .now
-                .get(&normalize_name(&m.model))
+                .get(&owner_key(inputs, &m.model))
                 .and_then(|n| n.device.clone())
                 .or_else(|| m.recommended.clone()),
             blocked: if matches!(r, Reach::Whole(_)) {
@@ -405,14 +433,17 @@ pub struct Parts {
 }
 
 impl Parts {
-    /// Read from `cfg` (training records, model files) for the models of `results`.
+    /// Read from `cfg` (training records, model files) for the configured models that own at
+    /// least one result of `results` (its bare, As served or variant result,
+    /// [`super::variant::owner`]).
     pub fn of(results: &BenchmarkResults, cfg: &crate::config::Config) -> Self {
-        let in_results = |name: &str| {
-            results
-                .find(name)
-                .or_else(|| results.find(&super::variant::served_name(name)))
-                .is_some()
-        };
+        let owners: std::collections::HashSet<String> = results
+            .models
+            .iter()
+            .filter_map(|r| super::variant::owner(cfg, &r.model))
+            .map(|m| normalize_name(&m.effective_name()))
+            .collect();
+        let in_results = |name: &str| owners.contains(&normalize_name(name));
         let trained = cfg
             .models
             .iter()
@@ -421,7 +452,7 @@ impl Parts {
                 if !in_results(&name) {
                     return None;
                 }
-                // Its As served result (`<model>+served`) trained on the same frames.
+                // Its As served and variant results trained on the same frames.
                 let frames =
                     crate::training::autolabel::trained_frames(cfg, m, &mut Vec::new()).ok()?;
                 (!frames.is_empty()).then(|| (normalize_name(&name), frames))

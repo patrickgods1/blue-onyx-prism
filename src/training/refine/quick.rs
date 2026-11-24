@@ -10,8 +10,9 @@
 //! validated on (its checkpoint was chosen on them, so they are not unseen either); held-out frames
 //! (`data/heldout/`) and frames reviewed since are unseen and are checked. A frame is "seen" when
 //! the dataset's name of any listed image is the frame's flat name as the dataset spells it (its
-//! file-name rule with each source prefix the lists use, the 120-byte cut included, so a name the
-//! cut made ambiguous leaves out every frame it may be), and, where the run recorded where each image
+//! file-name rule with each source prefix the lists use, the 120-byte cut included: the stem-only
+//! cut of datasets written now and the whole-name cut of older ones, [`names`]; a name the cut
+//! made ambiguous leaves out every frame it may be), and, where the run recorded where each image
 //! came from ([`crate::training::dataset::IMAGE_SOURCES_FILE`], newer runs), when the source's file
 //! name is the frame's flat name. A listed image that record does not name refuses the check.
 //!
@@ -53,6 +54,7 @@ use crate::config::{Config, ModelConfig};
 use crate::resources::catalog::Platform;
 use crate::resources::export::train::{self as env, TrainPaths};
 use crate::training::capability::{Accelerator, Capability};
+use crate::training::dataset::names;
 use crate::training::recipe::TrainRecipe;
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -108,8 +110,8 @@ pub struct Seen {
     /// Image names of `train.txt` / `valid.txt` as the dataset wrote them (`s<N>-<name>`).
     train: BTreeSet<String>,
     valid: BTreeSet<String>,
-    /// The source prefixes (`s0`, `s1`, ...) those names use.
-    prefixes: BTreeSet<String>,
+    /// The source indexes (`s0-`, `s1-`, ...) those names use.
+    prefixes: BTreeSet<usize>,
     /// The file names of the sources of those images ([`crate::training::dataset::IMAGE_SOURCES_FILE`]).
     train_sources: BTreeSet<String>,
     valid_sources: BTreeSet<String>,
@@ -135,39 +137,15 @@ pub enum Saw {
     Validated,
 }
 
-/// The dataset's file-name rule ([`crate::training::dataset`]: letters, digits, `-`, `_` and `.`,
-/// others `_`, at most 120 bytes) applied to `<prefix>-<flat>`.
-fn spelled(prefix: &str, flat: &str) -> String {
-    let mut s: String = format!("{prefix}-{flat}")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    s.truncate(120);
-    s
-}
-
-/// The `s<digits>` prefix of a dataset image name, and the rest.
-fn split_prefix(name: &str) -> Option<(&str, &str)> {
-    let (p, rest) = name.split_once('-')?;
-    let digits = p.strip_prefix('s')?;
-    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some((p, rest))
-}
-
 impl Seen {
     /// How the model saw `f`, if at all (see the module docs).
     pub fn saw(&self, f: &ExportFrame) -> Option<Saw> {
-        let hit = |names: &BTreeSet<String>, sources: &BTreeSet<String>| {
+        let hit = |listed: &BTreeSet<String>, sources: &BTreeSet<String>| {
             sources.contains(&f.name)
-                || self
-                    .prefixes
-                    .iter()
-                    .any(|p| names.contains(&spelled(p, &f.name)))
+                || self.prefixes.iter().any(|&p| {
+                    listed.contains(&names::spelling(p, &f.name))
+                        || listed.contains(&names::legacy_spelling(p, &f.name))
+                })
         };
         if hit(&self.train, &self.train_sources) {
             Some(Saw::Trained)
@@ -191,14 +169,16 @@ impl Seen {
 
 /// Whether the dataset image `name` (of a list, with its `s<N>-` prefix) carries no frame name of
 /// this program: no source prefix, or after it no flat frame name ([`export::parse_flat_name`])
-/// unless the dataset's 120-byte cut ([`spelled`]) took its end; `source` is the file name the
+/// unless the dataset's 120-byte cut ([`names`]) took its end; `source` is the file name the
 /// run's record of image sources gives it, when there is one (a frame name there counts).
 fn odd_name(name: &str, source: Option<&str>) -> bool {
     if source.is_some_and(|s| export::parse_flat_name(s).is_some()) {
         return false;
     }
-    match split_prefix(name) {
-        Some((_, rest)) => export::parse_flat_name(rest).is_none() && name.len() < 120,
+    match names::split_source(name) {
+        Some((_, rest)) => {
+            export::parse_flat_name(rest).is_none() && name.len() < names::MAX_NAME_BYTES
+        }
         None => true,
     }
 }
@@ -521,8 +501,8 @@ pub fn seen_of(config: &Config, m: &ModelConfig) -> Result<Seen> {
         out.by_source = true;
     }
     for n in train.iter().chain(&valid) {
-        if let Some((p, rest)) = split_prefix(n) {
-            out.prefixes.insert(p.to_string());
+        if let Some((p, rest)) = names::split_source(n) {
+            out.prefixes.insert(p);
             if let Some(r) = export::parse_flat_name(rest) {
                 out.days.insert((r.camera, r.date));
             }
@@ -534,16 +514,16 @@ pub fn seen_of(config: &Config, m: &ModelConfig) -> Result<Seen> {
         }
     }
     // The run's public sets (`s<i>-` is its i-th source in dataset.json) carry their own names.
-    let public: BTreeSet<String> = crate::training::dataset::read_summary_sources(&data)
+    let public: BTreeSet<usize> = crate::training::dataset::read_summary_sources(&data)
         .iter()
         .enumerate()
         .filter(|(_, s)| s.kind != "review")
-        .map(|(i, _)| format!("s{i}"))
+        .map(|(i, _)| i)
         .collect();
     out.odd_names = train
         .iter()
         .chain(&valid)
-        .filter(|n| !split_prefix(n).is_some_and(|(p, _)| public.contains(p)))
+        .filter(|n| !names::split_source(n).is_some_and(|(p, _)| public.contains(&p)))
         .filter(|n| odd_name(n, source_names.get(*n).map(String::as_str)))
         .count();
     out.train = train;

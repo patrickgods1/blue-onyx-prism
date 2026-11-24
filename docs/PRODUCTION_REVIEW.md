@@ -4354,26 +4354,26 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-021 | `server-handlers/handlers-7` | bug | low | 3 | fixed (phase 3): remove-env, training-folder move and SAM 3 Remove run in `TrainingService::while_idle`; TrainLock held = 409 | Busy check and destructive action are not atomic: remove-env, set_dir and SAM 3 remove can race a job being queued |
 | QA-022 | `training-core/tcore-17` | bug | low | 3 | fixed (phase 3): path copied out before other locks; lock order documented on `Inner` | write_runs/write_tasks hold the `stores` mutex across the fsync of runs.json, nested in the opposite order to set_store |
 | QA-023 | `training-core/tcore-18` | bug | low | 3 | fixed (phase 3): `runs_changed` / `tasks_changed` | One Condvar (`changed`) is waited on with two different mutexes (runs and tasks) |
-| QA-024 | `platform-config/platform-1` | bug | high | 7 | open | Install scripts treat a program-written config as 'already sets download_dir' and copy it verbatim, so the service's data root stays in the read-only program dir |
-| QA-025 | `resources/resources-1` | bug | high | 7 | open | A second install into a user --dir/--dest swaps the whole directory and deletes the user's other files |
+| QA-024 | `platform-config/platform-1` | bug | high | 7 | fixed (phase 7): string-value test; merge drops the inserted keys first | Install scripts treat a program-written config as 'already sets download_dir' and copy it verbatim, so the service's data root stays in the read-only program dir |
+| QA-025 | `resources/resources-1` | bug | high | 7 | fixed (phase 7): `manager::exclusively_ours` + `merged` flag; also `status::ours` | A second install into a user --dir/--dest swaps the whole directory and deletes the user's other files |
 | QA-026 | `backend/backend-1` | bug | medium | 5 | fixed (phase 5): `device::image_input_size` at load in OpenVINO and ORT (measured: a 16384² model refused in 0-3 ms) | PL-04 is only half fixed: the model input size is never checked at load, and the worker allocates its warm-up frame before any check |
-| QA-027 | `benchmark/bench-1` | bug | medium | 7 | open | The 'never scored on its own labels' rule (B10) misses As served and variant results of the reference model |
+| QA-027 | `benchmark/bench-1` | bug | medium | 7 | fixed (phase 7): `variant::owned_by` in `is_reference` | The 'never scored on its own labels' rule (B10) misses As served and variant results of the reference model |
 | QA-028 | `benchmark/bench-2` | bug | medium | 4 | fixed (phase 4): see RA-063 | forget_model leaves a removed model's `+served` / variant results, predictions and history |
-| QA-029 | `benchmark/bench-3` | bug | medium | 7 | open | The confidence search's 'configured now' ignores the per-device profiles that --apply-threshold writes |
-| QA-030 | `benchmark/bench-4` | bug | medium | 7 | open | apply_yolo turns an unreadable YOLO label file into 'no objects' silently |
+| QA-029 | `benchmark/bench-3` | bug | medium | 7 | fixed (phase 7): `search::configured_threshold` (device profile) | The confidence search's 'configured now' ignores the per-device profiles that --apply-threshold writes |
+| QA-030 | `benchmark/bench-4` | bug | medium | 7 | fixed (phase 7) | apply_yolo turns an unreadable YOLO label file into 'no objects' silently |
 | QA-031 | `collect/collect-2` | bug | medium | 6 | fixed (phase 6) | Pruning looks up each deleted file's size with a linear scan, so a large prune stalls the collector thread for seconds or more |
-| QA-032 | `gap-helpers-duplicated-across/gap-4` | bug | medium | 7 | open | Benchmark move-aside treats a failed read as a damaged file: a good benchmark.json is renamed away, or a held file fails the whole save |
-| QA-033 | `gap-helpers-duplicated-across/gap-5` | bug | medium | 7 | open | Benchmark lenient loads drop entries they cannot read, and the next save erases them for good (training keeps such records aside) |
-| QA-034 | `gap-most-of-the/benchgap-1` | bug | medium | 7 | open | Compare cannot map `--variants` results (`<model>+filters`, `+pre:clahe`, ...) back to their model, so on Your cameras they show as partial and trained-frame exclusion is skipped |
+| QA-032 | `gap-helpers-duplicated-across/gap-4` | bug | medium | 7 | fixed (phase 7): `json_aside` | Benchmark move-aside treats a failed read as a damaged file: a good benchmark.json is renamed away, or a held file fails the whole save |
+| QA-033 | `gap-helpers-duplicated-across/gap-5` | bug | medium | 7 | fixed (phase 7): whole file copied aside before a dropping save | Benchmark lenient loads drop entries they cannot read, and the next save erases them for good (training keeps such records aside) |
+| QA-034 | `gap-most-of-the/benchgap-1` | bug | medium | 7 | fixed (phase 7): `variant::owner` | Compare cannot map `--variants` results (`<model>+filters`, `+pre:clahe`, ...) back to their model, so on Your cameras they show as partial and trained-frame exclusion is skipped |
 | QA-035 | `resources/resources-3` | bug | medium | 2 | fixed (phase 2): only `.<n>.staging` and `.<n>.old-<digits>` match | Download cleanup deletes any hidden dir containing `.old-`/`.staging` under the data root, including a live training staging folder |
-| QA-036 | `resources/resources-4` | bug | medium | 7 | open | `download-models --add-to-config` stores model paths relative to the exe dir, but the service resolves them against the data root |
-| QA-037 | `resources/resources-5` | bug | medium | 7 | open | ManagerFetcher fails an export on the first transient download error although the service manager keeps retrying |
+| QA-036 | `resources/resources-4` | bug | medium | 7 | fixed (phase 7): `download::model_configs_for` | `download-models --add-to-config` stores model paths relative to the exe dir, but the service resolves them against the data root |
+| QA-037 | `resources/resources-5` | bug | medium | 7 | fixed (phase 7): retry already waited; log text + test | ManagerFetcher fails an export on the first transient download error although the service manager keeps retrying |
 | QA-038 | `server-core/srvcore-1` | bug | medium | 4 | fixed (phase 4): a new account starts at a random generation (`User::new`); devices store the account's `created`, compared by equality | A session of a removed account becomes valid again for a new account of the same name (CLI remove + add, or across a service restart) |
-| QA-039 | `training-core/tcore-3` | bug | medium | 7 | open | `--verbose` CLI output stops after the first 60 log lines (the log-tail cursor never moves once the tail is full) |
-| QA-040 | `training-jobs/training-jobs-1` | bug | medium | 7 | open | Prepared dataset image names are cut at 120 bytes, which drops the image extension, so YOLO trainers silently skip those frames |
-| QA-041 | `web-assets/web-5` | bug | medium | 7 | open | SAM 3 download progress stops for good after one failed poll, and the hand-rolled poll keeps running while the tab is hidden |
+| QA-039 | `training-core/tcore-3` | bug | medium | 7 | fixed (phase 7): in-memory line count + `LogFollower` (no record field) | `--verbose` CLI output stops after the first 60 log lines (the log-tail cursor never moves once the tail is full) |
+| QA-040 | `training-jobs/training-jobs-1` | bug | medium | 7 | fixed (phase 7): `dataset::names` | Prepared dataset image names are cut at 120 bytes, which drops the image extension, so YOLO trainers silently skip those frames |
+| QA-041 | `web-assets/web-5` | bug | medium | 7 | fixed (phase 7): `PrismPoll.create` | SAM 3 download progress stops for good after one failed poll, and the hand-rolled poll keeps running while the tab is hidden |
 | QA-042 | `backend/backend-15` | bug | low | 8 | open | The Unix benchmark `lower()` sets nice 10 unconditionally, unlike its siblings that never lower a higher nice value |
-| QA-043 | `backend/backend-2` | bug | low | 8 | open | `family: auto` decodes a YOLOv5 [1, >1000, 6] output as YOLO26 when the class count is not 1, giving wrong boxes and no error |
+| QA-043 | `backend/backend-2` | bug | low | 8 | fixed (phase 7) | `family: auto` decodes a YOLOv5 [1, >1000, 6] output as YOLO26 when the class count is not 1, giving wrong boxes and no error |
 | QA-044 | `backend/backend-3` | bug | low | 8 | open | An overlap rule whose `drop` and `if_overlaps` name the same label removes both overlapping boxes |
 | QA-045 | `backend/backend-4` | bug | low | 8 | open | Scene statistics call any frame with two or fewer samples, or any flat colour frame, IR (the fit is degenerate) |
 | QA-046 | `backend/backend-5` | bug | low | 8 | open | The ORT output reader has no f16 branch, though its OpenVINO twin widens f16; a model with f16 outputs fails every inference on ort:* |
@@ -4387,9 +4387,9 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-054 | `collect/collect-4` | bug | low | 8 | open | If the index append fails (for example on a full disk), the collector leaves the image and sidecar on disk with no index line; the import path removes both |
 | QA-055 | `collect/collect-6` | bug | low | 1 | fixed (phase 1): see RA-020 | A panic in prune, rescan or resume kills the collector thread, after which every frame is dropped with no error shown on the pages |
 | QA-056 | `gap-helpers-duplicated-across/gap-11` | bug | low | 8 | open | macOS port_holder reports the port as free when lsof, run without root, cannot see another account's listener |
-| QA-057 | `gap-helpers-duplicated-across/gap-6` | bug | low | 8 | open | A benchmark aside name has one-second wall-clock resolution, so a later move-aside can replace an earlier one |
-| QA-058 | `gap-helpers-duplicated-across/gap-7` | bug | low | 8 | open | Training move-aside's copy fallback makes another full copy on every load while the file stays held, and logs it as moved |
-| QA-059 | `gap-helpers-duplicated-across/gap-9` | bug | low | 7 | open | camera_dir gives Windows device names (aux, con, nul, prn; com1/lpt1 through the import's camera field), so every frame of that camera fails to save on Windows |
+| QA-057 | `gap-helpers-duplicated-across/gap-6` | bug | low | 8 | fixed (phase 7): `json_aside::aside_path` | A benchmark aside name has one-second wall-clock resolution, so a later move-aside can replace an earlier one |
+| QA-058 | `gap-helpers-duplicated-across/gap-7` | bug | low | 8 | fixed (phase 7): deduped copy, "copied to" | Training move-aside's copy fallback makes another full copy on every load while the file stays held, and logs it as moved |
+| QA-059 | `gap-helpers-duplicated-across/gap-9` | bug | low | 7 | fixed (phase 7): `_` suffix on every OS | camera_dir gives Windows device names (aux, con, nul, prn; com1/lpt1 through the import's camera field), so every frame of that camera fails to save on Windows |
 | QA-060 | `gap-most-of-the/benchgap-10` | bug | low | 8 | open | Markdown report still turns `![x](url)` and `[x](url)` inside untrusted text into images and links (BM-08 escapes them only at the start) |
 | QA-061 | `gap-most-of-the/benchgap-13` | bug | low | 8 | open | GET /benchmark stats the results file on the async runtime |
 | QA-062 | `gap-most-of-the/benchgap-3` | bug | low | 8 | open | Run page matches benchmark.reference_model by exact string; a case or spacing difference shows 'Automatic', and the next page run saves the reference as cleared |
@@ -4411,7 +4411,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-078 | `platform-config/platform-7` | bug | low | 8 | open | `diagnostics` falls back to Config::default() when the config fails validation, which drops the logs and scrubs against the wrong data root |
 | QA-079 | `platform-config/platform-8` | bug | low | 8 | open | Storage card counts the review folder twice when it lies inside the dataset folder |
 | QA-080 | `resources/resources-18` | bug | low | 8 | open | install_all can report success when the worker dies, and a failed update check reports current version 0.0.0 |
-| QA-081 | `resources/resources-2` | bug | low | 8 | open | under_root accepts `..` paths lexically, so Models-card Remove can delete files outside models_dir |
+| QA-081 | `resources/resources-2` | bug | low | 8 | fixed (phase 7) | under_root accepts `..` paths lexically, so Models-card Remove can delete files outside models_dir |
 | QA-082 | `resources/resources-6` | bug | low | 1 | fixed (phase 1): per-job panic containment; enqueue refused once the thread is gone | Exporter has no panic containment and enqueue leaves a stale Queued status when the worker is gone |
 | QA-083 | `resources/resources-7` | bug | low | 1 | fixed (phase 1): tickets; a cancelled export queued again runs once; a cancel during pickup is not lost | Cancel then re-Export of a queued model runs the export twice |
 | QA-084 | `resources/resources-8` | bug | low | 8 | open | Training-environment setup failures are worded for the export ('export again', 'Remove export toolchain'); the outer explain is dead |
@@ -4428,7 +4428,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-095 | `server-handlers/handlers-6` | bug | low | 8 | open | model_ranks cache key leaves out the models' current state, so Home/Stats ranks go stale after a device fallback |
 | QA-096 | `server-handlers/handlers-8` | bug | low | 8 | open | History pin/delete check that the run exists outside the update lock; a concurrent delete answers 500 'check that the file is writable' |
 | QA-097 | `server-handlers/handlers-9` | bug | low | 8 | open | Per-model `requests` counter counts bad uploads only when the model was not Ready |
-| QA-098 | `training-core/tcore-19` | bug | low | 7 | open | valid_model_name accepts Windows reserved device names (con, nul, aux, com1...) |
+| QA-098 | `training-core/tcore-19` | bug | low | 7 | fixed (phase 7) | valid_model_name accepts Windows reserved device names (con, nul, aux, com1...) |
 | QA-099 | `training-core/tcore-2` | bug | low | 6 | fixed (phase 6) | bench::run cannot tell its own benchmark from one started after it, so it can read another run's results and cancel another run |
 | QA-100 | `training-core/tcore-4` | bug | low | 8 | open | The CLI's `dataset: balanced:` line can never print: the job writes it only to train.log, never to the record's log |
 | QA-101 | `training-core/tcore-5` | bug | low | 8 | open | Queue duplicate-name check is case-sensitive, but registering compares names by normalize_name: on Linux the second run trains for hours, then is refused |
@@ -4456,7 +4456,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-123 | `benchmark/bench-12` | refactor | medium | 9 | open | One results save transaction, implemented twice (CLI save_results and ServiceRun::save) |
 | QA-124 | `benchmark/bench-13` | refactor | medium | 9 | open | Three 'which stored run of a model' rules that disagree (search, tune, advise) |
 | QA-125 | `collect/collect-7` | refactor | medium | 9 | open | The collector and the import each write a frame (image, sidecar, index line, rollback) with their own copy of the code, and the copies have already drifted |
-| QA-126 | `gap-helpers-duplicated-across/gap-8` | refactor | medium | 9 | open | Two `load_or_move_aside` functions with opposite rules; extract one json-aside module with training's policy |
+| QA-126 | `gap-helpers-duplicated-across/gap-8` | refactor | medium | 9 | fixed (phase 7): `src/json_aside.rs` primitives | Two `load_or_move_aside` functions with opposite rules; extract one json-aside module with training's policy |
 | QA-127 | `gap-the-training-dataset/gap-3` | refactor | medium | 9 | open | The full and quick checks' stage functions copy the write, look, report and summary tail |
 | QA-128 | `platform-config/platform-12` | refactor | medium | 9 | open | Config migration is copied between install_launchd.sh and systemd_common.sh; launchd_common's bop_seed_config is not used by the zip flow |
 | QA-129 | `resources/resources-13` | refactor | medium | 9 | open | ResourceRow: 30-field literal built three times and a stringly-typed state matched as strings |
@@ -4466,15 +4466,15 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-133 | `server-handlers/handlers-12` | refactor | medium | 9 | open | Form-field helpers re-implemented with different trim/empty rules; a custom urlencoded parser sits next to axum::Form |
 | QA-134 | `server-handlers/handlers-16` | refactor | medium | 9 | open | training::view_with is a ~480-line function and training.rs mixes view, forms, hooks and twelve handlers in 3500 non-test lines |
 | QA-135 | `training-core/tcore-10` | refactor | medium | 9 | open | job::stages is an ~810-line function doing eight stages, the export retry and two OOM retry loops |
-| QA-136 | `training-jobs/training-jobs-3` | refactor | medium | 9 | open | Five copies of the prepared-dataset naming rule (sanitize, 120-byte cut, s<N>- prefix) must stay equal by hand |
+| QA-136 | `training-jobs/training-jobs-3` | refactor | medium | 9 | fixed (phase 7): `dataset::names` (+ `legacy_spelling`) | Five copies of the prepared-dataset naming rule (sanitize, 120-byte cut, s<N>- prefix) must stay equal by hand |
 | QA-137 | `training-jobs/training-jobs-9` | refactor | medium | 9 | open | ImportJob::stages is one 860-line function carrying seven stages |
 | QA-138 | `web-assets/web-10` | refactor | medium | 9 | open | Seven copy-pasted dry-run/confirm/run bulk handlers in review.js |
 | QA-139 | `web-assets/web-11` | refactor | medium | 9 | open | review.js is one 5966-line IIFE mixing canvas editing, queue/prefetch, drafts, pace, bulk tools, job following and pickers |
 | QA-140 | `web-assets/web-14` | refactor | medium | 9 | open | live.js config poll re-implements PrismPoll (own timer, backoff, visibility, pageshow/online) |
 | QA-141 | `web-assets/web-9` | refactor | medium | 9 | open | One shared DOM/fetch helper module instead of ~10 copies of el(), 7 JSON request wrappers and 2 report()s |
 | QA-142 | `workers-registry/workers-8` | refactor | medium | 9 | open | WorkerCtx::finish is ~230 lines doing seven jobs |
-| QA-143 | `benchmark/bench-25` | test-gap | medium | 10 | open | No test of B10 (own labels) for As served / variant result names |
-| QA-144 | `gap-helpers-duplicated-across/gap-13` | test-gap | medium | 10 | open | Benchmark load_or_move_aside has no test for an unreadable file, a second aside, or keeping dropped entries |
+| QA-143 | `benchmark/bench-25` | test-gap | medium | 10 | fixed (phase 7) | No test of B10 (own labels) for As served / variant result names |
+| QA-144 | `gap-helpers-duplicated-across/gap-13` | test-gap | medium | 10 | fixed (phase 7) | Benchmark load_or_move_aside has no test for an unreadable file, a second aside, or keeping dropped entries |
 | QA-145 | `resources/resources-20` | test-gap | medium | 10 | open | No tests for put_in_place's merge branch, the cleanup name rules, or under_root escapes |
 | QA-146 | `server-core/srvcore-test-1` | test-gap | medium | 4 | fixed (phase 4): sessions, devices and an HTTP test through `accounts::commands` remove + add | No test that a removed-then-re-added account does not inherit old sessions / device trust |
 | QA-147 | `web-assets/web-18` | test-gap | medium | 10 | open | Async node drivers can pass without running their later asserts: most harnesses do not check the final 'ok' |
@@ -4516,12 +4516,12 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-183 | `collect/collect-16` | refactor | low | 10 | open | Sidecar verify outcomes and suppress reasons are compared as string literals in one place and through the enum in another |
 | QA-184 | `collect/collect-17` | refactor | low | 10 | open | Export grouping by camera day and the split assignment are written out twice |
 | QA-185 | `collect/collect-9` | test-gap | low | 10 | open | No test checks that the export's file count `written_files` matches what `build_export` actually writes |
-| QA-186 | `gap-helpers-duplicated-across/gap-14` | test-gap | low | 7 | open | camera_dir / camera_of have no test for Windows device names, or that legacy folders still parse |
-| QA-187 | `gap-helpers-duplicated-across/gap-15` | test-gap | low | 10 | open | Training move_aside's copy fallback (rename fails, copy works) is never exercised |
+| QA-186 | `gap-helpers-duplicated-across/gap-14` | test-gap | low | 7 | fixed (phase 7) | camera_dir / camera_of have no test for Windows device names, or that legacy folders still parse |
+| QA-187 | `gap-helpers-duplicated-across/gap-15` | test-gap | low | 10 | fixed (phase 7) | Training move_aside's copy fallback (rename fails, copy works) is never exercised |
 | QA-188 | `gap-most-of-the/benchgap-11` | refactor | low | 10 | open | Two Mann-Whitney AUC implementations; the weighted one never ends on a NaN score (roc::auc guards against it) |
 | QA-189 | `gap-most-of-the/benchgap-12` | refactor | low | 10 | open | is_image duplicated between benchmark::images and training::dataset; small misplaced docs and test-only pub items in this area |
 | QA-190 | `gap-most-of-the/benchgap-14` | test-gap | low | 10 | open | cameras::live staleness and eviction rules have no unit test |
-| QA-191 | `gap-most-of-the/benchgap-2` | refactor | low | 10 | open | No single 'which model owns this result name' helper; seven callers each pick base_name, is_reference or an exact match |
+| QA-191 | `gap-most-of-the/benchgap-2` | refactor | low | 10 | partial (phase 7): `variant::owner` / `owned_by`; forget.rs keeps its wider rule; current.rs keeps `base_name` | No single 'which model owns this result name' helper; seven callers each pick base_name, is_reference or an exact match |
 | QA-192 | `gap-the-review-index/labels-3` | refactor | low | 10 | open | FNV-1a 64 is hand-written four times |
 | QA-193 | `gap-the-review-index/labels-4` | refactor | low | 10 | open | Small box and union-find helpers copied between refine.rs, statics.rs, overlaps.rs, need.rs and stacks.rs |
 | QA-194 | `gap-the-review-index/labels-5` | refactor | low | 10 | open | bulk::accept_one is a test-only pub fn that silently ignores hidden classes |
@@ -4962,3 +4962,49 @@ boundary) is fixed in the test.
 
 Not verified here: the Windows Event Log gate on a real service, the Windows `BELOW_NORMAL` thread priority of the new
 background threads, the i5-8500 idle CPU (`measure_resources.ps1`).
+
+### Audit 2026-11, phase 7 notes
+
+Correctness bugs, high and medium, plus the items the plan pulled forward from phases 8-10 because they share a
+root (QA-043, QA-057, QA-058, QA-081, QA-126, QA-136, QA-143, QA-144, QA-187, QA-191). QA-028 was already fixed in
+phase 4. Two shared helpers: `src/json_aside.rs` (std + `fsx` + `clock` only: `read_retrying` / `open_retrying`,
+unique `aside_path`, `move_or_copy_aside[_with]`, content-deduplicated `keep_copy` / `copy_aside`; tags stay
+`corrupt` and `bad`) and `training::dataset::names` (`image_name`, `spelling`, `legacy_spelling`, `split_source`).
+
+| what was wrong | now | IDs |
+|---|---|---|
+| a second `setup-openvino --dest` / `setup-onnxruntime --dir` (or a staged update) into a folder with other files swapped the whole folder and deleted them; the Resources card could remove it as ours | replaced as a whole only when `manager::exclusively_ours` (our manifest, not `merged`, every top-level entry ours or rebuildable litter); a merge marks the manifest `merged`; `status::ours` and `in_use::apply_staged` use the same rule | QA-025 |
+| install scripts copied a program-written config (`"download_dir": null`) verbatim, leaving the data root in the read-only program dir; the migration branch wrote duplicate keys | string-value test (as the Docker entrypoint); `bop_merge_keys` drops the file's own top-level lines of the inserted keys; scriptlet test on the frozen 0.2.0 config | QA-024 |
+| Models-card Remove could delete files outside `models_dir` through `..` | `under_root` refuses `..`; canonical comparison when both paths exist (a symlink out of `models/` counts as outside) | QA-081 |
+| prepared image names cut at 120 bytes lost `.jpg` (YOLO skipped those frames); cut names could share a label file; five copies of the rule, one cutting with `s0-` for every source | one naming module: only the stem is cut, collision suffix before the extension, label stem from the helper; readers try the new and the legacy spelling (real `s<N>-`), `image_sources.json` fallback unchanged | QA-040, QA-136, +extras |
+| `download-models --add-to-config` stored paths relative to the exe dir | relative to the data root (`download::model_configs_for`, shared with the Resources card) | QA-036 |
+| an export said a retried download failed | the fetcher already waited on `retry_at: Some`; retry text in the log, test added | QA-037 |
+| `--verbose` CLI output stopped after 60 lines | the service counts every pushed line (`push_log`, in memory, no record field: the CLI follows its own in-process queue); `LogFollower` in both loops; lines evicted between two polls are skipped | QA-039 |
+| the reference model's `+served` / variant results were scored on their own detections; `--variants` results on Your cameras showed as partial and kept trained frames | `variant::owned_by` in `is_reference` (every B10 caller, the CLI warning, `in_run`); config-aware `variant::owner` in combos, `Parts::of`, `trained_on::backfill`, compare, eval, burst | QA-027, QA-143, QA-034, QA-191 |
+| the threshold search's "configured" ignored device profiles | `search::configured_threshold` (owner, then `ModelConfig::threshold_on(device)`) in the CLI and server | QA-029 |
+| an unreadable YOLO label file counted as "no objects" | fails that folder with the file named (skipped with a warning); a UTF-8 BOM is stripped | QA-030 |
+| SAM 3 progress froze after one failed poll and polled while hidden | `PrismPoll.create` (backs off, waits while hidden, parks when idle) | QA-041 |
+| `family: auto` read a static `[1, >1000, 6]` YOLOv5 output with 80 classes as YOLO26 | YOLOv5 for a static row count above 1000; a dynamic dim keeps the 1-class rule | QA-043 |
+| benchmark stores: an unreadable file renamed away or a held one failing the save; dropped entries erased by the next save; same-second asides replacing each other; history of a later format read | open retried, unreadable = refused and left alone; only a parse failure moves aside (copy fallback); a dropping merge/update/save copies the whole file aside first, refusing to save if that fails; unique aside names; later history format moved aside | QA-032, QA-033, QA-057, QA-126, QA-144 |
+| training move-aside copied the held file again on every load and logged "moved" | deduplicated copy, "copied to" / "already copied to" | QA-058, QA-187 |
+| model and camera folder names that are Windows device names | `valid_model_name` refuses them; `camera_dir` appends `_` on every OS (old `aux` folders still parse) | QA-098, QA-059, QA-186 |
+
+What a user notices: an existing `aux`/`con`/`nul`/`prn` camera folder on Linux or macOS gets that camera's new
+frames under `<name>_` (two cameras in Review); `train run --name nul` is refused; long-named cameras' frames now reach
+YOLO training, so their box counts and results change; a benchmark with an unreadable results file stops instead of
+replacing it; Compare lists `<model>+<variant>` rows on Your cameras.
+
+Left open: the benchmark trained-on share still maps listed names through `parse_flat_name`, so long-named frames of
+an old (cut) dataset count as not trained (map through `image_sources.json`); `tune::suggestions` still offers
+`<model>+<variant>` results, which match no configured model; `combos::blocked_for` says "no longer in the config"
+for `+served` / variant results; `forget_model` keeps its wider owner rule (also drops `+` remainders that no longer
+parse); `is_reference` is config-free, so a configured model literally named `m+filters` counts as reference `m`'s
+(errs toward not scoring); old prepared datasets keep their extension-less cut names until re-prepared.
+
+Tests: every fix has one. Shown failing without the fix: by the agents in private copies (QA-025 ×3 + status,
+QA-081 ×2, QA-036, QA-037, json_aside / report / history / preds asides, QA-039 follower, QA-187, history format,
+names ×5, unseen-check spellings, camera and import device names, QA-024 scriptlet); by the lead in one private copy
+(one mutation each): QA-043, QA-027 (3 tests), QA-034, QA-029, QA-030.
+
+Not verified here: the scripts on a real Debian/RPM/macOS install (CI's packaging smoke runs them), the SAM 3 panel
+in a browser.

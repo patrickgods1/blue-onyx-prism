@@ -243,15 +243,48 @@ fn trained_lines(data: &Path) -> Result<BTreeSet<String>> {
     Ok(out)
 }
 
-/// The flat names of trained `lines`, back to flat names as the export wrote them.
-fn trained_names(lines: &BTreeSet<String>) -> BTreeSet<String> {
-    lines
-        .iter()
-        .map(|line| {
+/// The images trained `lines` name, as the dataset named them ([`dataset::names`]).
+#[derive(Debug, Default)]
+struct Listed {
+    /// Their file names.
+    names: BTreeSet<String>,
+    /// The same without the `s<N>-` source prefix (a name without one as it is).
+    flat: BTreeSet<String>,
+    /// The source indexes the names carry.
+    sources: BTreeSet<usize>,
+}
+
+impl Listed {
+    fn of(lines: &BTreeSet<String>) -> Self {
+        let mut out = Self::default();
+        for line in lines {
             let name = line.rsplit(['/', '\\']).next().unwrap_or(line);
-            strip_source(name).to_string()
-        })
-        .collect()
+            match dataset::names::split_source(name) {
+                Some((i, rest)) => {
+                    out.sources.insert(i);
+                    out.flat.insert(rest.to_string());
+                }
+                None => {
+                    out.flat.insert(name.to_string());
+                }
+            }
+            out.names.insert(name.to_string());
+        }
+        out
+    }
+
+    /// Whether the export frame `flat` is listed by name: as the dataset spells it with any
+    /// source prefix the lists use (the current 120-byte cut, or the whole-name cut of a dataset
+    /// written before it), or as it is.
+    fn has(&self, flat: &str) -> bool {
+        self.flat.contains(flat)
+            || self.sources.iter().any(|&i| {
+                self.names.contains(&dataset::names::spelling(i, flat))
+                    || self
+                        .names
+                        .contains(&dataset::names::legacy_spelling(i, flat))
+            })
+    }
 }
 
 /// The fold frames among the sources of the images the lists `lines` name, by the dataset's own
@@ -285,36 +318,6 @@ fn by_provenance<'f>(
         .filter(|f| trained.contains(&f.name))
         .copied()
         .collect())
-}
-
-/// `name` without the dataset's `s<digits>-` source prefix.
-fn strip_source(name: &str) -> &str {
-    let Some(rest) = name.strip_prefix('s') else {
-        return name;
-    };
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    match rest.get(digits..).and_then(|r| r.strip_prefix('-')) {
-        Some(r) if digits > 0 => r,
-        _ => name,
-    }
-}
-
-/// A flat name as the training dataset spells its image (the dataset's file-name rule: letters,
-/// digits, `-`, `_` and `.`, others `_`, at most 120 bytes with the `s0-` prefix), without the
-/// prefix.
-fn dataset_spelling(flat: &str) -> String {
-    let mut s: String = format!("s0-{flat}")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    s.truncate(120);
-    strip_source(&s).to_string()
 }
 
 /// Most frames of a check's sample (the first frames written).
@@ -462,10 +465,10 @@ impl Acc {
 /// the export's). One that is would make the check meaningless, so the job fails loudly.
 pub fn check_unseen(data: &Path, fold: &[&ExportFrame]) -> Result<()> {
     let lines = trained_lines(data)?;
-    let trained = trained_names(&lines);
+    let trained = Listed::of(&lines);
     let mut leaked: Vec<&str> = fold
         .iter()
-        .filter(|f| trained.contains(&dataset_spelling(&f.name)) || trained.contains(&f.name))
+        .filter(|f| trained.has(&f.name))
         .map(|f| f.name.as_str())
         .collect();
     if leaked.is_empty() {

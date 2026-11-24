@@ -1334,19 +1334,66 @@ fn an_unavailable_review_folder_is_not_an_empty_dataset() {
     assert!(!p.folder_missing);
 }
 
+// QA-040 / QA-136: the fold-safety check finds a leaked long-named frame by name in a dataset
+// written with the old whole-name cut (any source index, not only s0) and with the new stem-only
+// cut, even where the record of sources would not tell (it points elsewhere here).
+#[test]
+fn the_unseen_check_finds_long_names_cut_the_old_and_the_new_way() {
+    let t = tmp("unseen-long");
+    let camera = "c".repeat(64);
+    let stem = "x".repeat(64);
+    let name = format!("ir.{camera}.2026-10-21.{stem}.jpg");
+    let frame = ExportFrame {
+        rel: crate::collect::layout::parse_rel(&format!("ir/{camera}/2026-10-21/{stem}.jpg"))
+            .unwrap(),
+        name: name.clone(),
+        image: PathBuf::new(),
+        width: 1,
+        height: 1,
+        buckets: Vec::new(),
+        split: Split::Val,
+        labels: LabelFile::default(),
+        floor: None,
+    };
+    std::fs::write(t.0.join("valid.txt"), "").unwrap();
+    for listed in [
+        dataset::names::legacy_spelling(0, &name),
+        dataset::names::legacy_spelling(10, &name),
+        dataset::names::spelling(0, &name),
+        dataset::names::spelling(10, &name),
+    ] {
+        std::fs::write(t.0.join("train.txt"), format!("./images/{listed}\n")).unwrap();
+        // The record names another frame: only the name can find the leak.
+        let m = BTreeMap::from([(listed.clone(), PathBuf::from("train/ir.b.2026-10-21.y.jpg"))]);
+        std::fs::write(
+            t.0.join(crate::training::dataset::IMAGE_SOURCES_FILE),
+            serde_json::to_string(&m).unwrap(),
+        )
+        .unwrap();
+        let e = check_unseen(&t.0, &[&frame]).unwrap_err().to_string();
+        assert!(
+            e.contains("are in the fold model's training"),
+            "{listed}: {e}"
+        );
+    }
+}
+
 #[test]
 fn the_unseen_check_reads_the_datasets_names() {
-    assert_eq!(
-        strip_source("s0-day.cam.2026-10-01.x.jpg"),
-        "day.cam.2026-10-01.x.jpg"
-    );
-    assert_eq!(strip_source("s12-a.jpg"), "a.jpg");
-    assert_eq!(strip_source("sun.jpg"), "sun.jpg");
-    assert_eq!(strip_source("s-a.jpg"), "s-a.jpg");
-    assert_eq!(
-        dataset_spelling("ir.my cam.2026-10-01.x.jpg"),
-        "ir.my_cam.2026-10-01.x.jpg"
-    );
+    let listed = |names: &[&str]| {
+        Listed::of(
+            &names
+                .iter()
+                .map(|n| format!("./images/{n}"))
+                .collect::<BTreeSet<_>>(),
+        )
+    };
+    assert!(listed(&["s0-day.cam.2026-10-01.x.jpg"]).has("day.cam.2026-10-01.x.jpg"));
+    assert!(listed(&["s12-a.jpg"]).has("a.jpg"));
+    assert!(listed(&["sun.jpg"]).has("sun.jpg"));
+    assert!(listed(&["s-a.jpg"]).has("s-a.jpg"));
+    assert!(!listed(&["s-a.jpg"]).has("a.jpg"));
+    assert!(listed(&["s0-ir.my_cam.2026-10-01.x.jpg"]).has("ir.my cam.2026-10-01.x.jpg"));
     assert_eq!(
         without_kept_note("boom. Its best checkpoint is kept (1 MB in w): Retry export"),
         "boom"

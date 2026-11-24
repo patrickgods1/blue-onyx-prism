@@ -95,3 +95,43 @@ pub(crate) fn argmax(xs: &[f32]) -> (usize, f32) {
     }
     best
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::OutputBuf;
+
+    // QA-043: `family: auto` now picks Yolo5 for a static `[1, 25200, 6]` output whatever the class
+    // count; a 1-class export given the 80 COCO names (no classes file) must fail with a message
+    // that names the cause, never decode as boxes.
+    #[test]
+    fn six_columns_with_80_class_names_fail_naming_the_classes_file() {
+        let out = NamedOutput {
+            name: "output".into(),
+            shape: vec![1, 25200, 6],
+            data: OutputBuf::F32(vec![0.0; 25200 * 6]),
+        };
+        let ctx = PreprocessCtx {
+            orig_w: 640,
+            orig_h: 640,
+            input_w: 640,
+            input_h: 640,
+            mode: ResizeMode::Letterbox,
+            scale: 1.0,
+            pad_x: 0.0,
+            pad_y: 0.0,
+        };
+        let params = PostParams {
+            confidence_threshold: 0.5,
+            nms_iou: 0.45,
+        };
+        let err = Yolo5::new(80)
+            .postprocess(&[out], &ctx, &params)
+            .expect_err("85 columns expected for 80 classes");
+        assert!(
+            err.to_string()
+                .contains("classes file lists another number of classes"),
+            "{err}"
+        );
+    }
+}

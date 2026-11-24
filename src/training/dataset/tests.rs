@@ -399,6 +399,119 @@ fn writes_yolo_coco_and_a_loadable_heldout_set() {
     );
 }
 
+// QA-040 / QA-136: frames of cameras with 64-character names and long stems. The old writer cut
+// the whole name at 120 bytes, extension included (Ultralytics then skipped the image without a
+// word) and took the label file's name from the cut string (frames sharing their first 117 bytes
+// shared it). Now: every image keeps `.jpg`, every frame gets its own image and label names.
+#[test]
+fn long_names_keep_their_extension_and_their_own_label_file() {
+    let t = tmp("long");
+    let mut frames: Vec<(String, String, Vec<String>)> = Vec::new();
+    for cam in ["a", "b", "c"] {
+        let camera = cam.repeat(64);
+        for day in ["2026-10-01", "2026-10-02"] {
+            for i in 0..3usize {
+                // Frames of one camera day share all but their last bytes; `i + 1` boxes each,
+                // so a label file tells which frame it was written for.
+                let name = format!("night.{camera}.{day}.{}{i:04}.jpg", "x".repeat(60));
+                let label = "0 0.5 0.5 0.2 0.4\n".repeat(i + 1);
+                frames.push((
+                    name,
+                    label,
+                    vec![
+                        "night".into(),
+                        format!("camera:{camera}"),
+                        format!("date:{day}"),
+                    ],
+                ));
+            }
+        }
+    }
+    let refs: Vec<(&str, &str, Vec<&str>)> = frames
+        .iter()
+        .map(|(n, l, t)| {
+            (
+                n.as_str(),
+                l.as_str(),
+                t.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    let refs2: Vec<(&str, &str, &[&str])> = refs
+        .iter()
+        .map(|(n, l, t)| (*n, *l, t.as_slice()))
+        .collect();
+    flat_export(&t.0, &["cat"], &refs2);
+    assert_eq!(frames[0].0.len(), 150);
+    let s = vec![read_export(&t.0).unwrap()];
+    let opts = Options::default();
+    let p = plan(&s, &opts).unwrap();
+    assert!(!p.heldout.is_empty() && !p.valid.is_empty() && !p.train.is_empty());
+    let out = tmp("long-out");
+    let dir = out.0.join("data");
+    let prep = write(&s, &p, &opts, &dir).unwrap();
+    let sources = read_image_sources(&dir).unwrap();
+    let boxes_of = |src: &Path| {
+        frames
+            .iter()
+            .find(|(n, _, _)| *n == file_name(src))
+            .map(|(_, l, _)| l.lines().count())
+            .unwrap()
+    };
+    let mut written = BTreeSet::new();
+    for list in ["train.txt", "valid.txt"] {
+        for l in std::fs::read_to_string(dir.join(list)).unwrap().lines() {
+            let n = l.trim_start_matches("./images/");
+            assert!(
+                n.ends_with(".jpg") && n.len() <= names::MAX_NAME_BYTES,
+                "{n}"
+            );
+            assert!(dir.join("images").join(n).is_file(), "{n}");
+            let stem = n.strip_suffix(".jpg").unwrap();
+            let label = std::fs::read_to_string(dir.join("labels").join(format!("{stem}.txt")))
+                .unwrap_or_else(|e| panic!("{stem}.txt: {e}"));
+            assert_eq!(label.lines().count(), boxes_of(&sources[n]), "{n}");
+            written.insert(n.to_string());
+        }
+    }
+    assert_eq!(written.len(), p.train.len() + p.valid.len());
+    assert_eq!(
+        std::fs::read_dir(dir.join("labels")).unwrap().count(),
+        written.len(),
+        "one label file per image"
+    );
+    // The held-out set: names with `.jpg`, each with its own label file, loadable.
+    let hd = prep.heldout_dir.unwrap();
+    let m: Manifest =
+        serde_json::from_slice(&std::fs::read(hd.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(m.images.len(), p.heldout.len());
+    for i in &m.images {
+        assert!(
+            i.file.ends_with(".jpg") && i.file.len() <= names::MAX_NAME_BYTES,
+            "{}",
+            i.file
+        );
+        let stem = i.file.strip_suffix(".jpg").unwrap();
+        assert!(
+            hd.join("labels").join(format!("{stem}.txt")).is_file(),
+            "{stem}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(hd.join("labels")).unwrap().count(),
+        p.heldout.len()
+    );
+    let (set, warnings) = images::load_dir(&hd, None, Some("heldout")).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(set.images.len(), p.heldout.len());
+    // COCO lists the same `.jpg` names.
+    let coco: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("valid.coco.json")).unwrap()).unwrap();
+    for i in coco["images"].as_array().unwrap() {
+        assert!(i["file_name"].as_str().unwrap().ends_with(".jpg"), "{i}");
+    }
+}
+
 #[test]
 fn the_review_export_layout_keeps_its_val_split_as_heldout() {
     let t = tmp("review");

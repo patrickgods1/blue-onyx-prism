@@ -1393,3 +1393,48 @@ fn planning_a_dataset_check_never_moves_runs_json_aside() {
     assert!(!names.iter().any(|n| n.contains(".corrupt-")), "{names:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// QA-039: `--verbose` stopped after 60 lines (the CLI followed the tail by its length, which
+/// stops at the cap). 200 lines go through [`push_log`]; the follower reads after varying
+/// batches, one of them larger than the tail: every line it returns is returned once, in order,
+/// and only the lines evicted before that read are missing.
+#[test]
+fn the_log_follower_returns_each_line_once_past_the_tail() {
+    let mut log = Vec::new();
+    let mut seq = 0u64;
+    let mut follow = LogFollower::new();
+    let mut got: Vec<String> = Vec::new();
+    let mut pushed = 0usize;
+    // Batches between two reads: small ones, one of 90 (> LOG_TAIL), then small ones again.
+    for batch in [1usize, 5, 30, 60, 90, 3, 7, 4]
+        .into_iter()
+        .chain(std::iter::repeat(1))
+    {
+        if pushed >= 200 {
+            break;
+        }
+        for _ in 0..batch.min(200 - pushed) {
+            push_log(&mut log, &mut seq, &format!("line {pushed}"));
+            pushed += 1;
+        }
+        assert!(log.len() <= LOG_TAIL);
+        got.extend(follow.new_lines(&log, seq).iter().cloned());
+        // A read with nothing new returns nothing.
+        assert!(follow.new_lines(&log, seq).is_empty());
+    }
+    assert_eq!(seq, 200);
+    let numbers: Vec<usize> = got
+        .iter()
+        .map(|l| l.strip_prefix("line ").unwrap().parse().unwrap())
+        .collect();
+    assert!(numbers.windows(2).all(|w| w[0] < w[1]), "once, in order");
+    // The 90-line batch (lines 96 to 185) lost its first 30, evicted before the read.
+    let expected: Vec<usize> = (0..96).chain(126..200).collect();
+    assert_eq!(numbers, expected);
+    // Long lines are cut, and a tail trimmed after the fact (a finished run) still follows.
+    push_log(&mut log, &mut seq, &"x".repeat(1000));
+    assert_eq!(log.last().unwrap().chars().count(), LOG_LINE_CHARS);
+    let skip = log.len() - 15;
+    log.drain(..skip);
+    assert_eq!(follow.new_lines(&log, seq).len(), 1);
+}

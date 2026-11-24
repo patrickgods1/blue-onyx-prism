@@ -750,3 +750,98 @@ fn your_cameras_compares_on_the_frames_no_listed_model_saw() {
     assert_eq!(p.block, Block::Unfair);
     assert_eq!(row(&v, "tuned").block, Block::Ok);
 }
+
+/// QA-027 / QA-143: the reference model's As served result is its own detections too: never on
+/// the relative set it labels, listed with why.
+#[test]
+fn the_reference_models_served_result_does_not_score_itself() {
+    let mut w = pair();
+    let mut served = w.results.models[0].clone();
+    served.model = "good+served".into();
+    w.results.models.push(served);
+    let mut run = w.preds.runs[0].clone();
+    run.model = "good+served".into();
+    w.preds.runs.push(run);
+    w.results.image_sets[0].ground_truth = GroundTruth::Pseudo("good on openvino:cpu".into());
+    let v = w.compare(None);
+    let models: Vec<&str> = v.rows.iter().map(|r| r.model.as_str()).collect();
+    assert_eq!(models, ["poor"]);
+    let m = v.missing.iter().find(|m| m.model == "good+served").unwrap();
+    assert!(m.why.contains("its own labels"), "{}", m.why);
+}
+
+/// QA-034 / QA-191: on "Your cameras" a `--variants` result (`<model>+filters`) is its model's:
+/// what the model saw excuses the frames its run left out, so it is on the set, the fair frames
+/// drop those, and its saved confidence is the model's.
+#[test]
+fn a_variant_result_on_your_cameras_is_judged_by_what_its_model_saw() {
+    use crate::benchmark::cameras::{ID, seen::Seen};
+    let names: Vec<String> = (0..6)
+        .map(|i| format!("day.cam.2026-11-0{}.f{i}.jpg", 1 + i % 2))
+        .collect();
+    let id_of = |f: &str| crate::training::autolabel::frame_of_file(f).unwrap();
+    let images: Vec<ImageInfo> = names
+        .iter()
+        .map(|f| img(f, &["day"], &["person"]))
+        .collect();
+    let preds: Vec<(&str, Vec<Pred>)> = names
+        .iter()
+        .map(|f| (f.as_str(), vec![(0, 0.9, BOX)]))
+        .collect();
+    let ms: Vec<(&str, f64)> = names.iter().map(|f| (f.as_str(), 10.0)).collect();
+    let mut r = results();
+    r.image_sets = vec![set(ID, SetKind::Dir, images)];
+    r.models = vec![
+        model(
+            "plain",
+            &[ID],
+            vec![timed(dev("ort:coreml", 1.0, Vec::new()), ID, &ms)],
+        ),
+        // Only the variant ran (`--variants filters`); it left out frames 0 and 1.
+        model(
+            "tuned+filters",
+            &[ID],
+            vec![timed(dev("ort:coreml", 1.0, Vec::new()), ID, &ms[2..])],
+        ),
+    ];
+    let runs = vec![
+        stored("plain", "ort:coreml", &["person"], ID, preds.clone()),
+        stored(
+            "tuned+filters",
+            "ort:coreml",
+            &["person"],
+            ID,
+            preds[2..].to_vec(),
+        ),
+    ];
+    let mut w = World::new(r, runs);
+    w.configured = ["plain", "tuned"]
+        .iter()
+        .map(|n| Configured {
+            name: (*n).into(),
+            blocked: None,
+        })
+        .collect();
+    w.seen.insert(
+        "tuned".into(),
+        Seen::Frames {
+            trained: [id_of(&names[0])].into(),
+            validated: [id_of(&names[1])].into(),
+        },
+    );
+    w.now.insert("tuned".into(), now_at(0.7, "ort:coreml"));
+    let v = w.compare(None);
+    let s = v.set.as_ref().unwrap();
+    assert_eq!(s.id, ID);
+    assert_eq!((s.frames, s.frames_left_out), (4, 2));
+    assert_eq!(s.left_out_by, ["tuned+filters"]);
+    let t = row(&v, "tuned+filters");
+    assert_eq!(t.block, Block::Ok, "an entrant, ranked");
+    assert_eq!(t.speed.frames, 4);
+    assert_eq!(
+        t.served_threshold,
+        Some(0.7),
+        "its model's saved confidence"
+    );
+    assert!(v.missing.iter().all(|m| m.model != "tuned+filters"));
+}

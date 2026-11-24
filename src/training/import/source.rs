@@ -1152,6 +1152,13 @@ mod tests {
             camera_of(Path::new("a.mp4"), Some("Back Yard")),
             "back_yard"
         );
+        // QA-186: a typed Windows device name keeps its digit, so the folder gets a `_`.
+        assert_ne!(camera_of(Path::new("a.mp4"), Some("COM1")), "com1");
+        assert_eq!(camera_of(Path::new("a.mp4"), Some("COM1")), "com1_");
+        assert_eq!(
+            camera_of(Path::new("/x/Nul.20240315_083012.mp4"), None),
+            "nul_"
+        );
     }
 
     #[test]

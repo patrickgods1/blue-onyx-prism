@@ -4,6 +4,11 @@
 //! device of a run without a reference), what a run shared the machine with
 //! ([`shared_load_text`]), and the persisted `benchmark.json` (the latest run of every model,
 //! next to the config file) that the CLI and the web UI both read and write.
+//!
+//! A load-modify-save of `benchmark.json`, its history and its stored predictions goes through
+//! [`load_or_move_aside`] ([`crate::json_aside`]'s policy, tag `bad`): a file that cannot be read
+//! is refused and left alone, one that does not parse is set aside as `<name>.bad-<time>`, and
+//! one whose entries were dropped is first copied aside whole, so a save never loses them.
 
 use super::grade::{AccuracyMetric, Grade, Grades, Weights};
 use super::images::{GroundTruth, ImageSet, SetKind};
@@ -1123,13 +1128,44 @@ pub struct BenchmarkResults {
     pub image_sets: Vec<ImageSetInfo>,
 }
 
-/// The text of `path`; None when it does not exist.
-pub(crate) fn read_if_exists(path: &Path) -> Result<Option<String>> {
-    match std::fs::read_to_string(path) {
-        Ok(t) => Ok(Some(t)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+/// Tag of the benchmark stores' asides ([`crate::json_aside`]): `<name>.bad-<time>`.
+pub(crate) const ASIDE_TAG: &str = "bad";
+
+/// A benchmark store that exists and could not be read (as opposed to one read and found
+/// damaged): kept in a load's error chain so [`load_or_move_aside`] refuses the save and never
+/// sets the file aside (QA-032).
+#[derive(Debug)]
+pub(crate) struct Unreadable(pub std::io::Error);
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
+}
+
+impl std::error::Error for Unreadable {}
+
+/// The error of store `path` that could not be read (`e`, after the retries).
+pub(crate) fn unreadable(path: &Path, e: std::io::Error) -> anyhow::Error {
+    anyhow::Error::new(Unreadable(e)).context(format!("reading {}", path.display()))
+}
+
+/// Whether `e` says a store could not be read ([`Unreadable`]), not that it is damaged.
+fn is_unreadable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Unreadable>())
+}
+
+/// The text of `path`; None when it does not exist. A failed read is tried again
+/// ([`crate::json_aside::read_retrying`]) and then an [`Unreadable`] error; text that is not
+/// UTF-8 was read and is damaged (a plain error).
+pub(crate) fn read_if_exists(path: &Path) -> Result<Option<String>> {
+    let Some(bytes) = crate::json_aside::read_retrying(path).map_err(|e| unreadable(path, e))?
+    else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .with_context(|| format!("parsing {}: not UTF-8 text", path.display()))
 }
 
 /// Parse the JSON object `text` (the file `path`) as `T` with its array field `list` taken
@@ -1175,47 +1211,108 @@ where
     Ok((head, items, warnings))
 }
 
-/// Rename `path` aside to `<name>.bad-<YYYYmmdd-HHMMSS>` (time zone wall time) in the same directory;
-/// returns the new path.
-pub(crate) fn move_aside(path: &Path) -> Result<PathBuf> {
-    let ts = crate::clock::name_stamp(std::time::SystemTime::now());
-    let mut name = path
-        .file_name()
-        .with_context(|| format!("{} has no file name", path.display()))?
-        .to_os_string();
-    name.push(format!(".bad-{ts}"));
-    let dest = path.with_file_name(name);
-    std::fs::rename(path, &dest)
-        .with_context(|| format!("renaming {} to {}", path.display(), dest.display()))?;
-    Ok(dest)
+/// What a lenient load of a store read: the value (None: no file), its warnings, and how many
+/// entries it dropped (each also has a warning; other warnings may be there too).
+pub(crate) struct Load<T> {
+    pub value: Option<T>,
+    pub warnings: Vec<String>,
+    pub dropped: usize,
 }
 
-/// `load(path)`, and when the file exists but does not load: rename it aside with a warning
-/// (logged and returned) and continue without it. Errors when the rename fails, so the caller
-/// does not overwrite the file.
+/// `load(path)` for a load-modify-save (the caller holds the store's lock), keeping what the
+/// save could lose ([`crate::json_aside`]'s policy, QA-032 / QA-033 / QA-126):
+///
+/// - a file that cannot be read ([`Unreadable`], after the retries) is an error: nothing is set
+///   aside or saved over it;
+/// - a file that was read and does not load is moved aside to `<name>.bad-<time>` (copied when
+///   the rename fails, once per content) with a warning, and the caller starts without it;
+///   when it cannot be set aside at all, an error;
+/// - a file that loaded but dropped entries (a later version's, a hand edit) is copied whole
+///   to such an aside before the caller's save drops them for good (once per content); when
+///   that copy fails, an error.
+///
+/// Warnings are logged and returned. An error means the caller must not save.
 pub(crate) fn load_or_move_aside<T>(
     path: &Path,
-    load: impl Fn(&Path) -> Result<(Option<T>, Vec<String>)>,
+    load: impl Fn(&Path) -> Result<Load<T>>,
+) -> Result<(Option<T>, Vec<String>)> {
+    load_or_move_aside_with(path, load, &|from, to| std::fs::rename(from, to))
+}
+
+/// [`load_or_move_aside`] with the rename step given (tests make it fail, as Windows does for a
+/// file another process holds).
+pub(crate) fn load_or_move_aside_with<T>(
+    path: &Path,
+    load: impl Fn(&Path) -> Result<Load<T>>,
+    rename: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<(Option<T>, Vec<String>)> {
     match load(path) {
-        Ok((v, warnings)) => {
+        Ok(Load {
+            value,
+            mut warnings,
+            dropped,
+        }) => {
+            if dropped > 0 {
+                let (aside, new) =
+                    crate::json_aside::copy_aside(path, ASIDE_TAG).with_context(|| {
+                        format!(
+                            "not overwriting {}: {dropped} entr{} that do not load could not be \
+                         copied aside first; check the disk and the permissions of its folder",
+                            path.display(),
+                            if dropped == 1 { "y" } else { "ies" }
+                        )
+                    })?;
+                warnings.push(if new {
+                    format!(
+                        "{}: kept a copy of the whole file, with the {dropped} dropped entr{}, \
+                         in {} before saving; restore from it by hand with a version that \
+                         reads them",
+                        path.display(),
+                        if dropped == 1 { "y" } else { "ies" },
+                        aside.display()
+                    )
+                } else {
+                    format!(
+                        "{}: the dropped entries are already kept in {}",
+                        path.display(),
+                        aside.display()
+                    )
+                });
+            }
             for w in &warnings {
                 tracing::warn!("{w}");
             }
-            Ok((v, warnings))
+            Ok((value, warnings))
         }
+        Err(e) if is_unreadable(&e) => Err(e).with_context(|| {
+            format!(
+                "not overwriting {}: it cannot be read (another program may hold it, or this \
+                 account may not be allowed to read it); check its permissions and try again",
+                path.display()
+            )
+        }),
         Err(e) => {
-            let dest = move_aside(path).with_context(|| {
+            let (dest, how) = crate::json_aside::move_or_copy_aside_with(path, ASIDE_TAG, rename)
+                .with_context(|| {
                 format!(
-                    "{} does not load ({e:#}) and could not be moved aside; not overwriting it",
+                    "{} does not load ({e:#}) and could not be set aside; not overwriting it",
                     path.display()
                 )
             })?;
-            let w = format!(
-                "{} does not load ({e:#}); moved it aside to {} and started a new file",
-                path.display(),
-                dest.display()
-            );
+            let w = match how {
+                crate::json_aside::Aside::Moved => format!(
+                    "{} does not load ({e:#}); moved it aside to {} and started a new file",
+                    path.display(),
+                    dest.display()
+                ),
+                _ => format!(
+                    "{} does not load ({e:#}); it could not be moved (another program may hold \
+                     it), so it was {} {} and the new file replaces it",
+                    path.display(),
+                    how.verb(),
+                    dest.display()
+                ),
+            };
             tracing::warn!("{w}");
             Ok((None, vec![w]))
         }
@@ -1365,23 +1462,38 @@ impl BenchmarkResults {
     /// deserialized entry by entry, so one bad entry drops only that entry (with a warning
     /// naming it). An unreadable or unparsable file is an error.
     pub fn load_with_warnings(path: &Path) -> Result<(Option<Self>, Vec<String>)> {
+        Self::load_counted(path).map(|l| (l.value, l.warnings))
+    }
+
+    /// [`Self::load_with_warnings`] with the count of model entries dropped.
+    fn load_counted(path: &Path) -> Result<Load<Self>> {
         let Some(text) = read_if_exists(path)? else {
-            return Ok((None, Vec::new()));
+            return Ok(Load {
+                value: None,
+                warnings: Vec::new(),
+                dropped: 0,
+            });
         };
         let (mut r, models, mut warnings) =
             parse_lenient::<Self, ModelResult>(&text, "models", path)?;
+        let dropped = warnings.len();
         r.models = models;
         // "Your cameras" is scored against its snapshot, kept beside the file.
         warnings.extend(super::cameras::snapshot::overlay(&mut r, path));
-        Ok((Some(r), warnings))
+        Ok(Load {
+            value: Some(r),
+            warnings,
+            dropped,
+        })
     }
 
-    /// The previous results to merge a new run into before saving: like
-    /// [`Self::load_with_warnings`], but a file that exists and does not load is renamed aside
-    /// (`move_aside`) with a warning instead of being overwritten by the next save. Errors
-    /// only when that rename fails (the caller must then not save).
+    /// The previous results to merge a new run into before saving ([`load_or_move_aside`]):
+    /// like [`Self::load_with_warnings`], but a file that does not load is set aside with a
+    /// warning instead of being overwritten by the next save, and a file whose entries were
+    /// dropped is first copied aside whole. Errors when the file cannot be read, or what the
+    /// save would lose cannot be kept (the caller must then not save).
     pub fn load_for_merge(path: &Path) -> Result<(Option<Self>, Vec<String>)> {
-        load_or_move_aside(path, Self::load_with_warnings)
+        load_or_move_aside(path, Self::load_counted)
     }
 
     /// [`Self::load`], logging (not returning) errors.
@@ -1840,6 +1952,140 @@ mod tests {
         assert_eq!(BenchmarkResults::merge_warning(Some(&prev), &all), None);
     }
 
+    /// The `<name>.bad-*` file names in `dir`, sorted.
+    fn bad_asides(dir: &Path, name: &str) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&format!("{name}.bad-")))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Two models' results saved at a new `benchmark.json` in a fresh folder.
+    fn two_model_file(tag: &str) -> (crate::test_dirs::TempDir, PathBuf, BenchmarkResults) {
+        let dir = crate::test_dirs::TempDir::new(tag);
+        let path = dir.join(RESULTS_FILE);
+        let mut a = model(vec![dev("openvino:cpu", 37.0, scene())], None);
+        a.model = "IPcam-general".into();
+        let mut b = model(vec![dev("ort:cpu", 44.0, scene())], None);
+        b.model = "dfine-s".into();
+        let r = BenchmarkResults::new(
+            HardwareSummary::default(),
+            RuntimeVersions::default(),
+            vec![a, b],
+        );
+        r.save(&path).unwrap();
+        (dir, path, r)
+    }
+
+    /// QA-032 / QA-144: a file that cannot be read (here a folder in its place, which fails to
+    /// read on every OS) is not set aside and not written over: the merge load refuses.
+    #[test]
+    fn an_unreadable_results_file_is_refused_and_left_alone() {
+        let dir = crate::test_dirs::TempDir::new("bench-unreadable");
+        let path = dir.join(RESULTS_FILE);
+        std::fs::create_dir(&path).unwrap();
+        let e = BenchmarkResults::load_for_merge(&path).unwrap_err();
+        let text = format!("{e:#}");
+        assert!(text.contains("not overwriting"), "{text}");
+        assert!(text.contains("cannot be read"), "{text}");
+        assert!(path.is_dir(), "still a folder");
+        assert!(bad_asides(&dir, RESULTS_FILE).is_empty());
+        // Text that is not UTF-8 was read: damaged, so it is set aside.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"{\"models\": \"\xff\"}").unwrap();
+        let (back, warnings) = BenchmarkResults::load_for_merge(&path).unwrap();
+        assert!(back.is_none());
+        assert!(warnings[0].contains("moved it aside"), "{warnings:?}");
+        assert_eq!(bad_asides(&dir, RESULTS_FILE).len(), 1);
+    }
+
+    /// QA-057 / QA-144: two damaged files set aside in the same second are both kept.
+    #[test]
+    fn a_second_damaged_results_file_does_not_replace_the_first() {
+        let dir = crate::test_dirs::TempDir::new("bench-twice");
+        let path = dir.join(RESULTS_FILE);
+        std::fs::write(&path, b"first").unwrap();
+        BenchmarkResults::load_for_merge(&path).unwrap();
+        std::fs::write(&path, b"second").unwrap();
+        BenchmarkResults::load_for_merge(&path).unwrap();
+        let texts: std::collections::BTreeSet<Vec<u8>> = bad_asides(&dir, RESULTS_FILE)
+            .iter()
+            .map(|a| std::fs::read(dir.join(a)).unwrap())
+            .collect();
+        assert_eq!(
+            texts,
+            [b"first".to_vec(), b"second".to_vec()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// QA-033 / QA-144: an entry this build cannot read survives the merge and save: the whole
+    /// original file is copied aside first, once.
+    #[test]
+    fn a_dropped_results_entry_is_kept_aside_before_the_save() {
+        let (dir, path, r) = two_model_file("bench-dropped");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["models"][1]["devices"] = serde_json::json!("from a later version");
+        let original = v.to_string();
+        std::fs::write(&path, &original).unwrap();
+        let (back, warnings) = BenchmarkResults::load_for_merge(&path).unwrap();
+        assert_eq!(back.as_ref().unwrap().models.len(), 1);
+        assert!(
+            warnings.iter().any(|w| w.contains("kept a copy")),
+            "{warnings:?}"
+        );
+        let aside = bad_asides(&dir, RESULTS_FILE);
+        assert_eq!(aside.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&aside[0])).unwrap(),
+            original
+        );
+        // A second load of the same file adds no copy.
+        BenchmarkResults::load_for_merge(&path).unwrap();
+        assert_eq!(bad_asides(&dir, RESULTS_FILE), aside);
+        // The save drops the entry from the file, not from the disk; the next load drops nothing.
+        back.unwrap().save(&path).unwrap();
+        let (again, warnings) = BenchmarkResults::load_for_merge(&path).unwrap();
+        assert_eq!(again.unwrap().models.len(), 1);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(bad_asides(&dir, RESULTS_FILE), aside);
+        assert_eq!(r.models.len(), 2);
+    }
+
+    /// QA-187 / QA-058: a damaged file that cannot be renamed (Windows: another process holds
+    /// it) is copied once, the original stays, and the next save replaces it.
+    #[test]
+    fn a_damaged_results_file_that_cannot_be_renamed_is_copied_once() {
+        let (dir, path, r) = two_model_file("bench-held");
+        std::fs::write(&path, b"{\"models\": [").unwrap();
+        let held = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::other("held by another process"))
+        };
+        let load = || load_or_move_aside_with(&path, BenchmarkResults::load_counted, &held);
+        let (back, warnings) = load().unwrap();
+        assert!(back.is_none());
+        assert!(warnings[0].contains("copied to"), "{warnings:?}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"models\": [",
+            "still there"
+        );
+        let aside = bad_asides(&dir, RESULTS_FILE);
+        assert_eq!(aside.len(), 1);
+        let (_, warnings) = load().unwrap();
+        assert!(warnings[0].contains("already copied to"), "{warnings:?}");
+        assert_eq!(bad_asides(&dir, RESULTS_FILE), aside);
+        r.save(&path).unwrap();
+        assert_eq!(BenchmarkResults::load(&path).unwrap().unwrap(), r);
+        assert_eq!(bad_asides(&dir, RESULTS_FILE), aside);
+    }
+
     #[test]
     fn unloadable_results_are_moved_aside_and_bad_entries_dropped() {
         let dir = std::env::temp_dir().join(format!("bop-bench-{}", uuid::Uuid::new_v4()));
@@ -1864,9 +2110,15 @@ mod tests {
         let (back, warnings) = BenchmarkResults::load_for_merge(&path).unwrap();
         let back = back.unwrap();
         assert_eq!(back.models, vec![a.clone()]);
-        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].contains("dfine-s"), "{}", warnings[0]);
         assert!(path.is_file(), "a partly bad file is not moved");
+        // ...but copied whole before a save can drop the entry (QA-033); that copy is set aside
+        // here so the truncated case below finds its own.
+        let copied = bad_asides(&dir, RESULTS_FILE);
+        assert_eq!(copied.len(), 1);
+        assert!(warnings[1].contains(&copied[0]), "{}", warnings[1]);
+        std::fs::remove_file(dir.join(&copied[0])).unwrap();
 
         // Missing optional fields load (older/newer writers).
         let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -1885,12 +2137,7 @@ mod tests {
         let (back, warnings) = BenchmarkResults::load_for_merge(&path).unwrap();
         assert!(back.is_none());
         assert!(!path.exists());
-        let aside: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(&format!("{RESULTS_FILE}.bad-")))
-            .collect();
+        let aside = bad_asides(&dir, RESULTS_FILE);
         assert_eq!(aside.len(), 1, "{aside:?}");
         assert_eq!(aside[0].len(), RESULTS_FILE.len() + ".bad-".len() + 15);
         assert_eq!(warnings.len(), 1);

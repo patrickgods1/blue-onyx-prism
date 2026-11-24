@@ -4,7 +4,6 @@
 //! the model's `<model>.provenance.json` ([`trained_frames`]). Results of older versions get the
 //! share when they are served ([`backfill`]), from the image names they stored.
 
-use super::find_model;
 use super::report::BenchmarkResults;
 use crate::config::{Config, ModelConfig};
 use crate::training::autolabel::{frame_of_file, trained_frames};
@@ -61,8 +60,8 @@ pub fn backfill(results: &mut BenchmarkResults, config: &Config) {
         if r.trained_on_share.is_some() {
             continue;
         }
-        // An As served result trained on what its model did.
-        let Some(m) = find_model(config, super::variant::base_name(&r.model)) else {
+        // An As served or variant result trained on what its model did.
+        let Some(m) = super::variant::owner(config, &r.model) else {
             continue;
         };
         let files = sets

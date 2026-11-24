@@ -13,8 +13,10 @@
 //! 4. Check the exact size and the pinned SHA-256. A mismatch deletes the file and fails the job
 //!    with "hash mismatch" (not retried automatically).
 //! 5. Archives: extract the whitelisted entries ([`super::extract`]) into a staging directory
-//!    next to the target, write the manifest there, then rename it into place. Model files are
-//!    renamed into place one by one. An update of a runtime that a process has loaded is kept
+//!    next to the target, write the manifest there, then rename it into place (an earlier install
+//!    is replaced as a whole only when the folder is that install alone, [`exclusively_ours`];
+//!    otherwise, as in a user's `--dir`, the files are merged in and the user's stay). Model files
+//!    are renamed into place one by one. An update of a runtime that a process has loaded is kept
 //!    beside it instead and swapped in by the next process that loads it (`in_use`).
 //! 6. Optionally mark an ONNX Runtime flavor active (`onnxruntime/active.txt`).
 //!
@@ -155,13 +157,31 @@ pub fn read_manifest(path: &Path) -> Option<Manifest> {
 }
 
 /// The manifest file as [`write_manifest`] writes it: a [`Manifest`] plus the size of every
-/// installed file. Apart so the sizes stay this module's detail; absent in older files.
+/// installed file and the merge flag. Apart so they stay this module's detail; absent in older
+/// files.
 #[derive(Serialize)]
 struct WrittenManifest<'a> {
     #[serde(flatten)]
     manifest: &'a Manifest,
     sizes: BTreeMap<&'a str, u64>,
+    /// The install was merged file by file into a directory that was there before
+    /// ([`mark_merged`]): that directory is never ours to replace ([`exclusively_ours`]).
+    /// Written only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    merged: bool,
 }
+
+/// The merge flag of a manifest ([`WrittenManifest::merged`]); absent = false.
+#[derive(Deserialize)]
+struct MergedFlag {
+    #[serde(default)]
+    merged: bool,
+}
+
+/// Top-level names that do not make a directory anyone else's: folder metadata the file managers
+/// write (Finder, Explorer) and Python's bytecode cache. All rebuilt on demand, so replacing the
+/// directory loses nothing a user made. Compared ASCII case-insensitively.
+const REBUILDABLE_NAMES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini", "__pycache__"];
 
 /// The file sizes of a manifest ([`WrittenManifest`]).
 #[derive(Deserialize)]
@@ -172,6 +192,77 @@ struct RecordedSizes {
 
 /// Write `m` for the files as they are in `dir`, with their sizes.
 fn write_manifest(path: &Path, m: &Manifest, dir: &Path) -> Result<()> {
+    write_manifest_as(path, m, dir, false)
+}
+
+/// Mark the install in `dir` (its `.installed.json`) as merged into a directory that already held
+/// other files ([`WrittenManifest::merged`]). Called on the staging directory right before the
+/// merge, so the flag arrives with the files. Nothing when `dir` has no readable manifest.
+fn mark_merged(dir: &Path) -> Result<()> {
+    let path = dir.join(MANIFEST_FILE);
+    match read_manifest(&path) {
+        Some(m) => write_manifest_as(&path, &m, dir, true),
+        None => Ok(()),
+    }
+}
+
+/// The manifest at `path` says its install was merged ([`mark_merged`]).
+fn is_merged(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<MergedFlag>(&b).ok())
+        .is_some_and(|f| f.merged)
+}
+
+/// `dir` holds our install of resource `id` and nothing else, so replacing the whole directory
+/// (rename aside, rename the new one in, delete the old) loses nothing (audit 2026-11, QA-025).
+/// True only when its `.installed.json` names `id`, does not say the install was merged into a
+/// directory that was there before ([`mark_merged`]: a user `--dir` / `--dest`, a legacy flat
+/// `onnxruntime/`), and every top-level entry is the manifest (or its temp file), the first
+/// component of a file the manifest lists, the `.partial` of a listed file, or one of
+/// [`REBUILDABLE_NAMES`]. The content check covers manifests written before the flag. An
+/// unreadable directory is not proven ours. Only the top level is looked at: one `read_dir`,
+/// cheap enough for every Resources card.
+pub fn exclusively_ours(dir: &Path, id: &str) -> bool {
+    let path = dir.join(MANIFEST_FILE);
+    let Some(m) = read_manifest(&path).filter(|m| m.id == id) else {
+        return false;
+    };
+    if is_merged(&path) {
+        return false;
+    }
+    let listed: HashSet<&std::ffi::OsStr> = m
+        .files
+        .iter()
+        .filter_map(|f| match Path::new(f).components().next() {
+            Some(std::path::Component::Normal(first)) => Some(first),
+            _ => None,
+        })
+        .collect();
+    let temp = format!("{MANIFEST_FILE}.tmp");
+    let Ok(mut rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    rd.all(|e| {
+        let Ok(e) = e else {
+            return false;
+        };
+        let name = e.file_name();
+        let text = name.to_string_lossy();
+        text == MANIFEST_FILE
+            || text == temp.as_str()
+            || listed.contains(name.as_os_str())
+            || text
+                .strip_suffix(".partial")
+                .is_some_and(|f| listed.contains(std::ffi::OsStr::new(f)))
+            || REBUILDABLE_NAMES
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&text))
+    })
+}
+
+/// [`write_manifest`] with the merge flag.
+fn write_manifest_as(path: &Path, m: &Manifest, dir: &Path, merged: bool) -> Result<()> {
     let sizes = m
         .files
         .iter()
@@ -180,7 +271,11 @@ fn write_manifest(path: &Path, m: &Manifest, dir: &Path) -> Result<()> {
             meta.is_file().then_some((f.as_str(), meta.len()))
         })
         .collect();
-    let written = WrittenManifest { manifest: m, sizes };
+    let written = WrittenManifest {
+        manifest: m,
+        sizes,
+        merged,
+    };
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&written)?)
         .with_context(|| format!("writing {}", tmp.display()))?;

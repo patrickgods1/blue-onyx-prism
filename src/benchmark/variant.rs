@@ -57,6 +57,14 @@
 //! `stale_rules` when the config's fingerprint differs now. `auto` device ordering, the device
 //! recommendation and Apply read the bare `<model>` results only (a `+served` name is no
 //! configured model).
+//!
+//! **Owner of a result.** [`owner`] maps a result name (`<model>`, `<model>+served`,
+//! `<model>+<variant>`) to the configured model it belongs to: what that model trained on and
+//! saw, its threshold now and its serving settings apply to all its results. [`owned_by`] is the
+//! config-free form behind the pseudo-ground-truth rule ([`super::is_reference`], B10): none of
+//! the reference model's results is scored on its own detections. `current.rs` keeps its
+//! bare-vs-served split ([`base_name`]); `forget.rs` keeps its own rule (it also drops variant
+//! names whose remainder no longer parses).
 
 use crate::config::{Config, ModelConfig};
 use crate::model::enhance::{Preprocess, PreprocessModes};
@@ -146,6 +154,34 @@ pub fn base_name(name: &str) -> &str {
         }
         _ => name,
     }
+}
+
+/// The names the result `result` may belong to, most specific first: `result` itself, then the
+/// part before each `+` from the right whose remainder is `served` or a variant
+/// ([`parse_variant`], which `<model>+<variant>` names, [`variant_name`], come from). A model
+/// name may itself contain `+`, so the longest prefix comes first.
+pub fn owner_candidates(result: &str) -> impl Iterator<Item = &str> {
+    std::iter::once(result).chain(result.rmatch_indices('+').filter_map(move |(at, _)| {
+        let head = result.get(..at)?;
+        let rest = result.get(at + 1..)?;
+        (!head.is_empty() && (rest.eq_ignore_ascii_case(SERVED) || parse_variant(rest).is_ok()))
+            .then_some(head)
+    }))
+}
+
+/// The configured model the result `result` belongs to: the model of that exact name, else of
+/// its `<model>+served` / `<model>+<variant>` prefix ([`owner_candidates`]; a configured name with
+/// a literal `+` wins over a shorter one). None: no configured model owns it.
+pub fn owner<'a>(config: &'a Config, result: &str) -> Option<&'a ModelConfig> {
+    owner_candidates(result).find_map(|n| super::find_model(config, n))
+}
+
+/// Whether the result `result` is model `model`'s own (normalized names): `model` itself, its As
+/// served result or one of its variants. Config-free, so a configured model `m+filters` also
+/// counts as `m`'s here; callers that must tell them apart use [`owner`].
+pub fn owned_by(result: &str, model: &str) -> bool {
+    let key = crate::registry::normalize_name(model);
+    owner_candidates(result).any(|n| crate::registry::normalize_name(n) == key)
 }
 
 /// The verifier of a `verify:<model>` variant.
@@ -786,6 +822,59 @@ mod tests {
             .to_string();
         assert!(e.contains("not a configured model"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn named(name: &str) -> ModelConfig {
+        ModelConfig {
+            name: Some(name.into()),
+            ..ModelConfig::default()
+        }
+    }
+
+    /// QA-034 / QA-191: a result name maps to the configured model it belongs to: As served and
+    /// `--variants` names (whose variant may itself hold `+`), never a prefix whose remainder is
+    /// no variant, and a configured name with a literal `+` wins.
+    #[test]
+    fn owner_maps_served_and_variant_results_to_their_model() {
+        let config = Config {
+            models: vec![named("m"), named("a+b")],
+            ..Config::default()
+        };
+        let owner_of = |r: &str| owner(&config, r).map(ModelConfig::effective_name);
+        for r in [
+            "m",
+            "M.onnx",
+            "m+served",
+            "m+SERVED",
+            "m+filters",
+            "M.onnx+filters",
+            "m+filters+verify:x",
+            "m+pre:clahe:2,8",
+            "m+filters+night-pre:grayscale",
+        ] {
+            assert_eq!(owner_of(r).as_deref(), Some("m"), "{r}");
+        }
+        // Not a variant remainder; another model; a bare suffix.
+        for r in ["m+blur", "mm+served", "mm", "+served", "m+"] {
+            assert_eq!(owner_of(r), None, "{r}");
+        }
+        // The literal `+` name owns its own results; its prefix `a` is no model.
+        assert_eq!(owner_of("a+b").as_deref(), Some("a+b"));
+        assert_eq!(owner_of("a+b+served").as_deref(), Some("a+b"));
+        assert_eq!(owner_of("a+b+filters").as_deref(), Some("a+b"));
+        // A configured `m+filters` owns that name over `m`.
+        let config = Config {
+            models: vec![named("m"), named("m+filters")],
+            ..Config::default()
+        };
+        assert_eq!(
+            owner(&config, "m+filters").map(ModelConfig::effective_name),
+            Some("m+filters".into())
+        );
+
+        assert!(owned_by("m+served", "m") && owned_by("M.onnx+filters", "m.onnx"));
+        assert!(owned_by("m+filters+verify:x", "M"));
+        assert!(!owned_by("mm+served", "m") && !owned_by("m+blur", "m"));
     }
 }
 

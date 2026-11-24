@@ -765,16 +765,17 @@ fn watch_task(
     let mut last = String::new();
     let mut last_step = usize::MAX;
     let mut last_print = std::time::Instant::now();
-    let mut seen_log = 0usize;
-    while let Some(r) = svc.wait_task(id, Duration::from_secs(1)) {
+    // QA-039: followed by the push count, not the tail's length (which stops at its cap).
+    let mut follow = service::LogFollower::new();
+    while let Some((r, seq)) = svc.wait_task_logged(id, Duration::from_secs(1)) {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             svc.cancel(id);
         }
+        let fresh = follow.new_lines(&r.log, seq);
         if verbose {
-            for l in r.log.iter().skip(seen_log.min(r.log.len())) {
+            for l in fresh {
                 eprintln!("    {l}");
             }
-            seen_log = r.log.len();
         }
         // One line per stage, else at most every 10 s.
         let line = format!("{:>3}% {}", r.percent, r.describe());
@@ -1293,21 +1294,21 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
             for id in &ids {
                 let mut last = (None, 0u8, String::new());
                 let mut last_print = std::time::Instant::now();
-                let mut seen_log = 0usize;
-                while let Some(r) = svc.wait(id, Duration::from_secs(1)) {
+                // QA-039: followed by the push count, not the tail's length.
+                let mut follow = service::LogFollower::new();
+                while let Some((r, seq)) = svc.wait_logged(id, Duration::from_secs(1)) {
                     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         for i in &ids {
                             svc.cancel(i);
                         }
                     }
-                    for l in r.log.iter().skip(seen_log.min(r.log.len())) {
+                    for l in follow.new_lines(&r.log, seq) {
                         if verbose {
                             eprintln!("    {l}");
                         } else if l.starts_with("dataset: balanced:") {
                             eprintln!("[{}] {}", r.name, l.trim_start_matches("dataset: "));
                         }
                     }
-                    seen_log = r.log.len();
                     // One line per stage or percent change, else at most every 10 s.
                     let line = format!("[{}] {:>3}% {}", r.name, r.percent, r.describe());
                     let key = (r.stage, r.percent, line.clone());

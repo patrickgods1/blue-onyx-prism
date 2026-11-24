@@ -807,7 +807,9 @@ pub fn parse_label(label: &str) -> Option<(TrainFamily, &'static str)> {
     None
 }
 
-/// A model name that is safe in a URL path and as a file stem.
+/// A model name that is safe in a URL path and as a file stem on every OS: a Windows reserved
+/// device name (`nul`, `aux.v2`, `COM1`, [`crate::fsx::is_windows_reserved`]) is refused
+/// everywhere, so a config stays portable (on Windows `<name>.onnx` would open the device).
 pub fn valid_model_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
@@ -819,6 +821,12 @@ pub fn valid_model_name(name: &str) -> Result<()> {
         bail!(
             "model name '{name}' must be 1-64 characters of letters, digits, '-', '_' and '.' (not \
              starting with '.')"
+        );
+    }
+    if crate::fsx::is_windows_reserved(name) {
+        bail!(
+            "model name '{name}' is a Windows device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, \
+             before the first '.'), which cannot be a file name there; choose another name"
         );
     }
     Ok(())
@@ -1367,6 +1375,18 @@ mod tests {
         valid_model_name("night-yolo26n-20261022-1930").unwrap();
         for bad in ["", ".hidden", "a/b", "a b", "x?y", &"a".repeat(65)] {
             assert!(valid_model_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    // QA-098: Windows device names are refused on every OS (the model file would be the device).
+    #[test]
+    fn model_names_that_are_windows_device_names_are_refused() {
+        for bad in ["NUL", "com1", "aux.v2", "Con", "lpt9.onnx"] {
+            let e = valid_model_name(bad).unwrap_err().to_string();
+            assert!(e.contains("Windows device name"), "{bad}: {e}");
+        }
+        for ok in ["console", "com10", "nullable", "my-aux"] {
+            valid_model_name(ok).unwrap();
         }
     }
 

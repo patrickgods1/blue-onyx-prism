@@ -98,6 +98,30 @@ CONF
   chmod 644 "$NEWSYSLOG_CONF"
 }
 
+# bop_merge_keys KEYS FILE: FILE (pretty JSON as the service writes it) with the member lines KEYS
+# after the opening brace. The file's own top-level lines (2-space indent) of those keys are
+# dropped first, so no key repeats (Config::load refuses duplicates), and a comma left before the
+# closing brace is removed.
+bop_merge_keys() {
+  KEYS="$1" awk '
+    BEGIN {
+      n = split(ENVIRON["KEYS"], L, "\n")
+      for (i = 1; i <= n; i++) {
+        if (L[i] ~ /^  "[^"]*"[ \t]*:/) { k = L[i]; sub(/^  "/, "", k); sub(/".*/, "", k); drop[k] = 1 }
+      }
+      m = 0
+    }
+    NR == 1 { out[++m] = $0; out[++m] = ENVIRON["KEYS"]; next }
+    {
+      if ($0 ~ /^  "[^"]*"[ \t]*:/) { k = $0; sub(/^  "/, "", k); sub(/".*/, "", k); if (k in drop) next }
+      out[++m] = $0
+    }
+    END {
+      for (i = 2; i <= m; i++) if (out[i] ~ /^}/ && out[i - 1] ~ /,[ \t]*$/) sub(/,[ \t]*$/, "", out[i - 1])
+      for (i = 1; i <= m; i++) print out[i]
+    }' "$2"
+}
+
 # Settings that point the daemon at the data root and the log dir. Prints the JSON members (each
 # line ending in a comma). An optional extra block (already formatted, comma-terminated) can be
 # passed as $1, e.g. the runtime dirs of the zip flow.

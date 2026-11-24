@@ -422,12 +422,14 @@ pub struct AllClasses {
 }
 
 /// The pseudo ground truth `reference` ("rt-detrv2-x on openvino:cpu", [`GroundTruth::Pseudo`])
-/// is the detections of the model `model` (normalized names, any device): its own labels, so
-/// it is never scored, ranked or advised on them (B10).
+/// is the detections of the model the result `model` belongs to (normalized names, any device;
+/// its As served and variant results too, [`variant::owned_by`]): its own labels, so it is never
+/// scored, ranked or advised on them (B10, QA-027).
 pub(crate) fn is_reference(reference: &str, model: &str) -> bool {
-    reference.split(" on ").next().is_some_and(|r| {
-        crate::registry::normalize_name(r.trim()) == crate::registry::normalize_name(model)
-    })
+    reference
+        .split(" on ")
+        .next()
+        .is_some_and(|r| variant::owned_by(model, r.trim()))
 }
 
 /// The scored classes a dataset annotates: every class of `map`, or those of the set's
@@ -1495,5 +1497,27 @@ mod tests {
         );
         assert!(two.scored_on_own_labels("b") && !two.scored_on_own_labels("c"));
         assert!(!acc(false, "ground truth").scored_on_own_labels("rt-detrv2-x"));
+        // QA-027: the reference's As served and variant results are its own too.
+        assert!(own.scored_on_own_labels("rt-detrv2-x+served"));
+        assert!(own.scored_on_own_labels("RT-DETRv2-X.onnx+filters"));
+    }
+
+    /// QA-027 / QA-143: B10 covers every result of the reference model (As served, `--variants`),
+    /// and no other model whose name merely starts with it.
+    #[test]
+    fn own_labels_cover_served_and_variant_names() {
+        let r = "m on openvino:cpu";
+        for own in [
+            "m",
+            "M.onnx",
+            "m+served",
+            "M.onnx+filters",
+            "m+pre:clahe:2,8",
+        ] {
+            assert!(is_reference(r, own), "{own}");
+        }
+        for other in ["mm+served", "mm", "m+blur", "n+served"] {
+            assert!(!is_reference(r, other), "{other}");
+        }
     }
 }

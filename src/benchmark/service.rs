@@ -1302,14 +1302,12 @@ impl ServiceRun<'_> {
         Ok(())
     }
 
-    /// Whether the model `name` is benchmarked by this run.
+    /// Whether the model `name` is benchmarked by this run (a requested name that is `name`'s
+    /// As served or variant result counts, the scoring's rule: B10, QA-027).
     fn in_run(&self, name: &str) -> bool {
-        let key = crate::registry::normalize_name;
-        self.req.models.is_empty()
-            && default_models(&self.ctx.config)
-                .iter()
-                .any(|m| key(m) == key(name))
-            || self.req.models.iter().any(|m| key(m) == key(name))
+        let owned = |m: &String| super::variant::owned_by(m, name);
+        self.req.models.is_empty() && default_models(&self.ctx.config).iter().any(owned)
+            || self.req.models.iter().any(owned)
     }
 
     /// Total device runs of `entries` (unknown models count none).

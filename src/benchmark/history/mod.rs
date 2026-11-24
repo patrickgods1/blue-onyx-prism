@@ -9,7 +9,9 @@
 //! baseline. Failed and cancelled models are never recorded.
 //!
 //! [`trust`] grades how much a result can be trusted, [`view`] adds the history-derived fields
-//! to `GET /v1/benchmark`. All of it is pure except the file functions here.
+//! to `GET /v1/benchmark`. All of it is pure except the file functions here. A file of a later
+//! format, or whose `models` is not an object, does not load; [`History::update`] then sets it
+//! aside ([`super::report::load_or_move_aside`]) rather than saving over it.
 
 pub mod compare;
 pub mod trust;
@@ -626,10 +628,22 @@ impl History {
     }
 
     /// The file at `path` (None when it does not exist) and warnings for entries that do not
-    /// load (dropped). An unreadable or unparsable file is an error.
+    /// load (dropped). An unreadable or unparsable file is an error, and so is one of a later
+    /// `version` than [`FORMAT_VERSION`] (its entries may mean something else here) or whose
+    /// `models` is not an object.
     pub fn load_with_warnings(path: &Path) -> Result<(Option<Self>, Vec<String>)> {
+        Self::load_counted(path).map(|l| (l.value, l.warnings))
+    }
+
+    /// [`Self::load_with_warnings`] with the count of what it dropped (entries, and models whose
+    /// history is not a list).
+    fn load_counted(path: &Path) -> Result<super::report::Load<Self>> {
         let Some(text) = super::report::read_if_exists(path)? else {
-            return Ok((None, Vec::new()));
+            return Ok(super::report::Load {
+                value: None,
+                warnings: Vec::new(),
+                dropped: 0,
+            });
         };
         let ctx = || format!("parsing {}", path.display());
         let v: serde_json::Value = serde_json::from_str(&text).with_context(ctx)?;
@@ -644,6 +658,16 @@ impl History {
                 .unwrap_or(FORMAT_VERSION),
             models: BTreeMap::new(),
         };
+        // QA-033: a later format is no history this build can merge into and save: bail, so
+        // `update` sets the file aside rather than rewriting it as this format.
+        if h.version > FORMAT_VERSION {
+            bail!(
+                "parsing {}: format version {} is newer than this version reads ({FORMAT_VERSION}); \
+                 it was written by a later version of blue-onyx-prism",
+                path.display(),
+                h.version
+            );
+        }
         let mut warnings = Vec::new();
         // A `models` that is present but not an object (a later format, a hand edit) is no
         // empty history: bail, so `update` moves the file aside instead of saving over it.
@@ -681,7 +705,12 @@ impl History {
                 }
             }
         }
-        Ok((Some(h), warnings))
+        let dropped = warnings.len();
+        Ok(super::report::Load {
+            value: Some(h),
+            warnings,
+            dropped,
+        })
     }
 
     /// [`Self::load_with_warnings`], logging the warnings.
@@ -714,8 +743,10 @@ impl History {
         super::results_io::write_atomic(path, text.as_bytes())
     }
 
-    /// Load the file at `path` (a file that does not load is moved aside with a warning;
-    /// missing: seeded from `seed`), apply `edit`, save. Serialized in this process by
+    /// Load the file at `path` ([`super::report::load_or_move_aside`]: a file that cannot be
+    /// read is an error and is left alone; one that does not load is set aside with a warning;
+    /// one whose entries were dropped is first copied aside whole; missing: seeded from `seed`),
+    /// apply `edit`, save. Serialized in this process by
     /// `HISTORY_LOCK`; **the caller holds `results_io::lock(results_file, Holder::Writer)`**
     /// (it is not reentrant, so this does not take it), which excludes other processes. The
     /// order is the results lock, then `HISTORY_LOCK`, as in `record` and `forget`. Returns
@@ -726,7 +757,7 @@ impl History {
         edit: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<(T, Vec<String>)> {
         let _held = HISTORY_LOCK.lock_recover();
-        let (h, warnings) = super::report::load_or_move_aside(path, Self::load_with_warnings)?;
+        let (h, warnings) = super::report::load_or_move_aside(path, Self::load_counted)?;
         let mut h = h.unwrap_or_else(|| Self::seeded(seed));
         let out = edit(&mut h)?;
         h.save(path)?;
