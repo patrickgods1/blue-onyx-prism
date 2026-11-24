@@ -1213,7 +1213,8 @@ config (the Windows service, the packages, Docker: `docker exec -it blue-onyx-pr
   addresses and the certificate's fingerprint. The code creates the first account once and is
   then deleted; once an account exists the command refuses. On the server,
   `blue-onyx-prism user add <name>` creates an account without a code, the first one included.
-- `user add <name>`, `user remove <name>` (never the last account), `user list` (name, created,
+- `user add <name>`, `user remove <name>` (never the last account; its sessions and device cookies
+  end, and a new account of the same name inherits none of them), `user list` (name, created,
   password changed, failed attempts, disabled; never the hashes), `user reset-password <name>`,
   `user unlock <name>`. Names are 1 to 32 characters of `a-z`, `0-9`, `.`, `_`, `-` (upper case
   is lowered).

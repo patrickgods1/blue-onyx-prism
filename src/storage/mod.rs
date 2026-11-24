@@ -2,7 +2,8 @@
 //!
 //! Automatic deletion here only ever touches rebuildable files: model caches, the staging folders
 //! of training runs, the work folders of jobs that crashed (an auto-label's finished proposals are
-//! first written to their frames, as a Cancel does) and duplicate or dangling review-queue lines.
+//! first written to their frames, as a Cancel does), the uv package cache a failed environment
+//! setup left, and duplicate or dangling review-queue lines.
 //! Never labels, datasets, exports, models, training runs or their checkpoints (a failed run's
 //! `work` is its retry), configs, or logs.
 //!

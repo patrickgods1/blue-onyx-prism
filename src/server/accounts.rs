@@ -421,7 +421,7 @@ async fn reauth<T: Send + 'static>(
             Some(u) => {
                 let trusted = device
                     .as_deref()
-                    .is_some_and(|d| state.auth.devices.trusted(d, &u.name, now));
+                    .is_some_and(|d| state.auth.devices.trusted(d, &u.name, u.created, now));
                 (u.lockout(), trusted)
             }
             None => (lockout::State::default(), false),
@@ -474,7 +474,7 @@ async fn reauth<T: Send + 'static>(
             return Ok(out);
         }
         if let Some(d) = &device {
-            st.auth.devices.record_failure(d, &user.name, now);
+            st.auth.devices.record_failure(d, &user.name, user.created, now);
         }
         match store.record_failure(&user.name, now) {
             Ok(Some(s)) if s.disabled => {

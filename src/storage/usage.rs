@@ -1,15 +1,24 @@
 //! The Storage card's numbers (Config page, Resources tab): what is safe to clear and what is
 //! the user's data, each with its size.
 //!
-//! - Safe to clear: each cache folder ([`super::caches`]), leftover staging folders (training
-//!   runs' in the models folder and in every install folder a run record names, and the scratch
-//!   folders of review exports that crashed), the work folders of crashed jobs, old log files.
-//!   Each has a Clear ([`super::sweep::clear`]).
+//! - Safe to clear: each cache folder ([`super::caches`]; an OpenVINO or TensorRT one lists its
+//!   compiled models as parts, [`caches::compiled_entries`], superseded ones named), the uv
+//!   package cache a failed setup left (`tools/uv-cache`), leftover staging folders (training
+//!   runs' in the models folder and in every install folder a run record names, the scratch
+//!   folders of review exports that crashed, and model exports' staging and work folders,
+//!   [`export_leftovers`]), the work folders of crashed jobs, old log files. Each has a Clear
+//!   ([`super::sweep::clear`]).
 //! - Your data: the dataset and review folders, each review export (with Remove), unfinished
 //!   review exports no sweep removes (no busy marker: an older version's, or a finished export
-//!   whose final move failed), training runs, the checkpoints failed runs keep for a retry, models,
-//!   and work folders kept on purpose. Sizes only: nothing here is deleted automatically, and only
+//!   whose final move failed), training runs, the checkpoints failed runs keep for a retry, run
+//!   folders no record names, models, work folders kept on purpose, the model export toolchain
+//!   and the training environment under `tools/` (their Remove is on the Resources card and the
+//!   Train tab), and ONNX Runtime installs this config does not load (another build's folder,
+//!   `cuda-libs` beside a build other than CUDA, the old flat layout; the user may switch back,
+//!   so they are never superseded). Sizes only: nothing here is deleted automatically, and only
 //!   exports have a Remove on this card.
+//!
+//! Parts ([`Item::parts`]) are listed under their row and already counted in its size.
 //!
 //! Sizes are bytes deleting a thing frees ([`crate::training::retry::disk_use`]: an export's frames
 //! are hard links to the dataset's, so they count where they are not shared). Measuring walks
@@ -41,6 +50,31 @@ pub struct Item {
     pub note: String,
     /// `clear`, `remove` or None.
     pub action: Option<&'static str>,
+    /// What the row holds, listed under it (report only, already counted in [`Item::bytes`]): a
+    /// cache folder's compiled models, a tools row's folders, the run folders no record names.
+    pub parts: Vec<Part>,
+}
+
+/// One entry listed under a row ([`Item::parts`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Part {
+    pub title: String,
+    pub path: String,
+    pub bytes: u64,
+    pub size: String,
+    pub note: String,
+}
+
+impl Part {
+    fn new(title: impl Into<String>, path: &Path, bytes: u64) -> Self {
+        Self {
+            title: title.into(),
+            path: path.display().to_string(),
+            bytes,
+            size: format_size(bytes),
+            note: String::new(),
+        }
+    }
 }
 
 impl Item {
@@ -53,6 +87,7 @@ impl Item {
             size: format_size(bytes),
             note: String::new(),
             action: None,
+            parts: Vec::new(),
         }
     }
 
@@ -63,6 +98,11 @@ impl Item {
 
     fn action(mut self, a: &'static str) -> Self {
         self.action = Some(a);
+        self
+    }
+
+    fn parts(mut self, p: Vec<Part>) -> Self {
+        self.parts = p;
         self
     }
 }
@@ -164,19 +204,22 @@ pub fn exports(training_dir: &Path) -> Vec<PathBuf> {
     v
 }
 
-/// The "Leftover staging" row (Clear `staging`): training runs' staging folders and the scratch
-/// folders of review exports that crashed. None when there is neither.
+/// The "Leftover staging" row (Clear `staging`): training runs' staging folders, the scratch
+/// folders of review exports that crashed, and model exports' leftovers ([`export_leftovers`]).
+/// None when there is none of them.
 fn staging_item(
     staging: &[PathBuf],
     crashed_exports: &[sweep::ExportScratch],
+    model_exports: &[PathBuf],
     models: &Path,
     training: &Path,
 ) -> Option<Item> {
-    if staging.is_empty() && crashed_exports.is_empty() {
+    if staging.is_empty() && crashed_exports.is_empty() && model_exports.is_empty() {
         return None;
     }
     let bytes: u64 = staging
         .iter()
+        .chain(model_exports)
         .map(|p| size_of(p))
         .chain(crashed_exports.iter().map(|x| size_of(&x.path)))
         .sum();
@@ -211,12 +254,43 @@ fn staging_item(
                 .join(", ")
         ));
     }
-    let (title, path) = if crashed_exports.is_empty() {
-        ("Leftover training staging", models)
-    } else if staging.is_empty() {
-        ("Unfinished review exports", training)
-    } else {
-        ("Leftover staging (training runs, review exports)", training)
+    if !model_exports.is_empty() {
+        notes.push(format!(
+            "{} staging or work folder(s) of model exports a crash or kill interrupted: {}",
+            model_exports.len(),
+            model_exports
+                .iter()
+                .take(5)
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let kinds = [
+        !staging.is_empty(),
+        !crashed_exports.is_empty(),
+        !model_exports.is_empty(),
+    ];
+    let (title, path) = match kinds {
+        [true, false, false] => ("Leftover training staging", models),
+        [false, true, false] => ("Unfinished review exports", training),
+        [false, false, true] => (
+            "Leftover model export folders",
+            // The models folder for a staging folder, else `tools/export-work`.
+            model_exports
+                .iter()
+                .find(|p| p.parent() == Some(models))
+                .or(model_exports.first())
+                .and_then(|p| p.parent())
+                .unwrap_or(models),
+        ),
+        [_, false, _] => ("Leftover staging (training runs, model exports)", models),
+        [false, _, _] => ("Leftover staging (review exports, model exports)", training),
+        [_, _, false] => ("Leftover staging (training runs, review exports)", training),
+        _ => (
+            "Leftover staging (training runs, review exports, model exports)",
+            training,
+        ),
     };
     Some(
         Item::new("staging", title, path, bytes)
@@ -265,6 +339,306 @@ fn unfinished_item(
     )
 }
 
+/// Whether the cache folder `name` holds per-model compiled entries
+/// ([`caches::compiled_entries`]): the OpenVINO and TensorRT caches.
+fn has_compiled_entries(name: &str) -> bool {
+    name.starts_with("openvino-") || name == "tensorrt"
+}
+
+/// The parts of an OpenVINO or TensorRT cache row: one per compiled model, superseded ones
+/// first (the next sweep removes them), then by size.
+fn compiled_parts(entries: &[caches::CompiledUse]) -> Vec<Part> {
+    let mut sorted: Vec<&caches::CompiledUse> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.superseded
+            .cmp(&a.superseded)
+            .then(b.bytes.cmp(&a.bytes))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    sorted
+        .into_iter()
+        .map(|e| {
+            let title = e.model.as_deref().and_then(Path::file_name).map_or_else(
+                || "compiled model (its model file is not recorded)".to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            let mut part = Part::new(title, &e.path, e.bytes);
+            part.note = if e.superseded {
+                "superseded: its model file is gone or was compiled again; the next sweep \
+                 removes it"
+                    .into()
+            } else {
+                e.model
+                    .as_ref()
+                    .map(|m| format!("compiled from {}", m.display()))
+                    .unwrap_or_default()
+            };
+            part
+        })
+        .collect()
+}
+
+/// "; 2 superseded compiled model(s) (1.2 GB) go at the next sweep", or nothing.
+fn superseded_note(entries: &[caches::CompiledUse]) -> String {
+    let gone: Vec<&caches::CompiledUse> = entries.iter().filter(|e| e.superseded).collect();
+    if gone.is_empty() {
+        return String::new();
+    }
+    format!(
+        "; {} superseded compiled model(s) ({}) go at the next sweep",
+        gone.len(),
+        format_size(gone.iter().map(|e| e.bytes).sum())
+    )
+}
+
+/// `.<stem>.export-staging` (non-empty stem): a model export's staging folder in the models
+/// folder (the shape [`crate::resources::export::sweep_leftovers`] matches).
+fn is_export_staging(name: &str) -> bool {
+    crate::resources::export::export_staging_stem(name).is_some()
+}
+
+/// What Clear `staging` (and the daily sweep) removes of model exports
+/// ([`crate::resources::export::sweep_leftovers`]): the staging folders of `models` whose export
+/// crashed (busy marker unlocked), or that have no marker while the export lock is free, and
+/// the folders of `tools/export-work` while the export lock is free. Looked at without waiting:
+/// the export lock is tried once, only when something needs it.
+fn export_leftovers(paths: &crate::resources::export::Paths) -> Vec<PathBuf> {
+    let dirs_in = |dir: &Path, keep: &dyn Fn(&str) -> bool| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| e.file_name().to_str().is_some_and(keep))
+            .map(|e| e.path())
+            .collect();
+        v.sort();
+        v
+    };
+    let mut out = Vec::new();
+    let mut unmarked = Vec::new();
+    for p in dirs_in(&paths.models, &is_export_staging) {
+        match super::busy::probe(&p) {
+            super::busy::State::Live => {}
+            super::busy::State::Ended => unmarked.push(p),
+            // The claim is dropped unfinished: the marker stays for the sweep.
+            super::busy::State::Crashed(_) => out.push(p),
+        }
+    }
+    let work = dirs_in(&paths.work, &|_| true);
+    if (!unmarked.is_empty() || !work.is_empty())
+        && matches!(sweep::try_export_lock(paths, Duration::ZERO), Ok(Some(_)))
+    {
+        out.extend(unmarked);
+        out.extend(work);
+    }
+    out
+}
+
+/// The "your data" rows of `tools/`: the model export toolchain and the training environment,
+/// with their folders as parts. Their Remove is elsewhere (the Resources card's model exports,
+/// the Train tab); the uv cache is a "safe to clear" row of its own and the export work folders
+/// are counted with the leftover staging.
+fn tools_items(config: &crate::config::Config, out: &mut Vec<Item>) {
+    let train = crate::resources::export::train::TrainPaths::for_config(config);
+    let e = crate::resources::export::Paths::for_config(config);
+    let mut export_parts: Vec<(&str, PathBuf)> = vec![
+        ("uv", e.uv_dir.clone()),
+        ("Python", e.python_installs.clone()),
+        ("Export environment (Python packages)", e.env.clone()),
+        (
+            "Export weights (also the YOLO training bases)",
+            e.weights.clone(),
+        ),
+        ("Export settings and caches", e.yolo_config.clone()),
+        ("DEIMv2 source", e.deimv2_src.clone()),
+        ("Visual C++ runtime", e.vc_runtime.clone()),
+    ];
+    export_parts.extend(
+        e.legacy_dirs()
+            .into_iter()
+            .map(|p| ("Files of an earlier YOLO26 export", p)),
+    );
+    let train_parts: Vec<(&str, PathBuf)> = vec![
+        (
+            "Training environment (Python packages)",
+            train.export.env.clone(),
+        ),
+        (
+            "Base weights and auto-label checkpoints",
+            train.weights.clone(),
+        ),
+        ("Training settings and caches", train.config.clone()),
+        ("Training scripts", train.scripts.clone()),
+    ];
+    let row = |id: &str, title: &str, parts: Vec<(&str, PathBuf)>, note: &str| -> Option<Item> {
+        let parts: Vec<Part> = parts
+            .into_iter()
+            .filter(|(_, p)| std::fs::symlink_metadata(p).is_ok())
+            .map(|(t, p)| Part::new(t, &p, size_of(&p)))
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        let bytes = parts.iter().map(|p| p.bytes).sum();
+        Some(
+            Item::new(id, title, &e.tools, bytes)
+                .note(note)
+                .parts(parts),
+        )
+    };
+    out.extend(row(
+        "tools-export",
+        "Model export toolchain",
+        export_parts,
+        "downloaded again when an export needs it; Remove export toolchain on the Resources \
+         card (model exports group) deletes it, refused while an export, a training setup or a \
+         training runs; the training environment then rebuilds on its next use",
+    ));
+    out.extend(row(
+        "tools-train",
+        "Training environment",
+        train_parts,
+        "built again when a training or an auto-label needs it; Remove training environment on \
+         the Train area's Train tab deletes it (the auto-label checkpoints too), refused while a \
+         job runs",
+    ));
+}
+
+/// The report-only row of folders under `training` with a run's files that no record of `runs`
+/// names ([`crate::training::service::unlisted_run_dirs`], also listed by `train list`).
+fn unlisted_runs_item(training: &Path, runs: &[RunRecord]) -> Option<Item> {
+    let dirs = crate::training::service::unlisted_run_dirs(training, runs);
+    if dirs.is_empty() {
+        return None;
+    }
+    let parts: Vec<Part> = dirs
+        .iter()
+        .map(|d| {
+            let name = d
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Part::new(name, d, crate::training::retry::disk_use(d))
+        })
+        .collect();
+    Some(
+        Item::new(
+            "unlisted-runs",
+            "Run folders no record names",
+            training,
+            parts.iter().map(|p| p.bytes).sum(),
+        )
+        .note(format!(
+            "{} folder(s) with a run's log or history that runs.json does not list (an earlier \
+             version lost their record); the Train area does not show them and nothing deletes \
+             them: delete them by hand if you do not need them (`blue-onyx-prism train list` \
+             lists them too)",
+            dirs.len()
+        ))
+        .parts(parts),
+    )
+}
+
+/// Whether `a` and `b` name the same folder (as written, or once resolved).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || a.canonicalize()
+            .ok()
+            .zip(b.canonicalize().ok())
+            .is_some_and(|(x, y)| x == y)
+}
+
+/// The report-only rows of ONNX Runtime installs under `ort_root` that this config does not load
+/// (`library`: what the lookup finds, [`crate::backend::libs::find_onnxruntime_with`]): a flavor
+/// folder other than the loaded one, `cuda-libs` while a build other than CUDA loads, and the
+/// files of the old flat layout. Never deleted automatically (the user may switch back); the
+/// flavors and `cuda-libs` have a Remove on the Resources card.
+fn runtime_items(ort_root: &Path, library: Option<&Path>) -> Vec<Item> {
+    use crate::backend::libs;
+    let in_use = library.and_then(Path::parent);
+    let loads = in_use.map_or_else(
+        || "no ONNX Runtime library is found to load".to_string(),
+        |d| format!("it loads the one in {}", d.display()),
+    );
+    let remove = "kept so switching back needs no download; Remove it on the Resources card \
+                  (runtimes), refused while a running process has it loaded";
+    let mut out = Vec::new();
+    for flavor in libs::ORT_FLAVOR_DIRS {
+        let dir = ort_root.join(flavor);
+        if !dir.is_dir() || in_use.is_some_and(|u| same_dir(u, &dir)) {
+            continue;
+        }
+        out.push(
+            Item::new(
+                format!("runtime:onnxruntime-{flavor}"),
+                format!("ONNX Runtime ({flavor} build), not loaded by this config"),
+                &dir,
+                size_of(&dir),
+            )
+            .note(format!("{loads}; {remove}")),
+        );
+    }
+    // The CUDA libraries serve only the CUDA build: unused while a build known to be another
+    // loads (one of our other flavor folders, or a folder whose flavor.txt names another).
+    let cuda_libs = ort_root.join(libs::CUDA_LIBS_DIR_NAME);
+    let other_build = in_use.is_some_and(|u| {
+        libs::ORT_FLAVOR_DIRS
+            .iter()
+            .filter(|f| **f != "cuda")
+            .any(|f| same_dir(u, &ort_root.join(f)))
+            || libs::read_ort_flavor(u).is_some_and(|f| f != "cuda")
+    });
+    if cuda_libs.is_dir() && other_build {
+        out.push(
+            Item::new(
+                "runtime:cuda-libs",
+                "NVIDIA CUDA libraries, not used by this config",
+                &cuda_libs,
+                size_of(&cuda_libs),
+            )
+            .note(format!(
+                "only the CUDA build of ONNX Runtime uses them, and {loads}; {remove}"
+            )),
+        );
+    }
+    // The flat layout of versions before the flavor folders: the libraries in the root itself.
+    let flat: Vec<PathBuf> = std::fs::read_dir(ort_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| crate::resources::extract::is_ort_file(n, cfg!(windows)))
+        })
+        .map(|e| e.path())
+        .collect();
+    let flat_lib = libs::find_ort_library_in(ort_root).is_some();
+    if flat_lib && !in_use.is_some_and(|u| same_dir(u, ort_root)) {
+        let mut names: Vec<String> = flat
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        out.push(
+            Item::new(
+                "runtime:onnxruntime-flat",
+                "ONNX Runtime files of the old flat layout, not loaded by this config",
+                ort_root,
+                flat.iter().map(|p| size_of(p)).sum(),
+            )
+            .note(format!(
+                "left by a version before the per-build folders; {loads}. No Remove: delete \
+                 these files in that folder by hand (never its subfolders): {}",
+                names.join(", ")
+            )),
+        );
+    }
+    out
+}
+
 /// Measure the card for `s`, with the training runs `runs` (their folders are skipped while
 /// busy).
 pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
@@ -285,6 +659,12 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
                     caches::UNUSED_DAYS
                 ));
             }
+            let entries = if has_compiled_entries(&c.name) {
+                caches::compiled_entries(&c.path)
+            } else {
+                Vec::new()
+            };
+            note.push_str(&superseded_note(&entries));
             safe.push(
                 Item::new(
                     format!("cache:{}", c.name),
@@ -293,23 +673,51 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
                     c.bytes,
                 )
                 .note(note)
-                .action("clear"),
+                .action("clear")
+                .parts(compiled_parts(&entries)),
             );
         }
+    }
+    let config = s.config();
+    let export_paths = crate::resources::export::Paths::for_config(config);
+    if std::fs::symlink_metadata(&export_paths.uv_cache).is_ok_and(|m| m.is_dir()) {
+        safe.push(
+            Item::new(
+                "uv-cache",
+                "uv package cache",
+                &export_paths.uv_cache,
+                size_of(&export_paths.uv_cache),
+            )
+            // "a day": sweep::UV_CACHE_MIN_AGE.
+            .note(
+                "Python packages a failed, timed-out or cancelled export or training setup \
+                 downloaded (a finished setup deletes it); deleted automatically once a day old \
+                 while no export or training setup runs, and cleared only then",
+            )
+            .action("clear"),
+        );
     }
     let models = s.models_dir();
     let training = s.training_dir();
     let staging = sweep::leftover_staging_all(s);
+    let model_exports = export_leftovers(&export_paths);
     // Only what lies in the models folder is inside the Models row below.
     let staging_bytes: u64 = staging
         .iter()
+        .chain(&model_exports)
         .filter(|p| p.parent() == Some(models.as_path()))
         .map(|p| size_of(p))
         .sum();
     let (crashed_exports, unfinished_exports): (Vec<_>, Vec<_>) = sweep::export_scratch(s)
         .into_iter()
         .partition(|x| x.crashed);
-    if let Some(item) = staging_item(&staging, &crashed_exports, &models, &training) {
+    if let Some(item) = staging_item(
+        &staging,
+        &crashed_exports,
+        &model_exports,
+        &models,
+        &training,
+    ) {
         safe.push(item);
     }
     let crashed = sweep::crashed_all(s);
@@ -387,12 +795,19 @@ pub fn measure(s: &Settings, runs: &[RunRecord]) -> Report {
         );
     }
     run_items(runs, &mut data, &training);
+    data.extend(unlisted_runs_item(&training, runs));
     data.push(Item::new(
         "models",
         "Models",
         &models,
         crate::training::retry::disk_use(&models).saturating_sub(staging_bytes),
     ));
+    tools_items(config, &mut data);
+    let ort_root = config.data_root().join(crate::backend::libs::ORT_DIR_NAME);
+    let library =
+        crate::backend::libs::find_onnxruntime_with(config.onnxruntime_dir.as_deref(), &ort_root)
+            .library;
+    data.extend(runtime_items(&ort_root, library.as_deref()));
     let kept = sweep::kept_all(s);
     if !kept.is_empty() {
         let bytes: u64 = kept.iter().map(|w| size_of(&w.dir)).sum();
@@ -782,5 +1197,203 @@ mod tests {
         assert!(unfinished.note.contains(&*kept.to_string_lossy()));
         assert_eq!(r.data_bytes, r.data.iter().map(|i| i.bytes).sum::<u64>());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn put(p: &Path, n: usize) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![0u8; n]).unwrap();
+    }
+
+    fn settings_at(root: &Path) -> Settings {
+        let mut c = crate::config::Config {
+            download_dir: Some(root.to_path_buf()),
+            cache_dir: root.join("cache").display().to_string(),
+            ..Default::default()
+        };
+        c.models.clear();
+        Settings::for_config(&c)
+    }
+
+    /// Audit 2026-11 phase 4: the uv cache is a "safe to clear" row of its own, model export
+    /// leftovers are counted in the staging row (and not again under Models), and the tools/
+    /// folders are "your data" rows with their folders as parts, the uv cache and the export
+    /// work folders in neither.
+    #[test]
+    fn tools_rows_and_export_leftovers_are_counted_once() {
+        let root = std::env::temp_dir().join(format!("bop-usage-tools-{}", uuid::Uuid::new_v4()));
+        let s = settings_at(&root);
+        let e = crate::resources::export::Paths::for_config(s.config());
+        let t = crate::resources::export::train::TrainPaths::for_config(s.config());
+        put(&e.uv_cache.join("wheels-v5/a.whl"), 100);
+        put(&e.env.join("lib/x.py"), 20);
+        put(&e.python_installs.join("bin/python"), 30);
+        put(&t.export.env.join("lib/y.py"), 40);
+        put(&t.weights.join("sam3/w.pt"), 50);
+        put(&e.work.join("yolo26s/tmp.onnx"), 7);
+        let crashed = e.models.join(".yolo26s.export-staging");
+        put(&crashed.join("yolo26s.onnx"), 9);
+        // Empty: the Models row counts the few bytes of a real marker beside the folder.
+        std::fs::write(super::super::busy::marker_of(&crashed), b"").unwrap();
+        put(&e.models.join("m.onnx"), 300);
+        let r = measure(&s, &[]);
+        let uv = r.safe.iter().find(|i| i.id == "uv-cache").unwrap();
+        assert_eq!((uv.bytes, uv.action), (100, Some("clear")));
+        let staging = r.safe.iter().find(|i| i.id == "staging").unwrap();
+        assert_eq!(staging.bytes, 16, "the crashed staging and the work folder");
+        assert_eq!(staging.title, "Leftover model export folders");
+        let models = r.data.iter().find(|i| i.id == "models").unwrap();
+        assert_eq!(
+            models.bytes, 300,
+            "export staging is counted under safe only"
+        );
+        let export = r.data.iter().find(|i| i.id == "tools-export").unwrap();
+        assert_eq!(
+            export.bytes, 50,
+            "env + python, not the uv cache or the work folders"
+        );
+        assert_eq!(export.action, None);
+        assert!(
+            export.note.contains("Remove export toolchain"),
+            "{}",
+            export.note
+        );
+        assert_eq!(export.parts.len(), 2, "{:?}", export.parts);
+        let train = r.data.iter().find(|i| i.id == "tools-train").unwrap();
+        assert_eq!((train.bytes, train.action), (90, None));
+        assert!(train.note.contains("Remove training environment"));
+        assert!(train.parts.iter().all(|p| !p.path.contains("uv-cache")));
+        assert_eq!(r.safe_bytes, r.safe.iter().map(|i| i.bytes).sum::<u64>());
+
+        // A running export (its staging held, the export lock held) is no leftover.
+        let held = super::super::busy::Busy::hold(&crashed);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(e.lock_file())
+            .unwrap();
+        fs4::FileExt::try_lock(&lock).unwrap();
+        assert!(export_leftovers(&e).is_empty());
+        fs4::FileExt::unlock(&lock).unwrap();
+        drop(held);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Run folders no record names are listed (report only) with their sizes; a recorded run is
+    /// not.
+    #[test]
+    fn run_folders_no_record_names_are_listed() {
+        let root =
+            std::env::temp_dir().join(format!("bop-usage-unlisted-{}", uuid::Uuid::new_v4()));
+        let s = settings_at(&root);
+        let training = s.training_dir();
+        put(&training.join("20261101-lost/train.log"), 11);
+        put(&training.join("20261101-lost/work/last.pt"), 22);
+        put(&training.join("exports/e1/classes.txt"), 1);
+        let r = measure(&s, &[]);
+        let row = r.data.iter().find(|i| i.id == "unlisted-runs").unwrap();
+        assert_eq!((row.bytes, row.action), (33, None));
+        assert_eq!(row.parts.len(), 1);
+        assert_eq!(row.parts[0].title, "20261101-lost");
+        assert!(row.note.contains("train list"), "{}", row.note);
+        assert!(unlisted_runs_item(&root.join("nope"), &[]).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ONNX Runtime builds this config does not load are listed, report only, and the loaded one
+    /// is not; `cuda-libs` only while another build loads; the old flat layout's files only
+    /// when the library is not loaded from there.
+    #[test]
+    fn runtimes_this_config_does_not_load_are_listed() {
+        let root = std::env::temp_dir().join(format!("bop-usage-ort-{}", uuid::Uuid::new_v4()));
+        let ort = root.join("onnxruntime");
+        let lib = crate::backend::libs::ort_library_file_name();
+        put(&ort.join("cpu").join(lib), 10);
+        put(&ort.join("cuda").join(lib), 20);
+        put(&ort.join("cuda-libs/libcudart.so.12"), 30);
+        let ids = |v: &[Item]| v.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
+
+        // The CPU build loads: CUDA and its libraries are unused.
+        let items = runtime_items(&ort, Some(&ort.join("cpu").join(lib)));
+        assert_eq!(
+            ids(&items),
+            ["runtime:onnxruntime-cuda", "runtime:cuda-libs"],
+            "{items:?}"
+        );
+        assert_eq!(items[0].bytes, 20);
+        assert_eq!(items[1].bytes, 30);
+        assert!(items.iter().all(|i| i.action.is_none()));
+        assert!(
+            items[0].note.contains("Resources card"),
+            "{}",
+            items[0].note
+        );
+
+        // The CUDA build loads: the CPU one is unused, the CUDA libraries are not.
+        let items = runtime_items(&ort, Some(&ort.join("cuda").join(lib)));
+        assert_eq!(ids(&items), ["runtime:onnxruntime-cpu"]);
+
+        // A library of the old flat layout in the root, not loaded: listed with its files.
+        put(&ort.join(lib), 5);
+        put(&ort.join("flavor.txt"), 4);
+        put(&ort.join("active.txt"), 4);
+        let items = runtime_items(&ort, Some(&ort.join("cuda").join(lib)));
+        let flat = items
+            .iter()
+            .find(|i| i.id == "runtime:onnxruntime-flat")
+            .unwrap();
+        assert_eq!(flat.bytes, 9, "the library and flavor.txt, not active.txt");
+        // Loaded from the root itself: nothing of the flat layout is listed.
+        let items = runtime_items(&ort, Some(&ort.join(lib)));
+        assert!(!ids(&items).contains(&"runtime:onnxruntime-flat".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The compiled models of an OpenVINO or TensorRT cache are parts of its row (from
+    /// [`caches::compiled_entries`]; a hand-built list here), superseded ones first and named in
+    /// the row's note.
+    #[test]
+    fn compiled_entries_are_listed_under_their_cache() {
+        assert!(has_compiled_entries("openvino-gpu-f16"));
+        assert!(has_compiled_entries("tensorrt"));
+        assert!(!has_compiled_entries("coreml"));
+        let entries = vec![
+            caches::CompiledUse {
+                path: PathBuf::from("cache").join("openvino-gpu-f16").join("a"),
+                model: Some(PathBuf::from("models").join("yolo.onnx")),
+                bytes: 2_000,
+                superseded: false,
+            },
+            caches::CompiledUse {
+                path: PathBuf::from("cache").join("openvino-gpu-f16").join("b"),
+                model: Some(PathBuf::from("models").join("old.onnx")),
+                bytes: 1_000,
+                superseded: true,
+            },
+            caches::CompiledUse {
+                path: PathBuf::from("cache").join("openvino-gpu-f16").join("c"),
+                model: None,
+                bytes: 3_000,
+                superseded: false,
+            },
+        ];
+        let parts = compiled_parts(&entries);
+        let titles: Vec<&str> = parts.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "old.onnx",
+                "compiled model (its model file is not recorded)",
+                "yolo.onnx"
+            ]
+        );
+        assert!(parts[0].note.starts_with("superseded"), "{}", parts[0].note);
+        assert_eq!(parts[0].size, format_size(1_000));
+        assert!(parts[2].note.contains("yolo.onnx"));
+        let note = superseded_note(&entries);
+        assert!(note.contains("1 superseded compiled model(s)"), "{note}");
+        assert_eq!(superseded_note(&entries[..1]), "");
+        assert!(compiled_parts(&[]).is_empty());
     }
 }

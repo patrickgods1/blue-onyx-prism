@@ -1,12 +1,16 @@
 //! Drop a removed model's benchmark results: its entry in `benchmark.json` (and the image sets
 //! only it used), its stored predictions in `benchmark-preds.json` and its history in
-//! `benchmark-history.json`, so the Benchmark page stops listing a model that is gone.
+//! `benchmark-history.json`, so the Benchmark page stops listing a model that is gone. The
+//! model's variants go with it: its `<model>+served` results always, and CLI variant results
+//! `<model>+<variant>` unless that full name is a model still in the config (model names may
+//! contain `+`, so a bare prefix rule would drop another model's results).
 
 use super::history::{self, History};
 use super::report::BenchmarkResults;
 use super::search::StoredPreds;
 use crate::registry::normalize_name;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// What [`forget_model`] dropped.
@@ -23,12 +27,31 @@ impl Forgotten {
     }
 }
 
+/// Normalized names of the models in `config`, the `keep` set of [`forget_model`].
+pub fn configured_names(config: &crate::config::Config) -> HashSet<String> {
+    config
+        .models
+        .iter()
+        .map(|m| normalize_name(&m.effective_name()))
+        .collect()
+}
+
 /// Drop model `name` (normalized match) from the results file `results_file` and the
-/// predictions and history files beside it. Files without the model are not rewritten; a
-/// missing file is nothing to drop.
-pub fn forget_model(results_file: &Path, name: &str) -> Result<Forgotten> {
+/// predictions and history files beside it, with its `+served` entry and its `+<variant>`
+/// entries whose full normalized name is not in `keep` (the models still in the config).
+/// Files without the model are not rewritten; a missing file is nothing to drop.
+pub fn forget_model(results_file: &Path, name: &str, keep: &HashSet<String>) -> Result<Forgotten> {
     let key = normalize_name(name);
-    let same = |m: &str| normalize_name(m) == key;
+    let same = |m: &str| {
+        let full = normalize_name(m);
+        if full == key || normalize_name(super::variant::base_name(m)) == key {
+            return true;
+        }
+        // `<model>+<variant>`: some `+` splits the name into the model and a variant.
+        !keep.contains(&full)
+            && m.match_indices('+')
+                .any(|(at, _)| m.get(..at).is_some_and(|b| normalize_name(b) == key))
+    };
     let mut out = Forgotten::default();
     // One load-modify-save of the results files at a time.
     let _held = super::results_io::lock(results_file, super::results_io::Holder::Writer)?;
@@ -86,7 +109,12 @@ mod tests {
             Default::default(),
             vec![
                 model("keep", &["a"]),
+                model("keep+served", &["a"]),
+                model("gone-12", &["a"]),
+                model("gone-1+x", &["a"]),
                 model("Gone-1", &["a", "heldout-gone-1"]),
+                model("Gone-1+served", &["a"]),
+                model("gone-1+CLAHE", &["a", "heldout-gone-1"]),
             ],
         );
         r.image_sets = ["a", "heldout-gone-1"]
@@ -103,23 +131,50 @@ mod tests {
             serde_json::json!({"version": "1", "runs": [
                 {"model": "keep", "device": "ort:cpu", "configured": 0.5, "eval_confidence": 0.05},
                 {"model": "gone-1", "device": "ort:cpu", "configured": 0.5, "eval_confidence": 0.05},
+                {"model": "gone-1+served", "device": "ort:cpu", "configured": 0.5, "eval_confidence": 0.05},
+                {"model": "gone-1+clahe", "device": "ort:cpu", "configured": 0.5, "eval_confidence": 0.05},
+                {"model": "gone-1+x", "device": "ort:cpu", "configured": 0.5, "eval_confidence": 0.05},
+                {"model": "keep+served", "device": "ort:cpu", "configured": 0.5, "eval_confidence": 0.05},
             ]})
             .to_string(),
         )
         .unwrap();
+        let entry = |m: &str| serde_json::json!([{"run_id": "r1", "model": m}]);
+        let history = history::history_path(&results);
+        std::fs::write(
+            &history,
+            serde_json::json!({"version": 1, "models": {
+                "keep": entry("keep"), "keep+served": entry("keep+served"),
+                "gone-12": entry("gone-12"), "gone-1+x": entry("gone-1+x"),
+                "Gone-1": entry("Gone-1"), "gone-1+served": entry("gone-1+served"),
+                "gone-1+clahe": entry("gone-1+clahe"),
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        // `gone-1+x` is a model of its own that stays configured.
+        let keep: HashSet<String> = ["keep", "gone-1+x"]
+            .iter()
+            .map(|n| normalize_name(n))
+            .collect();
 
-        let f = forget_model(&results, "gone-1").unwrap();
+        let f = forget_model(&results, "gone-1", &keep).unwrap();
         assert!(f.results);
-        assert_eq!(f.preds, 1);
+        assert_eq!(f.preds, 3);
+        assert_eq!(f.history, 3);
         let r = BenchmarkResults::load(&results).unwrap().unwrap();
         let names: Vec<&str> = r.models.iter().map(|m| m.model.as_str()).collect();
-        assert_eq!(names, ["keep"]);
+        assert_eq!(names, ["keep", "keep+served", "gone-12", "gone-1+x"]);
         let sets: Vec<&str> = r.image_sets.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(sets, ["a"]);
         let p = StoredPreds::load(&preds).unwrap().unwrap();
-        assert_eq!(p.runs.len(), 1);
+        let kept: Vec<&str> = p.runs.iter().map(|r| r.model.as_str()).collect();
+        assert_eq!(kept, ["keep", "gone-1+x", "keep+served"]);
+        let h = History::load(&history).unwrap().unwrap();
+        let kept: Vec<&String> = h.models.keys().collect();
+        assert_eq!(kept, ["gone-1+x", "gone-12", "keep", "keep+served"]);
         // Nothing left to drop: nothing rewritten.
-        assert!(!forget_model(&results, "gone-1").unwrap().any());
+        assert!(!forget_model(&results, "gone-1", &keep).unwrap().any());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -4,6 +4,14 @@
 //! Built against the `openvino` 0.11 crate (runtime-linking). Port metadata is read from the
 //! (possibly reshaped) `Model` before compilation; tensors are addressed by port index so models
 //! whose ports have no tensor names still work.
+//!
+//! Model cache: before each compile, CACHE_DIR of the device's plugin is pointed at the model's
+//! own subfolder `<cache>/openvino-<class>-<precision>/<stem>-<key16>/`
+//! ([`ov_cache_dir`] for the precision folder, [`crate::storage::caches::model_cache_dir`] for
+//! the subfolder and its `model.txt`), so the storage sweep can remove the blobs of a removed or
+//! retrained model while the folder stays in use. CACHE_DIR is a Core property: compiles are
+//! serialized under one `Runtimes`, and each `Runtimes` has its own Core, so it never changes
+//! under another compile. A [`LoadRequest::no_cache`] compile switches it off instead.
 
 use super::spec::{Runtime, Target};
 use super::{Candidate, Completion, CoreOptions, LoadRequest, ModelInfo, OvBackend, OvCompiled};
@@ -458,6 +466,7 @@ fn device_class(device: &str) -> String {
 
 /// The OpenVINO model cache folder for compiles on `device` with inference precision
 /// `precision`: `<root>/openvino-<class>-<precision>` (`openvino-cpu-f32`, `openvino-gpu-f16`).
+/// Each model compiles into its own subfolder of it ([`select_cache_dir`]).
 ///
 /// OpenVINO's blob hash covers only the plugin's `CACHING_PROPERTIES`; for CPU that is just
 /// FULL_DEVICE_NAME, so a blob compiled with INFERENCE_PRECISION_HINT=f16 (the transformed,
@@ -518,14 +527,16 @@ fn prune_legacy_blobs(root: &std::path::Path) {
     }
 }
 
-/// Points CACHE_DIR of `device`'s plugin at the folder for the precision it compiles with now
-/// (read back from the Core). Caching is switched off when that fails, so a blob of another
-/// precision is never imported.
+/// Points CACHE_DIR of `device`'s plugin at `model`'s subfolder of the folder for the precision
+/// it compiles with now (read back from the Core; see the module docs). Caching is switched off
+/// when that fails, so a blob of another precision is never imported and nothing is written
+/// where the sweep cannot tell its model.
 fn select_cache_dir(
     core: &mut openvino::Core,
     cache_root: Option<&std::path::Path>,
     device: &str,
     wanted: &str,
+    model: &std::path::Path,
 ) {
     let Some(root) = cache_root else { return };
     let class_name = device_class(device);
@@ -540,19 +551,20 @@ fn select_cache_dir(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| wanted.to_string());
     let dir = ov_cache_dir(root, device, &precision);
-    let set = std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating OpenVINO cache dir {}", dir.display()))
-        .and_then(|()| {
-            let s = dir
+    // `model_cache_dir` records the use of the subfolder and the folder (the storage sweep
+    // deletes those no load used for 60 days).
+    let set = crate::storage::caches::model_cache_dir(&dir, model)
+        .with_context(|| format!("creating OpenVINO cache dir in {}", dir.display()))
+        .and_then(|sub| {
+            let s = sub
                 .to_str()
-                .with_context(|| format!("cache dir {} is not valid UTF-8", dir.display()))?;
-            core_set_property(core, &class, &RwPropertyKey::CacheDir, s)
+                .with_context(|| format!("cache dir {} is not valid UTF-8", sub.display()))?;
+            core_set_property(core, &class, &RwPropertyKey::CacheDir, s)?;
+            Ok(sub)
         });
     match set {
-        Ok(()) => {
-            // The storage sweep deletes cache folders no load used for 60 days.
-            crate::storage::touch(&dir);
-            tracing::debug!("OpenVINO {class}: CACHE_DIR={}", dir.display());
+        Ok(sub) => {
+            tracing::debug!("OpenVINO {class}: CACHE_DIR={}", sub.display());
         }
         Err(e) => {
             tracing::warn!(
@@ -663,7 +675,7 @@ fn compile_on(
             }
         }
     } else {
-        select_cache_dir(core, cache_root, device, wanted);
+        select_cache_dir(core, cache_root, device, wanted, path);
     }
     core.compile_model(model, dt)
         .with_context(|| format!("compiling model {} on {device}", path.display()))
@@ -1579,5 +1591,115 @@ mod tests {
             assert!(root.join(f).exists(), "{f} removed");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A real compile writes its blob into the model's own subfolder with `model.txt`; the next
+    /// compile of the same file hits it; a changed file gets a new subfolder (the old one, which
+    /// this process compiled into, is kept by the sweep and reported superseded); a `no_cache`
+    /// compile writes nothing. Needs `openvino/` and `models/IPcam-general.onnx` at the repo
+    /// root: `cargo test --lib -- --ignored backend::device::tests::real_compile`.
+    #[test]
+    #[ignore = "needs openvino/ and models/IPcam-general.onnx at the repo root"]
+    fn real_compile_caches_per_model() {
+        use crate::storage::caches;
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ov = repo.join("openvino");
+        let src = repo.join("models").join("IPcam-general.onnx");
+        assert!(ov.is_dir() && src.is_file(), "fixtures missing");
+        let dir = std::env::temp_dir().join(format!("bop-ov-sub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("cam.onnx");
+        std::fs::copy(&src, &model).unwrap();
+        let cache = dir.join("cache");
+        let mut rt = super::super::Runtimes::new(&CoreOptions {
+            cache_dir: Some(cache.clone()),
+            intra_threads: 0,
+            openvino_dir: Some(ov),
+        });
+        rt.require_any().unwrap();
+        let cpu = super::super::spec::parse("openvino:cpu").unwrap();
+        let req = |no_cache| LoadRequest {
+            path: model.clone(),
+            requested: "openvino:cpu".into(),
+            gpu_precision: None,
+            no_cache,
+        };
+        // (subfolder, blob count) under every `openvino-*` folder, and flat blobs (none).
+        let layout = || {
+            let mut subs = Vec::new();
+            let mut flat = 0;
+            for f in caches::cache_dirs(&cache) {
+                for e in std::fs::read_dir(&f).unwrap().flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        let blobs = std::fs::read_dir(&p)
+                            .unwrap()
+                            .flatten()
+                            .filter(|b| b.file_name().to_string_lossy().ends_with(".blob"))
+                            .count();
+                        subs.push((p, blobs));
+                    } else if p.extension().is_some_and(|x| x == "blob") {
+                        flat += 1;
+                    }
+                }
+            }
+            subs.sort();
+            (subs, flat)
+        };
+        let ms = |rt: &mut super::super::Runtimes, no_cache| {
+            rt.load(&cpu, &req(no_cache)).unwrap().info().compile_ms
+        };
+        let cold = ms(&mut rt, false);
+        let (subs, flat) = layout();
+        println!("cold compile {cold} ms: {subs:?}");
+        assert_eq!(flat, 0);
+        let [(sub, 1)] = subs.as_slice() else {
+            panic!("{subs:?}")
+        };
+        let (canonical, key) = caches::model_identity(&model).unwrap();
+        assert_eq!(
+            sub.file_name().unwrap().to_string_lossy(),
+            format!("cam-{key}")
+        );
+        assert_eq!(
+            std::fs::read_to_string(sub.join(caches::MODEL_FILE))
+                .unwrap()
+                .trim(),
+            canonical.to_str().unwrap()
+        );
+        let warm = ms(&mut rt, false);
+        println!("warm compile {warm} ms");
+        assert_eq!(layout().0, subs, "a hit adds nothing");
+        // A no_cache compile writes nothing.
+        let thrown = ms(&mut rt, true);
+        println!("no_cache compile {thrown} ms");
+        assert_eq!(layout().0, subs);
+        // Retrained at the same path (a new modification time): a new subfolder.
+        let f = std::fs::File::options().write(true).open(&model).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(f);
+        let _ = ms(&mut rt, false);
+        let (after, _) = layout();
+        assert_eq!(after.len(), 2, "{after:?}");
+        let mut out = Vec::new();
+        caches::sweep_compiled(&cache, &[], std::time::SystemTime::now(), &mut out);
+        assert!(
+            out.is_empty(),
+            "this process's subfolders are kept: {out:?}"
+        );
+        let folder = sub.parent().unwrap();
+        let entries = caches::compiled_entries(folder);
+        assert!(
+            entries.iter().any(|u| &u.path == sub && u.superseded),
+            "{entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|u| &u.path != sub && !u.superseded && u.bytes > 0)
+        );
+        drop(rt);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1444,11 +1444,11 @@ fn collected_frames_get_their_buckets_and_a_full_queue_never_delays_replies() {
     use crate::collect::metrics::{Dropped, METRICS};
     use crate::collect::{Bucket, CollectConfig, CollectSettings, Record};
     use crate::model::filters::FilterRules;
-    let dir = std::env::temp_dir().join(format!("bop-collect-e2e-{}", uuid::Uuid::new_v4()));
+    let dir = crate::test_dirs::TempDir::unmade("collect-e2e");
     let collect = Arc::new(CollectSettings::from_config(
         &CollectConfig {
             enabled: true,
-            dir: Some(dir.clone()),
+            dir: Some(dir.to_path_buf()),
             ..CollectConfig::default()
         },
         &dir,
@@ -1586,7 +1586,6 @@ fn collected_frames_get_their_buckets_and_a_full_queue_never_delays_replies() {
     assert_eq!(summary.frames, 6);
     primary.stop();
     checker.stop();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- Saved images (`save_image_path`) ----
@@ -1596,12 +1595,12 @@ fn collected_frames_get_their_buckets_and_a_full_queue_never_delays_replies() {
 /// reference copy is the upload itself. A full queue drops saves, never replies.
 #[test]
 fn images_are_saved_after_the_reply() {
-    let dir = std::env::temp_dir().join(format!("bo_save_run_{}", uuid::Uuid::new_v4()));
+    let dir = crate::test_dirs::TempDir::unmade("save-run");
     let (saver, saves) = super::save::Saver::unstarted(1);
     let saver = Arc::new(saver);
     let live = LiveSettings {
         request_timeout: Duration::from_secs(30),
-        save_image_path: Some(dir.clone()),
+        save_image_path: Some(dir.to_path_buf()),
         save_ref_image: true,
         ..LiveSettings::default()
     };
@@ -1640,7 +1639,6 @@ fn images_are_saved_after_the_reply() {
     assert_eq!(saves.try_recv().unwrap().image_name, "a.jpg");
     assert!(saves.try_recv().is_err());
     h.stop();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// B4: the worker compiles with [`super::device_tuning`] for the device it loads on (the hardware

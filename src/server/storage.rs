@@ -3,9 +3,10 @@
 //! - `GET /v1/storage`: the card ([`crate::storage::usage::Report`]): "safe to clear" and "your
 //!   data", with sizes. Measured on its own thread and kept a minute; while a measurement runs the
 //!   answer has `computing: true` (and the previous report, if any), and the page asks again.
-//! - `POST /v1/storage/clear` (`id`: `cache:<name>`, `staging`, `work`, `logs`): one Clear. Only
-//!   rebuildable files go; a crashed auto-label's finished frames are written to their label files
-//!   before its folder goes.
+//! - `POST /v1/storage/clear` (`id`: `cache:<name>`, `staging`, `work`, `logs`, `uv-cache`): one
+//!   Clear. Only rebuildable files go; a crashed auto-label's finished frames are written to their
+//!   label files before its folder goes; the uv cache is refused (409) while an export or a
+//!   training environment setup holds the export lock.
 //! - `POST /v1/storage/exports/remove` (`name`): delete one review export; refused while a queued
 //!   or running training run reads it.
 
@@ -172,6 +173,9 @@ mod tests {
         let export = training.join("exports/e1/classes.txt");
         std::fs::create_dir_all(export.parent().unwrap()).unwrap();
         std::fs::write(&export, b"person\n").unwrap();
+        let uv = root.join("tools/uv-cache/wheels-v5/a.whl");
+        std::fs::create_dir_all(uv.parent().unwrap()).unwrap();
+        std::fs::write(&uv, b"123").unwrap();
 
         // The answer says `computing` while the measurement takes longer than the handler
         // waits (a loaded CI machine): ask again, as the page does.
@@ -207,11 +211,27 @@ mod tests {
             "{v}"
         );
 
+        assert!(
+            report["safe"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["id"] == "uv-cache" && i["action"] == "clear" && i["bytes"] == 3),
+            "{v}"
+        );
+
         let (code, _, body) = call(&state, post("/v1/storage/clear", "id=staging")).await;
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(code, StatusCode::OK, "{v}");
         assert_eq!(v["freed"], 5);
         assert!(!staging.exists());
+
+        // The uv cache, whatever its age, while no export or setup holds the export lock.
+        let (code, _, body) = call(&state, post("/v1/storage/clear", "id=uv-cache")).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(code, StatusCode::OK, "{v}");
+        assert_eq!(v["freed"], 3);
+        assert!(!root.join("tools/uv-cache").exists());
 
         let (code, _, _) = call(&state, post("/v1/storage/clear", "id=cache%3A..%2Fmodels")).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);

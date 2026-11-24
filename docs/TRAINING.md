@@ -164,7 +164,11 @@ benchmarked by the service's benchmark runner (held-out AP50 0.572, 92 ms p50 on
   empty environment (the export's allow-list). The scripts are embedded in the binary and written to
   `tools/train-work` before each run.
 - **Remove training environment** (page) or `train remove-env` deletes `train-env`,
-  `train-weights`, `train-config` and `train-work`; uv and Python stay for the export. The Config
+  `train-weights`, `train-config`, `train-work` and `tools/uv-cache` (a finished setup deletes the cache,
+  so what is left there is a failed or cancelled setup's download, up to about 3 GB with CUDA; the daily
+  storage sweep also deletes such a cache once it is a day old, and the Storage card's Clear at once, both
+  only while no export or setup holds `tools/.model-export.lock`); uv and
+  Python stay for the export. The Config
   page's *Remove export toolchain* deletes uv and `tools/python` too; the training environment is then
   downloaded and rebuilt on the next run (an environment whose base Python is gone counts as not
   installed). Both are refused while a training, import, auto-label, dataset check, environment
@@ -955,6 +959,12 @@ holds a best checkpoint the run's row (or `train retry-export <run>`) offers **R
 with `train_model.py --export-only <checkpoint>`, on the CPU, then install, config and benchmark as usual,
 under the run's own name. The checkpoints go when that succeeds, or with **Remove and delete files**; the
 row states their size. Cancelling a retry returns the run to its failure.
+
+Once a run has failed and its trainer has exited, it deletes the scratch that no retry reads: RF-DETR's
+dataset layout with its augmented copies (`work/rfdetr-data`), its per-epoch `rfdetr-out/last.ckpt` (only
+for resuming, which is not offered) and the export's scratch (`work/export`, `work/rfdetr-export-weights`).
+The checkpoints in the table below, `training_config.json`, `hf-best.tmp` and the trainer's own logs stay.
+A run stopped by the service shutting down keeps everything, and so does a run started with `--keep-work`.
 
 | Family | Checkpoint | From a run that died while training |
 |---|---|---|

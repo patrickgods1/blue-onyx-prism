@@ -75,8 +75,21 @@ pub mod history;
 
 /// File of the run records in the training folder.
 pub const RUNS_FILE: &str = "runs.json";
-/// Log lines kept per run.
+/// Log lines kept per run while it runs, and after it failed (the row's Log box shows why).
 const LOG_TAIL: usize = 60;
+/// Log lines a run keeps on its record once it ended Done or Cancelled ([`trim_finished_log`]):
+/// more than the row's Log box shows (6), and the full text is in `<run>/train.log`. Runs are
+/// never dropped, so this is what each finished record costs `runs.json` from then on.
+pub const FINISHED_LOG_TAIL: usize = 15;
+
+/// Trim a run that ended Done or Cancelled to its last [`FINISHED_LOG_TAIL`] log lines; a failed
+/// or busy run keeps its [`LOG_TAIL`].
+fn trim_finished_log(r: &mut RunRecord) {
+    if matches!(r.state, RunState::Done | RunState::Cancelled) {
+        let skip = r.log.len().saturating_sub(FINISHED_LOG_TAIL);
+        r.log.drain(..skip);
+    }
+}
 /// How often a running job's progress (percent, epoch, detail, log tail) is saved when nothing
 /// else changed; state changes, stage changes and results are saved at once.
 pub const PROGRESS_SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -1992,6 +2005,7 @@ fn run_job(inner: &Inner, mut job: TrainJob) {
                 r.error = None;
                 r.retrying = false;
                 r.finished = Some(now());
+                trim_finished_log(r);
             });
         }
         // Stopped for the process's exit: interrupted, its files kept for a retry.
@@ -2017,6 +2031,7 @@ fn run_job(inner: &Inner, mut job: TrainJob) {
                 };
                 r.retrying = false;
                 r.finished = Some(now());
+                trim_finished_log(r);
             });
         }
         Err(e) => {

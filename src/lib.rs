@@ -118,6 +118,8 @@ pub mod storage;
 pub mod supervisor;
 pub mod sync;
 pub mod system_info;
+#[cfg(test)]
+pub(crate) mod test_dirs;
 pub mod tls;
 pub mod training;
 pub mod tray;

@@ -23,6 +23,11 @@
 //!   when that fails);
 //! - download and model-export leftovers ([`crate::resources::manager::sweep_stale`],
 //!   [`crate::resources::export::sweep_leftovers`]);
+//! - `tools/uv-cache` ([`sweep_uv_cache`]): the wheels a failed, timed-out or cancelled
+//!   environment setup downloaded (a finished setup deletes the cache itself), once its newest
+//!   top-level entry is [`UV_CACHE_MIN_AGE`] old (an immediate retry resumes from it) and only
+//!   while this sweep holds `tools/.model-export.lock` without waiting: every uv run (an export's
+//!   and a training setup's) holds that lock, so with it in hand nothing writes the cache;
 //! - then `review-queue.jsonl` compaction of the dataset and review folders
 //!   ([`crate::collect::layout::compact_review`]).
 //!
@@ -180,7 +185,14 @@ impl Settings {
             });
         }
         v.extend(dataset_dirs);
-        if let Some(p) = self.config.save_image_path.as_deref() {
+        // Annotated image saves go through `fsx::write_atomic` (`crate::image::save_annotated`),
+        // flat in that folder; resolved as the saver and the retention prune resolve it.
+        if let Some(p) = self
+            .config
+            .save_image_path
+            .as_deref()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
             v.push(crate::resolve_path(p));
         }
         v.sort();
@@ -359,6 +371,9 @@ pub fn run_until(s: &Settings, stop: &dyn Fn() -> bool) -> Report {
     if !stop() {
         crate::resources::export::sweep_leftovers(s.config(), &mut rep.removed, stop);
     }
+    if !stop() {
+        sweep_uv_cache(s, now, &mut rep.removed);
+    }
     for dir in s.dataset_dirs() {
         if stop() {
             break;
@@ -532,9 +547,145 @@ fn sweep_caches_until(
 ) {
     let Some(root) = s.cache_root() else { return };
     caches::sweep_unused(&root, now, out);
+    if !stop() {
+        caches::sweep_compiled(&root, &s.model_files(), now, out);
+    }
     let coreml = root.join("coreml");
     if coreml.is_dir() && !stop() {
         caches::sweep_coreml(&coreml, &s.model_files(), now, out);
+    }
+}
+
+/// How long `tools/uv-cache` stays after its newest top-level entry last changed before the
+/// sweep removes it: a retry of a failed setup within a day resumes from the wheels it holds.
+pub const UV_CACHE_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// `tools/.model-export.lock` held by this process for a removal under `tools/`: unlocked when
+/// dropped (a child forked by another thread may share the descriptor until it execs, so closing
+/// alone could leave the lock held for that moment).
+pub(super) struct ExportLockHeld(std::fs::File);
+
+impl Drop for ExportLockHeld {
+    fn drop(&mut self) {
+        let _ = fs4::FileExt::unlock(&self.0);
+    }
+}
+
+/// Take the export lock of `paths` (in an existing `tools/` folder; the lock file is created
+/// there like the export creates it, never deleted) without waiting past `grace` (a lock dropped
+/// a moment ago may still look held, [`crate::resources::export::train::LOCK_GRACE`]). None while
+/// an export or a training environment setup holds it, or when there is no `tools/` folder.
+///
+/// Only this lock, not `tools/.train.lock`: every uv run holds the export lock (an export's
+/// stages and a training setup's `prepare_env`), while a training
+/// run, which never runs uv, takes the training lock without waiting and would fail if a sweep
+/// held it during a long removal.
+pub(super) fn try_export_lock(
+    paths: &crate::resources::export::Paths,
+    grace: Duration,
+) -> std::io::Result<Option<ExportLockHeld>> {
+    if !paths.tools.is_dir() {
+        return Ok(None);
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(paths.lock_file())?;
+    let waited = crate::fsx::lock_wait_with(
+        &file,
+        crate::fsx::LockKind::Exclusive,
+        crate::fsx::deadline_after(grace),
+        crate::fsx::Pauses::fixed(Duration::from_millis(20)),
+        || true,
+    )?;
+    Ok((waited == crate::fsx::Waited::Held).then_some(ExportLockHeld(file)))
+}
+
+/// The newest modification time of `dir` and its top-level entries (None when `dir` is missing).
+fn newest_top_level(dir: &Path) -> Option<SystemTime> {
+    let own = std::fs::symlink_metadata(dir).ok()?.modified().ok();
+    let entries = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| std::fs::symlink_metadata(e.path()).ok()?.modified().ok());
+    own.into_iter().chain(entries).max()
+}
+
+/// Why the uv cache was not removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UvCacheKept {
+    /// There is none.
+    Missing,
+    /// Changed less than the minimum age ago.
+    Fresh,
+    /// An export or a training environment setup holds the export lock (its uv may be filling
+    /// the cache), with the message to show.
+    Busy(String),
+    /// The removal failed (logged by [`super::remove_counted`]).
+    Failed,
+}
+
+/// Remove `tools/uv-cache` of `paths` when it is at least `min_age` old by
+/// [`newest_top_level`] (None = whatever its age, the Storage card's Clear) and the export lock
+/// is free ([`try_export_lock`]); recorded in `out`.
+pub fn remove_uv_cache(
+    paths: &crate::resources::export::Paths,
+    min_age: Option<Duration>,
+    now: SystemTime,
+    why: &str,
+    out: &mut Vec<Removed>,
+) -> Result<(), UvCacheKept> {
+    let dir = &paths.uv_cache;
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return Err(UvCacheKept::Missing);
+    }
+    if let Some(min) = min_age {
+        let old = newest_top_level(dir)
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= min);
+        if !old {
+            return Err(UvCacheKept::Fresh);
+        }
+    }
+    let busy = || {
+        UvCacheKept::Busy(format!(
+            "an export or a training environment setup is running (in this service or a \
+             `blue-onyx-prism fetch` / `train` command) and holds {}; its uv may be using {}. \
+             Wait for it to finish, then clear again",
+            paths.lock_file().display(),
+            dir.display()
+        ))
+    };
+    let _held = match try_export_lock(paths, crate::resources::export::train::LOCK_GRACE) {
+        Ok(Some(h)) => h,
+        Ok(None) => return Err(busy()),
+        Err(e) => {
+            tracing::debug!("storage: locking {}: {e}", paths.lock_file().display());
+            return Err(busy());
+        }
+    };
+    if remove_counted(dir, why, out) {
+        Ok(())
+    } else {
+        Err(UvCacheKept::Failed)
+    }
+}
+
+/// The sweep's step for `tools/uv-cache` (see the module docs): removed once
+/// [`UV_CACHE_MIN_AGE`] old while no export or training setup holds the export lock.
+pub fn sweep_uv_cache(s: &Settings, now: SystemTime, out: &mut Vec<Removed>) {
+    let paths = crate::resources::export::Paths::for_config(s.config());
+    if let Err(UvCacheKept::Busy(why)) = remove_uv_cache(
+        &paths,
+        Some(UV_CACHE_MIN_AGE),
+        now,
+        "uv package cache a failed or cancelled environment setup left (rebuildable)",
+        out,
+    ) {
+        tracing::debug!("storage: kept the uv cache for now: {why}");
     }
 }
 
@@ -1093,15 +1244,18 @@ pub enum Clear {
     /// The crashed work folders.
     Work,
     Logs,
+    /// `tools/uv-cache`, whatever its age, while the export lock is free.
+    UvCache,
 }
 
 impl Clear {
-    /// From the card's id: `cache:<name>`, `staging`, `work`, `logs`.
+    /// From the card's id: `cache:<name>`, `staging`, `work`, `logs`, `uv-cache`.
     pub fn parse(id: &str) -> Option<Self> {
         match id {
             "staging" => Some(Self::Staging),
             "work" => Some(Self::Work),
             "logs" => Some(Self::Logs),
+            "uv-cache" => Some(Self::UvCache),
             _ => id
                 .strip_prefix("cache:")
                 .filter(|n| caches::is_cache_name(n))
@@ -1137,6 +1291,24 @@ pub fn clear(s: &Settings, what: &Clear) -> anyhow::Result<Report> {
             crate::resources::export::sweep_leftovers(s.config(), &mut rep.removed, &|| false);
         }
         Clear::Work => sweep_work(s, &mut rep),
+        Clear::UvCache => {
+            let paths = crate::resources::export::Paths::for_config(s.config());
+            match remove_uv_cache(
+                &paths,
+                None,
+                SystemTime::now(),
+                "uv package cache, cleared from the Storage card",
+                &mut rep.removed,
+            ) {
+                Ok(()) | Err(UvCacheKept::Missing) | Err(UvCacheKept::Fresh) => {}
+                Err(UvCacheKept::Busy(why)) => anyhow::bail!("{why}"),
+                Err(UvCacheKept::Failed) => anyhow::bail!(
+                    "{} could not be removed (a file may be open in another program, such as an \
+                     antivirus scan); see the log, then clear again or delete it by hand",
+                    paths.uv_cache.display()
+                ),
+            }
+        }
         Clear::Logs => {
             if let Some(dir) = s.log_dir() {
                 for p in old_logs(&dir, SystemTime::now()) {
@@ -1335,6 +1507,7 @@ mod tests {
         assert_eq!(Clear::parse("cache:../models"), None);
         assert_eq!(Clear::parse("cache:"), None);
         assert_eq!(Clear::parse("models"), None);
+        assert_eq!(Clear::parse("uv-cache"), Some(Clear::UvCache));
     }
 
     #[test]
@@ -2027,6 +2200,143 @@ mod tests {
         for p in &kept {
             assert!(p.exists(), "{} should stay", p.display());
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Audit 2026-11 phase 4: annotated image saves go through `fsx::write_atomic`, so a crash
+    /// can leave `.<name>.<32 hex>.tmp` in `save_image_path`; the temp sweep looks there (only
+    /// at the exact shape, and never at the saved images).
+    #[test]
+    fn temps_in_the_saved_image_folder_go_once_old() {
+        let root = tmp("temps-saved");
+        let mut c = settings(&root).config().clone();
+        let shots = root.join("shots");
+        c.save_image_path = Some(shots.clone());
+        let s = Settings::for_config(&c);
+        assert!(s.temp_dirs().contains(&shots), "{:?}", s.temp_dirs());
+        let left = shots.join(format!(".cam_od.jpg.{}.tmp", hex(0xbeef)));
+        let image = shots.join("cam_od.jpg");
+        for p in [&left, &image] {
+            put(p, 3);
+            age(p, Duration::from_secs(7200));
+        }
+        let mut out = Vec::new();
+        sweep_temp_files(&s, SystemTime::now(), &mut out);
+        assert!(!left.exists(), "the crash-left temp goes");
+        assert!(image.exists(), "a saved image stays");
+        // Unset or empty: no folder of the saver's to look at.
+        c.save_image_path = Some(PathBuf::new());
+        let empty = Settings::for_config(&c).temp_dirs();
+        c.save_image_path = None;
+        assert_eq!(empty, Settings::for_config(&c).temp_dirs());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Hold `tools/.model-export.lock` as an export or a training setup does.
+    fn hold_export_lock(p: &crate::resources::export::Paths) -> std::fs::File {
+        std::fs::create_dir_all(&p.tools).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(p.lock_file())
+            .unwrap();
+        fs4::FileExt::try_lock(&f).unwrap();
+        f
+    }
+
+    /// Audit 2026-11 (RA-058): `tools/uv-cache` left by a failed or cancelled setup goes once a
+    /// day old while no export or setup holds the export lock; a fresh one, and one a running
+    /// uv may be filling, stay. The lock file is never deleted.
+    #[test]
+    fn a_left_uv_cache_goes_once_old_while_the_export_lock_is_free() {
+        let root = tmp("uv-cache");
+        let s = settings(&root);
+        let p = crate::resources::export::Paths::for_config(s.config());
+        let wheel = p.uv_cache.join("wheels-v5").join("a.whl");
+        put(&wheel, 100);
+        let later = SystemTime::now() + UV_CACHE_MIN_AGE + Duration::from_secs(3600);
+        let why = "test";
+        let mut out = Vec::new();
+
+        // Fresh: a retry within a day resumes from it.
+        assert_eq!(
+            remove_uv_cache(&p, Some(UV_CACHE_MIN_AGE), SystemTime::now(), why, &mut out),
+            Err(UvCacheKept::Fresh)
+        );
+        sweep_uv_cache(&s, SystemTime::now(), &mut out);
+        assert!(wheel.is_file() && out.is_empty());
+
+        // Old, but an export or a setup holds the lock: kept, by the sweep and by Clear.
+        let held = hold_export_lock(&p);
+        assert!(matches!(
+            remove_uv_cache(&p, Some(UV_CACHE_MIN_AGE), later, why, &mut out),
+            Err(UvCacheKept::Busy(_))
+        ));
+        sweep_uv_cache(&s, later, &mut out);
+        let e = clear(&s, &Clear::UvCache).unwrap_err();
+        assert!(format!("{e:#}").contains(".model-export.lock"), "{e:#}");
+        assert!(
+            wheel.is_file() && out.is_empty(),
+            "nothing removed under a held lock"
+        );
+        fs4::FileExt::unlock(&held).unwrap();
+        drop(held);
+
+        // Old and the lock free: gone (the lock try has LOCK_GRACE for a lock just dropped).
+        sweep_uv_cache(&s, later, &mut out);
+        assert!(!p.uv_cache.exists(), "the left cache is gone");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].bytes, 100);
+        assert!(p.lock_file().is_file(), "the lock file stays");
+        assert_eq!(
+            remove_uv_cache(&p, None, later, why, &mut out),
+            Err(UvCacheKept::Missing)
+        );
+
+        // Clear removes a fresh one while the lock is free.
+        put(&wheel, 7);
+        let rep = clear(&s, &Clear::UvCache).unwrap();
+        assert_eq!(super::super::total(&rep.removed), 7);
+        assert!(!p.uv_cache.exists());
+        assert!(p.lock_file().is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The age is the newest top-level entry's (or the folder's own): a cache whose folder and
+    /// entries are old goes, one with a fresh entry stays.
+    #[cfg(unix)]
+    #[test]
+    fn the_uv_caches_age_is_its_newest_top_level_entry() {
+        let root = tmp("uv-cache-age");
+        let s = settings(&root);
+        let p = crate::resources::export::Paths::for_config(s.config());
+        let old = p.uv_cache.join("archive-v0");
+        put(&old, 5);
+        let days = |n: u64| Duration::from_secs(n * 24 * 60 * 60);
+        let set = |path: &Path, ago: Duration| {
+            std::fs::File::open(path)
+                .unwrap()
+                .set_modified(SystemTime::now() - ago)
+                .unwrap();
+        };
+        set(&old, days(3));
+        set(&p.uv_cache, days(3));
+        assert!(
+            newest_top_level(&p.uv_cache)
+                .is_some_and(|t| SystemTime::now().duration_since(t).unwrap() >= days(2))
+        );
+        let fresh = p.uv_cache.join("CACHEDIR.TAG");
+        put(&fresh, 1);
+        set(&p.uv_cache, days(3));
+        let mut out = Vec::new();
+        sweep_uv_cache(&s, SystemTime::now(), &mut out);
+        assert!(old.is_file(), "a fresh entry keeps the cache");
+        set(&fresh, days(2));
+        set(&p.uv_cache, days(3));
+        sweep_uv_cache(&s, SystemTime::now(), &mut out);
+        assert!(!p.uv_cache.exists(), "every entry a day old: gone");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

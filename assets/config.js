@@ -812,6 +812,21 @@ document.addEventListener("click", function (e) {
       name.appendChild(el("br"));
       name.appendChild(el("code", "small", i.path));
       if (i.note) { name.appendChild(el("br")); name.appendChild(el("span", "muted", i.note)); }
+      // What the row holds (compiled models of a cache, a tools row's folders, run folders no
+      // record names): listed under it, already counted in its size.
+      if (i.parts && i.parts.length) {
+        var ul = el("ul", "storage-parts small");
+        i.parts.forEach(function (p) {
+          var li = el("li");
+          li.appendChild(el("span", null, p.title + " "));
+          li.appendChild(el("span", "muted", p.size));
+          li.appendChild(el("br"));
+          li.appendChild(el("code", "small", p.path));
+          if (p.note) { li.appendChild(el("br")); li.appendChild(el("span", "muted", p.note)); }
+          ul.appendChild(li);
+        });
+        name.appendChild(ul);
+      }
       tr.appendChild(name);
       var size = el("td", "num", i.size); size.dataset.label = "Size"; tr.appendChild(size);
       var act = el("td", "rc-action");

@@ -5,8 +5,11 @@
 //! ([`Attempts`]) and the data root all of it lives in (fixed at start: a restart that changes
 //! `download_dir` does not move the accounts; a process restart does).
 //!
-//! [`Auth::spawn_flusher`] writes what waits (moved `last_active`, expired entries) every
-//! [`FLUSH_EVERY_SECS`] and once more, forced, when it is stopped at shutdown.
+//! [`Auth::spawn_flusher`] writes what waits (moved `last_active`, expired entries, sessions and
+//! devices of accounts that are gone or replaced) every [`FLUSH_EVERY_SECS`] and once more,
+//! forced, when it is stopped at shutdown. [`Auth::load`] already leaves out, in memory, the
+//! sessions and devices `users.json` no longer allows (an account removed by the CLI while the
+//! service was stopped), and the first flush writes that.
 
 use super::devices::Devices;
 use super::lockout::UnknownNames;
@@ -48,15 +51,28 @@ impl std::fmt::Debug for Auth {
 }
 
 impl Auth {
-    /// The state saved under `data_root` at `now` (reads only).
+    /// The state saved under `data_root` at `now`, the sessions and devices of accounts that
+    /// are gone or replaced left out when `users.json` reads (reads only; the next flush writes
+    /// the removal).
     pub fn load(data_root: &Path, now: u64) -> Self {
-        Self {
+        let me = Self {
             users: Cached::new(data_root),
             sessions: Arc::new(Sessions::load(data_root, now)),
             devices: Arc::new(Devices::load(data_root, now)),
             unknown: Mutex::new(UnknownNames::new()),
             attempts: Attempts::default(),
             data_root: data_root.to_path_buf(),
+        };
+        me.prune_users(now);
+        me
+    }
+
+    /// Drop the sessions and devices the accounts no longer allow (gone, disabled, another
+    /// generation; a device whose account is gone or replaced), when the accounts read.
+    fn prune_users(&self, now: u64) {
+        if let Snapshot::Users(users) = &*self.users.get() {
+            self.sessions.prune_users(users, now);
+            self.devices.prune_users(users, now);
         }
     }
 
@@ -66,12 +82,11 @@ impl Auth {
         &self.data_root
     }
 
-    /// Drop the sessions the accounts no longer allow (when they read), then flush sessions and
-    /// devices (see [`Sessions::flush`]).
+    /// Drop the sessions and devices the accounts no longer allow (when they read; an account
+    /// the CLI removed never touches either file), then flush sessions and devices (see
+    /// [`Sessions::flush`]).
     pub fn flush(&self, now: u64, force: bool) {
-        if let Snapshot::Users(users) = &*self.users.get() {
-            self.sessions.prune_users(users, now);
-        }
+        self.prune_users(now);
         self.sessions.flush(now, force);
         self.devices.flush(now, force);
     }

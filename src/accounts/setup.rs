@@ -234,16 +234,7 @@ pub fn create_first(
         if let Err(e) = gate(&current, read_in(auth)?) {
             return Ok((None, Err(e)));
         }
-        let user = User {
-            name,
-            hash,
-            created: now,
-            password_changed: now,
-            generation: 1,
-            failures: 0,
-            last_failure: None,
-            disabled: false,
-        };
+        let user = User::new(name, hash, now);
         let users = super::Users {
             format: super::FORMAT,
             users: vec![user.clone()],

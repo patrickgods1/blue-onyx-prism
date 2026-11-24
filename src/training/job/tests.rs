@@ -51,8 +51,27 @@ struct TrainFake {
     export_fails: Vec<&'static str>,
     /// Fail like that with `--export-only` too.
     retry_fails: bool,
+    /// Leave what RF-DETR leaves in `<work>` (its dataset layout, `last.ckpt`, a running best,
+    /// the export's scratch), plus a transformers `hf-best.tmp`, before anything else happens.
+    rfdetr_files: bool,
+    /// Print this many plain lines while training.
+    extra_lines: usize,
     train_cmds: Mutex<Vec<Cmd>>,
 }
+
+/// What [`TrainFake::rfdetr_files`] writes under `<work>` (path, bytes).
+const RFDETR_FILES: [(&str, usize); 10] = [
+    ("rfdetr-data/train/_annotations.coco.json", 64),
+    ("rfdetr-data/train/aug-0001.jpg", 4096),
+    ("rfdetr-out/last.ckpt", 8192),
+    ("rfdetr-out/training_config.json", 32),
+    ("rfdetr-out/checkpoint_best_ema.pth", 2048),
+    ("rfdetr-out/log.txt", 16),
+    ("rfdetr-export-weights/checkpoint_best_total.pth", 2048),
+    ("export/night.onnx", 1024),
+    ("hf-best.tmp/model.safetensors", 512),
+    ("hf-best.tmp/config.json", 8),
+];
 
 impl TrainFake {
     fn new() -> Self {
@@ -88,6 +107,17 @@ impl CommandRunner for TrainFake {
             std::fs::write(w.join("best.pt"), vec![7u8; 2048]).unwrap();
         }
         let export_only = arg_after(cmd, "--export-only").is_some();
+        if self.rfdetr_files && !export_only {
+            let w = arg_after(cmd, "--work").unwrap();
+            for (f, n) in RFDETR_FILES {
+                let p = w.join(f);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, vec![3u8; n]).unwrap();
+            }
+        }
+        for i in 0..self.extra_lines {
+            on_line(&format!("trainer line {i}"));
+        }
         if export_only {
             if self.hang {
                 while !cancel.load(Ordering::Relaxed) {
@@ -1903,6 +1933,150 @@ fn a_finished_run_frees_its_work_and_a_cancelled_one_too() {
     let r = svc.wait(&id, Duration::from_secs(10)).unwrap();
     assert_eq!(r.state, RunState::Cancelled);
     assert!(!run_dir.join("work").exists());
+}
+
+/// Audit 2026-11 (RA-072): a failed run (the trainer reaped) deletes the scratch no Retry export
+/// reads (RF-DETR's dataset layout with its augmented copies, `last.ckpt`, the export's scratch)
+/// and keeps the checkpoint, `training_config.json`, the trainer's logs and a transformers
+/// `hf-best.tmp` (a retry's last fallback); the retry then still finds its checkpoint and makes
+/// the model. `keep_work` keeps everything.
+#[test]
+fn a_failed_run_frees_its_scratch_and_keeps_what_a_retry_reads() {
+    let t = tmp("failed-scratch");
+    let j = job(
+        &t.0,
+        TrainFamily::Rfdetr,
+        "nano",
+        mps(),
+        Platform::MACOS_ARM64,
+    );
+    let work = super::super::retry::work_dir(&j.run_dir);
+    let fake = TrainFake {
+        rfdetr_files: true,
+        export_fails: vec!["RuntimeError: ONNX Runtime and PyTorch disagree"],
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    let e = r.unwrap_err();
+    assert!(!e.cancelled);
+    assert!(e.message.contains("Retry export"), "{}", e.message);
+    for gone in [
+        "rfdetr-data",
+        "export",
+        "rfdetr-export-weights",
+        "rfdetr-out/last.ckpt",
+    ] {
+        assert!(!work.join(gone).exists(), "{gone} is scratch");
+    }
+    for kept in [
+        "rfdetr-out/checkpoint_best_ema.pth",
+        "rfdetr-out/training_config.json",
+        "rfdetr-out/log.txt",
+        "hf-best.tmp/model.safetensors",
+        "hf-best.tmp/config.json",
+    ] {
+        assert!(work.join(kept).is_file(), "{kept} is kept");
+    }
+    assert!(j.run_dir.join("data/dataset.json").is_file());
+    let ckpt = super::super::retry::best_checkpoint(catalog::Trainer::RfDetr, &work).unwrap();
+    assert_eq!(ckpt, work.join("rfdetr-out/checkpoint_best_ema.pth"));
+    // The note's size is what is left: the checkpoint, its config and logs, hf-best.tmp.
+    assert!(
+        e.message
+            .contains(&catalog::format_size(super::super::retry::disk_use(&work))),
+        "{}",
+        e.message
+    );
+
+    // The retry exports that checkpoint and makes the model.
+    let mut again = j.clone();
+    again.export_only = Some(ExportRetry {
+        checkpoint: ckpt.clone(),
+        train_seconds: None,
+        device: "mps".into(),
+    });
+    let fake = TrainFake::new();
+    let (r, _) = run(&again, &fake, &NoHooks, &AtomicBool::new(false));
+    r.unwrap();
+    assert_eq!(
+        arg_after(&training_cmd(&fake), "--export-only").unwrap(),
+        ckpt
+    );
+
+    // --keep-work: nothing goes.
+    let t = tmp("failed-scratch-kept");
+    let mut j = job(
+        &t.0,
+        TrainFamily::Rfdetr,
+        "nano",
+        mps(),
+        Platform::MACOS_ARM64,
+    );
+    j.keep_work = true;
+    let work = super::super::retry::work_dir(&j.run_dir);
+    let fake = TrainFake {
+        rfdetr_files: true,
+        fail_lines: vec!["RuntimeError: CUDA error: an illegal memory access"],
+        ..TrainFake::new()
+    };
+    let (r, _) = run(&j, &fake, &NoHooks, &AtomicBool::new(false));
+    assert!(!r.unwrap_err().cancelled);
+    for (f, _) in RFDETR_FILES {
+        assert!(work.join(f).is_file(), "{f} kept with keep_work");
+    }
+}
+
+/// Audit 2026-11 (RA-070): a run that ended Done or Cancelled keeps the last
+/// [`service::FINISHED_LOG_TAIL`] lines of its log on its record (in memory and in `runs.json`;
+/// the full log is `train.log`); a failed run keeps the 60 its row shows.
+#[test]
+fn a_finished_run_keeps_a_short_log_tail_and_a_failed_one_the_long_one() {
+    let t = tmp("log-tail");
+    for (tag, fail_lines, state, kept) in [
+        ("done", vec![], RunState::Done, service::FINISHED_LOG_TAIL),
+        (
+            "failed",
+            vec!["RuntimeError: CUDA error: an illegal memory access"],
+            RunState::Failed,
+            60,
+        ),
+    ] {
+        let store = t.0.join(tag).join("runs.json");
+        let fake = Arc::new(TrainFake {
+            extra_lines: 100,
+            fail_lines,
+            ..TrainFake::new()
+        });
+        let s = TrainingService::start(fake.clone(), fake, Arc::new(NoHooks), Some(store.clone()));
+        // A root each: the done run's model would refuse its name to the next.
+        let mut j = job(
+            &t.0.join(tag),
+            TrainFamily::Yolo26,
+            "n",
+            mps(),
+            Platform::MACOS_ARM64,
+        );
+        j.run_dir = t.0.join(tag).join("run");
+        let id = s.enqueue(j).unwrap();
+        let r = s.wait(&id, Duration::from_secs(30)).unwrap();
+        assert_eq!(r.state, state, "{}", r.describe());
+        assert_eq!(r.log.len(), kept, "{tag}");
+        assert!(
+            !r.log.iter().any(|l| l == "trainer line 0"),
+            "{tag}: the oldest lines go first"
+        );
+        // The save follows the in-memory change: wait for it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let back = service::load_records(&store);
+            let saved = back.iter().find(|x| x.id == id).map(|x| x.log.clone());
+            if saved.as_ref() == Some(&r.log) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{tag}: saved {saved:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// The service's stop is no cancel: the running run's tree is stopped, but the run keeps its

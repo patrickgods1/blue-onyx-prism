@@ -334,7 +334,11 @@ async fn wrong_current_passwords_meet_the_address_limit() {
 async fn removing_an_account_ends_its_sessions_and_devices() {
     let state = two_accounts();
     let bob_session = session_of(&state, BOB);
-    let device = state.auth.devices.issue(BOB, crate::accounts::now());
+    let created = account(&state, BOB).unwrap().created;
+    let device = state
+        .auth
+        .devices
+        .issue(BOB, created, crate::accounts::now());
     assert!(signed_in(&state, &bob_session).await);
 
     // Wrong current password: 403, counted against the test user (never bob), bob stays.
@@ -386,6 +390,103 @@ async fn removing_an_account_ends_its_sessions_and_devices() {
     // A new account of the same name does not bring the old session back.
     add_user(&state, BOB, BOB_PASSWORD);
     assert!(!signed_in(&state, &bob_session).await);
+    // The test user is still signed in.
+    assert!(signed_in(&state, TEST_SESSION).await);
+}
+
+/// QA-038 / QA-146: `user remove bob` then `user add bob` on the server (the commands, which
+/// touch neither sessions.json nor devices.json) while the service runs: the old browser's
+/// session cookie sends it to the login page, its device cookie is no device of the new bob,
+/// and the flusher drops both from memory and the files.
+#[tokio::test]
+async fn a_new_account_of_a_removed_ones_name_inherits_nothing() {
+    use crate::accounts::commands::{self, Lines};
+    use crate::cli::UserCommand;
+    let state = two_accounts();
+    // bob signs in in a browser: a session and a device cookie.
+    let (s, h, _) = call(
+        &state,
+        anonymous(post_form(
+            "/login",
+            &body(&[("username", BOB), ("password", BOB_PASSWORD)]),
+            true,
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    let session = cookie_set(&h, "__Host-bop_session").unwrap();
+    let device = cookie_set(&h, "__Host-bop_device").unwrap();
+    assert!(signed_in(&state, &session).await);
+    let old = account(&state, BOB).unwrap();
+    let old_device = state
+        .auth
+        .devices
+        .device(&crate::accounts::devices::DeviceId::from_presented(device.as_bytes()).unwrap())
+        .unwrap();
+    assert_eq!(old_device.account_created, old.created);
+
+    // On the server, as the service's account: remove bob, then add another bob.
+    let config = crate::config::Config {
+        download_dir: Some(root(&state)),
+        ..Default::default()
+    };
+    let run = |cmd: UserCommand, stdin: &str| {
+        let mut out = Vec::new();
+        let mut pw = Lines(std::io::Cursor::new(stdin.as_bytes().to_vec()));
+        commands::user(&config, &cmd, &mut pw, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    };
+    let said = run(UserCommand::Remove { name: BOB.into() }, "");
+    assert!(said.contains("its sessions end"), "{said}");
+    // A later second than the old bob's (`created` is in seconds; a device test of the same
+    // second is in `accounts::devices`' tests, the session check needs no clock at all).
+    while crate::accounts::now() <= old.created {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let said = run(
+        UserCommand::Add { name: BOB.into() },
+        &format!("{NEW_PASSWORD}\n"),
+    );
+    assert!(said.contains("Added the account bob"), "{said}");
+    let new = account(&state, BOB).unwrap();
+    assert_ne!(new.generation, old.generation, "a new generation");
+    assert_eq!(
+        state.auth.sessions.len(),
+        2,
+        "the commands touch no session"
+    );
+
+    // The old browser: its session sends it to the login page and is cleared.
+    let r = with_header(
+        with_header(
+            anonymous(Request::get("/").body(Body::empty()).unwrap()),
+            "cookie",
+            &format!("__Host-bop_session={session}; __Host-bop_device={device}"),
+        ),
+        "accept",
+        "text/html",
+    );
+    let (s, h, _) = call(&state, r).await;
+    assert_eq!(s, StatusCode::SEE_OTHER);
+    assert!(location(&h).starts_with("/login"), "{}", location(&h));
+    assert!(clears(&h, "__Host-bop_session"));
+    assert!(!signed_in(&state, &session).await);
+    // Its device cookie is no device of the new bob.
+    let now = crate::accounts::now();
+    assert!(
+        !state
+            .auth
+            .devices
+            .trusted(device.as_bytes(), BOB, new.created, now)
+    );
+    // The flusher drops the old bob's device too, and writes both files without him.
+    state.auth.flush(now, true);
+    let id = crate::accounts::devices::DeviceId::from_presented(device.as_bytes()).unwrap();
+    assert!(state.auth.devices.device(&id).is_none(), "device dropped");
+    for path in [state.auth.sessions.path(), state.auth.devices.path()] {
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"bob\""), "{}: {text}", path.display());
+    }
     // The test user is still signed in.
     assert!(signed_in(&state, TEST_SESSION).await);
 }
@@ -598,10 +699,12 @@ async fn changing_my_password_keeps_this_browser_with_a_new_session_id() {
         "another account is untouched"
     );
     assert!(
-        state
-            .auth
-            .devices
-            .trusted(device.as_bytes(), TEST_USER, crate::accounts::now()),
+        state.auth.devices.trusted(
+            device.as_bytes(),
+            TEST_USER,
+            account(&state, TEST_USER).unwrap().created,
+            crate::accounts::now()
+        ),
         "the device cookie stays"
     );
     // The new password signs in, the old one no longer.
