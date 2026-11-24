@@ -541,8 +541,42 @@ struct Kept {
     redo: bool,
 }
 
-/// The walks, per folder: the review folder, and few others over a process's life.
+/// The walks, per folder: the review folder, and few others ([`prune_kept`], RA-099).
 static KEPT: Mutex<BTreeMap<PathBuf, Kept>> = Mutex::new(BTreeMap::new());
+
+/// Folders [`KEPT`] holds at most besides those being walked, as refine's `OPEN_KEEP` and the
+/// coverage `KEEP` bound theirs: the review folder and the few the user switched between lately.
+const KEPT_MAX: usize = 4;
+
+/// Whether [`walked_of`] prunes the process-wide [`KEPT`]. Off in unit tests only: their scratch
+/// folders share the one map from parallel threads, and a prune by one test would evict another
+/// test's entry between its two asks. The rule itself is tested on a map of its own.
+const PRUNE_KEPT: bool = !cfg!(test);
+
+/// Drop from `kept` the entries other than `asked`'s that no walk is filling and whose answer is
+/// past its time ([`keep_for`]) or missing (a walk that failed), then, past `max`, the oldest
+/// answers among the rest. An entry being walked is never dropped ([`WalkDone`] would find it
+/// gone, which it tolerates, but its answer would be lost).
+fn prune_kept(kept: &mut BTreeMap<PathBuf, Kept>, asked: &Path, now: Instant, max: usize) {
+    kept.retain(|dir, k| {
+        dir == asked
+            || k.walking
+            || k.done
+                .as_ref()
+                .is_some_and(|(at, took, _)| now.saturating_duration_since(*at) < keep_for(*took))
+    });
+    while kept.len() > max {
+        let oldest = kept
+            .iter()
+            .filter(|(dir, k)| *dir != asked && !k.walking)
+            .min_by_key(|(_, k)| k.done.as_ref().map(|d| d.0))
+            .map(|(dir, _)| dir.clone());
+        match oldest {
+            Some(dir) => drop(kept.remove(&dir)),
+            None => break,
+        }
+    }
+}
 static WALKED: Condvar = Condvar::new();
 
 /// How long a walk's answer is kept: at least 10 s, and 20 times what it took, so a walk of
@@ -676,7 +710,13 @@ pub(super) fn tally_of(dir: &Path, wait: Duration) -> Option<Arc<Tally>> {
 /// [`tally_of`] with the [`AutoGap`] of the same walk.
 pub(super) fn walked_of(dir: &Path, wait: Duration) -> Option<Walked> {
     let mut kept = KEPT.lock_recover();
-    let k = kept.entry(dir.to_path_buf()).or_default();
+    if !kept.contains_key(dir) {
+        kept.insert(dir.to_path_buf(), Kept::default());
+    }
+    if PRUNE_KEPT {
+        prune_kept(&mut kept, dir, Instant::now(), KEPT_MAX);
+    }
+    let k = kept.get_mut(dir)?;
     let fresh = !k.redo
         && k.done
             .as_ref()
@@ -2251,6 +2291,61 @@ mod tests {
         // Walked after the drop: fresh, kept.
         let again = tally_of(&dir, Duration::ZERO).unwrap();
         assert!(Arc::ptr_eq(&third, &again));
+    }
+
+    /// RA-099: other folders' answers past their time go, at most [`KEPT_MAX`] folders stay
+    /// (the oldest answers go first), and neither the asked folder nor one being walked is ever
+    /// dropped.
+    #[test]
+    fn kept_walks_are_pruned_but_never_the_asked_or_a_walking_one() {
+        let now = Instant::now();
+        let ago = |s: u64| now.checked_sub(Duration::from_secs(s)).unwrap();
+        let walked = || (Arc::new(Tally::default()), Arc::new(AutoGap::default()));
+        let done = |at: Instant| Kept {
+            done: Some((at, Duration::from_millis(5), walked())),
+            ..Kept::default()
+        };
+        let p = |n: &str| PathBuf::from(n);
+        let mut kept = BTreeMap::new();
+        kept.insert(p("asked"), done(ago(600)));
+        kept.insert(p("stale"), done(ago(600)));
+        kept.insert(
+            p("walking"),
+            Kept {
+                walking: true,
+                ..done(ago(600))
+            },
+        );
+        kept.insert(p("failed"), Kept::default());
+        kept.insert(p("fresh"), done(ago(1)));
+        prune_kept(&mut kept, Path::new("asked"), now, KEPT_MAX);
+        let names: Vec<_> = kept.keys().cloned().collect();
+        assert_eq!(names, [p("asked"), p("fresh"), p("walking")]);
+
+        // Past the cap: the oldest answers go, the asked and walking ones stay.
+        for i in 0..6 {
+            kept.insert(p(&format!("f{i}")), done(ago(9 - i)));
+        }
+        prune_kept(&mut kept, Path::new("asked"), now, KEPT_MAX);
+        assert_eq!(kept.len(), KEPT_MAX);
+        assert!(kept.contains_key(&p("asked")) && kept.contains_key(&p("walking")));
+        assert!(kept.contains_key(&p("fresh")), "the newest answer");
+        assert!(kept.contains_key(&p("f5")), "the next newest");
+
+        // Every other entry walking: over the cap rather than drop one.
+        let mut busy: BTreeMap<PathBuf, Kept> = (0..6)
+            .map(|i| {
+                (
+                    p(&format!("w{i}")),
+                    Kept {
+                        walking: true,
+                        ..Kept::default()
+                    },
+                )
+            })
+            .collect();
+        prune_kept(&mut busy, Path::new("w0"), now, KEPT_MAX);
+        assert_eq!(busy.len(), 6);
     }
 
     #[test]

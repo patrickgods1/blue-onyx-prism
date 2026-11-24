@@ -8,7 +8,10 @@
 //! `/proc/self/status` in [`crate::metrics`], with no FFI. [`PageIns`] is the system's page-in
 //! (hard fault) rate: PDH on Windows, `/proc/vmstat` on Linux, none elsewhere. Never panics; a
 //! failed call is `None`. [`trim`] asks the allocator to give freed heap memory back to the OS
-//! (glibc `malloc_trim`, macOS `malloc_zone_pressure_relief`, Windows `HeapCompact`).
+//! (glibc `malloc_trim`, macOS `malloc_zone_pressure_relief`, Windows `HeapCompact`);
+//! [`trim_soon`] asks for one from a short-lived `bop-trim` thread, coalescing bursts.
+//! [`tune_allocator`] (Linux glibc, first thing in every binary's `main`) caps the malloc arenas
+//! and fixes the mmap threshold unless the environment already chose ([`allocator_plan`], pure).
 //!
 //! Paging files: [`parse_paging_files`] reads the registry's `PagingFiles` lines and
 //! [`growable_bytes`] (pure) how far they can still grow. That is commit a process gets on
@@ -17,6 +20,9 @@
 //! went from 7.6 to 16.9 GB during one training run, with no WinError 1455). Each volume keeps
 //! [`PAGING_DISK_MARGIN_BYTES`] free; a system-managed file may reach [`system_managed_max`]
 //! (3 x RAM, at least 4 GB, Windows' own rule).
+
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// The system commit charge (Windows): what every process may commit in total (RAM + paging
 /// file) and what is still free. A process that needs more fails with WinError 1455 ("the paging
@@ -289,24 +295,41 @@ pub struct ProcessMemory {
     /// compressed and swapped pages and GPU-backed memory charged to the process, which the
     /// resident size misses.
     pub footprint: Option<u64>,
+    /// Memory the process owns alone, whether in RAM or not (audit 2026-11, memgap-2): Windows'
+    /// private bytes (`PrivateUsage`, the commit charge WinError 1455 is about; the OS trims the
+    /// working set under pressure without lowering it), the physical footprint on macOS. Linux
+    /// reads `RssAnon` in [`crate::metrics::ProcessStats`].
+    pub private: Option<u64>,
 }
 
-/// [`ProcessMemory`] from `K32GetProcessMemoryInfo`; None when the call fails.
+/// [`ProcessMemory`] from `K32GetProcessMemoryInfo` (the `_EX` counters, for `PrivateUsage`);
+/// None when the call fails.
 #[cfg(windows)]
 pub fn process_memory() -> Option<ProcessMemory> {
-    use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
     use windows::Win32::System::Threading::GetCurrentProcess;
-    let cb = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?;
-    let mut counters = PROCESS_MEMORY_COUNTERS {
+    let cb = u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>()).ok()?;
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
         cb,
-        ..PROCESS_MEMORY_COUNTERS::default()
+        ..PROCESS_MEMORY_COUNTERS_EX::default()
     };
     // SAFETY: the pseudo-handle of the current process is always valid and needs no closing;
-    // `counters` is live and writable with `cb` set to its size, and is only written during the call.
-    let done = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, cb) };
+    // `counters` is live and writable for `cb` bytes (its own size). The EX struct starts with
+    // the plain one's fields, and the API takes it through this pointer type when `cb` is the EX
+    // size (documented for GetProcessMemoryInfo); it is only written during the call.
+    let done = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            std::ptr::from_mut(&mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+            cb,
+        )
+    };
     done.as_bool().then_some(ProcessMemory {
         resident: counters.WorkingSetSize as u64,
         footprint: None,
+        private: Some(counters.PrivateUsage as u64),
     })
 }
 
@@ -326,6 +349,8 @@ pub fn process_memory() -> Option<ProcessMemory> {
     Some(ProcessMemory {
         resident: usage.ri_resident_size,
         footprint: Some(usage.ri_phys_footprint),
+        // macOS has no separate private-bytes counter; the footprint is what the process owns.
+        private: Some(usage.ri_phys_footprint),
     })
 }
 
@@ -352,6 +377,11 @@ pub struct Trimmed {
     /// macOS only: the physical footprint before and after (what Activity Monitor shows).
     pub footprint_before: Option<u64>,
     pub footprint_after: Option<u64>,
+    /// Private bytes before and after ([`ProcessMemory::private`]; `RssAnon` on Linux): on
+    /// Windows the figure that shows whether the trim lowered the commit, which the working set
+    /// alone cannot.
+    pub private_before: Option<u64>,
+    pub private_after: Option<u64>,
 }
 
 /// Give freed heap memory back to the OS, once, on the calling thread (audit 2026-11, memgap-1):
@@ -376,21 +406,222 @@ pub fn trim() -> Trimmed {
         resident_after: after.resident_memory_bytes,
         footprint_before: before.memory_footprint_bytes,
         footprint_after: after.memory_footprint_bytes,
+        private_before: before.private_memory_bytes,
+        private_after: after.private_memory_bytes,
     };
     let mb = |b: Option<u64>| b.map_or_else(|| "?".to_string(), |b| format!("{:.1}", mib(b)));
     tracing::debug!(
-        "memory trim: asked={asked} released_mb={} resident_mb={} -> {} footprint_mb={} -> {}",
+        "memory trim: asked={asked} released_mb={} resident_mb={} -> {} private_mb={} -> {} \
+         footprint_mb={} -> {}",
         mb(out.released),
         mb(out.resident_before),
         mb(out.resident_after),
+        mb(out.private_before),
+        mb(out.private_after),
         mb(out.footprint_before),
         mb(out.footprint_after),
     );
     out
 }
 
+/// Quiet time after the last [`trim_soon`] request before the trim runs: a burst of releases (a
+/// generation's workers retiring one by one, the last sign-ins of a burst) becomes one trim.
+pub const TRIM_QUIET: Duration = Duration::from_secs(2);
+/// A trim runs at most this long after the first request of a burst, however long requests keep
+/// coming (a steady stream must not postpone it forever).
+pub const TRIM_MAX_DELAY: Duration = Duration::from_secs(15);
+/// Least time between two trims: each takes the allocator's locks while it walks the heap, so a
+/// caller that asks often (many small jobs) costs at most one walk per this interval.
+pub const TRIM_MIN_GAP: Duration = Duration::from_secs(10);
+
+/// Trims run by [`trim_soon`]'s thread so far (tests and the debug log).
+static TRIMS_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Default)]
+struct TrimState {
+    /// First and latest request of the pending burst; `None` = nothing pending.
+    first: Option<Instant>,
+    latest: Option<Instant>,
+    reasons: Vec<&'static str>,
+    /// When the previous trim ran.
+    last: Option<Instant>,
+    /// A `bop-trim` thread is alive (it exits once nothing is pending).
+    thread: bool,
+}
+
+static TRIM: (Mutex<TrimState>, Condvar) = (
+    Mutex::new(TrimState {
+        first: None,
+        latest: None,
+        reasons: Vec::new(),
+        last: None,
+        thread: false,
+    }),
+    Condvar::new(),
+);
+
+/// When the pending burst's trim runs (pure): [`TRIM_QUIET`] after its latest request, at most
+/// [`TRIM_MAX_DELAY`] after its first, and never sooner than [`TRIM_MIN_GAP`] after the last trim.
+pub fn trim_due(first: Instant, latest: Instant, last: Option<Instant>) -> Instant {
+    let quiet = (latest + TRIM_QUIET).min(first + TRIM_MAX_DELAY);
+    last.map_or(quiet, |l| quiet.max(l + TRIM_MIN_GAP))
+}
+
+/// Ask for a [`trim`] soon, off the calling thread (audit 2026-11, phase 5 trim points). Returns at
+/// once; requests close together become one trim ([`trim_due`]). For callers that just released a
+/// lot (a retired worker or generation, a finished job, benchmark or export, the end of a sign-in
+/// burst). `reason` names the caller in the debug log. The `bop-trim` thread lives only while a
+/// trim is pending; a failed thread spawn skips that trim (logged).
+pub fn trim_soon(reason: &'static str) {
+    let (lock, wake) = &TRIM;
+    let mut s = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = Instant::now();
+    s.first.get_or_insert(now);
+    s.latest = Some(now);
+    if !s.reasons.contains(&reason) {
+        s.reasons.push(reason);
+    }
+    if s.thread {
+        wake.notify_all();
+        return;
+    }
+    s.thread = true;
+    drop(s);
+    let spawned = std::thread::Builder::new()
+        .name("bop-trim".into())
+        .spawn(trim_thread);
+    if let Err(e) = spawned {
+        tracing::debug!("memory trim skipped: could not start its thread ({e})");
+        let mut s = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.thread = false;
+        s.first = None;
+        s.latest = None;
+        s.reasons.clear();
+    }
+}
+
+fn trim_thread() {
+    let (lock, wake) = &TRIM;
+    let mut s = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let (Some(first), Some(latest)) = (s.first, s.latest) else {
+            s.thread = false;
+            return;
+        };
+        let due = trim_due(first, latest, s.last);
+        let now = Instant::now();
+        if now < due {
+            s = wake
+                .wait_timeout(s, due - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+            continue;
+        }
+        let reasons = std::mem::take(&mut s.reasons);
+        s.first = None;
+        s.latest = None;
+        drop(s);
+        tracing::debug!("memory trim for: {}", reasons.join(", "));
+        let _ = trim();
+        TRIMS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        s = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s.last = Some(Instant::now());
+    }
+}
+
+/// How many trims [`trim_soon`] has run in this process.
+pub fn trims_run() -> u64 {
+    TRIMS_RUN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn mib(bytes: u64) -> f64 {
     bytes as f64 / f64::from(1u32 << 20)
+}
+
+/// glibc malloc arenas [`tune_allocator`] allows when the environment does not say (the systemd
+/// unit and the Docker image have set `MALLOC_ARENA_MAX=2` since 0.2): glibc otherwise gives each
+/// allocating thread its own arena, up to 8 per core, and the HTTP, worker, prep, collector and
+/// runtime threads all touch image-sized buffers, so a long run leaves many fragmented arenas
+/// that are rarely given back and resident memory creeps up for days. Two keep that bounded for
+/// a little allocator contention.
+pub const ARENA_MAX: i32 = 2;
+
+/// The fixed glibc mmap threshold [`tune_allocator`] sets when the environment does not say:
+/// 8 MiB. Blocks at least this large are mmapped and go back to the OS when freed.
+///
+/// glibc's threshold is dynamic by default: it starts at 128 KiB and rises to the size of every
+/// mmapped block freed, up to 32 MiB, so after the first 4K frame (24.9 MB decoded) or 1280-input
+/// tensor (19.7 MB) every later buffer of that size is served from an arena and stays there after
+/// a burst (and the trim threshold follows to twice that). Fixing it also stops that climb and
+/// keeps the trim threshold at 128 KiB. 8 MiB sits above every per-request buffer of a 640 model
+/// (the 4.9 MB tensor, a 1080p frame's 6.2 MB, a 2.8 MB output), so the hot path pays no
+/// mmap / munmap and ~1,200 zeroed page faults per buffer; frame-sized tensors are pooled
+/// ([`crate::prep::TensorPool`]) and the decode buffer is reused per thread, so what goes to mmap
+/// is the rare big one-off (a 1440p or 4K frame that is kept, a benchmark image) that should not
+/// pin heap after it is freed.
+pub const MMAP_THRESHOLD: i32 = 8 << 20;
+
+/// The GLIBC_TUNABLES names of the two settings (`name=value` entries separated by `:`).
+const ARENA_TUNABLE: &str = "glibc.malloc.arena_max";
+const MMAP_TUNABLE: &str = "glibc.malloc.mmap_threshold";
+
+/// What [`tune_allocator`] sets (`None`: left as the environment chose).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorPlan {
+    /// `mallopt(M_ARENA_MAX, ..)`.
+    pub arena_max: Option<i32>,
+    /// `mallopt(M_MMAP_THRESHOLD, ..)`.
+    pub mmap_threshold: Option<i32>,
+}
+
+/// What to set given the environment `var` reads (pure, every OS): [`ARENA_MAX`] unless
+/// `MALLOC_ARENA_MAX` is set or `GLIBC_TUNABLES` names `glibc.malloc.arena_max`; [`MMAP_THRESHOLD`]
+/// unless `MALLOC_MMAP_THRESHOLD_` is set or `GLIBC_TUNABLES` names `glibc.malloc.mmap_threshold`.
+/// A value set by the user (any value: glibc has already applied or rejected it) always wins.
+pub fn allocator_plan(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> AllocatorPlan {
+    let tunables = var("GLIBC_TUNABLES");
+    let tunables = tunables.as_ref().map(|t| t.to_string_lossy());
+    let tuned = |name: &str| {
+        tunables.as_deref().is_some_and(|t| {
+            t.split(':')
+                .any(|entry| entry.split('=').next().is_some_and(|n| n.trim() == name))
+        })
+    };
+    let unset = |env: &str, tunable: &str| var(env).is_none() && !tuned(tunable);
+    AllocatorPlan {
+        arena_max: unset("MALLOC_ARENA_MAX", ARENA_TUNABLE).then_some(ARENA_MAX),
+        mmap_threshold: unset("MALLOC_MMAP_THRESHOLD_", MMAP_TUNABLE).then_some(MMAP_THRESHOLD),
+    }
+}
+
+/// Linux glibc: apply [`allocator_plan`] of this process's environment with `mallopt` (audit
+/// 2026-11, memgap-3 / platform-16), so a tarball run, another supervisor and every CLI command get
+/// what the systemd unit and the Docker image set. Call it first thing in `main`, after
+/// `panic::install()` and before any thread starts: an arena cap set later does not bound arenas
+/// already made. `mallopt` does not survive `exec`, so child processes keep their own defaults.
+/// No-op elsewhere (macOS and Windows have no per-thread arenas of this kind).
+pub fn tune_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let plan = allocator_plan(|k| std::env::var_os(k));
+        if let Some(n) = plan.arena_max {
+            // SAFETY: mallopt takes glibc's own locks; M_ARENA_MAX with a positive count is a
+            // documented parameter, and a refused value (return 0) leaves glibc's default.
+            let _ = unsafe { libc::mallopt(libc::M_ARENA_MAX, n) };
+        }
+        if let Some(n) = plan.mmap_threshold {
+            // SAFETY: as above; M_MMAP_THRESHOLD with a value under glibc's 32 MiB maximum.
+            let _ = unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, n) };
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -673,6 +904,54 @@ mod tests {
         let _ = super::trim();
     }
 
+    #[test]
+    fn trim_due_coalesces_a_burst_and_keeps_the_gap() {
+        use super::{TRIM_MAX_DELAY, TRIM_MIN_GAP, TRIM_QUIET, trim_due};
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        // One request: quiet time after it.
+        assert_eq!(trim_due(t0, t0, None), t0 + TRIM_QUIET);
+        // A later request in the burst pushes it back...
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(trim_due(t0, t1, None), t1 + TRIM_QUIET);
+        // ...but never past the burst's cap.
+        let late = t0 + TRIM_MAX_DELAY + Duration::from_secs(5);
+        assert_eq!(trim_due(t0, late, None), t0 + TRIM_MAX_DELAY);
+        // A recent trim holds the next one off for the gap.
+        assert_eq!(trim_due(t0, t0, Some(t0)), t0 + TRIM_MIN_GAP);
+        // An old one does not.
+        let past = t0.checked_sub(Duration::from_secs(60));
+        if let Some(past) = past {
+            assert_eq!(trim_due(t0, t0, Some(past)), t0 + TRIM_QUIET);
+        }
+    }
+
+    /// The thread runs one trim for a burst and exits once nothing is pending.
+    #[test]
+    fn trim_soon_runs_one_trim_for_a_burst_then_stops_its_thread() {
+        let before = super::trims_run();
+        for _ in 0..5 {
+            super::trim_soon("test burst");
+        }
+        let deadline = std::time::Instant::now() + super::TRIM_MAX_DELAY + super::TRIM_MIN_GAP;
+        while super::trims_run() == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(super::trims_run() > before, "no trim ran");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let alive = super::TRIM.0.lock().map(|s| s.thread).unwrap_or(true);
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bop-trim thread did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     /// Grows by a large touched allocation. Other tests of this binary free memory at any moment,
     /// so one attempt showing the growth is enough; a counter that does not move fails them all.
     #[cfg(any(windows, target_os = "macos"))]
@@ -697,6 +976,116 @@ mod tests {
                 && by(before.footprint, after.footprint)
         });
         assert!(grew, "no growth seen over 5 allocations of {SIZE} bytes");
+    }
+
+    /// Private bytes are read where the OS has them, and are plausible: at least a MiB, and on
+    /// macOS the footprint (its stand-in). Growth is not asserted (other tests free memory).
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn private_bytes_are_read_where_supported() {
+        let m = super::process_memory().unwrap();
+        assert!(m.private.is_some_and(|b| b > 1 << 20), "{m:?}");
+        if cfg!(target_os = "macos") {
+            assert_eq!(m.private, m.footprint);
+        }
+        let t = super::trim();
+        assert!(
+            t.private_before.is_some() && t.private_after.is_some(),
+            "{t:?}"
+        );
+    }
+
+    #[test]
+    fn allocator_plan_leaves_what_the_environment_chose() {
+        use super::{AllocatorPlan, MMAP_THRESHOLD, allocator_plan};
+        use std::ffi::OsString;
+        let plan = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, OsString)> = vars
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), OsString::from(v)))
+                .collect();
+            allocator_plan(move |k| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()))
+        };
+        let both = AllocatorPlan {
+            arena_max: Some(2),
+            mmap_threshold: Some(MMAP_THRESHOLD),
+        };
+        let none = AllocatorPlan {
+            arena_max: None,
+            mmap_threshold: None,
+        };
+        // Nothing set: both.
+        assert_eq!(plan(&[]), both);
+        // Unrelated variables and tunables change nothing.
+        assert_eq!(
+            plan(&[
+                ("MALLOC_TRIM_THRESHOLD_", "1"),
+                (
+                    "GLIBC_TUNABLES",
+                    "glibc.malloc.tcache_count=0:glibc.malloc.arena_test=4"
+                ),
+            ]),
+            both
+        );
+        // The variables (any value, even empty) win.
+        let arena_only = AllocatorPlan {
+            arena_max: None,
+            ..both
+        };
+        let mmap_only = AllocatorPlan {
+            mmap_threshold: None,
+            ..both
+        };
+        assert_eq!(plan(&[("MALLOC_ARENA_MAX", "4")]), arena_only);
+        assert_eq!(plan(&[("MALLOC_ARENA_MAX", "")]), arena_only);
+        assert_eq!(plan(&[("MALLOC_MMAP_THRESHOLD_", "131072")]), mmap_only);
+        assert_eq!(
+            plan(&[("MALLOC_ARENA_MAX", "2"), ("MALLOC_MMAP_THRESHOLD_", "1")]),
+            none
+        );
+        // Without the trailing underscore it is not glibc's variable.
+        assert_eq!(plan(&[("MALLOC_MMAP_THRESHOLD", "1")]), both);
+        // Tunables, alone or in a list, by exact name.
+        assert_eq!(
+            plan(&[("GLIBC_TUNABLES", "glibc.malloc.arena_max=1")]),
+            arena_only
+        );
+        assert_eq!(
+            plan(&[(
+                "GLIBC_TUNABLES",
+                "glibc.malloc.tcache_count=0:glibc.malloc.mmap_threshold=65536"
+            )]),
+            mmap_only
+        );
+        assert_eq!(
+            plan(&[(
+                "GLIBC_TUNABLES",
+                "glibc.malloc.mmap_threshold=65536:glibc.malloc.arena_max=8"
+            )]),
+            none
+        );
+        assert_eq!(
+            plan(&[("GLIBC_TUNABLES", "glibc.malloc.arena_max_x=1")]),
+            both
+        );
+        // A variable and a tunable, one each.
+        assert_eq!(
+            plan(&[
+                ("MALLOC_ARENA_MAX", "2"),
+                ("GLIBC_TUNABLES", "glibc.malloc.mmap_threshold=1048576"),
+            ]),
+            none
+        );
+        // The threshold stays under glibc's 32 MiB maximum (a larger one is refused).
+        const { assert!(MMAP_THRESHOLD > 0 && MMAP_THRESHOLD <= 32 << 20) };
+    }
+
+    /// Harmless to call again (threads already run here): it only sets glibc parameters.
+    #[test]
+    fn tune_allocator_is_callable_anywhere() {
+        super::tune_allocator();
+        let v = vec![0u8; 16 << 20];
+        std::hint::black_box(&v);
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]

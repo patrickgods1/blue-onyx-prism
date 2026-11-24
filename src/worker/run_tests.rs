@@ -1950,3 +1950,68 @@ fn a_panic_while_serving_fails_the_model() {
     );
     assert!(h.stop() < SOON);
 }
+
+/// RA-082: a device a reaper still waits on is not compiled on again. The walk skips it to the
+/// next candidate, and keeps it as the better device (a lost one) to try once the reaper ends.
+#[test]
+fn a_device_a_reaper_still_waits_on_is_skipped_and_kept_as_better() {
+    static R: super::reap::Reapers = super::reap::Reapers::new(4, Duration::ZERO);
+    /// A backend on a device that does not answer: its drop waits for the release.
+    struct Hangs(crossbeam_channel::Receiver<()>);
+    impl Drop for Hangs {
+        fn drop(&mut self) {
+            let _ = self.0.recv_timeout(SOON);
+        }
+    }
+    let (release, wait) = crossbeam_channel::bounded(1);
+    assert_eq!(
+        R.hand_off("earlier", "openvino:gpu", Hangs(wait)),
+        super::reap::Handed::Reaper
+    );
+    let script = FakeScript::new(1, INPUT);
+    let faults = TestFaults {
+        candidates: Some(vec![
+            candidate("openvino:gpu", false),
+            candidate("openvino:cpu", true),
+        ]),
+        reapers: Some(&R),
+        ..TestFaults::default()
+    };
+    let (handle, shutdown) = spawn_faulty(&script, faults);
+    let t = Instant::now();
+    while handle.state.get() != ModelState::Ready {
+        assert!(
+            !matches!(handle.state.get(), ModelState::Failed(_)),
+            "{:?}",
+            handle.state.get()
+        );
+        assert!(t.elapsed() < SOON, "never ready");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let compiled: Vec<String> = script.compiles().into_iter().map(|(d, _)| d).collect();
+    assert_eq!(
+        compiled,
+        vec!["openvino:cpu".to_string()],
+        "the hung GPU was compiled on"
+    );
+    let better = handle
+        .better()
+        .expect("the hung device stays the better one");
+    assert_eq!(
+        better.candidate.device,
+        candidate("openvino:gpu", false).device
+    );
+    assert_eq!(
+        better.failure,
+        crate::backend::plan::LoadFailure::DeviceLost
+    );
+    assert!(better.reason.contains("still hung"), "{}", better.reason);
+    release.send(()).unwrap();
+    assert!(R.wait_idle(SOON));
+    assert!(
+        R.hung(&better.candidate.device, Instant::now()).is_none(),
+        "tried again once the reaper is done"
+    );
+    shutdown.cancel();
+    handle.join();
+}

@@ -501,6 +501,8 @@ impl BenchmarkService {
                 // `DevicePriority`, restored when it drops, also on a panic).
                 let outcome =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&handle)));
+                // The run's frames, result trees and caches are freed: give the heap back (RA-087).
+                crate::backend::memory::trim_soon("benchmark run");
                 let mut g = me.lock();
                 if g.run_id != run_id {
                     return;
@@ -959,7 +961,8 @@ pub fn run(ctx: &RunContext, req: &RunRequest, h: &RunHandle) -> Result<String> 
         match run.bench_model(&sets, &overall, mi, name, entry.as_ref()) {
             Ok(r) => {
                 let last = mi + 1 == entries.len();
-                finished.push(r.summary());
+                let mut r = r;
+                finished.push(r.summary_in_place());
                 run.save(&mut saver, &sets, r, last)?;
             }
             Err(e) => {
@@ -1019,7 +1022,7 @@ fn resolve_sets(
 /// Cut `sets` to about `cap` images in total (evenly spread within each set, each set keeping
 /// a share proportional to its size and at least one image); the warning to show, or None when
 /// they fit.
-fn cap_images(sets: &mut [ImageSet], cap: usize) -> Option<String> {
+pub(crate) fn cap_images(sets: &mut [ImageSet], cap: usize) -> Option<String> {
     let total: usize = sets.iter().map(|s| s.images.len()).sum();
     if total <= cap || cap == 0 {
         return None;
@@ -1391,7 +1394,7 @@ impl ServiceRun<'_> {
         if let Some(w) = warning {
             h.warn(w);
         }
-        h.push_done(r.summary());
+        h.push_done(r.summary_in_place());
         Ok(r)
     }
 

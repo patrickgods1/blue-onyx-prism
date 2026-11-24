@@ -607,7 +607,7 @@ pub(super) fn refused(
     peer: Option<SocketAddr>,
 ) -> Response {
     let peer = who(peer);
-    debug!(%peer, path = %uri.path(), ?outcome, "admin route refused");
+    debug!(%peer, path = %super::guard::path_for_log(uri.path()), ?outcome, "admin route refused");
     match outcome {
         Outcome::SignedIn(_) => see_other("/"),
         Outcome::NoAccounts => to_setup(headers),

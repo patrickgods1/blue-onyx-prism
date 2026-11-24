@@ -44,6 +44,8 @@ struct Forced {
     ahead: Option<Duration>,
     /// Whether the last query of the folder was answered by the index.
     served: bool,
+    /// The ceiling of the folder's index from now on, the running one too ([`set_ceiling_now`]).
+    ceiling_now: Option<usize>,
 }
 
 static FORCED: LazyLock<Mutex<HashMap<PathBuf, Forced>>> = LazyLock::new(Mutex::default);
@@ -84,6 +86,7 @@ pub(crate) fn force(dir: &Path) {
         frames: Arc::default(),
         ahead: None,
         served: false,
+        ceiling_now: None,
     });
 }
 
@@ -197,6 +200,18 @@ pub(super) fn panic_at(dir: &Path, at: u64) {
 pub(super) fn set_clock_ahead(dir: &Path, ahead: Duration) {
     force(dir);
     with(dir, |f| f.ahead = Some(ahead));
+}
+
+/// The index of `dir`, the running one included, may take `bytes` from now on: its walks look at
+/// this as they go ([`super::Index::ceiling`]).
+pub(super) fn set_ceiling_now(dir: &Path, bytes: usize) {
+    force(dir);
+    with(dir, |f| f.ceiling_now = Some(bytes));
+}
+
+/// See [`set_ceiling_now`].
+pub(super) fn ceiling_now(dir: &Path) -> Option<usize> {
+    with(dir, |f| f.ceiling_now).flatten()
 }
 
 /// See [`set_clock_ahead`].
@@ -3031,6 +3046,103 @@ mod cases {
     }
 
     const INDEX_CEILING: usize = super::super::INDEX_CEILING_BYTES;
+
+    /// The day folders of `dir`'s frames that are there (a line may name one that is not).
+    fn day_dirs(dir: &Path) -> Vec<PathBuf> {
+        by_day(dir)
+            .keys()
+            .map(|key| dir.join(key))
+            .filter(|d| d.is_dir())
+            .collect()
+    }
+
+    #[test]
+    fn a_walk_stops_where_it_passes_the_ceiling() {
+        for kind in [Pass::Scan, Pass::Full] {
+            let dir = Dir::new();
+            // So that the scan's stats see every change, whatever the folder times.
+            set_clock_ahead(&dir, Duration::from_secs(3600));
+            generate(&dir, 47, 200, false);
+            let f = all_any();
+            assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
+            let index = index_of(&dir).unwrap();
+            let days = day_dirs(&dir);
+            assert!(days.len() >= 20, "{} day folders", days.len());
+            if kind == Pass::Scan {
+                // Every day changed: the scan walks them all.
+                days.iter().for_each(|d| change_day(d));
+            }
+            // A third of the rows' worth on top of the names: the walk passes it a third of the
+            // way in, with at most WALK_THREADS_MAX shards in progress then.
+            let rows = index.state.read_recover().bytes();
+            let names = index.names.read_recover().bytes();
+            set_ceiling_now(&dir, names + rows / 3);
+            let all = queue::candidates(&dir, QueueSource::All).len() as u64;
+            let walked = frames_walked(&dir);
+            index.pass(kind, &|| panic!("{kind:?}: no swap once over the ceiling"));
+            let read = frames_walked(&dir) - walked;
+            assert!(
+                read < all * 3 / 4,
+                "{kind:?}: {read} of {all} frames read before the walk stopped"
+            );
+            assert!(index.cancelled() && index_of(&dir).is_none(), "{kind:?}");
+            let hub = HUB.lock_recover();
+            let refused = hub.refused.iter().find(|r| r.dir == *dir).unwrap();
+            assert!(refused.until.is_none(), "{kind:?}: refused for good");
+        }
+    }
+
+    #[test]
+    fn a_walk_of_everything_drops_an_index_of_mostly_unused_names() {
+        let dir = Dir::new();
+        let rels = generate(&dir, 53, 40, false);
+        set_timing(&dir, |t| t.compact = 1);
+        let f = all_any();
+        assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
+        let first = index_of(&dir).unwrap();
+        // Nothing relabelled: every name a row uses, the index stays.
+        first.pass(Pass::Full, &|| {});
+        assert!(
+            Arc::ptr_eq(&first, &index_of(&dir).unwrap()),
+            "no unused names, no rebuild"
+        );
+        // A frame relabelled twice: the class set of the first label is no row's any more.
+        let frame = readable(&dir, &rels);
+        for label in ["zebra", "giraffe"] {
+            let file = LabelFile {
+                status: Status::Skipped,
+                boxes: vec![LabelBox {
+                    label: label.into(),
+                    ..super::super::super::tests_support::auto_box(label)
+                }],
+                ..LabelFile::default()
+            };
+            super::super::super::write(&frame.labels, &file).unwrap();
+            assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
+        }
+        let unused = {
+            let state = first.state.read_recover();
+            let rows = state.shards.values().flat_map(|s| &s.rows);
+            first.names.read_recover().unused_bytes(rows)
+        };
+        assert!(unused > 0, "the zebra's names are left behind");
+        first.pass(Pass::Full, &|| {});
+        assert!(first.cancelled() && index_of(&dir).is_none(), "dropped");
+        assert!(
+            !HUB.lock_recover().refused.iter().any(|r| r.dir == *dir),
+            "not refused: the next query builds a fresh one"
+        );
+        assert_eq!(json(&from_index(&dir, &f, None)), walk(&dir, &f, None));
+        let second = index_of(&dir).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second), "a new index");
+        assert!(super::served(&dir), "answered by it");
+        let unused = {
+            let state = second.state.read_recover();
+            let rows = state.shards.values().flat_map(|s| &s.rows);
+            second.names.read_recover().unused_bytes(rows)
+        };
+        assert_eq!(unused, 0, "a fresh interner");
+    }
 
     #[test]
     fn a_panic_in_the_build_leaves_the_folder_walking() {

@@ -467,6 +467,41 @@ async fn read_charged(
     Ok((buf, charge))
 }
 
+/// The text fields [`read_multipart`] keeps (the image aside): `min_confidence` (Blue Iris, the
+/// Test page) and `model` (the Test page). Any other field (CodeProject.AI clients send e.g.
+/// `typ` or `api_key`) is read and dropped chunk by chunk, never buffered (RA-097).
+const KEPT_FIELDS: [&str; 2] = ["min_confidence", "model"];
+
+/// Longest kept text field, in bytes: a confidence or a model name is a few dozen bytes, so 4 KiB
+/// leaves room for any real value while a client cannot park megabytes outside the upload budget.
+pub(crate) const MAX_TEXT_FIELD: usize = 4096;
+
+/// Most parts one detection body may have: a real client sends the image and up to a handful of
+/// text fields; past this the body is refused before more names are parsed (a body of 400k tiny
+/// fields costs CPU even when nothing is kept).
+pub(crate) const MAX_FIELDS: usize = 32;
+
+/// A kept text field read whole; `Ok(None)` once it passed [`MAX_TEXT_FIELD`] (the rest unread).
+async fn read_text(
+    field: &mut axum::extract::multipart::Field<'_>,
+) -> Result<Option<Vec<u8>>, MultipartError> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = field.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > MAX_TEXT_FIELD {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Some(buf))
+}
+
+/// A field nobody reads, read to its end and dropped chunk by chunk (nothing buffered); the body
+/// limit bounds its size, the caller's deadline its time.
+async fn skip_field(field: &mut axum::extract::multipart::Field<'_>) -> Result<(), MultipartError> {
+    while field.chunk().await?.is_some() {}
+    Ok(())
+}
+
 /// The rest of a multipart body refused part way, read and thrown away (nothing buffered): what
 /// is left of `field`, then every other field, at most [`DISCARD_LIMIT`] bytes in all. The
 /// caller's time limit bounds it.
@@ -482,10 +517,13 @@ async fn discard_rest(mut field: axum::extract::multipart::Field<'_>) -> Option<
 }
 
 /// Parse the multipart body: `image` (required), `min_confidence` (parse errors become 0.0)
-/// and any other text fields, returned in the map (e.g. `model` on the test page).
+/// and `model` (the Test page), the text ones returned in the map ([`KEPT_FIELDS`]). Other
+/// fields are read and dropped ([`skip_field`]). A kept field over [`MAX_TEXT_FIELD`] bytes, or
+/// a body of more than [`MAX_FIELDS`] parts, is a bad request (RA-097).
 ///
-/// Every field's bytes are charged to `budget` as they arrive; the image keeps its charge
-/// ([`body_budget::charged_bytes`]), a text field's goes back once it is parsed. A chunk the
+/// The image's bytes are charged to `budget` as they arrive and keep their charge
+/// ([`body_budget::charged_bytes`]); kept text fields (at most 2 × [`MAX_TEXT_FIELD`]) and
+/// skipped chunks are not charged. A chunk the
 /// budget has no room for ends the read with a 503 [`BodyError`]; the rest of the body is then
 /// discarded when one of the [`OVERLOAD_DRAINS`] slots of `drains` is free (else the connection
 /// closes after the answer), within the caller's read deadline. Unlike a refusal at admission the
@@ -502,23 +540,54 @@ async fn read_multipart(
     let mut reserve = upload_reserve(declared);
     let mut fields = HashMap::new();
     let mut got_image = false;
+    let mut parts = 0usize;
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
             Err(e) => return Err(BodyError::from_multipart(&e, "Invalid multipart body")),
         };
+        parts += 1;
+        if parts > MAX_FIELDS {
+            return Err(BodyError::bad_request(format!(
+                "The upload has more than {MAX_FIELDS} multipart fields; a detection request \
+                 needs only 'image' and optionally 'min_confidence', so the client is sending \
+                 something else: send just those fields."
+            )));
+        }
         let name = field.name().map(str::to_string);
-        let what = if name.as_deref() == Some("image") {
-            "Reading the image field failed"
-        } else {
-            "Invalid multipart body"
-        };
-        let field_reserve = if name.as_deref() == Some("image") {
-            std::mem::take(&mut reserve)
-        } else {
-            0
-        };
+        match name.as_deref() {
+            Some("image") => {}
+            Some(n) if KEPT_FIELDS.contains(&n) => {
+                let text = match read_text(&mut field).await {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return Err(BodyError::bad_request(format!(
+                            "The multipart field '{n}' is longer than {MAX_TEXT_FIELD} bytes; \
+                             it holds a short value (a confidence such as 0.4 or a model name), \
+                             so the client put something else in it: send a short value."
+                        )));
+                    }
+                    Err(e) => return Err(BodyError::from_multipart(&e, "Invalid multipart body")),
+                };
+                let text = String::from_utf8(text).unwrap_or_default();
+                if n == "min_confidence" {
+                    req.min_confidence = text.trim().parse::<f32>().unwrap_or(0.0);
+                    fields.insert(n.to_string(), text.trim().to_string());
+                } else {
+                    fields.insert(n.to_string(), text);
+                }
+                continue;
+            }
+            _ => {
+                if let Err(e) = skip_field(&mut field).await {
+                    return Err(BodyError::from_multipart(&e, "Invalid multipart body"));
+                }
+                continue;
+            }
+        }
+        let what = "Reading the image field failed";
+        let field_reserve = std::mem::take(&mut reserve);
         let (buf, charge) = match read_charged(&mut field, budget, field_reserve).await {
             Ok(v) => v,
             Err(Some(e)) => return Err(BodyError::from_multipart(&e, what)),
@@ -537,26 +606,11 @@ async fn read_multipart(
                 return Err(BodyError::over_budget(budget));
             }
         };
-        match name {
-            Some(name) if name == "min_confidence" => {
-                let text = String::from_utf8(buf.to_vec()).unwrap_or_default();
-                req.min_confidence = text.trim().parse::<f32>().unwrap_or(0.0);
-                fields.insert(name, text.trim().to_string());
-            }
-            Some(name) if name == "image" => {
-                if let Some(n) = field.file_name() {
-                    req.image_name = crate::static_memory::cap_name(n).to_string();
-                }
-                req.image_data = body_budget::charged_bytes(buf, charge);
-                got_image = true;
-            }
-            Some(name) => {
-                if let Ok(text) = String::from_utf8(buf.to_vec()) {
-                    fields.insert(name, text);
-                }
-            }
-            None => {}
+        if let Some(n) = field.file_name() {
+            req.image_name = crate::static_memory::cap_name(n).to_string();
         }
+        req.image_data = body_budget::charged_bytes(buf, charge);
+        got_image = true;
     }
     if !got_image || req.image_data.is_empty() {
         return Err(BodyError::bad_request(
@@ -2140,6 +2194,91 @@ mod tests {
         drop(kept);
         assert_eq!(budget.used(), 0);
         assert_eq!(budget.rejected(), 0);
+    }
+
+    /// A multipart body of `parts` (name, data) and then the image `data`.
+    fn fields_then_image(parts: &[(&str, Vec<u8>)], image: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for (name, data) in parts {
+            b.extend_from_slice(
+                format!("--XBOUNDARYX\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                    .as_bytes(),
+            );
+            b.extend_from_slice(data);
+            b.extend_from_slice(b"\r\n");
+        }
+        b.extend_from_slice(&image_body(image));
+        b
+    }
+
+    async fn parse_fields(
+        body: Vec<u8>,
+        budget: &'static UploadBudget,
+    ) -> Result<(VisionDetectionRequest, HashMap<String, String>), BodyError> {
+        let mut upload = multipart_of(post(Body::from(body))).await;
+        upload.budget = budget;
+        parse_detection_body(upload).await
+    }
+
+    /// RA-097: what Blue Iris and CodeProject.AI clients send is accepted; only `model` and
+    /// `min_confidence` are kept, other fields (a 1 MiB one included) are dropped without being
+    /// buffered or charged.
+    #[tokio::test]
+    async fn unread_fields_are_dropped_and_client_fields_accepted() {
+        let budget = body_budget::leaked(64 << 10);
+        let body = fields_then_image(
+            &[
+                ("typ", b"person".to_vec()),
+                ("api_key", b"abc123".to_vec()),
+                ("blob", vec![b'z'; 1 << 20]),
+                ("min_confidence", b" 0.4 ".to_vec()),
+                ("model", b"ipcam-general".to_vec()),
+            ],
+            b"jpeg",
+        );
+        let (req, fields) = parse_fields(body, budget).await.unwrap();
+        assert_eq!(req.image_data.as_ref(), b"jpeg");
+        assert_eq!(req.min_confidence, 0.4);
+        let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["min_confidence", "model"]);
+        assert_eq!(fields["model"], "ipcam-general");
+        assert_eq!(budget.rejected(), 0, "the dropped field was never charged");
+        drop(req);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// RA-097: a kept text field over [`MAX_TEXT_FIELD`] and a body of more than [`MAX_FIELDS`]
+    /// parts are bad requests that say what to send; at the limits they are fine.
+    #[tokio::test]
+    async fn oversized_kept_fields_and_too_many_parts_are_refused() {
+        let budget = body_budget::leaked(1 << 20);
+        for name in ["model", "min_confidence"] {
+            let at = fields_then_image(&[(name, vec![b'1'; MAX_TEXT_FIELD])], b"jpeg");
+            assert!(
+                parse_fields(at, budget).await.is_ok(),
+                "{name} at the limit"
+            );
+            let over = fields_then_image(&[(name, vec![b'1'; MAX_TEXT_FIELD + 1])], b"jpeg");
+            let e = parse_fields(over, budget).await.unwrap_err();
+            assert_eq!(e.reason, RejectReason::BadRequest);
+            assert_eq!(e.status, StatusCode::OK);
+            assert!(e.message.contains(&format!("'{name}'")), "{}", e.message);
+            assert!(e.message.contains("send a short value"), "{}", e.message);
+        }
+        let parts =
+            |n: usize| -> Vec<(&str, Vec<u8>)> { (0..n).map(|_| ("typ", b"x".to_vec())).collect() };
+        let ok = fields_then_image(&parts(MAX_FIELDS - 1), b"jpeg");
+        assert!(parse_fields(ok, budget).await.is_ok(), "{MAX_FIELDS} parts");
+        let many = fields_then_image(&parts(MAX_FIELDS), b"jpeg");
+        let e = parse_fields(many, budget).await.unwrap_err();
+        assert_eq!(e.reason, RejectReason::BadRequest);
+        assert!(
+            e.message.contains("more than 32 multipart fields"),
+            "{}",
+            e.message
+        );
+        assert_eq!(budget.used(), 0);
     }
 
     /// M7: a read past the budget is a 503 counted apart, its bytes go back, and the rest of the

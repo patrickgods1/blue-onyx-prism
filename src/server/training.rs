@@ -357,6 +357,18 @@ pub(super) fn runs(state: &AppState) -> Vec<RunRecord> {
     }
 }
 
+/// [`runs`] with each run's epochs shared, not copied
+/// ([`crate::training::service::TrainingService::shown`]): for the page's poll, which only
+/// serializes them.
+pub(super) fn shown(state: &AppState) -> Vec<crate::training::service::Shown> {
+    match started_fresh() {
+        Some(s) => s.shown(),
+        None => {
+            crate::training::service::load_shown(&crate::training::runs_file(&state.config_read()))
+        }
+    }
+}
+
 /// The queue's [`Hooks`] on the [`Target`] run.
 struct ServerHooks {
     target: Arc<Target>,
@@ -2539,14 +2551,13 @@ pub(super) async fn json(
     axum::extract::Query(q): axum::extract::Query<TrainingQuery>,
 ) -> Response {
     blocking(move || {
-        let all = runs(&state);
         let columns = state.config_read().training.effective_metric_columns();
         let busy = started_queue().is_some_and(|s| s.busy());
         let tasks = tasks(&state);
         if q.poll.as_deref().is_some_and(|p| !p.is_empty() && p != "0") {
             let have = q.have.as_deref().map(poll::parse_have);
             let v = poll::answer(
-                all,
+                shown(&state),
                 &tasks,
                 busy,
                 serde_json::json!(columns),
@@ -2555,6 +2566,7 @@ pub(super) async fn json(
             );
             return Json(v).into_response();
         }
+        let all = runs(&state);
         let cap = crate::training::capability_with_runs(&all);
         // What a run of each recipe trained here before would get now (none without a GPU).
         let forced = state.config_read().training.workers;
@@ -3109,7 +3121,7 @@ pub(super) async fn queue(State(shared): State<Shared>, body: axum::body::Bytes)
                 .format("%Y%m%d-%H%M")
                 .to_string();
             let busy: Vec<String> = svc
-                .runs()
+                .records()
                 .into_iter()
                 .filter(|r| r.state.is_busy())
                 .map(|r| r.name)
@@ -3330,7 +3342,7 @@ pub(super) async fn remove(State(shared): State<Shared>, body: axum::body::Bytes
         if field(&f, "delete_files").is_some() {
             let config = state.config_read().clone();
             let size = service(&shared)
-                .get(&id)
+                .record(&id)
                 .map_or(0, |r| retry::disk_use(&r.run_dir));
             let done =
                 service(&shared).remove_with_files(&id, |r| retry::delete_files_of(&config, r));

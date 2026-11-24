@@ -479,6 +479,14 @@ pub struct ServedSettings {
     pub rules: String,
 }
 
+/// What [`ModelResult::summary_in_place`] moves aside: per-image runs, eval predictions and the
+/// threshold sweep.
+type RunDetails = (
+    Vec<super::ImageRun>,
+    Vec<Vec<super::PredBox>>,
+    Option<super::threshold::ThresholdSweep>,
+);
+
 impl ModelResult {
     /// An empty result for `job` (devices are added by the sweep).
     pub fn new(job: &Job, bench: &Bench, configured: Option<String>) -> Self {
@@ -545,39 +553,50 @@ impl ModelResult {
 
     /// Recompute the reference, each device's agreement and the recommendation.
     pub fn finish(&mut self) {
-        let reference = REFERENCE_DEVICES.iter().find_map(|r| {
+        // The reference run is taken out of its slot and put back, never cloned (BM-11).
+        let found = REFERENCE_DEVICES.iter().find_map(|r| {
             let spec = r.to_string();
             self.devices
                 .iter()
-                .find(|d| d.device == spec && d.ok())
-                .and_then(|d| d.run.clone())
-                .map(|run| (spec, run))
+                .position(|d| d.device == spec && d.ok())
+                .map(|i| (i, spec))
         });
-        self.reference = reference.as_ref().map(|(s, _)| s.clone());
+        let mut reference = found.and_then(|(i, spec)| {
+            let run = self.devices.get_mut(i)?.run.take()?;
+            Some((i, spec, run))
+        });
+        self.reference = reference.as_ref().map(|(_, s, _)| s.clone());
+        if let Some((_, spec, run)) = reference.as_mut() {
+            run.agreement = Some(Agreement {
+                reference: spec.clone(),
+                // Every image's detections (the first image's for results of old versions).
+                matched: if run.per_image.is_empty() {
+                    run.detections.len()
+                } else {
+                    run.per_image.iter().map(|i| i.preds.len()).sum()
+                },
+                only_device: 0,
+                only_reference: 0,
+                max_confidence_diff: 0.0,
+                mean_confidence_diff: 0.0,
+                score: 1.0,
+                verdict: Verdict::Reference,
+                images: run.per_image.len().max(1),
+            });
+        }
         for d in &mut self.devices {
             let ok = d.ok();
             let Some(run) = d.run.as_mut() else { continue };
             run.agreement = match &reference {
-                Some((spec, _)) if ok && *spec == d.device => Some(Agreement {
-                    reference: spec.clone(),
-                    // Every image's detections (the first image's for results of old versions).
-                    matched: if run.per_image.is_empty() {
-                        run.detections.len()
-                    } else {
-                        run.per_image.iter().map(|i| i.preds.len()).sum()
-                    },
-                    only_device: 0,
-                    only_reference: 0,
-                    max_confidence_diff: 0.0,
-                    mean_confidence_diff: 0.0,
-                    score: 1.0,
-                    verdict: Verdict::Reference,
-                    images: run.per_image.len().max(1),
-                }),
-                Some((spec, reference)) if ok => Some(run_agreement(run, reference, spec)),
+                Some((_, spec, reference)) if ok => Some(run_agreement(run, reference, spec)),
                 None if ok => Some(Agreement::not_checked()),
                 _ => None,
             };
+        }
+        if let Some((i, _, run)) = reference
+            && let Some(d) = self.devices.get_mut(i)
+        {
+            d.run = Some(run);
         }
         let rec = recommend(&self.devices, self.configured.as_deref(), NOISE_MARGIN);
         self.recommended = rec.device;
@@ -638,6 +657,35 @@ impl ModelResult {
             }
         }
         m
+    }
+
+    /// [`Self::summary`] without cloning the details (BM-11): they are moved aside, the
+    /// rest is cloned, and they are moved back, so `self` is unchanged afterwards.
+    pub fn summary_in_place(&mut self) -> Self {
+        let details: Vec<Option<RunDetails>> = self
+            .devices
+            .iter_mut()
+            .map(|d| {
+                d.run.as_mut().map(|r| {
+                    (
+                        std::mem::take(&mut r.per_image),
+                        std::mem::take(&mut r.eval_preds),
+                        r.accuracy.as_mut().and_then(|a| a.sweep.take()),
+                    )
+                })
+            })
+            .collect();
+        let summary = self.clone();
+        for (d, det) in self.devices.iter_mut().zip(details) {
+            if let (Some(r), Some((per_image, eval_preds, sweep))) = (d.run.as_mut(), det) {
+                r.per_image = per_image;
+                r.eval_preds = eval_preds;
+                if let Some(a) = r.accuracy.as_mut() {
+                    a.sweep = sweep;
+                }
+            }
+        }
+        summary
     }
 
     /// The device row with the lowest total p50 among successful runs.
@@ -2413,5 +2461,61 @@ mod tests {
         // A round trip keeps everything.
         let back: ModelResult = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back, m);
+    }
+
+    /// BM-11 / RA-088: `finish` takes the reference run out of its slot and puts it back; the
+    /// agreements equal a direct `run_agreement` on copies, every run keeps its details, and
+    /// `summary_in_place` equals `summary` and leaves the result unchanged.
+    #[test]
+    fn finish_and_summary_in_place_keep_every_run_whole() {
+        let mut m = model(
+            vec![
+                dev("ort:coreml", 5.0, scene()),
+                dev("openvino:cpu", 10.0, scene()),
+                dev("ort:cpu", 12.0, vec![]),
+            ],
+            None,
+        );
+        for d in &mut m.devices {
+            let r = d.run.as_mut().unwrap();
+            r.per_image = vec![image_run("a", scene()), image_run("b", scene())];
+            r.eval_preds = vec![Vec::new(), Vec::new()];
+        }
+        let before = m.devices[1].run.as_ref().unwrap().per_image.as_ptr();
+        m.devices[0].run.as_mut().unwrap().per_image[1]
+            .preds
+            .clear();
+        let copies: Vec<RunResult> = m.devices.iter().map(|d| d.run.clone().unwrap()).collect();
+        m.finish();
+        assert_eq!(m.reference.as_deref(), Some("openvino:cpu"));
+        let verdicts: Vec<_> = m
+            .devices
+            .iter()
+            .map(|d| d.run.as_ref().unwrap().agreement.as_ref().unwrap().verdict)
+            .collect();
+        assert_eq!(verdicts[1], Verdict::Reference);
+        for i in [0, 2] {
+            let want = run_agreement(&copies[i], &copies[1], "openvino:cpu");
+            assert_eq!(m.devices[i].run.as_ref().unwrap().agreement, Some(want));
+        }
+        for (d, c) in m.devices.iter().zip(&copies) {
+            let r = d.run.as_ref().unwrap();
+            assert_eq!(r.per_image, c.per_image, "{}", d.device);
+            assert_eq!(r.eval_preds, c.eval_preds, "{}", d.device);
+        }
+        assert_eq!(
+            m.devices[1].run.as_ref().unwrap().per_image.as_ptr(),
+            before,
+            "the reference run was put back, not replaced"
+        );
+
+        let whole = m.clone();
+        let expect = m.summary();
+        assert_eq!(m.summary_in_place(), expect);
+        assert_eq!(m, whole, "summary_in_place restores every detail");
+        assert!(expect.devices.iter().all(|d| {
+            let r = d.run.as_ref().unwrap();
+            r.per_image.is_empty() && r.eval_preds.is_empty()
+        }));
     }
 }

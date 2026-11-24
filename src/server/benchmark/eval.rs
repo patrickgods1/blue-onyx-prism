@@ -22,63 +22,29 @@ use super::{ApiError, file_stamp, json_error};
 use crate::benchmark::combos::{Inputs, Parts};
 use crate::benchmark::current::ModelNow;
 use crate::benchmark::eval::{Goal, compare, tune};
-use crate::benchmark::search::{CACHE_IDLE, StoredPreds, preds_path};
+use crate::benchmark::search::{CACHE_IDLE, IdleCache, StoredPreds, preds_path};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::Config;
 use crate::server::{AppState, save_config};
-use crate::sync::LockExt;
 use axum::Json;
 use axum::extract::rejection::{FormRejection, QueryRejection};
 use axum::extract::{Form, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-/// Answers kept at most (the oldest go first).
+/// Answers kept at most (the least recently read goes first).
 pub(super) const CACHE_ENTRIES: usize = 16;
 /// Example frames per answer by default, and at most.
 const IMAGES_DEFAULT: usize = 24;
 const IMAGES_MAX: usize = 200;
 
-/// A bounded, idle-dropping cache of computed answers (see the module docs).
-struct ViewCache {
-    entries: Mutex<VecDeque<(String, Instant, Arc<serde_json::Value>)>>,
-}
-
-impl ViewCache {
-    const fn new() -> Self {
-        Self {
-            entries: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    fn get(&self, key: &str) -> Option<Arc<serde_json::Value>> {
-        let mut e = self.entries.lock_recover();
-        let now = Instant::now();
-        e.retain(|(_, used, _)| now.saturating_duration_since(*used) < CACHE_IDLE);
-        let (_, used, v) = e.iter_mut().find(|(k, _, _)| k == key)?;
-        *used = now;
-        Some(v.clone())
-    }
-
-    fn put(&self, key: String, v: Arc<serde_json::Value>) {
-        let mut e = self.entries.lock_recover();
-        e.retain(|(k, _, _)| *k != key);
-        e.push_back((key, Instant::now(), v));
-        while e.len() > CACHE_ENTRIES {
-            e.pop_front();
-        }
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.entries.lock_recover().len()
-    }
-}
-
-static VIEWS: ViewCache = ViewCache::new();
+/// The computed answers (see the module docs): at most [`CACHE_ENTRIES`], each dropped by the
+/// cache's own thread after [`CACHE_IDLE`] unread, so a closed page leaves nothing behind
+/// (RA-098).
+type ViewCache = IdleCache<String, Arc<serde_json::Value>>;
+static VIEWS: ViewCache = IdleCache::with_capacity(CACHE_IDLE, CACHE_ENTRIES);
 
 /// The saved results seen through the config now, the stored predictions and what the combos
 /// reads of the config.
@@ -195,11 +161,20 @@ fn cached(
     key: String,
     make: impl FnOnce() -> Result<serde_json::Value, ApiError>,
 ) -> Result<Arc<serde_json::Value>, ApiError> {
-    if let Some(v) = VIEWS.get(&key) {
+    cached_in(&VIEWS, key, make)
+}
+
+/// [`cached`] in `cache` (tests).
+fn cached_in(
+    cache: &'static ViewCache,
+    key: String,
+    make: impl FnOnce() -> Result<serde_json::Value, ApiError>,
+) -> Result<Arc<serde_json::Value>, ApiError> {
+    if let Some(v) = cache.get(&key) {
         return Ok(v);
     }
     let v = Arc::new(make()?);
-    VIEWS.put(key, v.clone());
+    cache.put(key, v.clone());
     Ok(v)
 }
 
@@ -628,20 +603,43 @@ mod tests {
         assert_eq!(st.config_read().benchmark.goal.classes, ["person"]);
     }
 
+    /// The answers are bounded, keyed, and dropped once unread for the idle time (RA-098).
     #[test]
-    fn the_cache_is_bounded_and_keyed() {
-        let c = ViewCache::new();
+    fn the_cache_is_bounded_keyed_and_idle_dropped() {
+        let c: &'static ViewCache = Box::leak(Box::new(IdleCache::with_capacity(
+            CACHE_IDLE,
+            CACHE_ENTRIES,
+        )));
         for i in 0..(CACHE_ENTRIES + 5) {
             c.put(format!("k{i}"), Arc::new(serde_json::json!(i)));
         }
         assert_eq!(c.len(), CACHE_ENTRIES);
-        assert!(c.get("k0").is_none(), "the oldest went first");
+        assert!(c.get(&"k0".to_string()).is_none(), "the oldest went first");
         assert_eq!(
             c.get(&format!("k{}", CACHE_ENTRIES + 4)).as_deref(),
             Some(&serde_json::json!(CACHE_ENTRIES + 4))
         );
         c.put("k20".into(), Arc::new(serde_json::json!("new")));
-        assert_eq!(c.get("k20").as_deref(), Some(&serde_json::json!("new")));
+        assert_eq!(
+            c.get(&"k20".to_string()).as_deref(),
+            Some(&serde_json::json!("new"))
+        );
         assert_eq!(c.len(), CACHE_ENTRIES);
+        // Computed once while it is read, then gone once nobody asked for the idle time.
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Ok(serde_json::json!("answer"))
+        };
+        let a = cached_in(c, "view".into(), make).unwrap();
+        let b = cached_in(c, "view".into(), make).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(made.get(), 1);
+        let later = std::time::Instant::now() + CACHE_IDLE;
+        assert!(!c.sweep_at(later), "every entry idle: the sweeper ends");
+        assert!(c.is_empty());
+        assert_eq!(Arc::strong_count(&a), 2, "only the two handles here");
+        cached_in(c, "view".into(), make).unwrap();
+        assert_eq!(made.get(), 2, "computed again");
     }
 }

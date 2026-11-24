@@ -589,6 +589,13 @@ pub(super) fn print_ranking(rows: &[crate::benchmark::report::RankRow]) {
     }
 }
 
+/// A copy of a run for the report: the raw predictions at the lowest threshold (`eval_preds`, not
+/// serialized) are only for scoring and would be held twice otherwise.
+fn without_eval_preds(mut r: RunResult) -> RunResult {
+    r.eval_preds = Vec::new();
+    r
+}
+
 /// The `--all-devices` JSON/table view of a sweep.
 pub(super) fn model_report(m: &ModelResult) -> Result<ModelReport> {
     let runs: Vec<RunResult> = m
@@ -596,6 +603,7 @@ pub(super) fn model_report(m: &ModelResult) -> Result<ModelReport> {
         .iter()
         .filter(|d| d.ok())
         .filter_map(|d| d.run.clone())
+        .map(without_eval_preds)
         .collect();
     let mut skipped = m.skipped.clone();
     skipped.extend(
@@ -615,7 +623,8 @@ pub(super) fn model_report(m: &ModelResult) -> Result<ModelReport> {
         .as_ref()
         .and_then(|rec| m.devices.iter().find(|d| &d.device == rec))
         .or_else(|| m.fastest())
-        .and_then(|d| d.run.clone());
+        .and_then(|d| d.run.clone())
+        .map(without_eval_preds);
     let Some(primary) = primary else {
         bail!(
             "no device option could run this model ({})",

@@ -11,7 +11,7 @@
 
 use super::train_area::{AUTOLABEL, IMPORT};
 use super::training::{all, field, num, service, view};
-use super::{AppState, Shared, blocking, render};
+use super::{Shared, blocking, render};
 use crate::config::Config;
 use crate::resources::catalog;
 use crate::training::autolabel::models::{self as al_models, ConfigWriter};
@@ -427,7 +427,7 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
                         req,
                         &cap,
                     )?;
-                    attach_seams(&state, &shared, &config, &mut al);
+                    attach_seams(&shared, &config, &mut al);
                     crate::training::autolabel::follow_import(&mut al, &job);
                     al.finish = finish.take();
                     Ok(al)
@@ -580,7 +580,7 @@ pub(super) async fn autolabel(
             let cap = crate::training::capability_now();
             let mut job =
                 crate::training::autolabel::plan_autolabel(&config, &state.config_path, req, &cap)?;
-            attach_seams(&state, &shared, &config, &mut job);
+            attach_seams(&shared, &config, &mut job);
             let title = crate::training::task::Task::title(&job);
             let missing = job.request.missing_only;
             let id = service(&shared)
@@ -655,14 +655,16 @@ pub(super) async fn autolabel_preview(
     .await
 }
 
-/// The server's seams of a run with a model: the generation's runtimes (no second OpenVINO /
-/// ONNX Runtime instance) and the config writer of the model entry it adds.
-fn attach_seams(state: &AppState, shared: &Shared, config: &Config, job: &mut AutolabelJob) {
+/// The server's seams of a run with a model: the runtimes of the generation current at each
+/// detection (no second OpenVINO / ONNX Runtime instance, and a queued job pins no retired
+/// generation's runtimes, audit RA-100) and the config writer of the model entry it adds.
+fn attach_seams(shared: &Shared, config: &Config, job: &mut AutolabelJob) {
     if job.request.with_model.is_some() {
+        let s = shared.clone();
         job.detector = Some(Arc::new(
-            crate::training::autolabel::relabel::LocalDetector {
+            crate::training::autolabel::relabel::CurrentDetector {
                 config: config.clone(),
-                runtimes: state.registry.runtimes().cloned(),
+                resolve: Arc::new(move || s.current().registry.runtimes().cloned()),
                 no_cache: false,
             },
         ));
@@ -1696,12 +1698,12 @@ mod tests {
         let (_, page) = get_text(&state, "/train/import").await;
         assert!(page.contains("import-autolabel"), "the import card's box");
         assert!(page.contains("import-after"), "its follow-up options");
-        let tasks = |state: Arc<AppState>| async move {
+        let tasks = |state: Arc<crate::server::AppState>| async move {
             let (_, json) = get_text(&state, "/v1/training").await;
             let v: serde_json::Value = serde_json::from_str(&json).unwrap();
             v["tasks"].as_array().unwrap().clone()
         };
-        let post = |state: Arc<AppState>, body: String| async move {
+        let post = |state: Arc<crate::server::AppState>, body: String| async move {
             let (_, _, b) = call(&state, post_form("/training/import", &body, true)).await;
             String::from_utf8(b).unwrap()
         };

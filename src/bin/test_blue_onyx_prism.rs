@@ -681,6 +681,8 @@ async fn run(args: Args) -> Result<bool> {
 
 fn main() -> Result<()> {
     blue_onyx_prism::panic::install();
+    // Before any thread starts (Linux glibc: arena cap, fixed mmap threshold).
+    blue_onyx_prism::backend::memory::tune_allocator();
     let args = Args::parse();
     // Two threads: the open loop's timers and answers must not wait behind each other.
     let rt = tokio::runtime::Builder::new_multi_thread()

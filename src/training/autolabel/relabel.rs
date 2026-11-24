@@ -2,7 +2,9 @@
 //! self-training loop): the frames go through the benchmark's per-image pipeline
 //! ([`crate::benchmark::Bench`]: decode, preprocess, infer, postprocess, the code the workers
 //! run), at a given confidence, on the device the model is configured for or the run's device.
-//! [`Detector`] is the seam the job uses (tests fake it).
+//! [`Detector`] is the seam the job uses (tests fake it). A job the service queues holds a
+//! [`CurrentDetector`], which asks for the current registry generation's runtimes only when it
+//! detects ([`RuntimesResolver`]).
 
 use super::triage::Det;
 use crate::backend::{CoreOptions, Runtimes};
@@ -58,8 +60,16 @@ pub trait Detector: Send + Sync {
     ) -> Result<Detections>;
 }
 
+/// Where a queued job finds the runtimes when it runs (the service: the current registry
+/// generation's, read through its `Shared`), so a job queued before a generation restart neither
+/// keeps the retired generation's OpenVINO Core and ONNX Runtime alive while it waits nor
+/// compiles on them (audit 2026-11, RA-100). Called once per detection or prediction; the answer
+/// is dropped when that returns. None: no runtimes to share (the detector makes its own).
+pub type RuntimesResolver = Arc<dyn Fn() -> Option<Arc<Mutex<Runtimes>>> + Send + Sync>;
+
 /// The real [`Detector`]: the registry's runtimes when given (the service), else its own from
-/// the config (the CLI).
+/// the config (the CLI). A queued job uses [`CurrentDetector`] instead, which asks for the
+/// runtimes only when it runs.
 pub struct LocalDetector {
     pub config: Config,
     pub runtimes: Option<Arc<Mutex<Runtimes>>>,
@@ -81,18 +91,57 @@ impl LocalDetector {
         if let Some(rt) = &self.runtimes {
             return Ok(rt.clone());
         }
-        let c = &self.config;
-        crate::backend::libs::prepare_environment(c.openvino_dir_effective().as_deref());
-        let rt = Runtimes::new_with(
-            &CoreOptions {
-                cache_dir: c.cache_dir_path(),
-                intra_threads: c.intra_threads,
-                openvino_dir: c.openvino_dir_effective(),
-            },
-            &c.ort_options(),
-        );
-        rt.require_any()?;
-        Ok(Arc::new(Mutex::new(rt)))
+        own_runtimes(&self.config)
+    }
+}
+
+/// Runtimes of this process's own, from `c` (the CLI, or nothing to share).
+pub(crate) fn own_runtimes(c: &Config) -> Result<Arc<Mutex<Runtimes>>> {
+    crate::backend::libs::prepare_environment(c.openvino_dir_effective().as_deref());
+    let rt = Runtimes::new_with(
+        &CoreOptions {
+            cache_dir: c.cache_dir_path(),
+            intra_threads: c.intra_threads,
+            openvino_dir: c.openvino_dir_effective(),
+        },
+        &c.ort_options(),
+    );
+    rt.require_any()?;
+    Ok(Arc::new(Mutex::new(rt)))
+}
+
+/// A [`LocalDetector`] whose runtimes are resolved when it detects ([`RuntimesResolver`]), not
+/// when its job is queued: what a queued job of the service holds.
+pub struct CurrentDetector {
+    pub config: Config,
+    pub resolve: RuntimesResolver,
+    /// [`LocalDetector::no_cache`].
+    pub no_cache: bool,
+}
+
+impl std::fmt::Debug for CurrentDetector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CurrentDetector").finish_non_exhaustive()
+    }
+}
+
+impl Detector for CurrentDetector {
+    fn detect(
+        &self,
+        config: &Config,
+        m: &ModelConfig,
+        device: Option<&str>,
+        images: &[Image],
+        threshold: f32,
+        cancel: &AtomicBool,
+    ) -> Result<Detections> {
+        // Held for this detection only (the detector below is dropped with it).
+        let local = LocalDetector {
+            config: self.config.clone(),
+            runtimes: (self.resolve)(),
+            no_cache: self.no_cache,
+        };
+        local.detect(config, m, device, images, threshold, cancel)
     }
 }
 
@@ -214,4 +263,59 @@ fn dets_of(preds: &[ImagePred], threshold: f32) -> Vec<Det> {
             bbox: p.bbox,
         })
         .collect()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A queued job's detector asks for the runtimes when it detects, once per detection, and
+    /// keeps none of them afterwards (audit 2026-11, RA-100).
+    #[test]
+    fn the_current_detector_resolves_its_runtimes_per_detection() {
+        let rt = Arc::new(Mutex::new(Runtimes::fake(
+            crate::backend::fake::FakeScript::new(1, (64, 64)),
+        )));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (r, n) = (rt.clone(), asked.clone());
+        let d = CurrentDetector {
+            config: Config::default(),
+            resolve: Arc::new(move || {
+                n.fetch_add(1, Ordering::Relaxed);
+                Some(r.clone())
+            }),
+            no_cache: false,
+        };
+        assert_eq!(asked.load(Ordering::Relaxed), 0);
+        let m = ModelConfig {
+            path: PathBuf::from("/nonexistent/bop-model.onnx"),
+            ..ModelConfig::default()
+        };
+        let image = Image {
+            frame: "day/cam/2026-11-23/1.jpg".into(),
+            path: PathBuf::from("/nonexistent/1.jpg"),
+            width: 8,
+            height: 8,
+        };
+        let cancel = AtomicBool::new(false);
+        let config = Config::default();
+        for i in 1..=2 {
+            let e = d
+                .detect(
+                    &config,
+                    &m,
+                    None,
+                    std::slice::from_ref(&image),
+                    0.5,
+                    &cancel,
+                )
+                .unwrap_err();
+            assert!(format!("{e:#}").contains("model file not found"), "{e:#}");
+            assert_eq!(asked.load(Ordering::Relaxed), i);
+            // The resolver's clone and the test's: the detection kept none.
+            assert_eq!(Arc::strong_count(&rt), 2);
+        }
+    }
 }

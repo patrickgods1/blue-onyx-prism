@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import gc
 import json
 import math
 import os
@@ -1200,6 +1201,7 @@ def self_test(parity: Path = None) -> int:
         check(out.shape == ramp.shape and int(out.max()) - int(out.min()) > 15, "clahe stretches a low contrast")
         check(np.array_equal(enhance_array(ramp, None), ramp), "no mode is a copy")
         n += main_wiring_test(check)
+        tower_test(check, np)
     if parity:
         doc = json.loads(Path(parity).read_text(encoding="utf-8"))
         check(len(doc["crops"]) >= 4, "parity crops")
@@ -1211,6 +1213,163 @@ def self_test(parity: Path = None) -> int:
     event("self_test", passed=n)
     log(f"self-test: {n} checks passed")
     return 0
+
+
+def tower_test(check, np) -> None:
+    """SigLIP and SAM 3 drop their text towers once the prompts are encoded, and still score and
+    detect as before: the real `prepare`, `rank`, `encode` and `detect` over a fake torch (numpy) and
+    fake models (no transformers, no weights)."""
+    ok = check
+    class Tensor(np.ndarray):
+        def to(self, *a, **k):
+            return self
+
+        def exp(self):
+            return np.exp(self).view(Tensor)
+
+        def float(self):
+            return self
+
+    def tensor(x):
+        return np.asarray(x, dtype=np.float64).view(Tensor)
+
+    class NoGrad:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    freed = []
+
+    def normalize(x, dim=-1):
+        return (x / np.linalg.norm(x, axis=dim, keepdims=True)).view(Tensor)
+
+    def softmax(x, dim=-1):
+        e = np.exp(x - x.max(axis=dim, keepdims=True))
+        return (e / e.sum(axis=dim, keepdims=True)).view(Tensor)
+
+    torch = types.SimpleNamespace(
+        no_grad=NoGrad, stack=lambda xs: np.stack(xs).view(Tensor), softmax=softmax, float32="f32",
+        isfinite=lambda v: np.isfinite(v), nn=types.SimpleNamespace(functional=types.SimpleNamespace(normalize=normalize)),
+        cuda=types.SimpleNamespace(empty_cache=lambda: freed.append("cuda")),
+        mps=types.SimpleNamespace(empty_cache=lambda: freed.append("mps")))
+
+    class Inputs(dict):
+        def to(self, *a, **k):
+            return self
+
+    def text_vec(t: str):
+        v = [float((zlib.crc32(t.encode()) >> s) % 7) + 1.0 for s in (0, 3, 6, 9)]
+        return tensor(v)
+
+    class Text:
+        """A text tower: counts its calls."""
+        calls = 0
+
+        def parameters(self):
+            yield types.SimpleNamespace(device="cuda:0")
+
+        def __call__(self, prompts):
+            Text.calls += 1
+            return tensor([text_vec(p) for p in prompts])
+
+    class SigModel:
+        def __init__(self):
+            self.text_model = Text()
+            self.logit_scale = tensor([2.0])
+            self.logit_bias = tensor([-1.0])
+
+        def get_text_features(self, prompts):
+            return self.text_model(prompts)
+
+        def get_image_features(self, pixels):
+            return tensor([pixels])
+
+    class SigProcessor:
+        def __call__(self, text=None, images=None, **k):
+            return Inputs(prompts=text) if text is not None else Inputs(pixels=images)
+
+    def siglip():
+        s = Siglip.__new__(Siglip)
+        s.torch, s.processor, s.model, s.device = torch, SigProcessor(), SigModel(), "cuda:0"
+        s.cache, s.lock = {}, threading.Lock()
+        return s
+
+    classes, syn = ("cat", "fox", "raccoon"), {"fox": ["fox", "red fox"]}
+    crops = ([0.5, 1.0, 2.0, 1.5], [3.0, 0.1, 0.2, 0.4])
+    kept = siglip()
+    for night in (False, True):
+        kept.text_features(classes, night, syn)
+    want = [kept.rank(c, classes, night, syn) for c in crops for night in (False, True)]
+    dropped = siglip()
+    scale = dropped.model.logit_scale
+    dropped.prepare(classes, syn)
+    ok(dropped.model.text_model is None, "siglip: the text tower is gone after prepare")
+    ok(dropped.model.logit_scale is scale and dropped.model.logit_bias is not None, "siglip: logit scale and bias stay")
+    ok(freed == ["cuda"], f"siglip: cuda cache returned once, got {freed}")
+    calls = Text.calls
+    got = [dropped.rank(c, classes, night, syn) for c in crops for night in (False, True)]
+    ok(got == want and abs(sum(got[0].values()) - 1) < 1e-3, f"siglip: the same ranks without the tower ({got} vs {want})")
+    ok(Text.calls == calls, "siglip: rank encodes no prompt")
+    try:
+        dropped.rank(crops[0], ("dog",), False, syn)
+        ok(False, "siglip: an unprepared class tuple fails")
+    except RuntimeError as e:
+        ok("prepare every class tuple" in str(e), f"siglip: an unprepared class tuple says why ({e})")
+
+    # SAM 3: `forward` reads the text encoder only without `text_embeds`, as transformers' does.
+    class Pooled:
+        def __init__(self, pooler_output):
+            self.pooler_output = pooler_output
+
+    class Encoder:
+        def __call__(self, input_ids=None, attention_mask=None):
+            return Pooled(tensor([[float(len(input_ids))]]))
+
+    class SamModel:
+        def __init__(self):
+            self.text_encoder = Encoder()
+
+        def get_text_features(self, input_ids=None, attention_mask=None):
+            return self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
+
+        def get_vision_features(self, pixel_values=None):
+            return pixel_values
+
+        def __call__(self, vision_embeds=None, text_embeds=None, attention_mask=None, input_ids=None):
+            if text_embeds is None:
+                text_embeds = self.get_text_features(input_ids=input_ids, attention_mask=attention_mask)
+            score = float(text_embeds.pooler_output[0][0]) / 10.0
+            return types.SimpleNamespace(pred_logits=tensor([score]), pred_boxes=tensor([[1.0, 2.0, 11.0, 12.0]]),
+                                         presence_logits=None)
+
+    class SamProcessor:
+        def __call__(self, text=None, images=None, **k):
+            if text is not None:
+                return Inputs(input_ids=text.split(), attention_mask=[1] * len(text.split()))
+            return {"pixel_values": tensor([0.0])}
+
+        def post_process_object_detection(self, out, threshold=0.5, target_sizes=None):
+            keep = [float(out.pred_logits[0])] if float(out.pred_logits[0]) >= threshold else []
+            return [{"boxes": tensor([out.pred_boxes[0]] if keep else np.zeros((0, 4))), "scores": tensor(keep)}]
+
+    sam = Sam3.__new__(Sam3)
+    sam.torch, sam.device, sam.threshold, sam.nms_iou = torch, "mps", 0.15, 0.5
+    sam.processor, sam.model = SamProcessor(), SamModel()
+    freed.clear()
+    phrases = {"a cat": "cat", "a small red fox": "fox"}
+    sam.encode(list(phrases), Pooled, no_text_encoder(object))
+    ok(type(sam.model.text_encoder).__name__ == "NoTextEncoder" and freed == ["mps"],
+       f"sam3: the text encoder is a stub after encode ({type(sam.model.text_encoder).__name__}, {freed})")
+    found = sam.detect(types.SimpleNamespace(size=(64, 48)), phrases)
+    ok([(f["label"], round(f["score"], 3)) for f in found] == [("fox", 0.4), ("cat", 0.2)],
+       f"sam3: detect runs on the cached embeddings ({found})")
+    try:
+        sam.model(vision_embeds=None, input_ids=["x"])
+        ok(False, "sam3: the stub refuses to encode")
+    except RuntimeError as e:
+        ok("text encoder was dropped" in str(e), f"sam3: the stub says why ({e})")
 
 
 def main_wiring_test(check) -> int:
@@ -1480,8 +1639,10 @@ class Sam3:
       return the detector head's `pred_boxes`, not boxes derived from masks. So the mask decoder
       comes out (`no_mask_decoder`): boxes and scores are computed before it.
     - Both post-processors already multiply the class score by the presence score.
-    - The phrases are encoded once, then the text tower moves to the CPU, so load this model first:
-      the room it leaves on the GPU is there for the other labelers.
+    - The phrases are encoded once, then the text encoder is dropped (`encode`, `no_text_encoder`):
+      `detect` passes `text_embeds`, and `Sam3Model.forward` (transformers 5.22.1) calls the text
+      encoder only without them. Load this model first: the room it leaves on the GPU is there for
+      the other labelers, and its weights leave host memory too.
     - `attention_mask` stays with `text_embeds`: the processor pads to 32 tokens, and without the
       mask `forward` would read the padding as prompt.
     - `text_embeds` takes the object `get_text_features` returns, not `.pooler_output` as the
@@ -1506,17 +1667,20 @@ class Sam3:
         model = Sam3Model.from_pretrained(str(path), dtype=torch.float32)
         model.mask_decoder = no_mask_decoder()
         self.model = model.to(device).eval()
+        self.encode(phrases, BaseModelOutputWithPooling, no_text_encoder())
+
+    def encode(self, phrases: list, pooled, stub) -> None:
+        """Encode every phrase once (`embeds`, `masks`), then put `stub` in the text encoder's seat and
+        return its memory: `detect` never runs it again."""
+        torch = self.torch
         self.masks, self.embeds = {}, {}
         with torch.no_grad():
             for p in phrases:
-                t = self.processor(text=p, return_tensors="pt").to(device)
+                t = self.processor(text=p, return_tensors="pt").to(self.device)
                 self.masks[p] = t["attention_mask"]
-                self.embeds[p] = BaseModelOutputWithPooling(pooler_output=self.model.get_text_features(
+                self.embeds[p] = pooled(pooler_output=self.model.get_text_features(
                     input_ids=t["input_ids"], attention_mask=t["attention_mask"]).pooler_output)
-        if device.startswith(("cuda", "mps")):
-            self.model.text_encoder.to("cpu")
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
+        drop_tower(self.model, "text_encoder", stub, torch, self.device)
 
     def check(self, outputs, phrase: str) -> None:
         """A NaN compares false with every threshold, so without this a broken run would label frames
@@ -1560,6 +1724,39 @@ def no_mask_decoder():
             return types.SimpleNamespace(pred_masks=None, semantic_seg=None, attentions=None)
 
     return NoMaskDecoder()
+
+
+def no_text_encoder(base=None):
+    """Stands in for SAM 3's text encoder once the phrases are encoded (`Sam3.encode`): a module
+    (`base`, by default `torch.nn.Module`, which a submodule's seat requires) that fails, naming the
+    cause, if anything still calls it."""
+    if base is None:
+        import torch
+
+        base = torch.nn.Module
+
+    class NoTextEncoder(base):
+        def forward(self, *a, **k):
+            raise RuntimeError("SAM 3's text encoder was dropped after the phrases were encoded; "
+                               "pass text_embeds (a phrase that was not encoded?)")
+
+        __call__ = forward
+
+    return NoTextEncoder()
+
+
+def drop_tower(model, name: str, stub, torch, device: str) -> None:
+    """Replace the submodule `name` of `model` with `stub` (None, or a module that must not run),
+    collect it, and return the device's cached blocks: a text tower whose prompts are cached
+    (SigLIP's 1077 of 1431 MB in f32, SAM 3's text encoder) would otherwise stay in host or device
+    memory for the whole run (audit 2026-11, RA-081). The model's other weights (SigLIP's
+    `logit_scale` and `logit_bias` live on the root) stay."""
+    setattr(model, name, stub)
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+    elif device == "mps":
+        torch.mps.empty_cache()
 
 
 def native_grid_sample_on_mps() -> bool:
@@ -2051,21 +2248,23 @@ class Siglip:
         self.lock = threading.Lock()
 
     def prepare(self, classes: tuple, synonyms: dict) -> None:
-        """Encode the day and night prompts, then move the text tower (1077 MB of the 1431 MB in
-        f32) to the CPU: `rank` only needs the cached features. On an 8 GB card the tower pushed the
-        run into shared system memory, which slowed every model. Beside other models on the GPU the
-        whole model runs on the CPU (`siglip_device`)."""
+        """Encode the day and night prompts, then drop the text tower (1077 MB of the 1431 MB in
+        f32; `drop_tower`): `rank` only needs the cached features (every call passes the classes
+        prepared here) and `get_image_features` only the vision tower. On an 8 GB card the tower
+        pushed the run into shared system memory, which slowed every model; moved to the CPU it
+        still held over 1 GB of host memory for hours. Beside other models on the GPU the whole
+        model runs on the CPU (`siglip_device`)."""
         for night in (False, True):
             self.text_features(classes, night, synonyms)
-        if self.device.startswith(("cuda", "mps")):
-            self.model.text_model.to("cpu")
-            if self.device.startswith("cuda"):
-                self.torch.cuda.empty_cache()
+        drop_tower(self.model, "text_model", None, self.torch, self.device)
 
     def text_features(self, classes: tuple, night: bool, synonyms: dict):
         key = (classes, night)
         if key in self.cache:
             return self.cache[key]
+        if getattr(self.model, "text_model", None) is None:
+            raise RuntimeError(f"SigLIP: no prompt features for {key} were prepared, and its text tower was "
+                               "dropped after `prepare`; prepare every class tuple `rank` is asked for")
         torch = self.torch
         dev = next(self.model.text_model.parameters()).device
         feats = []

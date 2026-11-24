@@ -34,6 +34,8 @@ use tracing::{error, info, warn};
 
 fn main() -> ExitCode {
     blue_onyx_prism::panic::install();
+    // Before any thread starts (Linux glibc: arena cap, fixed mmap threshold).
+    blue_onyx_prism::backend::memory::tune_allocator();
     // A debug build's clap parsing alone needs more than Windows' 1 MiB main-thread stack.
     blue_onyx_prism::main_thread::run(cli_main)
 }

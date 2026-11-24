@@ -223,11 +223,13 @@ impl OvCore {
             .available
             .iter()
             .map(|name| {
-                let dt = openvino::DeviceType::from(name.as_str());
                 let device_type = name.starts_with("GPU").then(|| {
-                    self.core
-                        .get_property(&dt, &openvino::PropertyKey::Other("DEVICE_TYPE".into()))
-                        .ok()
+                    device::core_property(
+                        &self.core,
+                        name,
+                        &openvino::PropertyKey::Other("DEVICE_TYPE".into()),
+                    )
+                    .ok()
                 });
                 select::OvDevice {
                     name: name.clone(),

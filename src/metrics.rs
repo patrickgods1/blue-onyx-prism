@@ -728,15 +728,19 @@ pub struct ProcessStats {
     /// macOS only: [`crate::backend::memory::ProcessMemory::footprint`], for a soak test on a Mac:
     /// the resident size misses GPU-backed memory there.
     pub memory_footprint_bytes: Option<u64>,
+    /// Memory the process owns alone (audit 2026-11, memgap-2): private bytes on Windows (the
+    /// commit, which a working-set trim does not lower), the footprint on macOS, `RssAnon` on
+    /// Linux ([`crate::backend::memory::ProcessMemory::private`]).
+    pub private_memory_bytes: Option<u64>,
     pub open_fds: Option<u64>,
 }
 
 impl ProcessStats {
     #[cfg(target_os = "linux")]
     pub fn read() -> Self {
-        let resident_memory_bytes = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| parse_vm_rss(&s));
+        let status = std::fs::read_to_string("/proc/self/status").ok();
+        let resident_memory_bytes = status.as_deref().and_then(parse_vm_rss);
+        let private_memory_bytes = status.as_deref().and_then(parse_rss_anon);
         // The count includes the descriptor `read_dir` itself holds open.
         let open_fds = std::fs::read_dir("/proc/self/fd")
             .ok()
@@ -745,6 +749,7 @@ impl ProcessStats {
         Self {
             resident_memory_bytes,
             memory_footprint_bytes: None,
+            private_memory_bytes,
             open_fds,
         }
     }
@@ -755,6 +760,7 @@ impl ProcessStats {
         Self {
             resident_memory_bytes: memory.map(|m| m.resident),
             memory_footprint_bytes: memory.and_then(|m| m.footprint),
+            private_memory_bytes: memory.and_then(|m| m.private),
             open_fds: None,
         }
     }
@@ -766,8 +772,27 @@ impl ProcessStats {
     allow(dead_code, reason = "used on Linux and in tests")
 )]
 fn parse_vm_rss(status: &str) -> Option<u64> {
-    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    let mut it = line.trim_start_matches("VmRSS:").split_whitespace();
+    parse_status_kb(status, "VmRSS:")
+}
+
+/// `RssAnon` of a `/proc/<pid>/status` text, in bytes: resident anonymous memory (heap, arenas,
+/// runtime pools), what the process owns alone, without its mapped files and shared memory.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "used on Linux and in tests")
+)]
+fn parse_rss_anon(status: &str) -> Option<u64> {
+    parse_status_kb(status, "RssAnon:")
+}
+
+/// The `<key>   <n> kB` line of a `/proc/<pid>/status` text, in bytes.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "used on Linux and in tests")
+)]
+fn parse_status_kb(status: &str, key: &str) -> Option<u64> {
+    let line = status.lines().find(|l| l.starts_with(key))?;
+    let mut it = line.trim_start_matches(key).split_whitespace();
     let kb: u64 = it.next()?.parse().ok()?;
     match it.next() {
         Some("kB") | None => kb.checked_mul(1024),
@@ -907,6 +932,14 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         );
         let _ = writeln!(out, "# TYPE {PREFIX}process_resident_memory_bytes gauge");
         let _ = writeln!(out, "{PREFIX}process_resident_memory_bytes {rss}");
+    }
+    if let Some(private) = p.private_memory_bytes {
+        let _ = writeln!(
+            out,
+            "# HELP {PREFIX}process_private_bytes Memory the process owns alone in bytes (Windows: private bytes, the commit; macOS: the footprint; Linux: RssAnon)."
+        );
+        let _ = writeln!(out, "# TYPE {PREFIX}process_private_bytes gauge");
+        let _ = writeln!(out, "{PREFIX}process_private_bytes {private}");
     }
     if let Some(footprint) = p.memory_footprint_bytes {
         let _ = writeln!(
@@ -1350,6 +1383,8 @@ mod tests {
             assert!(line[prefix.len()..].parse::<u64>().is_ok(), "{line}");
         }
         assert!(text.contains("blue_onyx_prism_process_resident_memory_bytes "));
+        assert!(text.contains("# TYPE blue_onyx_prism_process_private_bytes gauge"));
+        assert!(text.contains("blue_onyx_prism_process_private_bytes "));
         assert_eq!(
             text.contains("blue_onyx_prism_process_memory_footprint_bytes "),
             cfg!(target_os = "macos")
@@ -1371,6 +1406,9 @@ mod tests {
         assert_eq!(parse_vm_rss("Name: x\n"), None);
         assert_eq!(parse_vm_rss("VmRSS: lots kB\n"), None);
         assert_eq!(parse_vm_rss("VmRSS: 5 MB\n"), None);
+        let status = "VmRSS:\t   12345 kB\nRssAnon:\t    4321 kB\nRssFile:\t 8000 kB\n";
+        assert_eq!(parse_rss_anon(status), Some(4321 * 1024));
+        assert_eq!(parse_rss_anon("VmRSS:\t1 kB\n"), None);
     }
 
     #[cfg(target_os = "linux")]
@@ -1380,6 +1418,10 @@ mod tests {
         assert!(p.resident_memory_bytes.is_some_and(|b| b > 0));
         assert!(p.open_fds.is_some_and(|n| n >= 3));
         assert_eq!(p.memory_footprint_bytes, None);
+        // Anonymous memory is part of the resident set.
+        let private = p.private_memory_bytes.unwrap();
+        assert!(private > 0, "{p:?}");
+        assert!(private <= p.resident_memory_bytes.unwrap(), "{p:?}");
     }
 
     #[cfg(target_os = "macos")]
@@ -1388,6 +1430,7 @@ mod tests {
         let p = ProcessStats::read();
         assert!(p.resident_memory_bytes.is_some_and(|b| b > 0));
         assert!(p.memory_footprint_bytes.is_some_and(|b| b > 0));
+        assert!(p.private_memory_bytes.is_some_and(|b| b > 0));
         assert_eq!(p.open_fds, None);
     }
 
@@ -1396,6 +1439,7 @@ mod tests {
     fn process_stats_on_windows() {
         let p = ProcessStats::read();
         assert!(p.resident_memory_bytes.is_some_and(|b| b > 0));
+        assert!(p.private_memory_bytes.is_some_and(|b| b > 0));
         assert_eq!((p.memory_footprint_bytes, p.open_fds), (None, None));
     }
 

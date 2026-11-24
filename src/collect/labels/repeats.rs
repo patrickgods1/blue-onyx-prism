@@ -360,8 +360,10 @@ fn history_with(key: Key, scan: &dyn Fn() -> History) -> Arc<History> {
                     .lock_recover()
                     .remove(&id)
                     .is_none_or(|(_, dirty)| dirty);
-                if !overtaken {
-                    c.insert(key, (Instant::now(), h.clone()));
+                if overtaken {
+                    evict_expired(&mut c, Instant::now());
+                } else {
+                    cache_insert(&mut c, key, h.clone(), Instant::now());
                 }
                 drop(c);
                 landing.history = Some(h.clone());
@@ -369,6 +371,21 @@ fn history_with(key: Key, scan: &dyn Fn() -> History) -> Arc<History> {
             }
         }
     }
+}
+
+/// Drop the cached histories older than [`HISTORY_TTL`] at `now`: nothing reads them again, and
+/// a folder no longer under review, or a camera asked about once, would otherwise keep its
+/// history (up to [`HISTORY_CAP`] decisions) for the life of the process (audit 2026-11, RA-091).
+/// The same rule as the collector's brief summaries.
+fn evict_expired(c: &mut Cache, now: Instant) {
+    c.retain(|_, (at, _)| now.saturating_duration_since(*at) < HISTORY_TTL);
+}
+
+/// Cache `h` for `key` as of `now`, the expired entries dropped first ([`evict_expired`]): the
+/// cache holds only what was asked for within the last [`HISTORY_TTL`].
+fn cache_insert(c: &mut Cache, key: Key, h: Arc<History>, now: Instant) {
+    evict_expired(c, now);
+    c.insert(key, (now, h));
 }
 
 /// Drop the cached histories of `dir`, and keep a scan of it running now from being cached (it
@@ -881,6 +898,32 @@ mod tests {
             assert_eq!(w.join().unwrap().camera, "scan 2");
         }
         assert_eq!(g.scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn an_insert_drops_the_expired_histories() {
+        let mut c: Cache = HashMap::new();
+        let start = Instant::now();
+        let old: Key = (PathBuf::from("folder-a"), "gate".into());
+        let recent: Key = (PathBuf::from("folder-a"), "yard".into());
+        let new: Key = (PathBuf::from("folder-b"), "gate".into());
+        cache_insert(&mut c, old.clone(), Arc::new(History::default()), start);
+        let later = start + HISTORY_TTL / 2;
+        cache_insert(&mut c, recent.clone(), Arc::new(History::default()), later);
+        assert_eq!(c.len(), 2, "both within the TTL");
+        // A TTL after the first insert: the first entry is expired, the second is not.
+        let now = start + HISTORY_TTL;
+        cache_insert(&mut c, new.clone(), Arc::new(History::default()), now);
+        assert!(!c.contains_key(&old), "expired, dropped by the insert");
+        assert!(c.contains_key(&recent) && c.contains_key(&new));
+        // Nothing asked for in a TTL: an insert leaves only itself.
+        cache_insert(
+            &mut c,
+            old.clone(),
+            Arc::new(History::default()),
+            now + HISTORY_TTL,
+        );
+        assert_eq!(c.keys().collect::<Vec<_>>(), vec![&old]);
     }
 
     #[test]

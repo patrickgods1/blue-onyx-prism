@@ -144,6 +144,11 @@ pub struct BenchArgs {
     /// Images per dataset, evenly spread (0 = all). Default: benchmark.max_images_per_dataset.
     #[arg(long)]
     pub max_images: Option<usize>,
+    /// Do not cut the run to the service's cap of 2000 images in total: every image of every
+    /// dataset is benchmarked, and the results are held in memory until the run ends (a large
+    /// folder with several models and devices can need many GB).
+    #[arg(long)]
+    pub no_image_cap: bool,
     /// List the datasets (built-in sets, their download state, the configured selection) and exit.
     #[arg(long)]
     pub list_datasets: bool,

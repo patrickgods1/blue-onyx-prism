@@ -57,7 +57,7 @@ pub(crate) mod save;
 mod verify;
 mod watch;
 
-pub(crate) use reap::wait_for_reapers;
+pub(crate) use reap::{Hung, hung_device, wait_for_reapers};
 use run::WorkerCtx;
 
 /// A message for a worker thread.
@@ -310,6 +310,9 @@ pub(crate) struct TestFaults {
     /// The image saver to use instead of the process-wide one (e.g. one without a thread, so
     /// a test sees what is queued).
     pub(crate) saver: Option<Arc<save::Saver>>,
+    /// The reapers whose blocked devices the candidate walk skips, instead of the process's
+    /// (a test's own, so its hangs never reach other tests).
+    pub(crate) reapers: Option<&'static reap::Reapers>,
 }
 
 #[cfg(test)]

@@ -2199,7 +2199,7 @@ connections and buffered bodies (SV-04), NMS candidate count, log ring bytes (SV
 ### src/prep.rs
 1. Inputs: request bytes (`PrepJob.image`), `PrepSpec` from the model geometry.
 2. Failure paths: `catch_unwind` around decode + preprocess; a panic drops that geometry's preprocessor and answers an error. `lock_recover` on the pool mutex. No indexing.
-3. Resources: one bounded channel `threads * 16`; `submit` blocks the worker when full. `TensorPool` keeps up to 32 buffers per tensor length forever (per generation), entries for old lengths are never dropped (PL-04 note). The decoded `RgbImage` (w*h*3) is allocated per request and not pooled.
+3. Resources: one bounded channel `threads * 16`; `submit` blocks the worker when full. `TensorPool` keeps up to 32 buffers per tensor length (PL-04 note; since audit 2026-11 phase 5 a length is dropped when its last model goes or after 10 min unused, and free tensors are capped at 64 MiB). The decoded `RgbImage` (w*h*3) is allocated per request and not pooled.
 4. Concurrency: pool threads exit on channel disconnect; `Drop` joins them (a job in progress completes first). Reply is `try_send` on a bounded(1) channel: cannot block.
 5. n/a.
 6. Correctness: matches the plain preprocessor bit for bit (tested).
@@ -3700,7 +3700,7 @@ is planned (1 crash safety, 2 security, 3 resources/load, 4 operability, 5 maint
 | NR-06 | resource-exhaustion | 3 | fixed in phase 2: launchd stdout log rotated by newsyslog |
 | PL-01 | resource-exhaustion | 3 | fixed in phase 3: effective threshold floored at 0.01; at most 3000 NMS candidates (O(n) top-k) and 300 detections; NMS compares against kept boxes only |
 | PL-03 | resource-exhaustion | 3 | fixed in phase 1: header-first decode with the max_image_pixels ceiling on both decoders; zero dims rejected |
-| PL-04 | resource-exhaustion | 3 | fixed in phase 1: model input side <= 8192 and tensor <= 256 MiB, else the model fails to load |
+| PL-04 | resource-exhaustion | 3 | fixed in phase 1 (the limits: input side <= 8192, tensor <= 256 MiB) and, for the load itself, in audit 2026-11 phase 5 (QA-026): until then only the preprocessor checked them, after the warm-up frame was allocated; now `device::image_input_size` refuses the model at load on OpenVINO and ONNX Runtime |
 | RS-02 | resource-exhaustion | 3 | fixed in phase 2: export children run in a process group (Unix) / Job Object (Windows) and the tree is killed on cancel, timeout and stop |
 | RS-03 | resource-exhaustion | 3 | fixed in phase 2: 4 GiB per entry / 8 GiB per archive decompressed ceilings enforced while streaming; hostile entries refuse the archive |
 | RS-05 | resource-exhaustion | 3 | fixed in phase 2: Content-Length / Content-Range / running count checked against the pin; mismatch is permanent, not retried |
@@ -4279,33 +4279,33 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | RA-074 | `training-jobs/training-jobs-10` | storage | low | 4 | fixed (phase 2): probes made in `<training dir>/runs` or the near-dataset base and swept after 1 h | Hard-link probe file is left behind if the process dies between link and unlink |
 | RA-075 | `workers-registry/workers-registry-7` | storage | low | 4 | fixed (phase 1): `image::save_annotated` writes through `fsx::write_atomic`; `worker::save::flush` drains at shutdown (registry shutdown); phase 4 added the saved-image folder's temp sweep test | The image-save thread is detached and never drained, and saves are written in place, so a stop or crash mid-write leaves a truncated JPEG in save_image_path |
 | RA-076 | `workers-registry/workers-registry-9` | storage | low | 4 | fixed (phase 4): `crate::test_dirs::TempDir` guard in plan.rs, run_tests.rs and save.rs tests | registry/plan.rs unit tests create temp directories and never remove them |
-| RA-077 | `backend/backend-2` | memory | medium | 5 | open | No allocator trim anywhere: freed compile/load and job transients stay in the glibc heap after a spike |
-| RA-078 | `benchmark/benchmark-3` | memory | medium | 5 | open | CLI benchmark has no image cap and keeps 4-5 full copies of every model x device x image result until it ends (the BM-11 fix covers the service only) |
-| RA-079 | `server-core/server-core-1` | memory | medium | 5 | open | Log ring keeps the full allocation of every truncated message, so the 8 MiB budget can be exceeded about 16x through request paths that unauthenticated LAN clients control (the SV-08 fix is incomplete) |
-| RA-080 | `training-core/training-core-3` | memory | medium | 5 | open | Every runs() / get() / wait() deep-clones every run's whole epoch history, and a process-wide cache keeps up to 256 histories for the life of the process |
-| RA-081 | `training-jobs/training-jobs-6` | memory | medium | 5 | open | Python labelers keep unused text towers resident in host RAM for the whole run |
-| RA-082 | `workers-registry/workers-registry-3` | memory | medium | 5 | open | A hung GPU is retried forever (better-device upgrades, and automatic reloads after a stuck inference); once MAX_REAPERS reapers are blocked, every new try leaks a whole backend with mem::forget |
-| RA-083 | `backend/backend-3` | memory | low | 5 | open | PL-04 fix incomplete: TensorPool keeps up to 32 buffers per tensor length for the whole generation, and each prep thread keeps a Preprocessor per geometry ever seen |
-| RA-084 | `backend/backend-4` | memory | low | 5 | open | A hung ONNX Runtime session thread (or a reaper-leaked backend) keeps the whole TensorPool of its generation alive, not just its one tensor |
-| RA-085 | `backend/backend-5` | memory | low | 5 | open | Every OpenVINO property read leaks the C string OpenVINO allocates (openvino 0.11 never calls ov_free) |
-| RA-086 | `backend/backend-7` | memory | low | 5 | open | The ORT provider probe loads cudart, cuDNN and TensorRT into the process for good even when no model uses ort:cuda/ort:tensorrt |
-| RA-087 | `benchmark/benchmark-2` | memory | low | 5 | open | No allocator trim after a benchmark run: the run's memory peak stays in the service's RSS |
-| RA-088 | `benchmark/benchmark-4` | memory | low | 5 | open | BM-11 fix is incomplete: ModelResult::finish clones the full CPU reference run on every call, and summary() clones everything before clearing it |
-| RA-089 | `collect/collect-10` | memory | low | 5 | open | The review index interner only grows while the index lives, so a long session with relabelling can trip the ceiling and disable the index until restart |
-| RA-090 | `collect/collect-8` | memory | low | 5 | open | The review index's full walk briefly holds about twice the index (ceiling checked only per shard), and freed index memory is never trimmed |
-| RA-091 | `collect/collect-9` | memory | low | 5 | open | The repeats history cache never evicts expired entries: up to 2000 decisions per (folder, camera) stay resident |
-| RA-092 | `gap-how-memory-returns/memgap-2` | memory | low | 5 | open | On Windows the process's memory is reported only as working set, never commit (private bytes), so neither a trim nor a leak can be seen on the main target |
-| RA-093 | `gap-how-memory-returns/memgap-3` | memory | low | 5 | open | MALLOC_ARENA_MAX=2 reaches only the systemd unit and the Docker image. Tarball runs, other supervisors and every CLI command get glibc's 8 x cores arenas. |
-| RA-094 | `gap-how-memory-returns/memgap-4` | memory | low | 5 | open | ort:cpu sessions keep ORT's default CPU BFC arena (kNextPowerOfTwo), one per session, although the CUDA path was changed for exactly this reason |
-| RA-095 | `platform-storage/platform-16` | memory | low | 5 | open | The Linux deploys set only MALLOC_ARENA_MAX=2, so glibc's dynamic mmap threshold keeps image-sized buffers in the heap and RSS stays high after a spike |
-| RA-096 | `server-core/server-core-8` | memory | low | 5 | open | Argon2id's 19 MiB buffer per hash (up to 4 at once) is not given back to the OS after a sign-in burst on Linux/glibc, because glibc's dynamic mmap threshold moves such buffers into arenas that are not trimmed |
-| RA-097 | `server-handlers/server-handlers-3` | memory | low | 5 | open | Detection multipart text fields are kept without being charged to the upload budget, so one LAN client can hold GBs outside UPLOAD_BUDGET |
-| RA-098 | `server-handlers/server-handlers-7` | memory | low | 5 | open | Benchmark server caches that claim idle eviction never evict once the pages stop asking: VIEWS, IMAGE_PATHS and RUN_MODELS live for the process lifetime |
-| RA-099 | `server-handlers/server-handlers-8` | memory | low | 5 | open | The Train strip's tally cache (KEPT) keeps one Tally + AutoGap per folder ever walked, with no eviction |
-| RA-100 | `training-jobs/training-jobs-7` | memory | low | 5 | open | Queued model-labelling and dataset-check jobs pin the enqueuing generation's Runtimes across generation restarts |
-| RA-101 | `training-jobs/training-jobs-8` | memory | low | 5 | open | Job-time heap spikes in the service are never trimmed back to the OS (Linux glibc) |
-| RA-102 | `workers-registry/workers-registry-5` | memory | low | 5 | open | Freed backends are never trimmed: after a reload, retire, reaper drop or generation swap, the old model's host memory stays in the allocator's arenas |
-| RA-103 | `workers-registry/workers-registry-8` | memory | low | 5 | open | Static-box memory keeps an idle camera's expired tracks until 256 other keys evict it, and the per-track VecDeque doubles to 128 slots to hold 64 |
+| RA-077 | `backend/backend-2` | memory | medium | 5 | fixed (phase 5): `memory::trim_soon` (coalescing `bop-trim` thread) at model Ready, worker retire, reaper drop, generation retire, job/benchmark/export ends, sign-in burst end, CoreML compile | No allocator trim anywhere: freed compile/load and job transients stay in the glibc heap after a spike |
+| RA-078 | `benchmark/benchmark-3` | memory | medium | 5 | fixed (phase 5): the CLI applies the 2000-image cap (`--no-image-cap`), `model_report` drops eval_preds | CLI benchmark has no image cap and keeps 4-5 full copies of every model x device x image result until it ends (the BM-11 fix covers the service only) |
+| RA-079 | `server-core/server-core-1` | memory | medium | 5 | fixed (phase 5): cut messages stored at their cut size, capacity counted; refusal logs cut the path to 200 chars | Log ring keeps the full allocation of every truncated message, so the 8 MiB budget can be exceeded about 16x through request paths that unauthenticated LAN clients control (the SV-08 fix is incomplete) |
+| RA-080 | `training-core/training-core-3` | memory | medium | 5 | partial (phase 5): the 3 s poll, task projection and run-state readers share `Arc` histories; LRU cache by entries and weight; `runs()` / `get()` / `wait()` still copy (TrainProgress.history is a Vec) | Every runs() / get() / wait() deep-clones every run's whole epoch history, and a process-wide cache keeps up to 256 histories for the life of the process |
+| RA-081 | `training-jobs/training-jobs-6` | memory | medium | 5 | fixed (phase 5): SigLIP text tower dropped after prompts (autolabel.py and import_footage.py), SAM 3 text encoder stubbed after encoding | Python labelers keep unused text towers resident in host RAM for the whole run |
+| RA-082 | `workers-registry/workers-registry-3` | memory | medium | 5 | partial (phase 5): a device a reaper waits on (30 s) or with every reaper busy is skipped, upgrades held until it ends; worker threads stuck in an inference are not tracked by device | A hung GPU is retried forever (better-device upgrades, and automatic reloads after a stuck inference); once MAX_REAPERS reapers are blocked, every new try leaks a whole backend with mem::forget |
+| RA-083 | `backend/backend-3` | memory | low | 5 | fixed (phase 5): idle lengths dropped after 10 min, 64 MiB cap on free tensors, the last `LengthHold` of a length frees it at once, idle preprocessors dropped | PL-04 fix incomplete: TensorPool keeps up to 32 buffers per tensor length for the whole generation, and each prep thread keeps a Preprocessor per geometry ever seen |
+| RA-084 | `backend/backend-4` | memory | low | 5 | fixed (phase 5): `PooledBuf` holds the pool weakly; a detached ORT session thread keeps the `vram::Hold` | A hung ONNX Runtime session thread (or a reaper-leaked backend) keeps the whole TensorPool of its generation alive, not just its one tensor |
+| RA-085 | `backend/backend-5` | memory | low | 5 | fixed (phase 5): `device::core_property` / `compiled_property` free the string with `ov_free` (measured: 0 vs ~16 B per read) | Every OpenVINO property read leaks the C string OpenVINO allocates (openvino 0.11 never calls ov_free) |
+| RA-086 | `backend/backend-7` | memory | low | 5 | fixed (phase 5): nvinfer probed by file, loaded by path when a TensorRT session is built; not measured on NVIDIA | The ORT provider probe loads cudart, cuDNN and TensorRT into the process for good even when no model uses ort:cuda/ort:tensorrt |
+| RA-087 | `benchmark/benchmark-2` | memory | low | 5 | fixed (phase 5): see RA-077 | No allocator trim after a benchmark run: the run's memory peak stays in the service's RSS |
+| RA-088 | `benchmark/benchmark-4` | memory | low | 5 | fixed (phase 5): `finish` borrows the reference run; `summary_in_place` | BM-11 fix is incomplete: ModelResult::finish clones the full CPU reference run on every call, and summary() clones everything before clearing it |
+| RA-089 | `collect/collect-10` | memory | low | 5 | fixed (phase 5): a full pass with 8 MiB of unused names drops the index from the hub (rebuilt on the next query) | The review index interner only grows while the index lives, so a long session with relabelling can trip the ceiling and disable the index until restart |
+| RA-090 | `collect/collect-8` | memory | low | 5 | fixed (phase 5): the walk counts shard bytes and stops past the ceiling | The review index's full walk briefly holds about twice the index (ceiling checked only per shard), and freed index memory is never trimmed |
+| RA-091 | `collect/collect-9` | memory | low | 5 | fixed (phase 5): expired entries dropped on insert | The repeats history cache never evicts expired entries: up to 2000 decisions per (folder, camera) stay resident |
+| RA-092 | `gap-how-memory-returns/memgap-2` | memory | low | 5 | fixed (phase 5): `ProcessMemory.private`, gauge `process_private_bytes`, trim log | On Windows the process's memory is reported only as working set, never commit (private bytes), so neither a trim nor a leak can be seen on the main target |
+| RA-093 | `gap-how-memory-returns/memgap-3` | memory | low | 5 | fixed (phase 5): `memory::tune_allocator` at the start of every binary (Linux glibc; an environment setting wins) | MALLOC_ARENA_MAX=2 reaches only the systemd unit and the Docker image. Tarball runs, other supervisors and every CLI command get glibc's 8 x cores arenas. |
+| RA-094 | `gap-how-memory-returns/memgap-4` | memory | low | 5 | fixed (phase 5): `BOP_ORT_CPU_ARENA=0` for measurement; default unchanged; the i5-8500 comparison is open | ort:cpu sessions keep ORT's default CPU BFC arena (kNextPowerOfTwo), one per session, although the CUDA path was changed for exactly this reason |
+| RA-095 | `platform-storage/platform-16` | memory | low | 5 | fixed (phase 5): `MALLOC_MMAP_THRESHOLD_=8388608` in the unit and image, and set by the binary | The Linux deploys set only MALLOC_ARENA_MAX=2, so glibc's dynamic mmap threshold keeps image-sized buffers in the heap and RSS stays high after a spike |
+| RA-096 | `server-core/server-core-8` | memory | low | 5 | fixed (phase 5): trim when the hashing semaphore is idle again | Argon2id's 19 MiB buffer per hash (up to 4 at once) is not given back to the OS after a sign-in burst on Linux/glibc, because glibc's dynamic mmap threshold moves such buffers into arenas that are not trimmed |
+| RA-097 | `server-handlers/server-handlers-3` | memory | low | 5 | fixed (phase 5): only `min_confidence` / `model` kept; others read and dropped; 4 KiB per kept field, 32 parts | Detection multipart text fields are kept without being charged to the upload budget, so one LAN client can hold GBs outside UPLOAD_BUDGET |
+| RA-098 | `server-handlers/server-handlers-7` | memory | low | 5 | fixed (phase 5): VIEWS, IMAGE_PATHS, RUN_MODELS are `IdleCache`s | Benchmark server caches that claim idle eviction never evict once the pages stop asking: VIEWS, IMAGE_PATHS and RUN_MODELS live for the process lifetime |
+| RA-099 | `server-handlers/server-handlers-8` | memory | low | 5 | fixed (phase 5): `prune_kept`, at most 4, never the asked or a walking folder | The Train strip's tally cache (KEPT) keeps one Tally + AutoGap per folder ever walked, with no eviction |
+| RA-100 | `training-jobs/training-jobs-7` | memory | low | 5 | fixed (phase 5): queued checks and model auto-labels resolve the current generation's runtimes per call | Queued model-labelling and dataset-check jobs pin the enqueuing generation's Runtimes across generation restarts |
+| RA-101 | `training-jobs/training-jobs-8` | memory | low | 5 | fixed (phase 5): embeddings read flat in chunks; `select::pick` takes a slice | Job-time heap spikes in the service are never trimmed back to the OS (Linux glibc) |
+| RA-102 | `workers-registry/workers-registry-5` | memory | low | 5 | fixed (phase 5): see RA-077 | Freed backends are never trimmed: after a reload, retire, reaper drop or generation swap, the old model's host memory stays in the allocator's arenas |
+| RA-103 | `workers-registry/workers-registry-8` | memory | low | 5 | fixed (phase 5): sweep every 64 calls, deque never past its cap | Static-box memory keeps an idle camera's expired tracks until 256 other keys evict it, and the per-track VecDeque doubles to 128 slots to hold 64 |
 | RA-104 | `collect/collect-1` | cpu | medium | 6 | open | Retention prune looks up each doomed file by linear search: O(doomed x entries), minutes to hours of one core |
 | RA-105 | `collect/collect-2` | cpu | medium | 6 | open | Every dataset prune is a full walk that reads every label file. At the size cap it repeats every 30 s, and it runs every 10 min while idle |
 | RA-106 | `gap-log-lines-with/logs-1` | storage | medium | 6 | open | The cross-site refusal warning has no throttle and logs the client's Origin header in full, so one unauthenticated LAN client can wipe the Windows Application log and fill today's log file in seconds |
@@ -4356,7 +4356,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-023 | `training-core/tcore-18` | bug | low | 3 | fixed (phase 3): `runs_changed` / `tasks_changed` | One Condvar (`changed`) is waited on with two different mutexes (runs and tasks) |
 | QA-024 | `platform-config/platform-1` | bug | high | 7 | open | Install scripts treat a program-written config as 'already sets download_dir' and copy it verbatim, so the service's data root stays in the read-only program dir |
 | QA-025 | `resources/resources-1` | bug | high | 7 | open | A second install into a user --dir/--dest swaps the whole directory and deletes the user's other files |
-| QA-026 | `backend/backend-1` | bug | medium | 5 | open | PL-04 is only half fixed: the model input size is never checked at load, and the worker allocates its warm-up frame before any check |
+| QA-026 | `backend/backend-1` | bug | medium | 5 | fixed (phase 5): `device::image_input_size` at load in OpenVINO and ORT (measured: a 16384² model refused in 0-3 ms) | PL-04 is only half fixed: the model input size is never checked at load, and the worker allocates its warm-up frame before any check |
 | QA-027 | `benchmark/bench-1` | bug | medium | 7 | open | The 'never scored on its own labels' rule (B10) misses As served and variant results of the reference model |
 | QA-028 | `benchmark/bench-2` | bug | medium | 4 | fixed (phase 4): see RA-063 | forget_model leaves a removed model's `+served` / variant results, predictions and history |
 | QA-029 | `benchmark/bench-3` | bug | medium | 7 | open | The confidence search's 'configured now' ignores the per-device profiles that --apply-threshold writes |
@@ -4499,7 +4499,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-166 | `benchmark/bench-15` | refactor | low | 10 | open | The 'relative to <ref> on <device>, not ground truth' text is built and parsed in five places |
 | QA-167 | `benchmark/bench-16` | refactor | low | 10 | open | Target-fallback loop copied in threshold::exact_pick and threshold::pick |
 | QA-168 | `benchmark/bench-18` | refactor | low | 10 | open | run.rs builds Pipeline twice and compiles through two near-identical candidate loops |
-| QA-169 | `benchmark/bench-19` | refactor | low | 5 | open | ModelResult::finish deep-clones the reference device's whole RunResult on every call, including every sweep progress step |
+| QA-169 | `benchmark/bench-19` | refactor | low | 5 | fixed (phase 5): see RA-088 | ModelResult::finish deep-clones the reference device's whole RunResult on every call, including every sweep progress step |
 | QA-170 | `benchmark/bench-20` | refactor | low | 10 | open | Saver::merge redoes the set merge that BenchmarkResults::merge just computed and discards |
 | QA-171 | `benchmark/bench-21` | refactor | low | 10 | open | 'Which frames did a model train on' has two rules: trained_on (train list only) vs cameras::seen (train + valid + image_sources renames) |
 | QA-172 | `benchmark/bench-22` | refactor | low | 10 | open | Dead code: ThresholdAdvice::apply_value_on (tests only) and an unreachable --repeat 0 check |
@@ -4860,3 +4860,55 @@ to the cached load), and the `backend_cache` / `backend_ort` ignored suites pass
 
 Not verified here: TensorRT (no NVIDIA GPU on the development Mac; type-checked and linted for Linux and Windows),
 the OpenVINO GPU cache folders (the UHD 630 box), the Windows lock behaviour of the uv-cache sweep (CI only).
+
+### Audit 2026-11, phase 5 notes
+
+Memory. Models stay resident (user decision); what is trimmed are transients, caches and copies. One helper,
+`backend::memory::trim_soon(reason)`, asks for an allocator trim (glibc `malloc_trim`, macOS
+`malloc_zone_pressure_relief`, Windows `HeapCompact`, never `EmptyWorkingSet`) from a `bop-trim` thread that lives
+only while one is pending; requests close together become one trim (2 s quiet, at most 15 s after the first, at
+least 10 s apart).
+
+| what stayed in memory | now | IDs |
+|---|---|---|
+| freed heap after a load, a reload, a retired worker or generation, a reaped backend, a job, a benchmark, an export, a sign-in burst, a CoreML rewrite | `trim_soon` at each of those points | RA-077, -102, -087, -096, -101 |
+| glibc's dynamic mmap threshold keeping frame-sized one-off buffers in the heap; `MALLOC_ARENA_MAX=2` only under systemd and Docker | `memory::tune_allocator` first in every binary (Linux glibc): arena max 2 and an 8 MiB mmap threshold unless the environment sets them; the unit and image set `MALLOC_MMAP_THRESHOLD_` too | RA-093, -095 |
+| prep tensors of input sizes no model uses, up to 32 per size for the whole generation; preprocessors per geometry | a size goes when its last model's `LengthHold` drops or after 10 min unused; free tensors capped at 64 MiB (or two of the largest); preprocessors dropped after 10 min; a buffer holds its pool weakly | RA-083, -084 |
+| a hung ORT session dropping its model from `vram::holders()` | the detached thread keeps the hold | RA-084 |
+| a C string per OpenVINO property read | freed with `ov_free` (200 000 reads: 0 KiB growth, was about 3 MiB) | RA-085 |
+| TensorRT's `nvinfer` loaded by the probe | checked by file; loaded when a TensorRT session is built | RA-086 |
+| a backend leaked per retry of a hung GPU | a device a reaper still waits on (30 s, or every reaper busy) is skipped; the model stays on its fallback and upgrade tries wait until the reaper ends | RA-082 |
+| expired static-box tracks of idle cameras | swept every 64 calls; a track's deque stays at its cap | RA-103 |
+| the full allocation of each cut log message | stored at its cut size, the 8 MiB budget counts capacity; refusal logs cut the path to 200 characters | RA-079 |
+| detection upload text fields nobody reads | dropped while read; a kept field over 4 KiB or more than 32 parts is refused (Blue Iris sends neither) | RA-097 |
+| benchmark page caches and the Train strip tally cache | `IdleCache` with a sweeper thread that exits when empty; the strip keeps at most 4 folders | RA-098, -099 |
+| a deep copy of every run's epoch history per Train poll | shared `Arc` histories, a weighted LRU cache, a borrowed task projection; byte-identical JSON | RA-080 |
+| SigLIP's text tower (about 1 GB) and SAM 3's text encoder for a whole run | dropped after the prompts are encoded (auto-label) and before embedding (import) | RA-081 |
+| a queued job holding the enqueuing generation's runtimes | resolves the current generation's at each call | RA-100 |
+| the review index's walk holding about twice the index; its name interner growing for good | the walk stops past the ceiling; an index with 8 MiB of unused names is rebuilt | RA-090, -089 |
+| repeats history past its time | dropped on insert | RA-091 |
+| the CLI benchmark: no image cap, copies of every result | 2000-image cap (`--no-image-cap`), no copies; `finish` borrows the reference run | RA-078, -088, QA-169 |
+| a model with a huge static input allocating before any check | refused at load (`device::image_input_size`) | QA-026 |
+
+Readouts: `ProcessMemory.private` (Windows private bytes, macOS physical footprint, Linux `RssAnon`), the
+`blue_onyx_prism_process_private_bytes` gauge, and before/after private bytes in the trim log line (RA-092).
+`BOP_ORT_CPU_ARENA=0` turns ONNX Runtime's CPU arena off, for measurement only (RA-094).
+
+What a user notices: a detection upload with more than 32 fields or a 4 KiB `model` / `min_confidence` field gets
+`success:false`; `blue-onyx-prism benchmark` stops at 2000 images unless `--no-image-cap`; a broken TensorRT install
+shows as available in `list-devices` and fails when the model loads, naming nvinfer; a GPU whose driver hung is not
+tried again until its stuck work is freed (a restart recovers it).
+
+Left open: `runs()` / `get()` / `wait()` still copy histories (the page render, the full `GET /v1/training`, CLI wait
+loops; needs an `Arc` in `TrainProgress.history`); a worker thread stuck inside an inference is not counted against its
+device; `openvino:gpu` and `openvino:gpu.0` are different keys for the hung check; no test tells which site asked for
+a trim (one counter for the process); the Train strip's prune is off in unit tests (shared static map; the rule is
+tested on its own map); `finish`'s no-clone test checks results only.
+
+Tests: every fix has a test. Shown failing without the fix in private copies: reap / hung device, static-memory
+sweep and deque cap, review walk ceiling, interner rebuild, repeats expiry, CLI cap, log ring, prep idle drop, byte
+cap and `LengthHold`, history LRU and sharing, `image_input_size`, the autolabel.py tower self-test. Real runtimes:
+the `backend_*` ignored suites, a 16384x16384 model refused at load on `ort:cpu`, `openvino:cpu` and `ort:coreml`.
+
+Not verified here: Linux glibc trim and allocator settings (CI only), Windows private bytes and `HeapCompact`
+(the i5-8500 box, `measure_resources.ps1`), TensorRT loading by path, the i5-8500 `BOP_ORT_CPU_ARENA` comparison.

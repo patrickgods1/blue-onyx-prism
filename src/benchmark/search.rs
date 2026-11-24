@@ -400,18 +400,21 @@ static PREDS_CACHE: PredsCache = IdleCache::new(CACHE_IDLE);
 /// A parsed file nobody asked for in this long is dropped from its cache (M10).
 pub(crate) const CACHE_IDLE: Duration = Duration::from_secs(10 * 60);
 
-/// A one-entry cache whose entry is dropped once nobody read it for its idle time: a thread
-/// started with an entry looks every tenth of that time (at most a minute) and ends with the
-/// entry, so an idle service holds neither. Process-wide caches are `static`s of it.
+/// A cache of at most `cap` entries (one by default, [`IdleCache::new`]) whose entries are each
+/// dropped once nobody read them for the idle time: a thread started with the first entry looks
+/// every tenth of that time (at most a minute) and ends with the last entry, so an idle service
+/// holds neither. Past `cap` the least recently read or put entry goes. Process-wide caches are
+/// `static`s of it.
 pub(crate) struct IdleCache<K, V> {
     state: Mutex<IdleState<K, V>>,
     idle: Duration,
+    cap: usize,
 }
 
 struct IdleState<K, V> {
     /// Key, value and when it was last read or put.
-    entry: Option<(K, V, Instant)>,
-    /// The thread that drops the entry is running.
+    entries: std::collections::VecDeque<(K, V, Instant)>,
+    /// The thread that drops idle entries is running.
     sweeping: bool,
 }
 
@@ -420,52 +423,76 @@ where
     K: PartialEq + Send + 'static,
     V: Clone + Send + 'static,
 {
+    /// A one-entry cache: a put replaces any other entry.
     pub(crate) const fn new(idle: Duration) -> Self {
+        Self::with_capacity(idle, 1)
+    }
+
+    /// A cache of at most `cap` entries (at least one).
+    pub(crate) const fn with_capacity(idle: Duration, cap: usize) -> Self {
         Self {
             state: Mutex::new(IdleState {
-                entry: None,
+                entries: std::collections::VecDeque::new(),
                 sweeping: false,
             }),
             idle,
+            cap: if cap == 0 { 1 } else { cap },
         }
     }
 
     /// The value cached under `key`, now counted as read.
     pub(crate) fn get(&self, key: &K) -> Option<V> {
         let mut st = self.state.lock_recover();
-        let (k, v, used) = st.entry.as_mut()?;
-        if k != key {
-            return None;
-        }
+        let (_, v, used) = st.entries.iter_mut().find(|(k, _, _)| k == key)?;
         *used = Instant::now();
         Some(v.clone())
     }
 
-    /// Cache `value` under `key` (replacing any other entry).
+    /// Cache `value` under `key` (replacing that key's entry; past the cap, the least recently
+    /// used other entry goes).
     pub(crate) fn put(&'static self, key: K, value: V) {
         let mut st = self.state.lock_recover();
-        st.entry = Some((key, value, Instant::now()));
-        self.start_sweeping(&mut st);
+        self.insert(&mut st, key, value);
     }
 
     /// The value under `key`, or `make()`'s, cached. `make` runs under the cache's lock, so
     /// callers asking at once compute it once.
     pub(crate) fn get_or_insert_with(&'static self, key: K, make: impl FnOnce() -> V) -> V {
         let mut st = self.state.lock_recover();
-        if let Some((k, v, used)) = st.entry.as_mut()
-            && *k == key
-        {
+        if let Some((_, v, used)) = st.entries.iter_mut().find(|(k, _, _)| *k == key) {
             *used = Instant::now();
             return v.clone();
         }
         let v = make();
-        st.entry = Some((key, v.clone(), Instant::now()));
-        self.start_sweeping(&mut st);
+        self.insert(&mut st, key, v.clone());
         v
     }
 
-    /// Start the thread that drops the entry when none runs (under the lock, so it cannot end
-    /// meanwhile). A thread that cannot start leaves the entry until the next put.
+    /// Drop every entry now (the sweeping thread ends at its next look).
+    pub(crate) fn clear(&self) {
+        self.state.lock_recover().entries.clear();
+    }
+
+    fn insert(&'static self, st: &mut IdleState<K, V>, key: K, value: V) {
+        st.entries.retain(|(k, _, _)| *k != key);
+        while st.entries.len() >= self.cap {
+            let oldest = st
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, _, used))| *used)
+                .map(|(i, _)| i);
+            match oldest {
+                Some(i) => drop(st.entries.remove(i)),
+                None => break,
+            }
+        }
+        st.entries.push_back((key, value, Instant::now()));
+        self.start_sweeping(st);
+    }
+
+    /// Start the thread that drops idle entries when none runs (under the lock, so it cannot end
+    /// meanwhile). A thread that cannot start leaves the entries until the next put.
     fn start_sweeping(&'static self, st: &mut IdleState<K, V>) {
         if st.sweeping {
             return;
@@ -484,28 +511,36 @@ where
         st.sweeping = spawned.is_ok();
     }
 
-    /// Drop the entry when it was not read for the idle time at `now`. False when no entry is
-    /// left: the sweeping thread then ends (marked under the lock, so a put starts a new one).
+    /// Drop the entries not read for the idle time at `now`. False when no entry is left: the
+    /// sweeping thread then ends (marked under the lock, so a put starts a new one).
     fn sweep(&self, now: Instant) -> bool {
         let mut st = self.state.lock_recover();
-        if st
-            .entry
-            .as_ref()
-            .is_some_and(|(_, _, used)| now.saturating_duration_since(*used) >= self.idle)
-        {
-            st.entry = None;
-        }
-        if st.entry.is_none() {
+        st.entries
+            .retain(|(_, _, used)| now.saturating_duration_since(*used) < self.idle);
+        if st.entries.is_empty() {
             st.sweeping = false;
             return false;
         }
         true
     }
 
-    /// Whether an entry is cached (tests).
+    /// [`IdleCache::sweep`] as the sweeping thread would run it at `now` (tests elsewhere in the
+    /// crate, with a clock of their own).
+    #[cfg(test)]
+    pub(crate) fn sweep_at(&self, now: Instant) -> bool {
+        self.sweep(now)
+    }
+
+    /// Whether no entry is cached (tests).
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.state.lock_recover().entry.is_none()
+        self.state.lock_recover().entries.is_empty()
+    }
+
+    /// Entries cached (tests).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.state.lock_recover().entries.len()
     }
 }
 
@@ -2006,6 +2041,56 @@ pub(crate) mod tests {
         cache.get_or_insert_with(3, make);
         cache.get_or_insert_with(3, make);
         assert_eq!(made.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// RA-098: a cache of several entries keeps at most its cap (the least recently used goes),
+    /// drops each idle entry on its own and ends its thread with the last one.
+    #[test]
+    fn a_multi_entry_idle_cache_is_bounded_and_drops_idle_entries() {
+        let cache: &'static IdleCache<u32, Arc<String>> = Box::leak(Box::new(
+            IdleCache::with_capacity(Duration::from_secs(600), 3),
+        ));
+        let vals: Vec<Arc<String>> = (0..5).map(|i| Arc::new(format!("v{i}"))).collect();
+        for (i, v) in vals.iter().enumerate().take(3) {
+            cache.put(i as u32, v.clone());
+        }
+        assert_eq!(cache.len(), 3);
+        // A read keeps 0 the most recent of the first ones: 1 goes when 3 comes in.
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(cache.get(&0).is_some());
+        cache.put(3, vals[3].clone());
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get(&1).is_none(), "the least recently used went");
+        assert_eq!(Arc::strong_count(&vals[1]), 1);
+        // A put under a key already there replaces it, the count stays.
+        cache.put(3, vals[4].clone());
+        assert_eq!(cache.len(), 3);
+        assert_eq!(Arc::strong_count(&vals[3]), 1);
+        // Idle entries go one by one: one left unread for the idle time goes, the others stay.
+        let t0 = Instant::now();
+        let old = t0.checked_sub(Duration::from_secs(700)).unwrap();
+        if let Some(e) = cache
+            .state
+            .lock_recover()
+            .entries
+            .iter_mut()
+            .find(|e| e.0 == 0)
+        {
+            e.2 = old;
+        }
+        assert!(cache.sweep(t0));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&0).is_none());
+        assert_eq!(Arc::strong_count(&vals[0]), 1);
+        // The rest go together once idle; the thread's loop then ends.
+        assert!(!cache.sweep(Instant::now() + Duration::from_secs(600)));
+        assert!(cache.is_empty());
+        assert!(vals.iter().all(|v| Arc::strong_count(v) == 1), "all let go");
+        // Clear empties it at once.
+        cache.put(9, vals[0].clone());
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(Arc::strong_count(&vals[0]), 1);
     }
 
     /// The real thread drops an idle entry and ends; a later put starts another.

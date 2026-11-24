@@ -22,6 +22,11 @@
 //! backoff ([`UPGRADE_FIRST_DELAY`] to [`UPGRADE_MAX_DELAY`]; each try costs a compile), beside
 //! the worker serving, which it replaces only if it loads. No try starts during a benchmark.
 //! The training queue is not checked: nothing outside `server::training` can see it.
+//! Tries of a device that a reaper still waits on are held (`crate::worker::hung_device`,
+//! audit 2026-11 RA-082): its hang has not cleared, and each try would leave one more backend
+//! that cannot be freed. The model stays where it serves and the schedule keeps its place; tries
+//! resume once the reaper finishes. A reload after a stuck inference skips such a device in its
+//! own candidate walk (the worker's), so it lands on the next one, CPU last.
 //!
 //! The decision logic is the pure [`Recovery`] and [`Upgrades`]; the thread only feeds them the
 //! workers' states.
@@ -33,7 +38,7 @@ use crate::server::AppState;
 use crate::startup::ModelState;
 use crate::sync::LockExt;
 use crate::worker::WorkerHandle;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Weak;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -263,6 +268,65 @@ impl Upgrades {
     }
 }
 
+/// Which models' better-device tries are held because a reaper still waits on that device
+/// (see the module docs), so the hold and its end are each logged once.
+#[derive(Debug, Default)]
+pub(crate) struct Holds {
+    held: HashSet<String>,
+}
+
+/// What [`Holds::note`] logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoldChange {
+    Held,
+    Released,
+}
+
+impl Holds {
+    /// Record whether `name`'s try of `better` is held now (`hung`: why). Logs and returns the
+    /// change, if any.
+    pub(crate) fn note(
+        &mut self,
+        name: &str,
+        better: &Better,
+        hung: Option<&crate::worker::Hung>,
+    ) -> Option<HoldChange> {
+        let device = better.candidate.device;
+        match hung {
+            Some(h) if self.held.insert(name.to_string()) => {
+                warn!(
+                    model = %name,
+                    device = %device,
+                    "not trying the better device again: {h}; the model keeps serving where it \
+                     is"
+                );
+                Some(HoldChange::Held)
+            }
+            None if self.held.remove(name) => {
+                info!(
+                    model = %name,
+                    device = %device,
+                    "the backends that waited on the better device were freed; its tries resume"
+                );
+                Some(HoldChange::Released)
+            }
+            _ => None,
+        }
+    }
+
+    /// Forget models no longer listed with a better device.
+    pub(crate) fn forget_others<'a>(&mut self, listed: impl IntoIterator<Item = &'a str>) {
+        let listed: HashSet<&str> = listed.into_iter().collect();
+        self.held.retain(|n| listed.contains(n.as_str()));
+    }
+
+    /// Models whose tries are held (tests).
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.held.len()
+    }
+}
+
 /// Start the supervisor thread of a generation: it polls the generation's workers until
 /// `generation` is cancelled (or the state is gone), reloads models that failed while serving on
 /// the schedule of [`Recovery`], and tries better devices on the schedule of [`Upgrades`].
@@ -272,6 +336,7 @@ pub fn spawn(state: Weak<AppState>, generation: CancellationToken) -> Option<Joi
         .spawn(move || {
             let mut recovery = Recovery::default();
             let mut upgrades = Upgrades::default();
+            let mut holds = Holds::default();
             loop {
                 if generation.is_cancelled() {
                     return;
@@ -292,13 +357,17 @@ pub fn spawn(state: Weak<AppState>, generation: CancellationToken) -> Option<Joi
                     if status == Status::Ready
                         && let Some(b) = w.better()
                     {
-                        better.push((w.name.clone(), b, replacing));
+                        let hung = crate::worker::hung_device(&b.candidate.device);
+                        holds.note(&w.name, &b, hung.as_ref());
+                        // A held try keeps its place in the schedule, like one under way.
+                        better.push((w.name.clone(), b, replacing || hung.is_some()));
                     }
                     // A model with a replacement on the way waits for its outcome.
                     let status = if replacing { Status::Other } else { status };
                     statuses.push((w.name.clone(), status));
                 }
                 drop(workers);
+                holds.forget_others(better.iter().map(|(n, _, _)| n.as_str()));
                 let now = Instant::now();
                 let due = recovery.due(now, statuses.iter().map(|(n, s)| (n.as_str(), *s)));
                 for r in due {
@@ -600,5 +669,61 @@ mod tests {
 
     fn metric() -> crate::metrics::ModelMetrics {
         crate::metrics::ModelMetrics::new("y", "CPU", "")
+    }
+
+    fn gpu_better() -> Better {
+        Better {
+            candidate: crate::backend::Candidate {
+                device: *crate::backend::spec::parse("openvino:gpu")
+                    .unwrap()
+                    .device()
+                    .unwrap(),
+                fell_back: false,
+                note: None,
+            },
+            failure: crate::backend::plan::LoadFailure::DeviceLost,
+            reason: "warm-up did not finish".into(),
+        }
+    }
+
+    /// RA-082: a held try is logged once when it starts and once when it ends, and a model that
+    /// stops listing a better device is forgotten.
+    #[test]
+    fn holds_log_each_change_once() {
+        let b = gpu_better();
+        let hung = crate::worker::Hung {
+            device: "openvino:gpu".into(),
+            waiting: 1,
+            longest: Duration::from_secs(400),
+            saturated: false,
+        };
+        let mut h = Holds::default();
+        assert_eq!(h.note("a", &b, None), None);
+        assert_eq!(h.note("a", &b, Some(&hung)), Some(HoldChange::Held));
+        assert_eq!(h.note("a", &b, Some(&hung)), None);
+        assert_eq!(h.held(), 1);
+        assert_eq!(h.note("a", &b, None), Some(HoldChange::Released));
+        assert_eq!(h.note("a", &b, None), None);
+        assert_eq!(h.note("b", &b, Some(&hung)), Some(HoldChange::Held));
+        h.forget_others(["a"]);
+        assert_eq!(h.held(), 0);
+    }
+
+    /// A held try is passed to the schedule as one under way: it keeps its place and starts
+    /// once the hold ends, with no new first delay.
+    #[test]
+    fn a_held_try_keeps_its_place_in_the_schedule() {
+        let b = gpu_better();
+        let t0 = Instant::now();
+        let mut u = Upgrades::default();
+        assert!(u.due(t0, [("a", &b, false)], false).is_empty());
+        let due = t0 + UPGRADE_FIRST_DELAY;
+        // Held (hung) when due: nothing starts, the model stays on the schedule.
+        assert!(u.due(due, [("a", &b, true)], false).is_empty());
+        assert_eq!(u.tracked(), 1);
+        // Released a minute later: the try starts at once.
+        let tries = u.due(due + Duration::from_secs(60), [("a", &b, false)], false);
+        assert_eq!(tries.len(), 1);
+        assert_eq!(tries[0].attempt, 1);
     }
 }

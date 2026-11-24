@@ -69,6 +69,8 @@ fn set_preshutdown_requested() -> bool {
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
     blue_onyx_prism::panic::install();
+    // Before any thread starts (Linux glibc: arena cap, fixed mmap threshold).
+    blue_onyx_prism::backend::memory::tune_allocator();
     if version_requested() {
         println!(
             "blue-onyx-prism-service {}",
@@ -85,6 +87,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(not(windows))]
 fn main() -> std::process::ExitCode {
     blue_onyx_prism::panic::install();
+    // Before any thread starts (Linux glibc: arena cap, fixed mmap threshold).
+    blue_onyx_prism::backend::memory::tune_allocator();
     if version_requested() {
         println!(
             "blue-onyx-prism-service {}",
