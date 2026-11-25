@@ -79,12 +79,18 @@
     var classes = cat.classes || [];
     var ordered = classes.filter(function (c) { return rel.indexOf(c) >= 0; });
     rel.forEach(function (c) { if (ordered.indexOf(c) < 0) ordered.push(c); });
-    return ordered.filter(function (c) { return hidden.indexOf(c) < 0; });
+    return ordered.filter(function (c) { return !isHidden(c, hidden); });
+  }
+
+  // Whether `name` is in `hidden`, ignoring case like Review and the server (a hand-edited config
+  // may spell a hidden class differently from the list).
+  function isHidden(name, hidden) {
+    return indexOfName(hidden || [], name) >= 0;
   }
 
   // The classes Review offers (pickers, shortcuts): the list minus the hidden ones.
   function visibleClasses(classes, hidden) {
-    return (classes || []).filter(function (c) { return (hidden || []).indexOf(c) < 0; });
+    return (classes || []).filter(function (c) { return !isHidden(c, hidden); });
   }
 
   // Classes of `names` that are not in the class list (they need appending before use).
@@ -172,7 +178,7 @@
 
   var util = {
     validName: validName, nameProblem: nameProblem, parseList: parseList, groupEntries: groupEntries,
-    mergeEntries: mergeEntries, defaultSelection: defaultSelection, visibleClasses: visibleClasses,
+    mergeEntries: mergeEntries, defaultSelection: defaultSelection, isHidden: isHidden, visibleClasses: visibleClasses,
     missingFrom: missingFrom, classChange: classChange, summaryText: summaryText, countText: countText,
     quickSetsFor: quickSetsFor, modelQuickSets: modelQuickSets, indexOfName: indexOfName, GROUPS: GROUPS
   };

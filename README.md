@@ -200,7 +200,8 @@ port 32168. The installers are not code-signed yet:
   firewall rules for TCP 32168 and 32169 (`msiexec /i <file>.msi PORT=<n> HTTPS_PORT=<n>` for other ports' rules; local subnet
   on Domain and Private networks only, so Blue Iris on another subnet or a PC on a Public network needs
   the manual rule in [packaging/windows/README.md](packaging/windows/README.md)), and a
-  Start Menu shortcut to the web UI. Silent install: `msiexec /i <file>.msi /qn /norestart`. Uninstall from
+  Start Menu shortcut to the web UI, and gives the service 75 s to stop at an OS shutdown (its
+  preshutdown timeout; Windows' default is 10 s). Silent install: `msiexec /i <file>.msi /qn /norestart`. Uninstall from
   *Settings > Apps*; it keeps `C:\ProgramData\BlueOnyxPrism` ([what uninstalling keeps](#uninstalling-keeps-your-data)).
   Upgrading to a newer MSI keeps it too. If you installed the service earlier with `scripts\install_service.ps1`,
   run `scripts\uninstall_service.ps1` first; the MSI refuses to install over it. The console
@@ -1062,6 +1063,28 @@ address. Every page below needs a sign-in:
 | `/train/models` | The trained models with their held-out benchmark, Comparison, and **Default model** (with a preview of what changes, and Revert) / **night model of** / **verifier of** actions |
 | `/logs` | The last 2,000 log events of this process, live (polls `/logs.json`), with level filter, search, pause/follow, Copy and Download .txt, and the server log level (applies immediately; `POST /config/loglevel` with `level=debug`, form or query) |
 | `/prometheus` | Prometheus metrics (`blue_onyx_prism_*{model="..."}`), linked in the footer with the JSON endpoints |
+
+#### Disk use: the Storage card
+
+The Storage card (Config page, Resources tab; live JSON at `GET /v1/storage`) lists what the
+service keeps on disk, with sizes, in two groups:
+
+- **Safe to clear**, each with a *Clear*: the compiled-model caches (OpenVINO, TensorRT, CoreML;
+  the OpenVINO and TensorRT rows list their compiled models, superseded ones first), the uv package
+  cache a failed setup left, leftover staging (training runs, review exports, model exports), the
+  work folders of crashed jobs and old log files. A cleared cache makes the next model load slower
+  once. The service also removes these by itself once a day: caches unused for 60 days, compiled
+  models whose model file is gone or was compiled again, staging and crashed jobs' folders, a
+  day-old uv cache, and temporary files a crash left (after an hour).
+- **Your data**, never deleted automatically: the dataset and review folders, review exports (each
+  with a *Remove*), unfinished review exports, training runs, the checkpoints failed runs keep for a
+  retry, run folders no record names, models, the model export toolchain and the training
+  environment (removed from the Resources card and the Train tab), and ONNX Runtime builds this
+  config does not load.
+
+After a crash or `kill -9` the next start ends the export or training processes the old one left
+running (only ones whose process id, start time and program all still match) and removes their
+leftovers; Python helpers also stop by themselves within a second of the service going away.
 
 #### Sorting tables
 

@@ -128,7 +128,7 @@
   // The class picker's entries of catalog `cat`.
   function alEntries(cat) {
     var out = root.ClassPicker.util.mergeEntries(cat.entries || [], (cat.classes || []));
-    out.forEach(function (e) { if ((cat.classes || []).indexOf(e.name) >= 0) e.in_list = true; e.hidden = (cat.hidden || []).indexOf(e.name) >= 0; });
+    out.forEach(function (e) { if ((cat.classes || []).indexOf(e.name) >= 0) e.in_list = true; e.hidden = root.ClassPicker.util.isHidden(e.name, cat.hidden); });
     return out;
   }
   // What the picker `picker` holds, for the Preview and the auto-label an import chains.

@@ -379,6 +379,16 @@ fn service_manager_stop_budgets_cover_the_app_s_hard_bound() {
     // The Windows installers set the preshutdown timeout through the service binary.
     let ps1 = repo_file("scripts/install_service.ps1");
     assert!(ps1.contains("--set-preshutdown-timeout"));
+    // RA-027: the MSI runs it too, scheduled after the service is installed, and its smoke test
+    // checks the value the SCM stored (milliseconds).
+    let wxs = repo_file("packaging/windows/main.wxs");
+    assert!(wxs.contains(r#"ExeCommand="--set-preshutdown-timeout""#));
+    assert!(wxs.contains(r#"<Custom Action="SetServicePreshutdownTimeout""#));
+    let smoke = repo_file("packaging/windows/smoke-test.ps1");
+    assert_eq!(
+        number_after(&smoke, "$svcKey.PreshutdownTimeout -ne "),
+        want * 1000
+    );
 }
 
 #[test]

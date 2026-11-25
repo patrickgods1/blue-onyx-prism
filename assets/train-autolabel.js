@@ -322,7 +322,7 @@
     var hideUnticked = function (names) {
       var box = document.getElementById("al-hide-unticked");
       var list = catalog.classes || [], hidden = catalog.hidden || [];
-      var skipped = !box || !box.checked ? [] : list.filter(function (c) { return names.indexOf(c) < 0 && hidden.indexOf(c) < 0; });
+      var skipped = !box || !box.checked ? [] : list.filter(function (c) { return names.indexOf(c) < 0 && !CP.util.isHidden(c, hidden); });
       if (!skipped.length || !window.confirm("Hide and auto-reject " + skipped.join(", ") + " in Review? (Cancel = only skip them in this run)")) return Promise.resolve();
       return postJson("/v1/review/classes", { classes: list.slice(), hidden: hidden.concat(skipped) }).then(function (j) {
         catalog.classes = j.classes || list;

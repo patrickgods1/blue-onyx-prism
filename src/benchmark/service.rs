@@ -2374,8 +2374,14 @@ mod tests {
     /// [`super::super::save::commit`] and the file, write the same `benchmark.json` (QA-123).
     #[test]
     fn cli_and_service_saves_write_the_same_file() {
+        // Every stamp fixed, the models' too: `ModelResult::failed` stamps the current second, and
+        // the CLI's and the service's results are built at different moments (a slow runner
+        // crossed a second between them).
         let fixed = |mut r: BenchmarkResults| {
             r.timestamp = "2026-11-24T00:00:00Z".into();
+            for m in &mut r.models {
+                m.timestamp = "2026-11-24T00:00:00Z".into();
+            }
             r
         };
         let grade = (AccuracyMetric::default(), Weights::default());

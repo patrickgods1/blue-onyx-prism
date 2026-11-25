@@ -76,6 +76,10 @@
   var CP = window.ClassPicker || null;
   var CU = CP ? CP.util : null;
   var hiddenClasses = [];
+  // Ignoring case, like Review and the server (QA-112).
+  function isHiddenName(c) {
+    return CU ? CU.isHidden(c, hiddenClasses) : hiddenClasses.indexOf(c) >= 0;
+  }
   var catalog = null;
   var classesPicker = null;
   var hideSet = {};   // class -> "don't want" ticked
@@ -232,7 +236,7 @@
     var out = CU.mergeEntries(base, classes);
     out.forEach(function (e) {
       if (classes.indexOf(e.name) >= 0) e.in_list = true;
-      e.hidden = hiddenClasses.indexOf(e.name) >= 0;
+      e.hidden = isHiddenName(e.name);
     });
     return out;
   }
@@ -268,7 +272,7 @@
       if (j.hidden) hiddenClasses = j.hidden;
       if (catalog) { catalog.classes = classes.slice(); catalog.hidden = hiddenClasses.slice(); }
       hideSet = {};
-      classes.forEach(function (c) { hideSet[c] = hiddenClasses.indexOf(c) >= 0; });
+      classes.forEach(function (c) { hideSet[c] = isHiddenName(c); });
       if (classesPicker) classesPicker.setEntries(entries());
       var lines = [j.message || 'Saved.'];
       var auto = unwantedNote(j);
@@ -282,7 +286,7 @@
   function initPicker() {
     var holder = $('rv-classes-picker');
     if (!holder || !CP) return;
-    classes.forEach(function (c) { hideSet[c] = hiddenClasses.indexOf(c) >= 0; });
+    classes.forEach(function (c) { hideSet[c] = isHiddenName(c); });
     classesPicker = CP.create(holder, {
       entries: entries(), selected: classes.slice(), mode: 'full', allowAdd: true,
       extra: function (entry, chip) {

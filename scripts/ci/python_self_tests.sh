@@ -16,4 +16,5 @@ PY=${PYTHON:-python}
 "$PY" -I packaging/release/ci_green.py --self-test
 "$PY" -I scripts/ci/check_deps.py --self-test
 "$PY" -I scripts/gen_icons.py --check
+"$PY" -I scripts/ci/test_parent_watch.py
 echo "python self-tests ok"
