@@ -431,6 +431,78 @@ pub enum WaitStatus {
 pub struct Wait {
     manager: Arc<Manager>,
     blocks: Vec<Block>,
+    /// Tests: the statuses [`Self::poll`] answers instead of the manager's (QA-273).
+    #[cfg(test)]
+    script: Option<WaitScript>,
+}
+
+/// Tests (QA-273): what a scripted [`Wait`] answers, in order; the last status is held until
+/// another is pushed. Clones share the script, so a test keeps one to push and count polls.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WaitScript(
+    Arc<std::sync::Mutex<(std::collections::VecDeque<WaitStatus>, usize)>>,
+);
+
+#[cfg(test)]
+impl WaitScript {
+    pub(crate) fn new(statuses: impl IntoIterator<Item = WaitStatus>) -> Self {
+        let s = Self::default();
+        s.0.lock_recover().0.extend(statuses);
+        s
+    }
+
+    /// Answer `status` once the statuses before it were polled.
+    pub(crate) fn push(&self, status: WaitStatus) {
+        self.0.lock_recover().0.push_back(status);
+    }
+
+    /// How often the script was polled.
+    pub(crate) fn polls(&self) -> usize {
+        self.0.lock_recover().1
+    }
+
+    fn next(&self) -> WaitStatus {
+        let mut g = self.0.lock_recover();
+        g.1 += 1;
+        if g.0.len() > 1 {
+            g.0.pop_front().unwrap_or(WaitStatus::Ready)
+        } else {
+            g.0.front()
+                .cloned()
+                .unwrap_or_else(|| WaitStatus::Pending(String::new()))
+        }
+    }
+}
+
+#[cfg(test)]
+impl Wait {
+    /// A wait on `blocks` that answers from `script` (`manager` is never asked).
+    pub(crate) fn scripted(manager: Arc<Manager>, blocks: Vec<Block>, script: WaitScript) -> Self {
+        Self {
+            manager,
+            blocks,
+            script: Some(script),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Provision {
+    /// [`Self::none`] with `model` waiting for `blocks` on `manager` (QA-151).
+    pub(crate) fn with_blocks(
+        config: &Config,
+        manager: Arc<Manager>,
+        model: &str,
+        blocks: Vec<Block>,
+    ) -> Self {
+        let mut p = Self::none(config);
+        p.manager = Some(manager);
+        p.auto_download = true;
+        p.blocks
+            .insert(crate::registry::normalize_name(model), blocks);
+        p
+    }
 }
 
 impl std::fmt::Debug for Wait {
@@ -447,6 +519,10 @@ impl Wait {
     }
 
     pub fn poll(&self) -> WaitStatus {
+        #[cfg(test)]
+        if let Some(script) = &self.script {
+            return script.next();
+        }
         let mut pending: Vec<String> = Vec::new();
         let mut runtime_installed: Option<&'static str> = None;
         for b in &self.blocks {
@@ -553,6 +629,8 @@ impl Provision {
         Some(Wait {
             manager: self.manager.clone()?,
             blocks: blocks.to_vec(),
+            #[cfg(test)]
+            script: None,
         })
     }
 
@@ -629,14 +707,15 @@ pub fn describe_event(ev: &manager::Event) -> String {
             error,
             retry_at,
             ..
-        } => match retry_at {
-            Some(t) => format!(
-                "download of {id} failed: {error}; retrying in {} s",
-                t.duration_since(std::time::SystemTime::now())
-                    .unwrap_or_default()
-                    .as_secs()
-            ),
-            None => format!("download of {id} failed: {error}"),
-        },
+        } => {
+            let unix = |t: &std::time::SystemTime| {
+                t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+            };
+            match manager::retry_in(retry_at.as_ref().map(unix)) {
+                Some(s) => format!("download of {id} failed: {error}; retrying in {s} s"),
+                None => format!("download of {id} failed: {error}"),
+            }
+        }
     }
 }

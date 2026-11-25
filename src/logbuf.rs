@@ -49,13 +49,10 @@ fn truncate_text(mut s: String, max: usize) -> String {
         }
         return s;
     }
-    let mut cut = max;
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let dropped = s.len() - cut;
-    let mut out = String::with_capacity(cut + MARKER_ROOM);
-    out.push_str(s.get(..cut).unwrap_or_default());
+    let kept = crate::text::cap_bytes(&s, max);
+    let dropped = s.len() - kept.len();
+    let mut out = String::with_capacity(kept.len() + MARKER_ROOM);
+    out.push_str(kept);
     let _ = write!(out, "… [truncated {dropped} bytes]");
     out
 }
@@ -423,6 +420,41 @@ mod tests {
         let e = &b.since(0, None, 10).entries[0];
         assert_eq!(e.target, "reqwest::connect");
         assert_eq!(e.message, "starting new connection peer=x");
+    }
+
+    /// QA-232: a bridged record with an empty message shows its other fields alone (no leading
+    /// space) and no `log.` text; a non-str `log.*` field (`log.line`) is dropped too.
+    #[test]
+    fn a_bridged_record_without_a_message_shows_only_its_own_fields() {
+        let b = LogBuffer::new(10);
+        let sub = tracing_subscriber::registry().with(b.clone());
+        tracing::subscriber::with_default(sub, || {
+            tracing::warn!(
+                target: "log",
+                {
+                    log.target = "hyper::proto",
+                    log.file = "src/proto.rs",
+                    log.line = 7u64,
+                    peer = "x",
+                },
+                ""
+            );
+        });
+        let e = &b.since(0, None, 10).entries[0];
+        assert_eq!(e.target, "hyper::proto");
+        assert_eq!(e.message, "peer=x");
+        assert_eq!(e.level, "WARN");
+    }
+
+    /// QA-272: the cut goes through `text::cap_bytes` (never inside a character) and the
+    /// marker counts the bytes dropped.
+    #[test]
+    fn truncate_text_cuts_on_a_char_boundary_with_its_marker() {
+        assert_eq!(truncate_text("abc".into(), 3), "abc");
+        assert_eq!(truncate_text("abcd".into(), 3), "abc… [truncated 1 bytes]");
+        // 'é' is two bytes: a cut at 2 falls inside the second byte of the first 'é'.
+        assert_eq!(truncate_text("aéé".into(), 2), "a… [truncated 4 bytes]");
+        assert_eq!(truncate_text("日本".into(), 2), "… [truncated 6 bytes]");
     }
 
     // QA-087

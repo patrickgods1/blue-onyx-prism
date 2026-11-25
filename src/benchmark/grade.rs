@@ -155,11 +155,6 @@ impl Grade {
             .map_or(Grade::F, |(_, g)| g)
     }
 
-    /// Grade of an AP50 accuracy score.
-    pub fn accuracy(score: f64) -> Self {
-        Self::at_least(score, &ACCURACY_THRESHOLDS)
-    }
-
     /// Grade of an accuracy score of `metric`.
     pub fn accuracy_for(metric: AccuracyMetric, score: f64) -> Self {
         Self::at_least(score, metric.thresholds())
@@ -357,12 +352,12 @@ mod tests {
 
     #[test]
     fn accuracy_thresholds() {
-        assert_eq!(Grade::accuracy(0.95), Grade::A);
-        assert_eq!(Grade::accuracy(0.70), Grade::A);
-        assert_eq!(Grade::accuracy(0.69), Grade::B);
-        assert_eq!(Grade::accuracy(0.55), Grade::C);
-        assert_eq!(Grade::accuracy(0.40), Grade::D);
-        assert_eq!(Grade::accuracy(0.1), Grade::F);
+        assert_eq!(Grade::accuracy_for(AccuracyMetric::Ap50, 0.95), Grade::A);
+        assert_eq!(Grade::accuracy_for(AccuracyMetric::Ap50, 0.70), Grade::A);
+        assert_eq!(Grade::accuracy_for(AccuracyMetric::Ap50, 0.69), Grade::B);
+        assert_eq!(Grade::accuracy_for(AccuracyMetric::Ap50, 0.55), Grade::C);
+        assert_eq!(Grade::accuracy_for(AccuracyMetric::Ap50, 0.40), Grade::D);
+        assert_eq!(Grade::accuracy_for(AccuracyMetric::Ap50, 0.1), Grade::F);
         assert!((accuracy_score(0.8, Some(0.3)) - 0.70).abs() < 1e-12);
         assert_eq!(accuracy_score(0.8, None), 0.8);
     }

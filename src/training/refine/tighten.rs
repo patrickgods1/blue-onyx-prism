@@ -5,7 +5,7 @@
 //! the pair, through the overlap check's own script and runner (`scripts/autolabel.py
 //! --zoom-pairs`, [`crate::training::overlaps::zoom`]), unchanged: one crop per candidate, the
 //! union of the label `L` and the fold model's detection `D` ([`Loose::union`]), padded by the
-//! script's `--zoom-pad`. [`super::judge::tighten`] decides from both looks.
+//! script's `--zoom-pad`. [`super::judge::tighten_verdict`] decides from both looks.
 //!
 //! - **Candidates** ([`FrameCandidates`]): what each fold's writes judged loose and worth a look
 //!   ([`super::judge::Judged::candidates`]), with the fold model's detections of the frame, appended to
@@ -35,15 +35,15 @@
 use super::job::{Acc, RefineJob};
 use super::judge::{Look, Loose};
 use super::write;
+use crate::collect::layout;
 use crate::training::autolabel::triage::Det;
 use crate::training::overlaps::select::{Crop, Selected};
 use crate::training::overlaps::zoom::{self, CropPlace, CropResult};
 use crate::training::pyenv::{is_cancel, stage};
 use crate::training::task::{TaskContext, TaskReport};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -82,7 +82,7 @@ pub fn time_line() -> String {
     format!(
         "the closer look adds a minute or two to set up, then up to about a second per loose label \
          it looks at (at most {})",
-        crate::training::import::preview::thousands(MAX_TIGHTEN_CANDIDATES)
+        crate::training::text::thousands(MAX_TIGHTEN_CANDIDATES)
     )
 }
 
@@ -131,7 +131,7 @@ pub fn bound(frames: &[FrameCandidates], max: usize) -> (Vec<FrameCandidates>, u
 
 /// The warning of a check whose look left `left` candidates out ([`bound`]).
 pub fn left_out_warning(left: usize) -> String {
-    let n = crate::training::import::preview::thousands;
+    let n = crate::training::text::thousands;
     format!(
         "the closer look took the {} loose labels with the most confident fold detections and left \
          {} out (their open better-fitting boxes stay as they were); a check of part of the frames \
@@ -197,47 +197,38 @@ pub struct FrameCandidates {
     pub loose: Vec<Loose>,
 }
 
-/// Append `frames` to `<work>/`[`CANDIDATES_FILE`] (created when missing), flushed to disk.
+/// Append `frames` to `<work>/`[`CANDIDATES_FILE`] (created when missing) in one write, synced to
+/// disk ([`layout::append_lines`]: after a torn last line, left by an append that failed midway,
+/// the new lines start on a line of their own, so only the torn record is lost).
 pub fn append(work: &Path, frames: &[FrameCandidates]) -> Result<()> {
     if frames.is_empty() {
         return Ok(());
     }
     std::fs::create_dir_all(work).with_context(|| format!("creating {}", work.display()))?;
     let path = work.join(CANDIDATES_FILE);
-    let mut bytes = Vec::new();
-    for f in frames {
-        serde_json::to_writer(&mut bytes, f)?;
-        bytes.push(b'\n');
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
-    file.write_all(&bytes)
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_data())
-        .with_context(|| format!("writing {}", path.display()))
+    let lines = frames
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<serde_json::Result<Vec<String>>>()?;
+    layout::append_lines(&path, &lines, true).with_context(|| format!("writing {}", path.display()))
 }
 
-/// The candidates of `<work>/`[`CANDIDATES_FILE`]: none when there is no file; a line that does
-/// not parse is left out with a warning (its frame gets no closer look).
+/// The candidates of `<work>/`[`CANDIDATES_FILE`] ([`layout::read_lines`]): none when there is no
+/// file; a file that cannot be read is an error; a line that does not parse is left out with a
+/// warning (its frame gets no closer look).
 pub fn read(work: &Path, warnings: &mut Vec<String>) -> Result<Vec<FrameCandidates>> {
-    let path = work.join(CANDIDATES_FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        t => t.with_context(|| format!("reading {}", path.display()))?,
-    };
-    let mut out = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        match serde_json::from_str::<FrameCandidates>(line) {
-            Ok(f) => out.push(f),
-            Err(e) => warnings.push(format!(
-                "a loose label's record does not parse ({e}); its frame got no closer look"
-            )),
-        }
+    let read = layout::read_lines::<FrameCandidates>(&work.join(CANDIDATES_FILE));
+    if let Some(failed) = read.failed {
+        bail!("reading {failed}");
     }
-    Ok(out)
+    warnings.extend(
+        std::iter::repeat_n(
+            "a loose label's record does not parse; its frame got no closer look",
+            read.damaged,
+        )
+        .map(str::to_string),
+    );
+    Ok(read.lines)
 }
 
 /// The loose labels of `frames`.
@@ -583,6 +574,31 @@ mod tests {
         assert_eq!(back, vec![a, b]);
         assert_eq!(warnings.len(), 1);
         assert_eq!(count(&back), 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Audit 2026-11 (QA-261): a fold's append that failed midway (disk full) leaves a torn last
+    /// line; the next fold's records start on a line of their own, so only the torn record is
+    /// lost, not the first new one glued to it. A damaged byte costs its own line, not the file.
+    #[test]
+    fn an_append_after_a_torn_line_keeps_the_new_record() {
+        let d = std::env::temp_dir().join(format!("bop-tighten-{}", uuid::Uuid::new_v4()));
+        let a = frame("day/cam/2026-10-01/a.jpg", vec![pair(0.0)]);
+        let b = frame("day/cam/2026-10-02/b.jpg", vec![pair(200.0)]);
+        let c = frame("day/cam/2026-10-03/c.jpg", vec![pair(300.0)]);
+        append(&d, std::slice::from_ref(&a)).unwrap();
+        let path = d.join(CANDIDATES_FILE);
+        let mut t = std::fs::read(&path).unwrap();
+        t.extend_from_slice(b"\xff\n{\"rel\":\"torn");
+        std::fs::write(&path, t).unwrap();
+        append(&d, &[b.clone(), c.clone()]).unwrap();
+        let mut warnings = Vec::new();
+        let back = read(&d, &mut warnings).unwrap();
+        assert_eq!(back, vec![a, b, c]);
+        assert_eq!(
+            warnings,
+            vec!["a loose label's record does not parse; its frame got no closer look"; 2]
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

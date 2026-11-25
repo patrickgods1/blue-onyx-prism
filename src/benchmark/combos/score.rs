@@ -75,7 +75,6 @@ pub(crate) fn eval_of(img: &SetImage<'_>, map: &ClassMap, run: &StoredRun, k: us
     eval_input(map, img.set.scored_labels.as_deref(), gt, &preds).1
 }
 
-/// The one class of `img`.
 /// The run of a device that ran itself (no fallback to another device).
 pub fn usable(d: &DeviceResult) -> Option<&RunResult> {
     d.run.as_ref().filter(|r| !r.fell_back)

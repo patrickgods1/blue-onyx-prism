@@ -35,7 +35,6 @@ use crate::resources::export::train::{self as env, TrainPaths};
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// What to check.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,7 +117,7 @@ pub fn plan_overlaps(
         paths,
         platform,
         accelerator,
-        timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
+        timeout: config.training.timeout(),
         headroom: crate::training::commit::now,
     })
 }

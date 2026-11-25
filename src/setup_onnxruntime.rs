@@ -10,8 +10,9 @@
 //! archive is executed.
 
 use crate::resources::catalog;
+use crate::resources::manager::dir_size;
 use crate::resources::manager::{self, Job, ManagerOptions};
-use crate::setup_openvino::{ArchiveKind, dir_size};
+use crate::setup_openvino::ArchiveKind;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -19,8 +20,8 @@ use std::path::{Path, PathBuf};
 pub use crate::resources::catalog::{DIRECTML_VERSION, Flavor, Layout, ONNXRUNTIME_VERSION};
 /// Default folder name next to the executable.
 pub const DIR_NAME: &str = "onnxruntime";
-/// File recording the installed flavor.
-pub const FLAVOR_FILE: &str = "flavor.txt";
+/// File recording the installed flavor (one name, shared with the extractor and the loader).
+pub use crate::resources::extract::FLAVOR_FILE;
 
 /// `--flavor` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -120,7 +121,8 @@ pub fn installed(dir: &Path) -> Option<InstalledOrt> {
     };
     let flavor = read(FLAVOR_FILE)?;
     Some(InstalledOrt {
-        version: read("VERSION").unwrap_or_else(|| "unknown version".to_string()),
+        version: read(crate::resources::extract::VERSION_FILE)
+            .unwrap_or_else(|| "unknown version".to_string()),
         flavor,
     })
 }

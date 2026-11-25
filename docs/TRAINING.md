@@ -1012,7 +1012,7 @@ Stages (page and `train run` show them with percent and ETA):
    trainer reports it, `eval`, `phase`, `done`; `epoch` / `eval` also carry every scalar metric, see
    [Metrics per epoch](#metrics-per-epoch); a NaN or infinite value is written as `null`, since a bare
    `NaN` is no JSON and the line would be lost); everything else goes to `<run>/train.log` (capped
-   at 20 MB). Out of GPU memory, missing kernels and unusable images get their own messages (lower the
+   at 20 MB for the whole file, a retry export's lines included; the cut is noted once). Out of GPU memory, missing kernels and unusable images get their own messages (lower the
    batch or input size, ...); other failures go through the export's classifier. **Out of GPU memory
    before 3 finished epochs** restarts the training at half the batch (down to 1, at most 3 restarts):
    the log, the stage text and `describe()` say "out of GPU memory at batch 16, retrying with batch 8",
@@ -1681,7 +1681,9 @@ dataset.
    on the dHash Hamming distance instead (no embeddings; an image-folder import then needs no Python,
    no GPU and no download). On Windows a SigLIP 2 import needs about 4.6 GB of memory commit (plus 1 GB
    spare), checked before its first Python process: short, it is refused and the message offers the
-   dHash selection (*Memory commit check before a job* in [A run](#a-run)).
+   dHash selection (*Memory commit check before a job* in [A run](#a-run)). If the embeddings fail
+   (for example on an image the embedder cannot read), the import warns and picks by dHash instead; a
+   Cancel still cancels.
 5. **Writing**: each frame becomes `<scene>/<camera>/<date>/<ts>_imp-<id>-<n>.jpg`, the date and
    `<ts>` (`20240315T083012500-0700`) in the configured `timezone` (the JPEG copied as is), with a
    version-1 sidecar without detections, `source: "import:<id>"` and its

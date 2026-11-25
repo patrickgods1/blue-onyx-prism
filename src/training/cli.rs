@@ -1,7 +1,11 @@
 //! `blue-onyx-prism train ...`: what this machine can train (`capability`), estimates
 //! (`estimate`), a dry run of the dataset assembly (`prepare`), one or several training runs in a
 //! row (`run`), past runs (`list`), removing the training environment (`remove-env`), footage
-//! import (`import`) and auto-labelling (`autolabel`, also the self-training re-label).
+//! import (`import`) and auto-labelling (`autolabel`, also the self-training re-label). One
+//! `cmd_*` function per subcommand; the ones that queue jobs follow them through
+//! [`follow::follow`] and print their own outcome.
+
+mod follow;
 
 #[cfg(test)]
 use super::capability;
@@ -80,110 +84,7 @@ pub enum TrainCommand {
     /// best checkpoint, from
     /// the Train tab (Finish now) or by creating the file `<run dir>/work/stop-request`
     /// (the run dir is under the training folder, see `train list`). Ctrl-C cancels instead.
-    Run {
-        /// Model label, repeatable (runs one after the other): yolo26n, yolo11s, yolov8m,
-        /// rfdetr-nano, rt-detrv2-s, dfine-s, ...
-        #[arg(long = "model", required = true)]
-        models: Vec<String>,
-        #[command(flatten)]
-        data: Box<DataArgs>,
-        /// Most epochs (default: the family's recommendation: YOLO 100, RF-DETR 100,
-        /// RT-DETRv2 / D-FINE 80; config `training.epochs`).
-        #[arg(long)]
-        epochs: Option<u32>,
-        /// Epochs without an improvement of the selected metric (--select-metric, mAP by
-        /// default) before the run stops and keeps its best checkpoint; 0 = off (default: the
-        /// family's recommendation: YOLO 15, others 10; config `training.patience`). At most
-        /// --epochs.
-        #[arg(long)]
-        patience: Option<u32>,
-        /// Images per batch (default: the largest the GPU fits by the estimate, at most 16).
-        #[arg(long)]
-        batch: Option<u32>,
-        /// Square input size (default: the size's own, 640 for YOLO).
-        #[arg(long)]
-        imgsz: Option<u32>,
-        /// Learning rate (default: config `training.lr`, else the family's: YOLO auto (the
-        /// optimizer picks), RF-DETR 1e-4 (5e-5 under 1000 unique training frames), RT-DETRv2 /
-        /// D-FINE 1e-4).
-        #[arg(long)]
-        lr: Option<f32>,
-        /// Learning-rate schedule: cosine, linear or step (default: config
-        /// `training.lr_schedule`, else the family's: YOLO linear (or cosine), RF-DETR cosine
-        /// (or step), RT-DETRv2 / D-FINE cosine (or linear)).
-        #[arg(long, value_parser = ["cosine", "linear", "step"])]
-        lr_schedule: Option<String>,
-        /// Final learning rate as a share of the starting one, 0-1 (default: config
-        /// `training.lr_min_factor`, else the family's: YOLO 0.01, RF-DETR 0.1 (also its
-        /// anneal's), RT-DETRv2 / D-FINE 0).
-        #[arg(long)]
-        lr_min_factor: Option<f32>,
-        /// The metric the run optimizes: it picks the exported epoch and drives the convergence
-        /// rule (default: config `training.select_metric`, else map). With a small validation
-        /// split any choice but mAP is noisy; the held-out benchmark stays the number to trust.
-        #[arg(long, value_parser = select_metric_arg())]
-        select_metric: Option<recipe::SelectMetric>,
-        /// RF-DETR multi-scale training: auto (on when the estimate fits batch 4 with it), on
-        /// (rfdetr's default: batches up to ~1.4x the input size, about twice the memory) or off.
-        #[arg(long, default_value = "auto", value_parser = ["auto", "on", "off"])]
-        multi_scale: String,
-        /// Night augmentation preset: darkness 0.5, noise 0.3, grayscale 0.5.
-        #[arg(long)]
-        night_aug: bool,
-        #[arg(long)]
-        aug_dark: Option<f32>,
-        #[arg(long)]
-        aug_noise: Option<f32>,
-        #[arg(long)]
-        aug_gray: Option<f32>,
-        /// Repeat every run with N (1-3) different training seeds on the same frames; the
-        /// runs form one comparison group and the Comparison card shows the spread. Differences
-        /// of 2-3 mAP between seeds are noise.
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=3))]
-        seeds: u64,
-        /// Model name (only with one --model and one --scene; repeats get -s1, -s2; default <scene>-<model>-<stamp>:
-        /// custom-, day-, night-, ...).
-        #[arg(long)]
-        name: Option<String>,
-        /// Allow downloads over 500 MB: the training environment and, with --public, the public
-        /// night subset (about 926 MB). Also config `allow_large_downloads`.
-        #[arg(long)]
-        allow_large: bool,
-        /// Folder the model is installed in (default: the models folder; relative = under the
-        /// data root). The config entry points at the file there.
-        #[arg(long)]
-        install_dir: Option<PathBuf>,
-        /// GPU to train on, cuda:N (`train capability` lists the usable ones; default the one
-        /// with the most memory). A GPU on another PyTorch build (cu126 / cu130) sets up that
-        /// build's environment.
-        #[arg(long)]
-        gpu: Option<String>,
-        /// Install the model but do not add it to the config (and do not benchmark it).
-        #[arg(long)]
-        no_register: bool,
-        /// Do not benchmark the trained model.
-        #[arg(long)]
-        no_benchmark: bool,
-        /// Built-in benchmark set to run besides the held-out frames, repeatable (nir-night,
-        /// exdark-ir, ...).
-        #[arg(long = "benchmark-set")]
-        benchmark_sets: Vec<String>,
-        /// Device to benchmark the trained model on, repeatable, run one after the other
-        /// (ort:cuda:0, openvino:gpu.0, ...); default training.benchmark_devices, else the
-        /// device the model would load on.
-        #[arg(long = "benchmark-device")]
-        benchmark_devices: Vec<String>,
-        /// Keep the checkpoints in <run>/work.
-        #[arg(long)]
-        keep_work: bool,
-        /// Start even when the memory commit check (Windows) would refuse a run: it may grow the
-        /// paging file into the last 16 GB of its drive. It logs a warning, in train.log too.
-        #[arg(long)]
-        ignore_memory_check: bool,
-        /// Print the trainer's output.
-        #[arg(long)]
-        verbose: bool,
-    },
+    Run(RunArgs),
     /// Import frames from a video, an image folder (Blue Iris clips / alerts), a video URL or
     /// pinned open footage into the dataset folder, queued for review.
     Import(ImportArgs),
@@ -217,6 +118,112 @@ pub enum TrainCommand {
     },
     /// Delete the training environment (tools/train-env, its base weights and settings).
     RemoveEnv,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct RunArgs {
+    /// Model label, repeatable (runs one after the other): yolo26n, yolo11s, yolov8m,
+    /// rfdetr-nano, rt-detrv2-s, dfine-s, ...
+    #[arg(long = "model", required = true)]
+    pub models: Vec<String>,
+    #[command(flatten)]
+    pub data: Box<DataArgs>,
+    /// Most epochs (default: the family's recommendation: YOLO 100, RF-DETR 100,
+    /// RT-DETRv2 / D-FINE 80; config `training.epochs`).
+    #[arg(long)]
+    pub epochs: Option<u32>,
+    /// Epochs without an improvement of the selected metric (--select-metric, mAP by
+    /// default) before the run stops and keeps its best checkpoint; 0 = off (default: the
+    /// family's recommendation: YOLO 15, others 10; config `training.patience`). At most
+    /// --epochs.
+    #[arg(long)]
+    pub patience: Option<u32>,
+    /// Images per batch (default: the largest the GPU fits by the estimate, at most 16).
+    #[arg(long)]
+    pub batch: Option<u32>,
+    /// Square input size (default: the size's own, 640 for YOLO).
+    #[arg(long)]
+    pub imgsz: Option<u32>,
+    /// Learning rate (default: config `training.lr`, else the family's: YOLO auto (the
+    /// optimizer picks), RF-DETR 1e-4 (5e-5 under 1000 unique training frames), RT-DETRv2 /
+    /// D-FINE 1e-4).
+    #[arg(long)]
+    pub lr: Option<f32>,
+    /// Learning-rate schedule: cosine, linear or step (default: config
+    /// `training.lr_schedule`, else the family's: YOLO linear (or cosine), RF-DETR cosine
+    /// (or step), RT-DETRv2 / D-FINE cosine (or linear)).
+    #[arg(long, value_parser = ["cosine", "linear", "step"])]
+    pub lr_schedule: Option<String>,
+    /// Final learning rate as a share of the starting one, 0-1 (default: config
+    /// `training.lr_min_factor`, else the family's: YOLO 0.01, RF-DETR 0.1 (also its
+    /// anneal's), RT-DETRv2 / D-FINE 0).
+    #[arg(long)]
+    pub lr_min_factor: Option<f32>,
+    /// The metric the run optimizes: it picks the exported epoch and drives the convergence
+    /// rule (default: config `training.select_metric`, else map). With a small validation
+    /// split any choice but mAP is noisy; the held-out benchmark stays the number to trust.
+    #[arg(long, value_parser = select_metric_arg())]
+    pub select_metric: Option<recipe::SelectMetric>,
+    /// RF-DETR multi-scale training: auto (on when the estimate fits batch 4 with it), on
+    /// (rfdetr's default: batches up to ~1.4x the input size, about twice the memory) or off.
+    #[arg(long, default_value = "auto", value_parser = ["auto", "on", "off"])]
+    pub multi_scale: String,
+    /// Night augmentation preset: darkness 0.5, noise 0.3, grayscale 0.5.
+    #[arg(long)]
+    pub night_aug: bool,
+    #[arg(long)]
+    pub aug_dark: Option<f32>,
+    #[arg(long)]
+    pub aug_noise: Option<f32>,
+    #[arg(long)]
+    pub aug_gray: Option<f32>,
+    /// Repeat every run with N (1-3) different training seeds on the same frames; the
+    /// runs form one comparison group and the Comparison card shows the spread. Differences
+    /// of 2-3 mAP between seeds are noise.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=3))]
+    pub seeds: u64,
+    /// Model name (only with one --model and one --scene; repeats get -s1, -s2; default <scene>-<model>-<stamp>:
+    /// custom-, day-, night-, ...).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Allow downloads over 500 MB: the training environment and, with --public, the public
+    /// night subset (about 926 MB). Also config `allow_large_downloads`.
+    #[arg(long)]
+    pub allow_large: bool,
+    /// Folder the model is installed in (default: the models folder; relative = under the
+    /// data root). The config entry points at the file there.
+    #[arg(long)]
+    pub install_dir: Option<PathBuf>,
+    /// GPU to train on, cuda:N (`train capability` lists the usable ones; default the one
+    /// with the most memory). A GPU on another PyTorch build (cu126 / cu130) sets up that
+    /// build's environment.
+    #[arg(long)]
+    pub gpu: Option<String>,
+    /// Install the model but do not add it to the config (and do not benchmark it).
+    #[arg(long)]
+    pub no_register: bool,
+    /// Do not benchmark the trained model.
+    #[arg(long)]
+    pub no_benchmark: bool,
+    /// Built-in benchmark set to run besides the held-out frames, repeatable (nir-night,
+    /// exdark-ir, ...).
+    #[arg(long = "benchmark-set")]
+    pub benchmark_sets: Vec<String>,
+    /// Device to benchmark the trained model on, repeatable, run one after the other
+    /// (ort:cuda:0, openvino:gpu.0, ...); default training.benchmark_devices, else the
+    /// device the model would load on.
+    #[arg(long = "benchmark-device")]
+    pub benchmark_devices: Vec<String>,
+    /// Keep the checkpoints in <run>/work.
+    #[arg(long)]
+    pub keep_work: bool,
+    /// Start even when the memory commit check (Windows) would refuse a run: it may grow the
+    /// paging file into the last 16 GB of its drive. It logs a warning, in train.log too.
+    #[arg(long)]
+    pub ignore_memory_check: bool,
+    /// Print the trainer's output.
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 /// `train import`.
@@ -755,6 +762,18 @@ fn run_tasks_cli(
     Ok(out)
 }
 
+/// How a task reads to [`follow::follow`]: "<percent>% <describe>", a new line at once on a new
+/// step (from `usize::MAX`, before any).
+fn task_shown(r: &super::task::TaskRecord) -> follow::Shown<'_, usize> {
+    follow::Shown {
+        busy: r.state.is_busy(),
+        running: r.state == RunState::Running,
+        line: format!("{:>3}% {}", r.percent, r.describe()),
+        key: r.step,
+        log: &r.log,
+    }
+}
+
 /// Follow task `id` until it is no longer busy, printing its progress and outcome.
 fn watch_task(
     svc: &TrainingService,
@@ -762,51 +781,34 @@ fn watch_task(
     cancel: &AtomicBool,
     verbose: bool,
 ) -> Option<super::task::TaskRecord> {
-    let mut last = String::new();
-    let mut last_step = usize::MAX;
-    let mut last_print = std::time::Instant::now();
-    // QA-039: followed by the push count, not the tail's length (which stops at its cap).
-    let mut follow = service::LogFollower::new();
-    while let Some((r, seq)) = svc.wait_task_logged(id, Duration::from_secs(1)) {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+    // One line per stage, else at most every 10 s.
+    let r = follow::follow(
+        || svc.wait_task_logged(id, Duration::from_secs(1)),
+        task_shown,
+        usize::MAX,
+        cancel,
+        &|| {
             svc.cancel(id);
-        }
-        let fresh = follow.new_lines(&r.log, seq);
-        if verbose {
-            for l in fresh {
-                eprintln!("    {l}");
+        },
+        verbose,
+        &mut |_| {},
+        &mut |l| eprintln!("{l}"),
+    )?;
+    println!("{}: {}", r.title, r.describe());
+    if let Some(res) = &r.result {
+        if let Some(w) = res["warnings"].as_array() {
+            for x in w {
+                println!("  warning: {}", x.as_str().unwrap_or_default());
             }
         }
-        // One line per stage, else at most every 10 s.
-        let line = format!("{:>3}% {}", r.percent, r.describe());
-        if r.state == RunState::Running
-            && line != last
-            && (r.step != last_step || last_print.elapsed() >= Duration::from_secs(10))
-        {
-            eprintln!("{line}");
-            last = line;
-            last_step = r.step;
-            last_print = std::time::Instant::now();
-        }
-        if !r.state.is_busy() {
-            println!("{}: {}", r.title, r.describe());
-            if let Some(res) = &r.result {
-                if let Some(w) = res["warnings"].as_array() {
-                    for x in w {
-                        println!("  warning: {}", x.as_str().unwrap_or_default());
-                    }
-                }
-                if let Some(s) = res["sample"].as_array().filter(|s| !s.is_empty()) {
-                    println!("  frames, for example:");
-                    for x in s.iter().take(5) {
-                        println!("    {}", x.as_str().unwrap_or_default());
-                    }
-                }
+        if let Some(s) = res["sample"].as_array().filter(|s| !s.is_empty()) {
+            println!("  frames, for example:");
+            for x in s.iter().take(5) {
+                println!("    {}", x.as_str().unwrap_or_default());
             }
-            return Some(r);
         }
     }
-    None
+    Some(r)
 }
 
 /// Whether task `i` of an import chain ended well: Done, or (the auto-label) not run because
@@ -1004,606 +1006,664 @@ pub(super) fn run(args: TrainArgs, config_path: Option<PathBuf>) -> Result<bool>
     let path = config_path.unwrap_or_else(Config::default_config_path);
     let config = load_config(&path)?;
     match args.command {
-        TrainCommand::Capability { json } => {
-            let cap = super::capability_now();
-            if json {
-                println!("{}", serde_json::to_string_pretty(&cap)?);
-            } else {
-                print!("{}", capability_text(&cap));
-            }
-            Ok(cap.available)
-        }
+        TrainCommand::Capability { json } => cmd_capability(json),
         TrainCommand::Estimate {
             model,
             images,
             epochs,
             batch,
             imgsz,
-        } => {
-            let (family, size) = recipe::parse_label(&model)
-                .with_context(|| format!("unknown model label '{model}'"))?;
-            let cap = super::capability_now();
-            let target = cap.accelerator.as_ref().map_or(
-                estimate::Target::Cuda(crate::backend::detect::ComputeCapability::new(6, 1)),
-                |a| a.target(),
-            );
-            let imgsz = imgsz.unwrap_or_else(|| family.default_imgsz(size));
-            let batch = batch.unwrap_or(8);
-            let epochs = epochs.unwrap_or(config.training.epochs_for(family));
-            match estimate::estimate(family, size, imgsz, batch, images, epochs, target) {
-                Some(e) => println!(
-                    "{} {size} at {imgsz} px, batch {batch}, {images} images x {epochs} epochs: about {} MB of GPU memory, {} per epoch, {} in total ({}; rough estimate)",
-                    family.title(),
-                    e.vram_mb,
-                    estimate::format_duration(e.epoch_s),
-                    estimate::format_duration(e.total_s),
-                    cap.accelerator
-                        .as_ref()
-                        .map_or_else(|| "a GTX 1080 class GPU".to_string(), |a| a.describe())
-                ),
-                None => println!("{} {size} does not train on this device", family.title()),
-            }
-            Ok(true)
-        }
+        } => cmd_estimate(&config, &model, images, epochs, batch, imgsz),
         TrainCommand::Prepare {
             data,
             out,
             dry_run,
             allow_large,
-        } => {
-            if data.public && !dry_run {
-                fetch_public(&config, allow_large || config.allow_large_downloads)?;
-            }
-            let [scene] = data.scenes()[..] else {
-                bail!("prepare takes one --scene (train run compares several)");
-            };
-            // `--static-cap` and `--ignore` over the config's (in memory only).
-            let config = data.with_plan_flags(&config);
-            if dry_run {
-                let request = preview_request(&config, &data, scene)?;
-                // No model: the run's input size is not known (its placeholder recipe's is not).
-                let options = dataset::Options {
-                    imgsz: None,
-                    ..super::options_for(&config, &request)?
-                };
-                let p = super::preview_with(&config, &request, options)?;
-                println!("{}", dry_run_text(&p.plan, &request.balance));
-                let unreviewed = super::unreviewed_frames(&config);
-                let mut report = preflight::report(&p.plan, &p.sources, &p.options, unreviewed);
-                report.memory = preflight::memory(
-                    std::slice::from_ref(&request.recipe),
-                    config
-                        .training
-                        .workers
-                        .map_or(super::job::Workers::Auto, super::job::Workers::Fixed),
-                    super::commit::now().as_ref(),
-                );
-                print!("{}", preflight::text(&report));
-                let needs = preflight::run_needs(
-                    &p.plan,
-                    &p.sources,
-                    &request.recipe,
-                    &super::training_dir(&config).join("preview"),
-                    &TrainPaths::for_config(&config).export.models,
-                )?;
-                for n in preflight::combine(needs) {
-                    let s = super::import::disk::space(&n.dir);
-                    println!("disk: {}", preflight::disk_line(&n, s).text);
-                }
-                return Ok(true);
-            }
-            let Some(out) = out else {
-                bail!("--out <folder> is required (or --dry-run)");
-            };
-            let (sources, opts) = read_sources(&config, &data, scene)?;
-            let plan = preflight::planned(&sources, &opts)?;
-            let prepared = dataset::write(&sources, &plan, &opts, &out)?;
-            if let Some(note) = dataset::static_cap_note(&plan.stats, opts.static_cap) {
-                println!("{note}");
-            }
-            if let Some(note) = dataset::static_cap_idle_note(&plan.classes, opts.static_cap) {
-                println!("{note}");
-            }
-            println!(
-                "{}: {} training, {} validation, {} held-out images; classes: {}",
-                out.display(),
-                prepared.train_images,
-                prepared.valid_images,
-                prepared.heldout_images,
-                prepared.classes.join(", ")
-            );
-            if let Some(t) = dataset::valid_groups_text(&prepared.valid_groups) {
-                println!("{t}");
-            }
-            if let Some(b) = &prepared.balance_summary {
-                println!("balanced: {b}");
-            }
-            if let Some(h) = &prepared.heldout_dir {
-                println!("held-out benchmark set: dir:{}", h.display());
-            }
-            for w in &prepared.warnings {
-                println!("warning: {w}");
-            }
-            Ok(true)
-        }
-        TrainCommand::Run {
-            models,
-            data,
-            epochs,
-            patience,
-            batch,
-            imgsz,
-            lr,
-            lr_schedule,
-            lr_min_factor,
-            select_metric,
-            multi_scale,
-            night_aug,
-            aug_dark,
-            aug_noise,
-            aug_gray,
-            seeds,
-            name,
-            allow_large,
-            install_dir,
-            gpu,
-            no_register,
-            no_benchmark,
-            benchmark_sets,
-            benchmark_devices,
-            keep_work,
-            ignore_memory_check,
-            verbose,
-        } => {
-            let scenes = data.scenes();
-            if name.is_some() && (models.len() > 1 || scenes.len() > 1) {
-                bail!("--name needs exactly one --model and one --scene");
-            }
-            // `--static-cap` and `--ignore` over the config's (in memory only; the hooks read the
-            // file again).
-            let config = data.with_plan_flags(&config);
-            // Several runs of different scenes or seeds are compared on the same held-out frames.
-            let group = (scenes.len() as u64 * seeds > 1).then(|| {
-                format!(
-                    "cmp-{}",
-                    crate::clock::name_stamp(std::time::SystemTime::now())
-                )
-            });
-            // A chosen GPU: its lane, memory and suggested batches.
-            let cap = super::capability_now().for_gpu(gpu.as_deref())?;
-            eprintln!("{}", cap.summary());
-            let Some(accel) = cap.accelerator.clone() else {
-                for r in &cap.reasons {
-                    eprintln!("  {r}");
-                }
-                return Ok(false);
-            };
-            let paths = TrainPaths::for_config(&config);
-            let platform = catalog::Platform::current();
-            if !env::train_env_ready(&paths, platform, accel.lane())
-                && !(allow_large || config.allow_large_downloads)
-            {
-                let (dl, disk) = accel.lane().estimate();
-                bail!(
-                    "the training environment (PyTorch {} and the trainers) is a large download \
-                     (about {} GB, {} GB on disk under {}); rerun with --allow-large",
-                    accel.lane().as_str(),
-                    dl / 1_000_000_000,
-                    disk / 1_000_000_000,
-                    paths.export.tools.display()
-                );
-            }
-            let mut base = Augment::default();
-            if night_aug {
-                base = Augment::NIGHT;
-            }
-            let augment = Augment {
-                dark: aug_dark.unwrap_or(base.dark),
-                noise: aug_noise.unwrap_or(base.noise),
-                gray: aug_gray.unwrap_or(base.gray),
-            };
-            let benchmark_devices =
-                super::config::benchmark_devices(if benchmark_devices.is_empty() {
-                    &config.training.benchmark_devices
-                } else {
-                    &benchmark_devices
-                })?;
-            let balance = data.balance(&config)?;
-            if !balance.is_off() {
-                eprintln!("balance: {}", balance.describe());
-            }
-            let mut jobs = Vec::new();
-            for m in &models {
-                let (family, size) = recipe::parse_label(m)
-                    .with_context(|| format!("unknown model label '{m}' (e.g. yolo26n, rfdetr-nano, rt-detrv2-s, dfine-s)"))?;
-                let r = recipe::build_recipe(
-                    family,
-                    size,
-                    &recipe::RecipeInputs {
-                        epochs,
-                        patience,
-                        imgsz,
-                        batch,
-                        lr,
-                        lr_schedule: lr_schedule.as_deref().and_then(recipe::LrSchedule::parse),
-                        lr_min_factor,
-                        select_metric,
-                        augment,
-                        multi_scale: recipe::MultiScale::parse(&multi_scale).unwrap_or_default(),
-                    },
-                    &config.training,
-                    &cap,
-                )?;
-                for (scene, i) in scenes.iter().flat_map(|s| (0..seeds).map(move |i| (s, i))) {
-                    let req = TrainRequest {
-                        recipe: r.clone(),
-                        datasets: data.datasets.clone(),
-                        include_public: data.public,
-                        scene: *scene,
-                        classes: data.class_list(),
-                        rename: data.rename.iter().cloned().collect::<BTreeMap<_, _>>(),
-                        benchmark_sets: benchmark_sets.clone(),
-                        benchmark_devices: benchmark_devices.clone(),
-                        allow_large,
-                        install_dir: install_dir.clone(),
-                        gpu: gpu.clone(),
-                        excluded: data.excluded,
-                        balance: balance.clone(),
-                        compare_group: group.clone(),
-                        train_seed: (seeds > 1).then_some(i),
-                        ignore_memory_check,
-                    };
-                    let run_name = seed_run_name(name.as_deref(), &req.recipe, req.scene, i);
-                    let mut job = super::plan_job(&config, req, &cap, run_name)?;
-                    job.keep_work = keep_work;
-                    jobs.push(job);
-                }
-            }
-            super::check_jobs(&config, &jobs)?;
-            if jobs.len() > 1 {
-                eprintln!("queued {} runs:", jobs.len());
-                for j in &jobs {
-                    eprintln!("  {} ({})", j.name, j.request.scene.as_str());
-                }
-            }
-            let hooks: Arc<dyn Hooks> = Arc::new(CliHooks {
-                config_path: path.clone(),
-                register: !no_register,
-                benchmark: !no_register && !no_benchmark,
-            });
-            if !no_register && !no_benchmark {
-                eprintln!("{BASELINE_NOTE}");
-            }
-            let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
-            let svc = TrainingService::start_owner(
-                Arc::new(crate::resources::export::SystemRunner),
-                fetcher,
-                hooks,
-                super::runs_file(&config),
-            )
-            .map_err(anyhow::Error::msg)?;
-            let cancel = Arc::new(AtomicBool::new(false));
-            let _ctrl_c =
-                crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the training");
-            let ids: Vec<String> = jobs
-                .into_iter()
-                .map(|j| svc.enqueue(j).map_err(anyhow::Error::msg))
-                .collect::<Result<_>>()?;
-            let mut ok = true;
-            let mut finished: Vec<service::RunRecord> = Vec::new();
-            for id in &ids {
-                let mut last = (None, 0u8, String::new());
-                let mut last_print = std::time::Instant::now();
-                // QA-039: followed by the push count, not the tail's length.
-                let mut follow = service::LogFollower::new();
-                let mut balance_shown = false;
-                while let Some((r, seq)) = svc.wait_logged(id, Duration::from_secs(1)) {
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        for i in &ids {
-                            svc.cancel(i);
-                        }
-                    }
-                    for l in follow.new_lines(&r.log, seq) {
-                        if verbose {
-                            eprintln!("    {l}");
-                        }
-                    }
-                    if let Some(b) = balance_note(r.dataset.as_ref(), &mut balance_shown) {
-                        eprintln!("[{}] balanced: {b}", r.name);
-                    }
-                    // One line per stage or percent change, else at most every 10 s.
-                    let line = format!("[{}] {:>3}% {}", r.name, r.percent, r.describe());
-                    let key = (r.stage, r.percent, line.clone());
-                    let changed = key.0 != last.0 || key.1 != last.1;
-                    if r.state == RunState::Running
-                        && key.2 != last.2
-                        && (changed || last_print.elapsed() >= Duration::from_secs(10))
-                    {
-                        eprintln!("{line}");
-                        last = key;
-                        last_print = std::time::Instant::now();
-                    }
-                    if !r.state.is_busy() {
-                        report_run(&r);
-                        ok &= r.state == RunState::Done;
-                        finished.push(r);
-                        break;
-                    }
-                }
-            }
-            svc.shutdown();
-            if group.is_some() {
-                println!();
-                println!("{}", compare_text(&finished));
-            }
-            Ok(ok)
-        }
-        TrainCommand::Classes(a) => {
-            let dirs = if a.datasets.is_empty() {
-                config.training.datasets.clone()
-            } else {
-                a.datasets.clone()
-            };
-            if dirs.is_empty() {
-                bail!("no dataset: pass --dataset <review export folder> or set training.datasets");
-            }
-            let mut sources = Vec::new();
-            for d in dirs {
-                sources.push(dataset::read_export(&config.data_path(&d))?);
-            }
-            let rename: BTreeMap<String, String> = a.rename.iter().cloned().collect();
-            let inv = dataset::inventory(&sources, &rename);
-            if a.json {
-                println!("{}", classes_json(&inv, a.scene)?);
-            } else {
-                print!("{}", classes_text(&inv, a.scene));
-            }
-            Ok(true)
-        }
-        TrainCommand::Import(a) => {
-            let Some(req) = import_request(&a)? else {
-                println!("Pinned footage (--dataset):");
-                for r in crate::resources::catalog::IMPORT_DATASETS {
-                    println!(
-                        "  {:<14} {} ({}, {}): {}",
-                        crate::resources::catalog::install_key(r),
-                        r.title,
-                        r.license,
-                        crate::resources::catalog::format_size(r.size()),
-                        r.description
-                    );
-                }
-                let dir = crate::collect::CollectSettings::for_config(&config).dir;
-                let imports = super::import::write::read_imports(&dir);
-                println!("Imports in {}: {}", dir.display(), imports.len());
-                for i in imports.iter().rev().take(20) {
-                    println!(
-                        "  {}  {} frames  {}  ({})",
-                        i.id, i.frames, i.source, i.license
-                    );
-                }
-                return Ok(true);
-            };
-            let chain = import_chain(&a)?;
-            let cap = super::capability_now();
-            let mut job = super::import::plan_import(&config, req, &cap)?;
-            // The folder switch and a model the auto-label adds go to the config file.
-            let writer: Arc<dyn super::autolabel::models::ConfigWriter> =
-                Arc::new(super::autolabel::models::FileConfigWriter { path: path.clone() });
-            let finish = super::finish::Finish {
-                reject_below: chain.reject_below,
-                accept_auto: chain.accept_auto,
-                review_folder: chain.review_folder.then(|| job.dataset_dir.clone()),
-                config_writer: Some(writer.clone()),
-            };
-            let finish = (!finish.is_empty()).then_some(finish);
-            // Planned before anything runs: a bad auto-label setting imports nothing.
-            let autolabel = match chain.autolabel {
-                Some(r) => {
-                    let mut al = super::autolabel::plan_autolabel(&config, &path, r, &cap)
-                        .context("auto-label of the import (nothing was imported)")?;
-                    super::autolabel::follow_import(&mut al, &job);
-                    al.config_writer = Some(writer);
-                    al.finish = finish;
-                    Some(al)
-                }
-                None => {
-                    job.finish = finish;
-                    None
-                }
-            };
-            eprintln!(
-                "importing {} into {} (licence: {}){}",
-                job.request.source.describe(),
-                job.dataset_dir.display(),
-                if job.license.is_empty() {
-                    "the dataset's"
-                } else {
-                    &job.license
-                },
-                if autolabel.is_some() {
-                    ", then auto-labelling its frames"
-                } else {
-                    ""
-                }
-            );
-            let mut tasks: Vec<Box<dyn super::task::Task>> = vec![Box::new(job)];
-            if let Some(al) = autolabel {
-                tasks.push(Box::new(al));
-            }
-            let n = tasks.len();
-            let recs = run_tasks_cli(&config, tasks, a.verbose)?;
-            Ok(recs.len() == n
-                && recs
-                    .iter()
-                    .enumerate()
-                    .all(|(i, r)| chain_ok(i, r.as_ref())))
-        }
-        TrainCommand::Autolabel(a) => {
-            let req = autolabel_request(&a)?;
-            if a.dry_run {
-                println!(
-                    "{}",
-                    autolabel_dry_run_text(&super::autolabel::preview_autolabel(&config, req)?)
-                );
-                return Ok(true);
-            }
-            let cap = super::capability_now();
-            let mut job = super::autolabel::plan_autolabel(&config, &path, req, &cap)?;
-            // A local or catalog model is added to the config file (disabled).
-            job.config_writer = Some(Arc::new(super::autolabel::models::FileConfigWriter {
-                path: path.clone(),
-            }));
-            eprintln!(
-                "{} in {}",
-                super::task::Task::title(&job),
-                job.dataset_dir.display()
-            );
-            run_task_cli(&config, Box::new(job), a.verbose)
-        }
-        TrainCommand::Overlaps(a) => {
-            let mut req = super::overlaps::OverlapsRequest::parse(&a.frames)?;
-            req.gpu.clone_from(&a.gpu);
-            req.allow_large = a.allow_large;
-            req.ignore_memory_check = a.ignore_memory_check;
-            let cap = super::capability_now();
-            let job = super::overlaps::plan_overlaps(&config, req, &cap)?;
-            eprintln!(
-                "{} in {}",
-                super::task::Task::title(&job),
-                job.dataset_dir.display()
-            );
-            if a.dry_run {
-                let s = job.select()?;
-                println!(
-                    "{} frames, {} pairs to check ({} of classes RF-DETR cannot see), {} crops; {} \
-                     pairs answered before, {} frames skipped or checked by a reviewer",
-                    s.frame_count, s.pairs, s.no_zoom, s.crops, s.answered, s.passed_over
-                );
-                if s.crops > 0
-                    && let Some(why) =
-                        super::overlaps::job::commit_problem((job.headroom)().as_ref())
-                {
-                    println!("warning: it would be refused if it started now: {why}");
-                }
-                return Ok(true);
-            }
-            run_task_cli(&config, Box::new(job), a.verbose)
-        }
-        TrainCommand::Refine(a) => {
-            let req = refine_request(&a)?;
-            let cap = super::capability_now();
-            if a.dry_run {
-                let p = super::refine::preview(&config, &req, &cap)?;
-                print!("{}", super::refine::preview_text(&p));
-                return Ok(p.refused.is_none());
-            }
-            // An explicit command asks nothing, but says what a rerun replaces before it starts
-            // (the page asks; `refine::start_warnings`).
-            let p = super::refine::preview(&config, &req, &cap)?;
-            let job = super::refine::plan_refine(&config, req, &cap)?;
-            let family = job.train.as_ref().map(|t| t.request.recipe.family);
-            for w in super::refine::start_warnings(&p, family) {
-                eprintln!("warning: {w}");
-            }
-            eprintln!(
-                "{} in {}",
-                super::task::Task::title(&job),
-                job.dataset_dir.display()
-            );
-            run_task_cli(&config, Box::new(job), a.verbose)
-        }
-        TrainCommand::List => {
-            // A reader: never writes runs.json, and a run another process trains shows running.
-            let runs = service::load_records(&super::runs_file(&config));
-            let dir = super::training_dir(&config);
-            if runs.is_empty() {
-                println!("no training runs in {}", dir.display());
-            }
-            for r in &runs {
-                println!(
-                    "{}  {}  {}  {}",
-                    r.id,
-                    r.name,
-                    r.request.recipe.label(),
-                    r.describe()
-                );
-            }
-            let unlisted = service::unlisted_run_dirs(&dir, &runs);
-            if !unlisted.is_empty() {
-                println!(
-                    "run folders no record names (their record was lost by an earlier version; \
-                     delete them by hand if you do not need them):"
-                );
-                for p in unlisted {
-                    println!(
-                        "  {}  {}",
-                        p.display(),
-                        crate::resources::catalog::format_size(super::retry::disk_use(&p))
-                    );
-                }
-            }
-            Ok(true)
-        }
+        } => cmd_prepare(&config, &data, out, dry_run, allow_large),
+        TrainCommand::Run(a) => cmd_run(&config, &path, a),
+        TrainCommand::Classes(a) => cmd_classes(&config, &a),
+        TrainCommand::Import(a) => cmd_import(&config, &path, &a),
+        TrainCommand::Autolabel(a) => cmd_autolabel(&config, &path, &a),
+        TrainCommand::Overlaps(a) => cmd_overlaps(&config, &a),
+        TrainCommand::Refine(a) => cmd_refine(&config, &a),
+        TrainCommand::List => cmd_list(&config),
         TrainCommand::RetryExport {
             run,
             no_register,
             no_benchmark,
-        } => {
-            let hooks: Arc<dyn Hooks> = Arc::new(CliHooks {
-                config_path: path.clone(),
-                register: !no_register,
-                benchmark: !no_register && !no_benchmark,
-            });
-            if !no_register && !no_benchmark {
-                eprintln!("{BASELINE_NOTE}");
-            }
-            let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
-            let svc = TrainingService::start_owner(
-                Arc::new(crate::resources::export::SystemRunner),
-                fetcher,
-                hooks,
-                super::runs_file(&config),
-            )
-            .map_err(anyhow::Error::msg)?;
-            let rec = svc
-                .get(&run)
-                .with_context(|| format!("no run {run} (train list shows the runs)"))?;
-            let job = super::retry::plan_retry(&config, &rec, &super::capability_now())?;
-            let cancel = Arc::new(AtomicBool::new(false));
-            let _ctrl_c =
-                crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the export");
-            let id = svc.enqueue_retry(job).map_err(anyhow::Error::msg)?;
-            let mut last = String::new();
-            let mut ok = false;
-            while let Some(r) = svc.wait(&id, Duration::from_secs(1)) {
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    svc.cancel(&id);
-                }
-                let line = format!("[{}] {:>3}% {}", r.name, r.percent, r.describe());
-                if r.state == RunState::Running && line != last {
-                    eprintln!("{line}");
-                    last = line;
-                }
-                if !r.state.is_busy() {
-                    report_run(&r);
-                    ok = r.state == RunState::Done;
-                    break;
-                }
-            }
-            svc.shutdown();
-            Ok(ok)
+        } => cmd_retry_export(&config, &path, &run, no_register, no_benchmark),
+        TrainCommand::RemoveEnv => cmd_remove_env(&config),
+    }
+}
+
+/// `train capability`.
+fn cmd_capability(json: bool) -> Result<bool> {
+    let cap = super::capability_now();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&cap)?);
+    } else {
+        print!("{}", capability_text(&cap));
+    }
+    Ok(cap.available)
+}
+
+/// `train estimate`.
+fn cmd_estimate(
+    config: &Config,
+    model: &str,
+    images: usize,
+    epochs: Option<u32>,
+    batch: Option<u32>,
+    imgsz: Option<u32>,
+) -> Result<bool> {
+    let (family, size) =
+        recipe::parse_label(model).with_context(|| format!("unknown model label '{model}'"))?;
+    let cap = super::capability_now();
+    let target = cap.accelerator.as_ref().map_or(
+        estimate::Target::Cuda(crate::backend::detect::ComputeCapability::new(6, 1)),
+        |a| a.target(),
+    );
+    let imgsz = imgsz.unwrap_or_else(|| family.default_imgsz(size));
+    let batch = batch.unwrap_or(8);
+    let epochs = epochs.unwrap_or(config.training.epochs_for(family));
+    match estimate::estimate(family, size, imgsz, batch, images, epochs, target) {
+        Some(e) => println!(
+            "{} {size} at {imgsz} px, batch {batch}, {images} images x {epochs} epochs: about {} MB of GPU memory, {} per epoch, {} in total ({}; rough estimate)",
+            family.title(),
+            e.vram_mb,
+            estimate::format_duration(e.epoch_s),
+            estimate::format_duration(e.total_s),
+            cap.accelerator
+                .as_ref()
+                .map_or_else(|| "a GTX 1080 class GPU".to_string(), |a| a.describe())
+        ),
+        None => println!("{} {size} does not train on this device", family.title()),
+    }
+    Ok(true)
+}
+
+/// `train prepare`.
+fn cmd_prepare(
+    config: &Config,
+    data: &DataArgs,
+    out: Option<PathBuf>,
+    dry_run: bool,
+    allow_large: bool,
+) -> Result<bool> {
+    if data.public && !dry_run {
+        fetch_public(config, allow_large || config.allow_large_downloads)?;
+    }
+    let [scene] = data.scenes()[..] else {
+        bail!("prepare takes one --scene (train run compares several)");
+    };
+    // `--static-cap` and `--ignore` over the config's (in memory only).
+    let config = data.with_plan_flags(config);
+    if dry_run {
+        let request = preview_request(&config, data, scene)?;
+        // No model: the run's input size is not known (its placeholder recipe's is not).
+        let options = dataset::Options {
+            imgsz: None,
+            ..super::options_for(&config, &request)?
+        };
+        let p = super::preview_with(&config, &request, options)?;
+        println!("{}", dry_run_text(&p.plan, &request.balance));
+        let unreviewed = super::unreviewed_frames(&config);
+        let mut report = preflight::report(&p.plan, &p.sources, &p.options, unreviewed);
+        report.memory = preflight::memory(
+            std::slice::from_ref(&request.recipe),
+            config
+                .training
+                .workers
+                .map_or(super::job::Workers::Auto, super::job::Workers::Fixed),
+            super::commit::now().as_ref(),
+        );
+        print!("{}", preflight::text(&report));
+        let needs = preflight::run_needs(
+            &p.plan,
+            &p.sources,
+            &request.recipe,
+            &super::training_dir(&config).join("preview"),
+            &TrainPaths::for_config(&config).export.models,
+        )?;
+        for n in preflight::combine(needs) {
+            let s = super::import::disk::space(&n.dir);
+            println!("disk: {}", preflight::disk_line(&n, s).text);
         }
-        TrainCommand::RemoveEnv => {
-            let paths = TrainPaths::for_config(&config);
-            env::remove_train_env(&paths)?;
-            println!(
-                "removed the training environment under {}",
-                paths.export.tools.display()
-            );
-            Ok(true)
+        return Ok(true);
+    }
+    let Some(out) = out else {
+        bail!("--out <folder> is required (or --dry-run)");
+    };
+    let (sources, opts) = read_sources(&config, data, scene)?;
+    let plan = preflight::planned(&sources, &opts)?;
+    let prepared = dataset::write(&sources, &plan, &opts, &out)?;
+    if let Some(note) = dataset::static_cap_note(&plan.stats, opts.static_cap) {
+        println!("{note}");
+    }
+    if let Some(note) = dataset::static_cap_idle_note(&plan.classes, opts.static_cap) {
+        println!("{note}");
+    }
+    println!(
+        "{}: {} training, {} validation, {} held-out images; classes: {}",
+        out.display(),
+        prepared.train_images,
+        prepared.valid_images,
+        prepared.heldout_images,
+        prepared.classes.join(", ")
+    );
+    if let Some(t) = dataset::valid_groups_text(&prepared.valid_groups) {
+        println!("{t}");
+    }
+    if let Some(b) = &prepared.balance_summary {
+        println!("balanced: {b}");
+    }
+    if let Some(h) = &prepared.heldout_dir {
+        println!("held-out benchmark set: dir:{}", h.display());
+    }
+    for w in &prepared.warnings {
+        println!("warning: {w}");
+    }
+    Ok(true)
+}
+
+/// `train run`: one or several training runs in a row, followed until they end.
+fn cmd_run(config: &Config, path: &Path, a: RunArgs) -> Result<bool> {
+    let RunArgs {
+        models,
+        data,
+        epochs,
+        patience,
+        batch,
+        imgsz,
+        lr,
+        lr_schedule,
+        lr_min_factor,
+        select_metric,
+        multi_scale,
+        night_aug,
+        aug_dark,
+        aug_noise,
+        aug_gray,
+        seeds,
+        name,
+        allow_large,
+        install_dir,
+        gpu,
+        no_register,
+        no_benchmark,
+        benchmark_sets,
+        benchmark_devices,
+        keep_work,
+        ignore_memory_check,
+        verbose,
+    } = a;
+    let scenes = data.scenes();
+    if name.is_some() && (models.len() > 1 || scenes.len() > 1) {
+        bail!("--name needs exactly one --model and one --scene");
+    }
+    // `--static-cap` and `--ignore` over the config's (in memory only; the hooks read the
+    // file again).
+    let config = data.with_plan_flags(config);
+    // Several runs of different scenes or seeds are compared on the same held-out frames.
+    let group = (scenes.len() as u64 * seeds > 1).then(|| {
+        format!(
+            "cmp-{}",
+            crate::clock::name_stamp(std::time::SystemTime::now())
+        )
+    });
+    // A chosen GPU: its lane, memory and suggested batches.
+    let cap = super::capability_now().for_gpu(gpu.as_deref())?;
+    eprintln!("{}", cap.summary());
+    let Some(accel) = cap.accelerator.clone() else {
+        for r in &cap.reasons {
+            eprintln!("  {r}");
+        }
+        return Ok(false);
+    };
+    let paths = TrainPaths::for_config(&config);
+    let platform = catalog::Platform::current();
+    if !env::train_env_ready(&paths, platform, accel.lane())
+        && !(allow_large || config.allow_large_downloads)
+    {
+        let (dl, disk) = accel.lane().estimate();
+        bail!(
+            "the training environment (PyTorch {} and the trainers) is a large download \
+             (about {} GB, {} GB on disk under {}); rerun with --allow-large",
+            accel.lane().as_str(),
+            dl / 1_000_000_000,
+            disk / 1_000_000_000,
+            paths.export.tools.display()
+        );
+    }
+    let mut base = Augment::default();
+    if night_aug {
+        base = Augment::NIGHT;
+    }
+    let augment = Augment {
+        dark: aug_dark.unwrap_or(base.dark),
+        noise: aug_noise.unwrap_or(base.noise),
+        gray: aug_gray.unwrap_or(base.gray),
+    };
+    let benchmark_devices = super::config::benchmark_devices(if benchmark_devices.is_empty() {
+        &config.training.benchmark_devices
+    } else {
+        &benchmark_devices
+    })?;
+    let balance = data.balance(&config)?;
+    if !balance.is_off() {
+        eprintln!("balance: {}", balance.describe());
+    }
+    let mut jobs = Vec::new();
+    for m in &models {
+        let (family, size) = recipe::parse_label(m).with_context(|| {
+            format!("unknown model label '{m}' (e.g. yolo26n, rfdetr-nano, rt-detrv2-s, dfine-s)")
+        })?;
+        let r = recipe::build_recipe(
+            family,
+            size,
+            &recipe::RecipeInputs {
+                epochs,
+                patience,
+                imgsz,
+                batch,
+                lr,
+                lr_schedule: lr_schedule.as_deref().and_then(recipe::LrSchedule::parse),
+                lr_min_factor,
+                select_metric,
+                augment,
+                multi_scale: recipe::MultiScale::parse(&multi_scale).unwrap_or_default(),
+            },
+            &config.training,
+            &cap,
+        )?;
+        for (scene, i) in scenes.iter().flat_map(|s| (0..seeds).map(move |i| (s, i))) {
+            let req = TrainRequest {
+                recipe: r.clone(),
+                datasets: data.datasets.clone(),
+                include_public: data.public,
+                scene: *scene,
+                classes: data.class_list(),
+                rename: data.rename.iter().cloned().collect::<BTreeMap<_, _>>(),
+                benchmark_sets: benchmark_sets.clone(),
+                benchmark_devices: benchmark_devices.clone(),
+                allow_large,
+                install_dir: install_dir.clone(),
+                gpu: gpu.clone(),
+                excluded: data.excluded,
+                balance: balance.clone(),
+                compare_group: group.clone(),
+                train_seed: (seeds > 1).then_some(i),
+                ignore_memory_check,
+            };
+            let run_name = seed_run_name(name.as_deref(), &req.recipe, req.scene, i);
+            let mut job = super::plan_job(&config, req, &cap, run_name)?;
+            job.keep_work = keep_work;
+            jobs.push(job);
         }
     }
+    super::check_jobs(&config, &jobs)?;
+    if jobs.len() > 1 {
+        eprintln!("queued {} runs:", jobs.len());
+        for j in &jobs {
+            eprintln!("  {} ({})", j.name, j.request.scene.as_str());
+        }
+    }
+    let hooks: Arc<dyn Hooks> = Arc::new(CliHooks {
+        config_path: path.to_path_buf(),
+        register: !no_register,
+        benchmark: !no_register && !no_benchmark,
+    });
+    if !no_register && !no_benchmark {
+        eprintln!("{BASELINE_NOTE}");
+    }
+    let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
+    let svc = TrainingService::start_owner(
+        Arc::new(crate::resources::export::SystemRunner),
+        fetcher,
+        hooks,
+        super::runs_file(&config),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _ctrl_c = crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the training");
+    let ids: Vec<String> = jobs
+        .into_iter()
+        .map(|j| svc.enqueue(j).map_err(anyhow::Error::msg))
+        .collect::<Result<_>>()?;
+    let mut ok = true;
+    let mut finished: Vec<service::RunRecord> = Vec::new();
+    for id in &ids {
+        let mut balance_shown = false;
+        // One line per stage or percent change, else at most every 10 s.
+        let end = follow::follow(
+            || svc.wait_logged(id, Duration::from_secs(1)),
+            |r: &service::RunRecord| follow::Shown {
+                busy: r.state.is_busy(),
+                running: r.state == RunState::Running,
+                line: run_line(r),
+                key: (r.stage, r.percent),
+                log: &r.log,
+            },
+            (None, 0),
+            &cancel,
+            &|| {
+                for i in &ids {
+                    svc.cancel(i);
+                }
+            },
+            verbose,
+            &mut |r: &service::RunRecord| {
+                if let Some(b) = balance_note(r.dataset.as_ref(), &mut balance_shown) {
+                    eprintln!("[{}] balanced: {b}", r.name);
+                }
+            },
+            &mut |l| eprintln!("{l}"),
+        );
+        if let Some(r) = end {
+            report_run(&r);
+            ok &= r.state == RunState::Done;
+            finished.push(r);
+        }
+    }
+    svc.shutdown();
+    if group.is_some() {
+        println!();
+        println!("{}", compare_text(&finished));
+    }
+    Ok(ok)
+}
+
+/// `train classes`.
+fn cmd_classes(config: &Config, a: &ClassesArgs) -> Result<bool> {
+    let dirs = if a.datasets.is_empty() {
+        config.training.datasets.clone()
+    } else {
+        a.datasets.clone()
+    };
+    if dirs.is_empty() {
+        bail!("no dataset: pass --dataset <review export folder> or set training.datasets");
+    }
+    let mut sources = Vec::new();
+    for d in dirs {
+        sources.push(dataset::read_export(&config.data_path(&d))?);
+    }
+    let rename: BTreeMap<String, String> = a.rename.iter().cloned().collect();
+    let inv = dataset::inventory(&sources, &rename);
+    if a.json {
+        println!("{}", classes_json(&inv, a.scene)?);
+    } else {
+        print!("{}", classes_text(&inv, a.scene));
+    }
+    Ok(true)
+}
+
+/// `train import` (and the auto-label it chains).
+fn cmd_import(config: &Config, path: &Path, a: &ImportArgs) -> Result<bool> {
+    let Some(req) = import_request(a)? else {
+        println!("Pinned footage (--dataset):");
+        for r in crate::resources::catalog::IMPORT_DATASETS {
+            println!(
+                "  {:<14} {} ({}, {}): {}",
+                crate::resources::catalog::install_key(r),
+                r.title,
+                r.license,
+                crate::resources::catalog::format_size(r.size()),
+                r.description
+            );
+        }
+        let dir = crate::collect::CollectSettings::for_config(config).dir;
+        let imports = super::import::write::read_imports(&dir);
+        println!("Imports in {}: {}", dir.display(), imports.len());
+        for i in imports.iter().rev().take(20) {
+            println!(
+                "  {}  {} frames  {}  ({})",
+                i.id, i.frames, i.source, i.license
+            );
+        }
+        return Ok(true);
+    };
+    let chain = import_chain(a)?;
+    let cap = super::capability_now();
+    let mut job = super::import::plan_import(config, req, &cap)?;
+    // The folder switch and a model the auto-label adds go to the config file.
+    let writer: Arc<dyn super::autolabel::models::ConfigWriter> =
+        Arc::new(super::autolabel::models::FileConfigWriter {
+            path: path.to_path_buf(),
+        });
+    let finish = super::finish::Finish {
+        reject_below: chain.reject_below,
+        accept_auto: chain.accept_auto,
+        review_folder: chain.review_folder.then(|| job.dataset_dir.clone()),
+        config_writer: Some(writer.clone()),
+    };
+    let finish = (!finish.is_empty()).then_some(finish);
+    // Planned before anything runs: a bad auto-label setting imports nothing.
+    let autolabel = match chain.autolabel {
+        Some(r) => {
+            let mut al = super::autolabel::plan_autolabel(config, path, r, &cap)
+                .context("auto-label of the import (nothing was imported)")?;
+            super::autolabel::follow_import(&mut al, &job);
+            al.config_writer = Some(writer);
+            al.finish = finish;
+            Some(al)
+        }
+        None => {
+            job.finish = finish;
+            None
+        }
+    };
+    eprintln!(
+        "importing {} into {} (licence: {}){}",
+        job.request.source.describe(),
+        job.dataset_dir.display(),
+        if job.license.is_empty() {
+            "the dataset's"
+        } else {
+            &job.license
+        },
+        if autolabel.is_some() {
+            ", then auto-labelling its frames"
+        } else {
+            ""
+        }
+    );
+    let mut tasks: Vec<Box<dyn super::task::Task>> = vec![Box::new(job)];
+    if let Some(al) = autolabel {
+        tasks.push(Box::new(al));
+    }
+    let n = tasks.len();
+    let recs = run_tasks_cli(config, tasks, a.verbose)?;
+    Ok(recs.len() == n
+        && recs
+            .iter()
+            .enumerate()
+            .all(|(i, r)| chain_ok(i, r.as_ref())))
+}
+
+/// `train autolabel`.
+fn cmd_autolabel(config: &Config, path: &Path, a: &AutolabelArgs) -> Result<bool> {
+    let req = autolabel_request(a)?;
+    if a.dry_run {
+        println!(
+            "{}",
+            autolabel_dry_run_text(&super::autolabel::preview_autolabel(config, req)?)
+        );
+        return Ok(true);
+    }
+    let cap = super::capability_now();
+    let mut job = super::autolabel::plan_autolabel(config, path, req, &cap)?;
+    // A local or catalog model is added to the config file (disabled).
+    job.config_writer = Some(Arc::new(super::autolabel::models::FileConfigWriter {
+        path: path.to_path_buf(),
+    }));
+    eprintln!(
+        "{} in {}",
+        super::task::Task::title(&job),
+        job.dataset_dir.display()
+    );
+    run_task_cli(config, Box::new(job), a.verbose)
+}
+
+/// `train overlaps`.
+fn cmd_overlaps(config: &Config, a: &OverlapsArgs) -> Result<bool> {
+    let mut req = super::overlaps::OverlapsRequest::parse(&a.frames)?;
+    req.gpu.clone_from(&a.gpu);
+    req.allow_large = a.allow_large;
+    req.ignore_memory_check = a.ignore_memory_check;
+    let cap = super::capability_now();
+    let job = super::overlaps::plan_overlaps(config, req, &cap)?;
+    eprintln!(
+        "{} in {}",
+        super::task::Task::title(&job),
+        job.dataset_dir.display()
+    );
+    if a.dry_run {
+        let s = job.select()?;
+        println!(
+            "{} frames, {} pairs to check ({} of classes RF-DETR cannot see), {} crops; {} \
+             pairs answered before, {} frames skipped or checked by a reviewer",
+            s.frame_count, s.pairs, s.no_zoom, s.crops, s.answered, s.passed_over
+        );
+        if s.crops > 0
+            && let Some(why) = super::overlaps::job::commit_problem((job.headroom)().as_ref())
+        {
+            println!("warning: it would be refused if it started now: {why}");
+        }
+        return Ok(true);
+    }
+    run_task_cli(config, Box::new(job), a.verbose)
+}
+
+/// `train refine`.
+fn cmd_refine(config: &Config, a: &RefineArgs) -> Result<bool> {
+    let req = refine_request(a)?;
+    let cap = super::capability_now();
+    if a.dry_run {
+        let p = super::refine::preview(config, &req, &cap)?;
+        print!("{}", super::refine::preview_text(&p));
+        return Ok(p.refused.is_none());
+    }
+    // An explicit command asks nothing, but says what a rerun replaces before it starts
+    // (the page asks; `refine::start_warnings`).
+    let p = super::refine::preview(config, &req, &cap)?;
+    let job = super::refine::plan_refine(config, req, &cap)?;
+    let family = job.train.as_ref().map(|t| t.request.recipe.family);
+    for w in super::refine::start_warnings(&p, family) {
+        eprintln!("warning: {w}");
+    }
+    eprintln!(
+        "{} in {}",
+        super::task::Task::title(&job),
+        job.dataset_dir.display()
+    );
+    run_task_cli(config, Box::new(job), a.verbose)
+}
+
+/// `train list`.
+fn cmd_list(config: &Config) -> Result<bool> {
+    // A reader: never writes runs.json, and a run another process trains shows running.
+    let runs = service::load_records(&super::runs_file(config));
+    let dir = super::training_dir(config);
+    if runs.is_empty() {
+        println!("no training runs in {}", dir.display());
+    }
+    for r in &runs {
+        println!(
+            "{}  {}  {}  {}",
+            r.id,
+            r.name,
+            r.request.recipe.label(),
+            r.describe()
+        );
+    }
+    let unlisted = service::unlisted_run_dirs(&dir, &runs);
+    if !unlisted.is_empty() {
+        println!(
+            "run folders no record names (their record was lost by an earlier version; \
+             delete them by hand if you do not need them):"
+        );
+        for p in unlisted {
+            println!(
+                "  {}  {}",
+                p.display(),
+                crate::resources::catalog::format_size(super::retry::disk_use(&p))
+            );
+        }
+    }
+    Ok(true)
+}
+
+/// `train retry-export`.
+fn cmd_retry_export(
+    config: &Config,
+    path: &Path,
+    run: &str,
+    no_register: bool,
+    no_benchmark: bool,
+) -> Result<bool> {
+    let hooks: Arc<dyn Hooks> = Arc::new(CliHooks {
+        config_path: path.to_path_buf(),
+        register: !no_register,
+        benchmark: !no_register && !no_benchmark,
+    });
+    if !no_register && !no_benchmark {
+        eprintln!("{BASELINE_NOTE}");
+    }
+    let fetcher = Arc::new(crate::resources::export::cli_fetcher(&config.data_root()));
+    let svc = TrainingService::start_owner(
+        Arc::new(crate::resources::export::SystemRunner),
+        fetcher,
+        hooks,
+        super::runs_file(config),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let rec = svc
+        .get(run)
+        .with_context(|| format!("no run {run} (train list shows the runs)"))?;
+    let job = super::retry::plan_retry(config, &rec, &super::capability_now())?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _ctrl_c = crate::resources::export::CtrlC::cancels_named(cancel.clone(), "the export");
+    let id = svc.enqueue_retry(job).map_err(anyhow::Error::msg)?;
+    // Every change of the line is printed (keyed by the line itself); no log lines.
+    let end = follow::follow(
+        || svc.wait(&id, Duration::from_secs(1)).map(|r| (r, 0)),
+        |r: &service::RunRecord| {
+            let line = run_line(r);
+            follow::Shown {
+                busy: r.state.is_busy(),
+                running: r.state == RunState::Running,
+                key: line.clone(),
+                line,
+                log: &[],
+            }
+        },
+        String::new(),
+        &cancel,
+        &|| {
+            svc.cancel(&id);
+        },
+        false,
+        &mut |_| {},
+        &mut |l| eprintln!("{l}"),
+    );
+    let mut ok = false;
+    if let Some(r) = end {
+        report_run(&r);
+        ok = r.state == RunState::Done;
+    }
+    svc.shutdown();
+    Ok(ok)
+}
+
+/// `train remove-env`.
+fn cmd_remove_env(config: &Config) -> Result<bool> {
+    let paths = TrainPaths::for_config(config);
+    env::remove_train_env(&paths)?;
+    println!(
+        "removed the training environment under {}",
+        paths.export.tools.display()
+    );
+    Ok(true)
 }
 
 /// `--select-metric`: an id of [`recipe::SELECT_METRICS`], each shown in `--help` with its hint.
@@ -1745,6 +1805,11 @@ fn balance_note<'a>(d: Option<&'a service::DatasetCounts>, shown: &mut bool) -> 
     let b = d?.balance_summary.as_deref()?;
     *shown = true;
     Some(b)
+}
+
+/// A run's progress line: "[<name>]  40% <describe>".
+fn run_line(r: &service::RunRecord) -> String {
+    format!("[{}] {:>3}% {}", r.name, r.percent, r.describe())
 }
 
 fn report_run(r: &service::RunRecord) {
@@ -2207,6 +2272,102 @@ mod tests {
         T::try_parse_from(std::iter::once("train").chain(args.iter().copied())).map(|t| t.c)
     }
 
+    /// A task that prints `n` lines, each once the follower has printed the one before (so no
+    /// line is evicted from the tail between two polls), then finishes.
+    struct Printing {
+        n: usize,
+        printed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl super::super::task::Task for Printing {
+        fn id(&self) -> &str {
+            "printing"
+        }
+        fn kind(&self) -> super::super::task::TaskKind {
+            super::super::task::TaskKind::Import
+        }
+        fn title(&self) -> String {
+            "print lines".into()
+        }
+        fn steps(&self) -> usize {
+            1
+        }
+        fn run(
+            &self,
+            _ctx: super::super::task::TaskContext<'_>,
+            report: &mut dyn FnMut(super::super::task::TaskReport<'_>),
+            _cancel: &AtomicBool,
+        ) -> Result<super::super::task::TaskOutcome> {
+            use std::sync::atomic::Ordering;
+            for i in 0..self.n {
+                report(super::super::task::TaskReport::Stage {
+                    stage: "printing",
+                    step: 1,
+                    steps: 1,
+                    percent: 50,
+                    step_percent: 50,
+                    detail: "",
+                });
+                report(super::super::task::TaskReport::Line(&format!("line {i}")));
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while self.printed.load(Ordering::SeqCst) <= i {
+                    if std::time::Instant::now() > deadline {
+                        bail!("the follower never printed line {i}");
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(super::super::task::TaskOutcome {
+                summary: "printed".into(),
+                result: serde_json::Value::Null,
+            })
+        }
+    }
+
+    /// QA-249: the task commands' follower over a real queue: a task printing 200 lines (more
+    /// than the record's tail of 60) has every line printed once, in order, with `--verbose`,
+    /// and its final record returned.
+    #[test]
+    fn a_task_printing_200_lines_is_followed_line_by_line() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = crate::test_dirs::TempDir::new("cli-follow");
+        let fake = Arc::new(crate::resources::export::fake::Fake::default());
+        let svc = TrainingService::start(
+            fake.clone(),
+            fake,
+            Arc::new(super::super::job::NoHooks),
+            Some(dir.join("runs.json")),
+        );
+        let printed = Arc::new(AtomicUsize::new(0));
+        let id = svc
+            .enqueue_task(Box::new(Printing {
+                n: 200,
+                printed: printed.clone(),
+            }))
+            .unwrap();
+        let mut lines = Vec::new();
+        let end = follow::follow(
+            || svc.wait_task_logged(&id, Duration::from_millis(5)),
+            task_shown,
+            usize::MAX,
+            &AtomicBool::new(false),
+            &|| {},
+            true,
+            &mut |_| {},
+            &mut |l| {
+                if let Some(l) = l.strip_prefix("    ") {
+                    lines.push(l.to_string());
+                    printed.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .expect("the task's record");
+        svc.shutdown();
+        assert_eq!(end.state, RunState::Done, "{:?}", end.error);
+        let want: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
+        assert_eq!(lines, want);
+    }
+
     /// `--ignore-memory-check` on every command that starts a checked job reaches its request;
     /// without it, false.
     #[test]
@@ -2242,14 +2403,10 @@ mod tests {
                 panic!()
             };
             assert_eq!(a.ignore_memory_check, on);
-            let TrainCommand::Run {
-                ignore_memory_check,
-                ..
-            } = with(&["run", "--model", "yolo26n"])
-            else {
+            let TrainCommand::Run(a) = with(&["run", "--model", "yolo26n"]) else {
                 panic!()
             };
-            assert_eq!(ignore_memory_check, on);
+            assert_eq!(a.ignore_memory_check, on);
         }
     }
 
@@ -2789,13 +2946,14 @@ mod tests {
 
     #[test]
     fn the_gpu_flag_reaches_the_requests() {
-        let TrainCommand::Run { gpu, .. } =
+        let TrainCommand::Run(RunArgs { gpu, .. }) =
             parse(&["run", "--model", "yolo26n", "--gpu", "cuda:1"]).unwrap()
         else {
             panic!("not run")
         };
         assert_eq!(gpu.as_deref(), Some("cuda:1"));
-        let TrainCommand::Run { gpu, .. } = parse(&["run", "--model", "yolo26n"]).unwrap() else {
+        let TrainCommand::Run(RunArgs { gpu, .. }) = parse(&["run", "--model", "yolo26n"]).unwrap()
+        else {
             panic!("not run")
         };
         assert_eq!(gpu, None);
@@ -2819,13 +2977,14 @@ mod tests {
 
     #[test]
     fn run_takes_an_install_folder() {
-        let TrainCommand::Run { install_dir, .. } =
+        let TrainCommand::Run(RunArgs { install_dir, .. }) =
             parse(&["run", "--model", "yolo26n", "--install-dir", "/srv/models"]).unwrap()
         else {
             panic!("not run")
         };
         assert_eq!(install_dir, Some(PathBuf::from("/srv/models")));
-        let TrainCommand::Run { install_dir, .. } = parse(&["run", "--model", "yolo26n"]).unwrap()
+        let TrainCommand::Run(RunArgs { install_dir, .. }) =
+            parse(&["run", "--model", "yolo26n"]).unwrap()
         else {
             panic!("not run")
         };
@@ -2853,20 +3012,22 @@ mod tests {
 
     #[test]
     fn seeds_parse_and_name_the_repeats() {
-        let TrainCommand::Run { seeds, name, .. } =
+        let TrainCommand::Run(RunArgs { seeds, name, .. }) =
             parse(&["run", "--model", "yolo26n", "--seeds", "3", "--name", "cam"]).unwrap()
         else {
             panic!("not run")
         };
         assert_eq!((seeds, name.as_deref()), (3, Some("cam")));
-        let TrainCommand::Run { seeds, .. } = parse(&["run", "--model", "yolo26n"]).unwrap() else {
+        let TrainCommand::Run(RunArgs { seeds, .. }) =
+            parse(&["run", "--model", "yolo26n"]).unwrap()
+        else {
             panic!("not run")
         };
         assert_eq!(seeds, 1);
         assert!(parse(&["run", "--model", "a", "--seeds", "4"]).is_err());
         // --select-metric: the ids of the one list; unset = None (config, else map).
         let metric = |args: &[&str]| match parse(args) {
-            Ok(TrainCommand::Run { select_metric, .. }) => Ok(select_metric),
+            Ok(TrainCommand::Run(RunArgs { select_metric, .. })) => Ok(select_metric),
             Ok(_) => panic!("not run"),
             Err(e) => Err(e.to_string()),
         };
@@ -2897,12 +3058,12 @@ mod tests {
 
     #[test]
     fn scenes_excluded_classes_and_patience_parse() {
-        let TrainCommand::Run {
+        let TrainCommand::Run(RunArgs {
             data,
             patience,
             epochs,
             ..
-        } = parse(&[
+        }) = parse(&[
             "run",
             "--model",
             "yolo26n",
@@ -2933,7 +3094,7 @@ mod tests {
         assert_eq!(data.excluded, Excluded::DropFrame);
         assert_eq!(data.class_list().unwrap(), ["person", "car", "dog"]);
 
-        let TrainCommand::Run { data, patience, .. } =
+        let TrainCommand::Run(RunArgs { data, patience, .. }) =
             parse(&["run", "--model", "yolo26n", "--patience", "0"]).unwrap()
         else {
             panic!("not run")
@@ -3059,7 +3220,7 @@ mod tests {
         assert!(parse(&["prepare", "--out", "o", "--static-cap", "-1"]).is_err());
         assert!(parse(&["prepare", "--out", "o", "--static-cap", "100001"]).is_err());
         // `train run` takes it too.
-        let TrainCommand::Run { data, .. } =
+        let TrainCommand::Run(RunArgs { data, .. }) =
             parse(&["run", "--model", "yolo26n", "--static-cap", "3"]).unwrap()
         else {
             panic!("not run")
@@ -3098,7 +3259,7 @@ mod tests {
             parse(&["prepare", "--out", "o", "--ignore", ""]).is_err(),
             "an empty value is refused, not read as the default"
         );
-        let TrainCommand::Run { data, .. } =
+        let TrainCommand::Run(RunArgs { data, .. }) =
             parse(&["run", "--model", "yolo26n", "--ignore", "drop-frame"]).unwrap()
         else {
             panic!("not run")

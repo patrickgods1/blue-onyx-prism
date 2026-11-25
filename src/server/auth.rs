@@ -886,6 +886,46 @@ fn unknown_key(typed: &str) -> String {
     typed.trim().to_lowercase().chars().take(64).collect()
 }
 
+/// The account `name` as the accounts read now; None when there is no such account or the
+/// accounts cannot be used. Called inside an attempt's reservation (`Attempts::reserve`), so
+/// what it reads and the attempts in flight are one view.
+pub(super) fn account_now(state: &AppState, name: Option<&str>) -> Option<accounts::User> {
+    match &*state.auth.users.get() {
+        Snapshot::Users(users) => name.and_then(|n| users.get(n)).cloned(),
+        _ => None,
+    }
+}
+
+/// What an attempt on the account `u` at `now` is decided by (the base of
+/// `accounts::process::Attempts::reserve`): its recorded failures, and whether `device` (the
+/// request's device cookie) is a trusted device of this account, which skips only its wait
+/// (never a disabled account). The one rule `/login` and the Accounts card's password check share.
+pub(super) fn lockout_base(
+    state: &AppState,
+    u: &accounts::User,
+    device: Option<&[u8]>,
+    now: u64,
+) -> (lockout::State, bool) {
+    let trusted = device.is_some_and(|d| state.auth.devices.trusted(d, &u.name, u.created, now));
+    (u.lockout(), trusted)
+}
+
+/// Whether `password` is `u`'s, checked with `permit` (on the blocking pool). A stored hash
+/// that cannot be checked is logged with the way out and counts as wrong.
+pub(super) fn verify_logged(
+    u: &accounts::User,
+    password: &str,
+    permit: &password::Permit<'_>,
+) -> bool {
+    match password::verify(&u.hash, password, permit) {
+        Ok(good) => good,
+        Err(e) => {
+            error!(user = %u.name, "the stored password of this account cannot be checked: {e:#}; reset it with `blue-onyx-prism user reset-password <name>`");
+            false
+        }
+    }
+}
+
 /// Reserve an attempt for `peer` in the password bucket.
 pub(super) fn reserve(state: &AppState, peer: Option<SocketAddr>) -> Result<Reserved, u64> {
     let ip = peer.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |a| a.ip());
@@ -987,17 +1027,9 @@ pub(super) async fn login_submit(
     // attempts are judged as if one at a time (`accounts::process::Attempts`).
     let mut account: Option<accounts::User> = None;
     let slot = state.auth.attempts.reserve(&key, now, || {
-        account = match &*state.auth.users.get() {
-            Snapshot::Users(users) => name.as_deref().and_then(|n| users.get(n)).cloned(),
-            _ => None,
-        };
+        account = account_now(&state, name.as_deref());
         match &account {
-            Some(u) => {
-                let trusted = device
-                    .as_deref()
-                    .is_some_and(|d| state.auth.devices.trusted(d, &u.name, u.created, now));
-                (u.lockout(), trusted)
-            }
+            Some(u) => lockout_base(&state, u, device.as_deref(), now),
             None => (state.auth.unknown.lock_recover().state(&key), false),
         }
     });
@@ -1029,32 +1061,23 @@ pub(super) async fn login_submit(
         }
     };
     let logins = Arc::clone(&state.login);
-    let hash = account.as_ref().map(|u| u.hash.clone());
+    let user = account.clone();
     let verified = blocking(move || {
         let permit = logins.hashing.acquire(logins.hash_wait)?;
         logins.hashed.fetch_add(1, Ordering::Relaxed);
-        Some(match hash {
-            Some(h) => password::verify(&h, &password, &permit),
-            None => Ok(password::dummy_verify(&password, &permit)),
+        Some(match &user {
+            Some(u) => verify_logged(u, &password, &permit),
+            None => password::dummy_verify(&password, &permit),
         })
     })
     .await;
-    let Some(verified) = verified else {
+    let Some(good) = verified else {
         refund(&state, reserved);
         drop(slot);
         if let Some(dropped) = REFUSED_WARNS.allow_now() {
             warn!(peer = %who(peer), dropped, "sign-in not checked: every password-hashing slot stayed busy; answered 503");
         }
         return answer.busy();
-    };
-    let good = match verified {
-        Ok(good) => good,
-        Err(e) => {
-            if let Some(u) = &account {
-                error!(user = %u.name, "the stored password of this account cannot be checked: {e:#}; reset it with `blue-onyx-prism user reset-password <name>`");
-            }
-            false
-        }
     };
     match account {
         Some(u) if good => {

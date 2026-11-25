@@ -13,6 +13,8 @@
 // PrismPoll.create({run, period, max, more, env}): `run()` returns a promise (a rejection counts
 // as a failure); `more(value)` false parks the loop until `kick()` (polling only while busy).
 // `env` is for tests: {hidden(), set(fn, ms), clear(id), onVisible(cb)}.
+// PrismPoll.latest(): "latest request wins" for a view that fetches on a change (a newer request
+// aborts the one before; ticket.current() / ticket.wins(answer) drop a superseded answer).
 // Signed-in requests: every same-origin `fetch` of the pages goes through the wrapper below. A
 // request made by a poll loop (synchronously inside a PrismPoll run, inside
 // PrismPoll.background(fn), or through PrismPoll.fetch) carries `X-Prism-Poll: 1`, so it does not
@@ -364,8 +366,40 @@
       state: function () { return {busy: busy, timer: timer !== null, parked: parked, failures: failures}; }
     };
   }
+  // "Latest request wins", for a view a select, a typed field or a reload fetches: begin() aborts
+  // the request before it and returns a ticket {init (fetch options with its signal), current(),
+  // wins(answer)}. current() says whether no newer begin() (or stop()) took its place: what a
+  // `.catch` asks before it shows an error. wins(answer) is true for the latest ticket's real
+  // answer only (an array: all of them) and ends it; an aborted answer ({aborted: true}, as
+  // PrismBench.getJSON gives), or any answer of a ticket a newer begin() replaced, is false: the
+  // caller drops it and leaves the page (error line, busy mark) to the newer one. stop() aborts
+  // the one in flight; busy() says whether one is. `make` builds the AbortController (default: the
+  // browser's; none: answers still go by the sequence). BenchCore.latest is this one.
+  function latest(make) {
+    var cur = null, n = 0;
+    make = make || function () { return typeof root.AbortController === "function" ? new root.AbortController() : null; };
+    function stop() { var t = cur; cur = null; if (t && t.ctl) t.ctl.abort(); }
+    return {
+      begin: function () {
+        stop();
+        var ctl = make(), t = {n: ++n, ctl: ctl, init: ctl ? {signal: ctl.signal} : {}};
+        t.current = function () { return cur === t; };
+        t.wins = function (j) {
+          if (cur !== t) return false;
+          cur = null;
+          var list = Array.isArray(j) ? j : [j];
+          return !list.some(function (x) { return x && x.aborted; });
+        };
+        cur = t;
+        return t;
+      },
+      stop: stop,
+      busy: function () { return cur !== null; }
+    };
+  }
   root.PrismPoll = {
     create: create,
+    latest: latest,
     delay: delay,
     background: background,
     inPoll: function () { return polling > 0; },

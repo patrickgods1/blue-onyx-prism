@@ -2,6 +2,8 @@
 //! [`RECORD_VERSION`], documented in `docs/DATASET.md`) and the pure bucket decision
 //! [`decide`].
 
+use crate::model::filters::SuppressReason;
+use crate::verify::Outcome;
 use serde::{Deserialize, Serialize};
 
 /// Version of the sidecar schema ([`Record::version`]). Readers skip records of a newer major.
@@ -107,8 +109,16 @@ pub struct VerifyCandidate {
     pub score: f32,
     #[serde(rename = "box")]
     pub bbox: BoxPx,
-    /// `kept | rejected | unverified`.
+    /// `kept | rejected | unverified` ([`Outcome::as_str`]; a string, so an unknown outcome a newer
+    /// build wrote still reads).
     pub outcome: String,
+}
+
+impl VerifyCandidate {
+    /// Whether the stored outcome is `o`.
+    pub fn is(&self, o: Outcome) -> bool {
+        self.outcome == o.as_str()
+    }
 }
 
 /// The verifier cascade's part of a record.
@@ -357,6 +367,13 @@ impl IndexLine {
             bytes,
         }
     }
+
+    /// The frame's image path relative to the dataset root when this line is in day folder
+    /// `date`: `<scene>/<camera>/<date>/<id>.jpg` (forward slashes). The one mapping from an index
+    /// line to its frame: the queue, the frame references and the strays all use it.
+    pub fn rel(&self, date: &str) -> String {
+        format!("{}/{}/{date}/{}.jpg", self.scene, self.camera, self.id)
+    }
 }
 
 pub(crate) fn round2(x: f32) -> f32 {
@@ -388,19 +405,22 @@ pub fn decide(r: &Record, margin: f32) -> Vec<Bucket> {
     if r.raw.is_empty() {
         out.push(Bucket::Empty);
     }
-    if r.suppressed.iter().any(|s| s.reason != "verify") {
+    if r.suppressed
+        .iter()
+        .any(|s| s.reason != SuppressReason::Verify.as_str())
+    {
         out.push(Bucket::Suppressed);
     }
-    let outcome = |o: &str| {
+    let outcome = |o: Outcome| {
         r.verify
             .as_ref()
-            .is_some_and(|v| v.candidates.iter().any(|c| c.outcome == o))
+            .is_some_and(|v| v.candidates.iter().any(|c| c.is(o)))
     };
-    let rejected = outcome("rejected");
+    let rejected = outcome(Outcome::Rejected);
     if rejected {
         out.push(Bucket::VerifyRejected);
     }
-    if outcome("kept") {
+    if outcome(Outcome::Kept) {
         out.push(Bucket::VerifyKept);
     }
     if near_threshold(r, margin) {
@@ -597,5 +617,39 @@ mod tests {
         assert_eq!(back, r);
         assert_eq!(Bucket::parse("near_threshold"), Some(Bucket::NearThreshold));
         assert_eq!(Bucket::parse("x"), None);
+    }
+
+    // QA-183: the stored outcome strings are the verifier's own spelling, and an unknown one is
+    // none of them.
+    #[test]
+    fn a_candidate_is_its_stored_outcome_only() {
+        let c = |o: &str| VerifyCandidate {
+            label: "person".into(),
+            score: 0.5,
+            bbox: B,
+            outcome: o.into(),
+        };
+        assert!(c("kept").is(Outcome::Kept));
+        assert!(c("rejected").is(Outcome::Rejected));
+        assert!(c("unverified").is(Outcome::Unverified));
+        for o in Outcome::ALL {
+            assert!(c(o.as_str()).is(o));
+            assert!(!c("later").is(o));
+            assert!(!c("Rejected").is(o), "exact spelling");
+        }
+        assert_eq!(SuppressReason::Verify.as_str(), "verify");
+    }
+
+    // QA-182: the one mapping from an index line to its frame.
+    #[test]
+    fn an_index_line_names_its_frame() {
+        let mut r = record();
+        r.id = "20261021T010203004Z_a".into();
+        r.scene = "night".into();
+        let line = IndexLine::of(&r, 10);
+        assert_eq!(
+            line.rel("2026-10-21"),
+            "night/cam/2026-10-21/20261021T010203004Z_a.jpg"
+        );
     }
 }

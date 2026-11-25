@@ -1438,3 +1438,83 @@ fn the_log_follower_returns_each_line_once_past_the_tail() {
     log.drain(..skip);
     assert_eq!(follow.new_lines(&log, seq).len(), 1);
 }
+
+/// A busy run's and a busy task's line: the stage, its step and the detail, "paused (...)" while
+/// paused, "starting" / "paused" before the first stage ([`progress_text`], shared by both
+/// `describe`s).
+#[test]
+fn busy_runs_and_tasks_describe_their_stage_alike() {
+    let recipe =
+        crate::training::TrainRecipe::new(crate::resources::catalog::TrainFamily::Yolo26, "n")
+            .unwrap();
+    let mut r: RunRecord = serde_json::from_value(serde_json::json!({
+        "id": "r1", "name": "my-model", "created": "",
+        "request": {"recipe": recipe, "datasets": []},
+        "device": "mps", "state": "running", "stage": "train", "step": 5, "steps": 8,
+        "percent": 40, "detail": "epoch 3/50", "run_dir": "runs/r1"
+    }))
+    .unwrap();
+    let train = TrainStage::Train.label();
+    assert_eq!(r.describe(), format!("{train} (5/8): epoch 3/50"));
+    r.state = RunState::Paused;
+    assert_eq!(r.describe(), format!("paused ({train} 5/8): epoch 3/50"));
+    r.detail.clear();
+    assert_eq!(r.describe(), format!("paused ({train} 5/8)"));
+    r.state = RunState::Running;
+    assert_eq!(r.describe(), format!("{train} (5/8)"));
+    r.stage = None;
+    assert_eq!(r.describe(), "starting");
+    r.state = RunState::Paused;
+    assert_eq!(r.describe(), "paused");
+
+    // A task's arms say the same of the same stage.
+    let mut t = task::TaskRecord {
+        id: "t1".into(),
+        kind: task::TaskKind::Import,
+        title: "import".into(),
+        created: String::new(),
+        state: RunState::Running,
+        stage: Some("extracting frames".into()),
+        step: 2,
+        steps: 5,
+        percent: 30,
+        detail: String::new(),
+        log: vec![],
+        summary: None,
+        result: None,
+        error: None,
+        finished: None,
+        after: None,
+        uses: Vec::new(),
+    };
+    for paused in [false, true] {
+        t.state = if paused {
+            RunState::Paused
+        } else {
+            RunState::Running
+        };
+        for detail in ["", "12 frames"] {
+            t.detail = detail.into();
+            t.stage = Some("extracting frames".into());
+            assert_eq!(
+                t.describe(),
+                progress_text(paused, Some("extracting frames"), 2, 5, detail)
+            );
+            t.stage = None;
+            assert_eq!(t.describe(), progress_text(paused, None, 2, 5, detail));
+        }
+    }
+    assert_eq!(
+        progress_text(false, Some("labelling"), 2, 2, "3 of 6 frames"),
+        "labelling (2/2): 3 of 6 frames"
+    );
+}
+
+/// A stage's detail keeps its first 300 characters (characters, not bytes).
+#[test]
+fn a_detail_keeps_its_first_300_characters() {
+    let long = "é".repeat(400);
+    assert_eq!(detail_text(&long).chars().count(), DETAIL_CHARS);
+    assert_eq!(DETAIL_CHARS, 300);
+    assert_eq!(detail_text("12 frames"), "12 frames");
+}

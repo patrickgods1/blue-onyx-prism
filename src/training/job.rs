@@ -37,6 +37,7 @@ use super::capability::Accelerator;
 use super::dataset::{self, Prepared, SceneFilter};
 use super::preflight;
 use super::progress::{self, TrainEvent, TrainProgress};
+use super::pyenv::{self, check};
 use super::recipe::TrainRecipe;
 use crate::benchmark::metrics::{ApBasis, ClassRecall};
 use crate::model::ModelFamilyKind;
@@ -565,7 +566,8 @@ pub fn stop_file(run_dir: &Path) -> PathBuf {
 
 /// Log file of a run.
 pub const LOG_FILE: &str = "train.log";
-/// Largest log written (bytes); later lines are dropped with a note.
+/// Largest log written (bytes; the whole file, a retry export's lines included); later lines are
+/// dropped with a note.
 pub const MAX_LOG_BYTES: u64 = 20 * 1024 * 1024;
 /// Timeout of the self-check.
 const SELF_CHECK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -577,6 +579,8 @@ pub const OOM_RETRIES: u32 = 3;
 pub const OOM_RETRY_EPOCHS: usize = 3;
 /// MPS allocator limits on macOS (ratios of the recommended working set; see
 /// `scripts/train_model.py` `main`): an oversized batch fails in seconds instead of swapping.
+/// The script sets the same values by `setdefault` for runs by hand (twin, checked by
+/// `progress::tests::mps_watermarks_match_the_script`).
 pub const MPS_WATERMARKS: [(&str, &str); 2] = [
     ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "1.0"),
     ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.8"),
@@ -823,39 +827,64 @@ fn explain_full_disk(e: anyhow::Error, dir: &Path) -> anyhow::Error {
     ))
 }
 
-fn check(cancel: &AtomicBool) -> Result<()> {
-    if cancel.load(Ordering::Relaxed) {
-        Err(anyhow!(Cancelled))
-    } else {
-        Ok(())
-    }
-}
-
-/// The run log, capped at [`MAX_LOG_BYTES`].
+/// The run log, capped at [`MAX_LOG_BYTES`] for the whole file: a retry export of the run appends
+/// to the same `train.log` and counts from its size, so the cap holds across reopenings and the
+/// cut note is written once.
 struct Log {
     file: Option<std::fs::File>,
     written: u64,
+    cap: u64,
+}
+
+/// The note a cut log ends with (`cap` in whole MB).
+fn cut_note(cap: u64) -> String {
+    format!("[log cut at {} MB]", cap / (1024 * 1024))
 }
 
 impl Log {
     fn open(path: &Path) -> Self {
-        let file = std::fs::OpenOptions::new()
+        Self::open_capped(path, MAX_LOG_BYTES)
+    }
+
+    /// [`Log::open`] with another cap (tests use a small one).
+    fn open_capped(path: &Path, cap: u64) -> Self {
+        let mut file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(path)
             .map_err(|e| tracing::warn!("cannot write the training log {}: {e}", path.display()))
             .ok();
-        Self { file, written: 0 }
+        let written = file.as_mut().map_or(0, |f| Self::already_written(f, cap));
+        Self { file, written, cap }
+    }
+
+    /// What an existing log already holds against `cap`: its size, or past the cap when it ends
+    /// with the cut note (a cut log may stay just under the cap: the dropped line is not in it).
+    fn already_written(f: &mut std::fs::File, cap: u64) -> u64 {
+        use std::io::{Read, Seek, SeekFrom};
+        let len = f.metadata().map_or(0, |m| m.len());
+        let note = cut_note(cap);
+        let tail = u64::try_from(note.len() + 2).unwrap_or(u64::MAX);
+        let mut end = Vec::new();
+        let cut = f.seek(SeekFrom::Start(len.saturating_sub(tail))).is_ok()
+            && f.read_to_end(&mut end).is_ok()
+            && String::from_utf8_lossy(&end).trim_end().ends_with(&note);
+        if cut {
+            cap.saturating_add(1).max(len)
+        } else {
+            len
+        }
     }
 
     fn line(&mut self, l: &str) {
         let Some(f) = self.file.as_mut() else { return };
-        if self.written > MAX_LOG_BYTES {
+        if self.written > self.cap {
             return;
         }
         self.written += l.len() as u64 + 1;
-        let _ = if self.written > MAX_LOG_BYTES {
-            writeln!(f, "[log cut at {} MB]", MAX_LOG_BYTES / (1024 * 1024))
+        let _ = if self.written > self.cap {
+            writeln!(f, "{}", cut_note(self.cap))
         } else {
             writeln!(f, "{l}")
         };

@@ -304,7 +304,7 @@ pub struct Outcome {
 }
 
 fn unit(seed: u64, key: &str) -> f64 {
-    super::rank(seed, key) as f64 / (u64::MAX as f64 + 1.0)
+    super::seeded_rank(seed, key) as f64 / (u64::MAX as f64 + 1.0)
 }
 
 /// Median of `v` (mean of the middle two for an even count); 0 when empty.
@@ -342,7 +342,7 @@ pub fn round_repeats(x: &[f64], keys: &[&str], seed: u64) -> Vec<u32> {
     let mut order: Vec<(u64, usize)> = (0..x.len())
         .map(|i| {
             let k = keys.get(i).copied().unwrap_or("");
-            (super::rank(seed ^ ROUND_SALT, k), i)
+            (super::seeded_rank(seed ^ ROUND_SALT, k), i)
         })
         .collect();
     order.sort_unstable();
@@ -413,7 +413,7 @@ fn cap(
     let rank_of = |i: usize| {
         items
             .get(i)
-            .map_or(0, |it| super::rank(seed ^ CAP_SALT, &it.key))
+            .map_or(0, |it| super::seeded_rank(seed ^ CAP_SALT, &it.key))
     };
     let mut dropped = 0usize;
     for axis in b.axes.iter().copied().filter(|a| *a != BalanceAxis::Class) {

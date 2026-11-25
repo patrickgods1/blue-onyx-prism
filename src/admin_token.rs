@@ -48,8 +48,8 @@ impl std::fmt::Debug for AdminToken {
 }
 
 impl AdminToken {
-    /// The value, for `admin-token` to print and for the login cookie. Nothing else should
-    /// call this.
+    /// The value, for `admin-token` to print and for the CLI's own clients (`diagnostics`, the
+    /// load test) to send as a bearer. Nothing else should call this.
     pub fn reveal(&self) -> &str {
         &self.0
     }
@@ -57,14 +57,7 @@ impl AdminToken {
     /// Whether `presented` is this token, in time that depends on neither: both are hashed and
     /// the digests compared with no early exit.
     pub fn matches(&self, presented: &[u8]) -> bool {
-        use sha2::{Digest, Sha256};
-        let ours = Sha256::digest(self.0.as_bytes());
-        let theirs = Sha256::digest(presented);
-        let diff = ours
-            .iter()
-            .zip(theirs.iter())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        std::hint::black_box(diff) == 0
+        crate::secret::digest_eq(self.0.as_bytes(), presented)
     }
 }
 
@@ -381,6 +374,58 @@ mod tests {
         assert_eq!(read(&p).unwrap().reveal(), a.reveal());
         let left: Vec<_> = std::fs::read_dir(&d).unwrap().collect();
         assert_eq!(left.len(), 2, "the token and the lock only");
+    }
+
+    /// QA-231: concurrent first starts (the service and a CLI command) agree: exactly one makes
+    /// the token and every caller returns the one on disk (`auth/.lock` around load, write and
+    /// read back, an fs4 lock that conflicts between handles of one process too).
+    #[test]
+    fn concurrent_first_starts_return_the_token_on_disk() {
+        let d = dir();
+        let p = d.join(FILE_NAME);
+        let results: Vec<(AdminToken, bool)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8).map(|_| s.spawn(|| ensure(&p).unwrap())).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let on_disk = read(&p).unwrap();
+        assert!(results.iter().all(|(t, _)| t.reveal() == on_disk.reveal()));
+        assert_eq!(results.iter().filter(|(_, created)| *created).count(), 1);
+    }
+
+    /// QA-231: rotations racing first starts: every `ensure` returns a token that was on disk
+    /// at the time (the first one or a rotation's), and the file ends as the last writer's.
+    #[test]
+    fn rotations_and_first_starts_never_return_a_lost_token() {
+        let d = dir();
+        let p = d.join(FILE_NAME);
+        let (ensured, rotated): (Vec<AdminToken>, Vec<AdminToken>) = std::thread::scope(|s| {
+            let ensures: Vec<_> = (0..6).map(|_| s.spawn(|| ensure(&p).unwrap().0)).collect();
+            let rotates: Vec<_> = (0..3).map(|_| s.spawn(|| rotate(&p).unwrap())).collect();
+            (
+                ensures.into_iter().map(|h| h.join().unwrap()).collect(),
+                rotates.into_iter().map(|h| h.join().unwrap()).collect(),
+            )
+        });
+        let on_disk = read(&p).unwrap();
+        // The file holds one of the rotations' tokens, or the first start's when every rotation
+        // ran before it (then no rotation's token survives, and all ensures agree with it).
+        let made: Vec<&str> = ensured
+            .iter()
+            .chain(rotated.iter())
+            .map(AdminToken::reveal)
+            .collect();
+        assert!(
+            made.contains(&on_disk.reveal()),
+            "the file holds a returned token"
+        );
+        // At most one token came from a first start: every other ensure returned a token some
+        // caller wrote (the first start's or a rotation's).
+        let firsts: std::collections::HashSet<&str> = ensured
+            .iter()
+            .map(AdminToken::reveal)
+            .filter(|t| !rotated.iter().any(|r| r.reveal() == *t))
+            .collect();
+        assert!(firsts.len() <= 1, "two first starts made a token each");
     }
 
     fn config_in(root: &Path) -> Config {

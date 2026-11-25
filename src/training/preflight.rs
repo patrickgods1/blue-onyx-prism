@@ -70,18 +70,9 @@ fn frame(sources: &[Source], r: FrameRef) -> Option<&dataset::Frame> {
 fn scene_frames(plan: &Plan, sources: &[Source]) -> SceneCounts {
     let mut c = SceneCounts::default();
     for f in plan.train.iter().filter_map(|(r, _)| frame(sources, *r)) {
-        *scene_slot(&mut c, f.scene.as_deref()) += 1;
+        *c.slot_mut(f.scene.as_deref()) += 1;
     }
     c
-}
-
-fn scene_slot<'a>(c: &'a mut SceneCounts, scene: Option<&str>) -> &'a mut usize {
-    match scene {
-        Some("day") => &mut c.day,
-        Some("night") => &mut c.night,
-        Some("ir") => &mut c.ir,
-        _ => &mut c.unknown,
-    }
 }
 
 /// The warnings of a usable plan, each with the next action (see the constants). A class without
@@ -278,7 +269,7 @@ pub fn report(plan: &Plan, sources: &[Source], opts: &Options, unreviewed: Optio
             if let Some(l) = class_at(i).and_then(|c| classes.get_mut(c.as_str())) {
                 *slot(l) += 1;
                 if scenes {
-                    *scene_slot(&mut l.by_scene, f.scene.as_deref()) += 1;
+                    *l.by_scene.slot_mut(f.scene.as_deref()) += 1;
                 }
             }
         }

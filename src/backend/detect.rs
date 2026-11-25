@@ -812,42 +812,32 @@ mod cuda_driver {
     fn query() -> Result<(Vec<CudaDevice>, Option<CudaVersion>), String> {
         // SAFETY: loads the NVIDIA driver library (an OS-provided one: `System32` / the
         // driver's ld.so.conf dir, never the working directory), the same one ONNX Runtime's
-        // CUDA provider loads; its initializers have no preconditions.
-        let lib = unsafe { crate::backend::libs::open_system(LIBRARY) }
+        // CUDA provider loads; its initializers have no preconditions. Never unloaded:
+        // unloading the driver after cuInit is not supported, and the CUDA provider uses it
+        // later anyway.
+        let lib = unsafe { crate::backend::libs::leak_system(LIBRARY) }
             .map_err(|e| format!("{LIBRARY}: {e}"))?;
-        // Never unloaded: unloading the driver after cuInit is not supported, and the CUDA
-        // provider uses it later anyway.
-        let lib: &'static libloading::Library = Box::leak(Box::new(lib));
-        let sym = |name: &[u8]| -> Result<*const (), String> {
-            // SAFETY: `lib` stays loaded for the whole process (leaked above) and the symbol is
-            // read as a plain code pointer; it is cast to its cuda.h signature below.
-            unsafe { crate::backend::libs::symbol::<*const ()>(lib, name) }
-                .map(|s| *s)
-                .map_err(|e| format!("{LIBRARY}: {e}"))
-        };
-        // SAFETY: each pointer comes from the symbol of that name and is transmuted to its
-        // cuda.h signature.
+        let in_lib = |e: String| format!("{LIBRARY}: {e}");
+        use crate::backend::libs::static_symbol;
+        // SAFETY: each symbol is read with its cuda.h signature.
         let (init, count, get, attr, name, bus) = unsafe {
             (
-                std::mem::transmute::<*const (), CuInit>(sym(b"cuInit\0")?),
-                std::mem::transmute::<*const (), CuDeviceGetCount>(sym(b"cuDeviceGetCount\0")?),
-                std::mem::transmute::<*const (), CuDeviceGet>(sym(b"cuDeviceGet\0")?),
-                std::mem::transmute::<*const (), CuDeviceGetAttribute>(sym(
-                    b"cuDeviceGetAttribute\0",
-                )?),
-                std::mem::transmute::<*const (), CuDeviceGetString>(sym(b"cuDeviceGetName\0")?),
-                std::mem::transmute::<*const (), CuDeviceGetString>(sym(b"cuDeviceGetPCIBusId\0")?),
+                static_symbol::<CuInit>(lib, b"cuInit\0").map_err(in_lib)?,
+                static_symbol::<CuDeviceGetCount>(lib, b"cuDeviceGetCount\0").map_err(in_lib)?,
+                static_symbol::<CuDeviceGet>(lib, b"cuDeviceGet\0").map_err(in_lib)?,
+                static_symbol::<CuDeviceGetAttribute>(lib, b"cuDeviceGetAttribute\0")
+                    .map_err(in_lib)?,
+                static_symbol::<CuDeviceGetString>(lib, b"cuDeviceGetName\0").map_err(in_lib)?,
+                static_symbol::<CuDeviceGetString>(lib, b"cuDeviceGetPCIBusId\0")
+                    .map_err(in_lib)?,
             )
         };
         #[cfg(windows)]
         // SAFETY: as above.
-        let luid_fn = sym(b"cuDeviceGetLuid\0")
-            .ok()
-            .map(|p| unsafe { std::mem::transmute::<*const (), CuDeviceGetLuid>(p) });
+        let luid_fn = unsafe { static_symbol::<CuDeviceGetLuid>(lib, b"cuDeviceGetLuid\0") }.ok();
         // SAFETY: as above.
-        let version_fn = sym(b"cuDriverGetVersion\0")
-            .ok()
-            .map(|p| unsafe { std::mem::transmute::<*const (), CuDriverGetVersion>(p) });
+        let version_fn =
+            unsafe { static_symbol::<CuDriverGetVersion>(lib, b"cuDriverGetVersion\0") }.ok();
 
         // SAFETY: every driver call below is a plain query with its cuda.h signature, writing
         // into local out-parameters of the documented sizes.

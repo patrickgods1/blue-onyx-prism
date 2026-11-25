@@ -63,6 +63,13 @@ pub(crate) use nvidia::*;
 pub(crate) use onnxruntime::*;
 pub(crate) use openvino::*;
 
+/// File naming the flavor in an ONNX Runtime install directory (`cpu`, `cuda`, ...), written by
+/// [`finalize`] and read by `setup-onnxruntime` and the loader (`backend::libs`).
+pub const FLAVOR_FILE: &str = "flavor.txt";
+/// File holding the installed version of a runtime or tool, written by [`finalize`] (a lone
+/// `VERSION` without a manifest is an install from before manifests, `resolve`).
+pub const VERSION_FILE: &str = "VERSION";
+
 /// An extraction stopped because its stop flag was set (service shutdown).
 #[derive(Debug, thiserror::Error)]
 #[error("cancelled")]
@@ -213,8 +220,10 @@ fn check_entry_mode(entry: &str, mode: Option<u32>) -> Result<()> {
 }
 
 /// Extract the whitelisted entries of one downloaded `archive` (a part with `layout`) into
-/// `dest`. Returns the written paths relative to `dest` (`/`-separated).
-pub fn extract_part(
+/// `dest`. Returns the written paths relative to `dest` (`/`-separated). Tests only: the
+/// manager extracts through [`extract_part_until`].
+#[cfg(test)]
+pub(crate) fn extract_part(
     archive: &Path,
     kind: ArchiveKind,
     layout: Layout,
@@ -233,7 +242,8 @@ pub fn extract_part(
     )
 }
 
-/// [`extract_part`] that stops with [`Cancelled`] as soon as `stop` is set (checked between
+/// Extract the whitelisted entries of one downloaded `archive` (a part with `layout`) into
+/// `dest`, stopping with [`Cancelled`] as soon as `stop` is set (checked between
 /// entries and every 256 KiB inside one), so a service stop does not wait for a large archive.
 pub(crate) fn extract_part_until(
     archive: &Path,
@@ -255,8 +265,9 @@ pub(crate) fn extract_part_until(
     )
 }
 
-/// [`extract_part`] with explicit decompressed-size [`Limits`].
-pub fn extract_part_with(
+/// [`extract_part`] with explicit decompressed-size [`Limits`]. Tests only.
+#[cfg(test)]
+pub(crate) fn extract_part_with(
     archive: &Path,
     kind: ArchiveKind,
     layout: Layout,
@@ -300,10 +311,7 @@ fn extract_impl(
                 let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
                 Some(format!("{dir}/{name}"))
             };
-            match kind {
-                ArchiveKind::Zip => extract_zip(archive, dest, wanted, b),
-                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, link, b),
-            }
+            drive(kind, archive, dest, wanted, link, b)
         }
         Layout::OrtRelease | Layout::NugetOrt | Layout::NugetDirectMl => {
             let wanted = |e: &str| ort_wanted(layout, flavor, windows, e);
@@ -314,35 +322,38 @@ fn extract_impl(
                     .is_some_and(|s| stem_allowed(s, flavor))
                     .then_some(tn)
             };
-            match kind {
-                ArchiveKind::Zip => extract_zip(archive, dest, wanted, b),
-                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, link, b),
-            }
+            drive(kind, archive, dest, wanted, link, b)
         }
         Layout::NvidiaWheel => {
             let wanted = |e: &str| wheel_wanted(windows, e);
-            match kind {
-                ArchiveKind::Zip => extract_zip(archive, dest, wanted, b),
-                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, |_, _, _| None, b),
-            }
+            drive(kind, archive, dest, wanted, no_links, b)
         }
-        Layout::Uv => {
-            let wanted = |e: &str| uv_wanted(windows, e);
-            match kind {
-                ArchiveKind::Zip => extract_zip(archive, dest, wanted, b),
-                ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, |_, _, _| None, b),
-            }
-        }
-        Layout::SourceTree => match kind {
-            ArchiveKind::Zip => extract_zip(archive, dest, source_wanted, b),
-            ArchiveKind::TarGz => extract_tgz(archive, dest, source_wanted, |_, _, _| None, b),
-        },
-        Layout::VcRuntime => match kind {
-            ArchiveKind::Zip => extract_zip(archive, dest, vc_runtime_wanted, b),
-            ArchiveKind::TarGz => extract_tgz(archive, dest, vc_runtime_wanted, |_, _, _| None, b),
-        },
+        Layout::Uv => drive(kind, archive, dest, |e| uv_wanted(windows, e), no_links, b),
+        Layout::SourceTree => drive(kind, archive, dest, source_wanted, no_links, b),
+        Layout::VcRuntime => drive(kind, archive, dest, vc_runtime_wanted, no_links, b),
         Layout::File => anyhow::bail!("{} is not an archive", archive.display()),
     }
+}
+
+/// Run the driver of `kind`: [`extract_zip`] (which never recreates links) or [`extract_tgz`]
+/// with `link`.
+fn drive(
+    kind: ArchiveKind,
+    archive: &Path,
+    dest: &Path,
+    wanted: impl Fn(&str) -> Option<String>,
+    link: impl Fn(&str, &str, bool) -> Option<String>,
+    b: &mut Budget<'_>,
+) -> Result<BTreeSet<String>> {
+    match kind {
+        ArchiveKind::Zip => extract_zip(archive, dest, wanted, b),
+        ArchiveKind::TarGz => extract_tgz(archive, dest, wanted, link, b),
+    }
+}
+
+/// The `link` of a layout whose links are never recreated.
+fn no_links(_rel: &str, _target: &str, _hard: bool) -> Option<String> {
+    None
 }
 
 /// Source archives (`<top>/...`, as GitHub makes them): `engine/**/*.py`, `configs/**/*.yml`
@@ -457,7 +468,7 @@ pub(crate) fn finalize(
         }
         ResourceKind::OnnxRuntime(flavor) => {
             let w = ort_check(flavor, target.windows(), got)?;
-            write_marker(dest, ORT_FLAVOR_FILE, flavor.as_str(), got)?;
+            write_marker(dest, FLAVOR_FILE, flavor.as_str(), got)?;
             w
         }
         ResourceKind::CudaLibs => wheel_check(target.windows(), dest, got)?,
@@ -476,7 +487,7 @@ pub(crate) fn finalize(
         ResourceKind::Model | ResourceKind::BenchImages | ResourceKind::ExportModel => Vec::new(),
     };
     if !resource.kind.is_plain_files() {
-        write_marker(dest, "VERSION", version, got)?;
+        write_marker(dest, VERSION_FILE, version, got)?;
     }
     Ok(warnings)
 }
@@ -626,6 +637,26 @@ impl Read for StopRead<'_, '_> {
     }
 }
 
+/// Make `dest/link_rel` point at `dest/target_rel`, a file in the same directory: a symlink to
+/// its bare file name on Unix, a copy elsewhere. Whatever is at `link_rel` is removed first
+/// (a failed removal shows as the link's own error).
+fn place_link(dest: &Path, link_rel: &str, target_rel: &str) -> Result<()> {
+    let link_path = dest.join(link_rel);
+    if link_path.symlink_metadata().is_ok() {
+        std::fs::remove_file(&link_path).ok();
+    }
+    #[cfg(unix)]
+    {
+        let name = target_rel.rsplit('/').next().unwrap_or(target_rel);
+        std::os::unix::fs::symlink(name, &link_path)
+            .with_context(|| format!("creating symlink {}", link_path.display()))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::copy(dest.join(target_rel), &link_path)
+        .with_context(|| format!("copying {}", link_path.display()))?;
+    Ok(())
+}
+
 /// Split an archive entry name into clean components; None for suspicious ones.
 fn components(entry: &str) -> Option<Vec<String>> {
     let e = entry.replace('\\', "/");
@@ -749,19 +780,7 @@ fn extract_tgz(
             if got.contains(rel) || !got.contains(target_rel) {
                 continue;
             }
-            let link_path = dest.join(rel);
-            if link_path.symlink_metadata().is_ok() {
-                std::fs::remove_file(&link_path).ok();
-            }
-            #[cfg(unix)]
-            {
-                let name = target_rel.rsplit('/').next().unwrap_or(target_rel);
-                std::os::unix::fs::symlink(name, &link_path)
-                    .with_context(|| format!("creating symlink {}", link_path.display()))?;
-            }
-            #[cfg(not(unix))]
-            std::fs::copy(dest.join(target_rel), &link_path)
-                .with_context(|| format!("copying {}", link_path.display()))?;
+            place_link(dest, rel, target_rel)?;
             got.insert(rel.clone());
             progressed = true;
         }

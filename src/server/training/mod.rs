@@ -1,7 +1,7 @@
 //! The Import, Auto-label, Train and Models tabs (`/train/...`, admin only, docs/TRAINING.md): what this machine can train
 //! (capability, environment state), the dataset picker (review export folders), the family /
 //! size picker with estimates and hardware fit, the run queue with live progress
-//! (`assets/training.js` polls `GET /v1/training`), finished runs with their benchmark and the
+//! (`TrainArea.follow` in `assets/train-area.js` polls `GET /v1/training`), finished runs with their benchmark and the
 //! "Use as default / night model / verify model" actions (written with [`save_config`]).
 //!
 //! The queue ([`TrainingService`]) is one per process at a time, started on first use. It acts on
@@ -47,7 +47,7 @@ pub(super) use routes::{
     import_tab, json, metric_columns, models_tab, pause, queue, remove, remove_env, resume,
     retry_export, set_dir, train_tab, use_model,
 };
-pub(super) use view::view;
+pub(super) use view::flash;
 
 /// Built-in benchmark sets offered besides the held-out frames.
 const EXTRA_SETS: [&str; 3] = ["nir-night", "exdark-ir", "exdark-night"];

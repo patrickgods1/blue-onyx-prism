@@ -86,35 +86,50 @@ pub fn of_model<'a>(
         }
     };
     let (mut trained, mut validated) = (s.train, s.valid);
-    // A renamed or cut list name: the run's record of image sources names the frame.
-    if let Ok(q) = crate::training::refine::quick::seen_of(config, m)
-        && q.by_source
-    {
-        for f in files {
-            let Some(rel) = export::parse_flat_name(f) else {
-                continue;
-            };
-            let probe = ExportFrame {
-                image: std::path::PathBuf::new(),
-                name: f.to_string(),
-                width: 0,
-                height: 0,
-                buckets: Vec::new(),
-                split: Split::Train,
-                labels: Default::default(),
-                floor: None,
-                rel: rel.clone(),
-            };
-            match q.saw(&probe) {
-                Some(crate::training::refine::quick::Saw::Trained) => {
-                    trained.insert(rel.jpg());
-                }
-                Some(crate::training::refine::quick::Saw::Validated) => {
-                    validated.insert(rel.jpg());
-                }
-                None => {}
+    by_source(config, m, files, &mut trained, &mut validated);
+    Seen::Frames { trained, validated }
+}
+
+/// Add to `trained` / `validated` (frame identities) the set images of `files` (flat export
+/// names) that `m`'s run listed under a renamed or cut name: its record of image sources
+/// ([`crate::training::refine::quick::seen_of`]) names the frame. Nothing is added when that
+/// record is absent or does not read (the lists' names are then all there is).
+pub(crate) fn by_source<'a>(
+    config: &Config,
+    m: &ModelConfig,
+    files: impl IntoIterator<Item = &'a str>,
+    trained: &mut BTreeSet<String>,
+    validated: &mut BTreeSet<String>,
+) {
+    let Ok(q) = crate::training::refine::quick::seen_of(config, m) else {
+        return;
+    };
+    if !q.by_source {
+        return;
+    }
+    for f in files {
+        let Some(rel) = export::parse_flat_name(f) else {
+            continue;
+        };
+        let probe = ExportFrame {
+            image: std::path::PathBuf::new(),
+            name: f.to_string(),
+            width: 0,
+            height: 0,
+            buckets: Vec::new(),
+            split: Split::Train,
+            labels: Default::default(),
+            floor: None,
+            rel: rel.clone(),
+        };
+        match q.saw(&probe) {
+            Some(crate::training::refine::quick::Saw::Trained) => {
+                trained.insert(rel.jpg());
             }
+            Some(crate::training::refine::quick::Saw::Validated) => {
+                validated.insert(rel.jpg());
+            }
+            None => {}
         }
     }
-    Seen::Frames { trained, validated }
 }

@@ -11,8 +11,8 @@
 
 use super::form::{all, checked, field, num};
 use super::train_area::{AUTOLABEL, IMPORT};
-use super::training::{service, view};
-use super::{Shared, blocking, render};
+use super::training::{flash, service};
+use super::{Shared, blocking};
 use crate::config::Config;
 use crate::resources::catalog;
 use crate::training::autolabel::models::{self as al_models, ConfigWriter};
@@ -474,15 +474,11 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
             }
             Ok(msg)
         })();
-        match result {
-            Ok(m) => render(&view(&state, IMPORT, Some(m), None)),
-            Err(e) => render(&view(
-                &state,
-                IMPORT,
-                None,
-                Some(format!("Not imported: {e:#}")),
-            )),
-        }
+        flash(
+            &state,
+            IMPORT,
+            result.map_err(|e| format!("Not imported: {e:#}")),
+        )
     })
     .await
 }
@@ -610,13 +606,11 @@ pub(super) async fn autolabel(
                 ),
             )
                 .into_response(),
-            (Ok((m, _)), false) => render(&view(&state, AUTOLABEL, Some(m), None)),
-            (Err(e), false) => render(&view(
+            (r, false) => flash(
                 &state,
                 AUTOLABEL,
-                None,
-                Some(format!("Not queued: {e:#}")),
-            )),
+                r.map(|(m, _)| m).map_err(|e| format!("Not queued: {e:#}")),
+            ),
         }
     })
     .await

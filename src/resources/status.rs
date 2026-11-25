@@ -851,17 +851,12 @@ fn download_state(
         // A failed update shows too: the installed version still works.
         Some(State::Failed {
             error, retry_at, ..
-        }) if !on_disk || update => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            (
-                RowState::Failed,
-                None,
-                Some(error.clone()),
-                retry_at.map(|t| t.saturating_sub(now)),
-            )
-        }
+        }) if !on_disk || update => (
+            RowState::Failed,
+            None,
+            Some(error.clone()),
+            super::manager::retry_in(*retry_at),
+        ),
         _ if on_disk => (RowState::Installed, None, None, None),
         _ if needed => (RowState::Needed, None, None, None),
         _ if optional => (RowState::Optional, None, None, None),

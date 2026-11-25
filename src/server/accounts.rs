@@ -99,15 +99,7 @@ pub(super) struct AccountsPanel {
 
 /// `secs` (unix) in the process-wide zone, `YYYY-MM-DD HH:MM PST`.
 fn when(secs: u64) -> String {
-    when_in(crate::clock::zone(), secs)
-}
-
-/// [`when`] in `zone`.
-fn when_in(zone: crate::clock::Zone, secs: u64) -> String {
-    i64::try_from(secs)
-        .ok()
-        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
-        .map_or_else(|| secs.to_string(), |t| zone.display(t))
+    crate::clock::zone().display_unix(secs)
 }
 
 /// The failures column of `u`.
@@ -436,17 +428,9 @@ async fn reauth<T: Send + 'static>(
     let device = auth::cookie(&ctx.headers, cookies::DEVICE).map(<[u8]>::to_vec);
     let mut account: Option<accounts::User> = None;
     let slot = state.auth.attempts.reserve(&me, now, || {
-        account = match &*state.auth.users.get() {
-            Snapshot::Users(users) => users.get(&me).cloned(),
-            _ => None,
-        };
+        account = auth::account_now(state, Some(&me));
         match &account {
-            Some(u) => {
-                let trusted = device
-                    .as_deref()
-                    .is_some_and(|d| state.auth.devices.trusted(d, &u.name, u.created, now));
-                (u.lockout(), trusted)
-            }
+            Some(u) => auth::lockout_base(state, u, device.as_deref(), now),
             None => (lockout::State::default(), false),
         }
     });
@@ -482,13 +466,7 @@ async fn reauth<T: Send + 'static>(
             return Err(Denied::Busy);
         };
         st.login.hashed.fetch_add(1, Ordering::Relaxed);
-        let good = match password::verify(&user.hash, &current, &permit) {
-            Ok(good) => good,
-            Err(e) => {
-                error!(user = %user.name, "the stored password of this account cannot be checked: {e:#}; reset it with `blue-onyx-prism user reset-password <name>`");
-                false
-            }
-        };
+        let good = auth::verify_logged(&user, &current, &permit);
         let store = Store::open(st.auth.data_root());
         if good {
             auth::refund(&st, reserved);

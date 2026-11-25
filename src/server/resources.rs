@@ -449,6 +449,24 @@ mod tests {
         assert!(action_fields(&f).1);
     }
 
+    /// QA-244: a large download with a false-like `confirm_large` is the large-download refusal
+    /// (409 asking to confirm), on the route itself; nothing starts.
+    #[tokio::test]
+    async fn a_false_like_confirm_large_refuses_a_large_download() {
+        let (state, root) = resources_state();
+        for v in crate::server::form::FALSE_LIKE {
+            let body = format!("id=model%3Abig-model&confirm_large={}", v.replace(' ', "+"));
+            let (s, b) = post_action(&state, "/v1/resources/download", &body).await;
+            assert_eq!(s, StatusCode::CONFLICT, "{v:?}: {b}");
+            assert!(b["message"].as_str().unwrap().contains("confirm"), "{b}");
+        }
+        assert_eq!(
+            row(&resources(&state).await, "model:big-model")["state"],
+            "available"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn resources_download_add_and_remove() {
         let (state, root) = resources_state();
@@ -789,6 +807,64 @@ mod tests {
             .provisioner
             .exporter()
             .expect("exporter started")
+    }
+
+    /// QA-244: `add_to_config=0`, what the Resources card posts with the box unticked, exports
+    /// without adding the model: no "added when done" in the answer, and once the export is
+    /// installed (its callback runs before that) the config has no entry and no such change.
+    #[tokio::test]
+    async fn an_unticked_add_to_config_exports_without_adding_the_model() {
+        if !export_supported() {
+            return;
+        }
+        let fake = Arc::new(crate::resources::export::fake::Fake::new());
+        let (state, root) = export_state(fake);
+        let (s, b) = post_action(
+            &state,
+            "/v1/resources/export",
+            "id=model%3Ayolo26n&confirm_large=1&add_to_config=0",
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{b}");
+        assert!(
+            !b["message"]
+                .as_str()
+                .unwrap()
+                .contains("added to the config"),
+            "{b}"
+        );
+        let st = exporter(&state)
+            .wait("model:yolo26n", Some(Duration::from_secs(20)))
+            .unwrap();
+        assert_eq!(
+            st.state,
+            crate::resources::export::ExportState::Installed,
+            "{st:?}"
+        );
+        assert!(root.join("models/yolo26n.onnx").is_file());
+        // The file exists only once something saved it.
+        if state.config_path.is_file() {
+            let saved = Config::load(&state.config_path).unwrap();
+            assert!(
+                !saved.models.iter().any(|m| m.effective_name() == "yolo26n"),
+                "not added to the config file"
+            );
+        }
+        assert!(
+            !state
+                .config_read()
+                .models
+                .iter()
+                .any(|m| m.effective_name() == "yolo26n")
+        );
+        assert!(
+            state
+                .config
+                .changes(10)
+                .iter()
+                .all(|c| c.source != "resources export")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

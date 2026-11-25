@@ -91,16 +91,8 @@ pub(crate) fn soname_links(names: &BTreeSet<String>) -> Vec<(String, String)> {
 /// Create the [`soname_links`] in `dest` (symlinks on Unix, copies elsewhere).
 fn add_soname_links(dest: &Path, got: &mut BTreeSet<String>) -> Result<()> {
     for (link, target) in soname_links(got) {
-        let path = dest.join(&link);
-        if path.symlink_metadata().is_ok() {
-            std::fs::remove_file(&path).ok();
-        }
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&target, &path)
-            .with_context(|| format!("creating symlink {}", path.display()))?;
-        #[cfg(not(unix))]
-        std::fs::copy(dest.join(&target), &path)
-            .with_context(|| format!("copying {}", path.display()))?;
+        // Flat names (the wheel layout is flat), so the symlink names `target` itself.
+        super::place_link(dest, &link, &target)?;
         got.insert(link);
     }
     Ok(())

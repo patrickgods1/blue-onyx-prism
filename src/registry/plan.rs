@@ -384,6 +384,105 @@ mod tests {
         assert!(plan_models(&dup, &Fake::cpu_only(), None, DeviceSpec::OPENVINO_CPU).is_err());
     }
 
+    /// A runtime and a model file of the catalog, as blocks of a waiting model.
+    fn blocks(kinds: &[bool]) -> Vec<crate::resources::provision::Block> {
+        use crate::resources::catalog;
+        kinds
+            .iter()
+            .map(|&runtime| {
+                let resource = catalog::all()
+                    .find(|r| {
+                        if runtime {
+                            !r.kind.is_plain_files()
+                        } else {
+                            r.kind.is_model()
+                        }
+                    })
+                    .unwrap();
+                crate::resources::provision::Block {
+                    key: resource.id.to_string(),
+                    resource,
+                }
+            })
+            .collect()
+    }
+
+    /// [`Fake`] whose runtimes stay busy past the reload's wait (`LockedRuntimes` timing out).
+    struct Busy(Fake);
+
+    impl PlanRuntimes for Busy {
+        fn first_runnable(&self, spec: &DeviceSpec, model: &Path) -> Option<(Device, String)> {
+            self.0.first_runnable(spec, model)
+        }
+
+        fn first_runnable_wait(&self, _: &DeviceSpec, _: &Path) -> Option<(Device, String)> {
+            None
+        }
+    }
+
+    /// QA-151: the plan of model `m` (file `file`, written when `present`) waiting for
+    /// `kinds` (true: a runtime, false: a model file) on a manager that never runs them.
+    fn plan_waiting<R: PlanRuntimes>(runtimes: &R, present: bool, kinds: &[bool]) -> ModelPlan {
+        use crate::resources::manager::{Manager, ManagerOptions};
+        let dir = temp_dir();
+        let file = dir.join("m.onnx");
+        if present {
+            std::fs::write(&file, b"x").unwrap();
+        }
+        let config = config_with(vec![entry(file)]);
+        let manager =
+            std::sync::Arc::new(Manager::start(ManagerOptions::new(dir.join("downloads"))));
+        let provision = Provision::with_blocks(&config, manager, "m", blocks(kinds));
+        assert!(provision.wait_for("m").is_some());
+        let mut plans = plan_models(
+            &config,
+            runtimes,
+            Some(&provision),
+            DeviceSpec::OPENVINO_CPU,
+        )
+        .unwrap();
+        plans.remove(0)
+    }
+
+    /// Only a runtime downloads and the file is here: it loads now on what runs already.
+    #[test]
+    fn a_model_waiting_only_for_a_runtime_loads_on_an_interim_device() {
+        let plan = plan_waiting(&Fake::cpu_only(), true, &[true]);
+        assert_eq!(plan.outcome, PlanOutcome::Spawn);
+        assert!(plan.wait.is_none());
+        assert_eq!(plan.device, DeviceSpec::Auto);
+        assert_eq!(plan.classes, crate::model::classes::coco80());
+    }
+
+    /// The model file itself downloads: it waits, its classes read later by the worker.
+    #[test]
+    fn a_model_waiting_for_its_file_keeps_the_wait() {
+        let plan = plan_waiting(&Fake::cpu_only(), true, &[true, false]);
+        assert_eq!(plan.outcome, PlanOutcome::Spawn);
+        assert_eq!(plan.wait.as_ref().unwrap().blocks().len(), 2);
+        assert!(plan.classes.is_empty());
+    }
+
+    /// Only a runtime downloads but the file is not there: nothing to load in the meantime.
+    #[test]
+    fn a_runtime_wait_without_the_file_keeps_the_wait() {
+        let plan = plan_waiting(&Fake::cpu_only(), false, &[true]);
+        assert_eq!(plan.outcome, PlanOutcome::Spawn);
+        assert!(plan.wait.is_some());
+        assert!(plan.classes.is_empty());
+    }
+
+    /// Runtimes busy compiling another model (no answer within the reload's wait): it waits.
+    #[test]
+    fn busy_runtimes_keep_the_wait() {
+        let plan = plan_waiting(&Busy(Fake::cpu_only()), true, &[true]);
+        assert_eq!(plan.outcome, PlanOutcome::Spawn);
+        assert!(plan.wait.is_some());
+        assert!(plan.classes.is_empty());
+        // The label still comes from the plain query.
+        assert!(plan.planned.is_some());
+    }
+
     #[test]
     fn provision_without_needs_changes_nothing() {
         let dir = temp_dir();

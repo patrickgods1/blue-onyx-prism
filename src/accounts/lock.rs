@@ -110,8 +110,7 @@ fn hand_over(path: &Path) {
     ) else {
         return;
     };
-    if let Some((uid, gid)) = crate::resources::hf_token::chown_to(me.uid(), (dir.uid(), dir.gid()))
-    {
+    if let Some((uid, gid)) = crate::private_dir::chown_to(me.uid(), (dir.uid(), dir.gid())) {
         let _ = chown(path, Some(uid), Some(gid));
     }
 }

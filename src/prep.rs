@@ -108,12 +108,14 @@ impl Scratch {
     }
 
     /// Capacity of the kept buffer (0: none).
-    pub fn capacity(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
         self.rgb.capacity()
     }
 
     /// Address of the kept buffer, for tests that check a kept frame never aliases it.
-    pub fn as_ptr(&self) -> *const u8 {
+    #[cfg(test)]
+    pub(crate) fn as_ptr(&self) -> *const u8 {
         self.rgb.as_ptr()
     }
 }
@@ -317,7 +319,8 @@ impl TensorPool {
     }
 
     /// Buffers currently free for `len`.
-    pub fn free_count(&self, len: usize) -> usize {
+    #[cfg(test)]
+    pub(crate) fn free_count(&self, len: usize) -> usize {
         self.free
             .lock_recover()
             .lists
@@ -536,7 +539,14 @@ pub struct PrepPool {
     tx: Option<Sender<PrepJob>>,
     threads: Vec<JoinHandle<()>>,
     tensors: Arc<TensorPool>,
-    /// Jobs the pool threads finished (any outcome).
+    /// Jobs the pool threads finished (any outcome). Only tests read it ([`Self::jobs_done`]).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the pool threads count every job; tests read the count"
+        )
+    )]
     done: Arc<AtomicU64>,
 }
 
@@ -577,7 +587,8 @@ impl PrepPool {
     }
 
     /// Jobs the pool threads have finished so far (prepared or failed).
-    pub fn jobs_done(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn jobs_done(&self) -> u64 {
         self.done.load(Ordering::Acquire)
     }
 
@@ -605,7 +616,8 @@ impl PrepPool {
 
     /// Decode + preprocess `image` on the calling thread (what a pool thread does, without a
     /// reused buffer): scene statistics of the decoded frame, then [`PrepPool::prepare_image`].
-    pub fn prepare_now(
+    #[cfg(test)]
+    pub(crate) fn prepare_now(
         pre: &mut Preprocessor,
         tensors: &Arc<TensorPool>,
         image: &[u8],
@@ -679,8 +691,10 @@ impl PrepPool {
 
     /// Preprocess an already decoded `img` whose statistics are `stats`: the enhancement of
     /// `modes` for `stats.scene()` (on a copy when the original is kept), then the letterbox /
-    /// stretch into a pooled tensor. [`Prepared::decode`] is zero.
-    pub fn prepare_image(
+    /// stretch into a pooled tensor. [`Prepared::decode`] is zero. Tests only; the pool threads
+    /// call [`Self::prepare`].
+    #[cfg(test)]
+    pub(crate) fn prepare_image(
         pre: &mut Preprocessor,
         tensors: &Arc<TensorPool>,
         img: RgbImage,
@@ -702,8 +716,10 @@ impl PrepPool {
         )
     }
 
-    /// [`Self::prepare_image`] with `scratch`: the enhanced copy of a kept frame is made in its
-    /// buffer, and a frame that is not kept goes back to it afterwards.
+    /// Preprocess an already decoded `img` whose statistics are `stats` (the enhancement of
+    /// `modes` for its scene, then the letterbox / stretch into a pooled tensor) with `scratch`:
+    /// the enhanced copy of a kept frame is made in its buffer, and a frame that is not kept goes
+    /// back to it afterwards.
     #[allow(
         clippy::too_many_arguments,
         reason = "the preprocessing state of a pool thread plus one request's inputs"

@@ -107,10 +107,7 @@ pub struct Devices {
     state: Mutex<State>,
 }
 
-struct State {
-    map: HashMap<Digest, Device>,
-    v: Versions,
-}
+type State = opaque::Kept<Device>;
 
 impl std::fmt::Debug for Devices {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -199,25 +196,12 @@ impl Devices {
     pub fn load(data_root: &Path, now: u64) -> Self {
         let persist = Persist::new(data_root, FILE_NAME, now);
         let path = persist.path();
-        let mut map = match opaque::read(&path) {
-            opaque::Loaded::Missing => HashMap::new(),
-            opaque::Loaded::Failed(why) => {
-                tracing::warn!(
-                    "{}: {why}; no browser counts as a known device until it signs in again. \
-                     Check that the service's account may read it",
-                    path.display()
-                );
-                HashMap::new()
-            }
-            opaque::Loaded::Bytes(bytes) => parse(&bytes).unwrap_or_else(|why| {
-                tracing::warn!(
-                    "{} is damaged ({why}); no browser counts as a known device until it signs \
-                     in again. The file is replaced at the next sign-in",
-                    path.display()
-                );
-                HashMap::new()
-            }),
-        };
+        let mut map = opaque::load_or_warn(
+            &path,
+            "no browser counts as a known device until it signs in again",
+            parse,
+            |line| tracing::warn!("{line}"),
+        );
         map.retain(|_, d| now < d.expires && d.failures < DEVICE_FAILURE_BUDGET);
         Self {
             persist,
@@ -408,47 +392,26 @@ impl Devices {
     /// or [`FLUSH_EVERY_SECS`] since the last write; expired devices are dropped first. Whether
     /// it wrote.
     pub fn flush(&self, now: u64, force: bool) -> bool {
-        let mut w = self.persist.writer();
-        let (text, version) = {
-            let mut s = self.state.lock_recover();
-            let before = s.map.len();
-            s.map.retain(|_, d| now < d.expires);
-            if s.map.len() != before {
-                s.v.lazy();
-            }
-            if !s.v.due(force, now, w.last, FLUSH_EVERY_SECS) {
-                return false;
-            }
-            let mut devices: Vec<Entry> = s
-                .map
-                .iter()
-                .map(|(k, d)| Entry {
-                    hash: opaque::digest_hex(k),
-                    user: d.user.clone(),
-                    account_created: Some(d.account_created),
-                    failures: d.failures,
-                    expires: d.expires,
-                })
-                .collect();
-            devices.sort_unstable_by(|a, b| a.hash.cmp(&b.hash));
-            let file = FileRepr {
+        opaque::write_due(
+            &self.persist,
+            &self.state,
+            now,
+            force,
+            FLUSH_EVERY_SECS,
+            |d| now < d.expires,
+            |hash, d| Entry {
+                hash,
+                user: d.user.clone(),
+                account_created: Some(d.account_created),
+                failures: d.failures,
+                expires: d.expires,
+            },
+            |devices| FileRepr {
                 format: FORMAT,
                 devices,
-            };
-            match opaque::to_text(&file, "the known devices") {
-                Ok(t) => (t, s.v.changed),
-                Err(e) => {
-                    tracing::warn!("{e:#}");
-                    return false;
-                }
-            }
-        };
-        if !self.persist.write(&mut w, &text, now) {
-            return false;
-        }
-        let mut s = self.state.lock_recover();
-        s.v.written = s.v.written.max(version);
-        true
+            },
+            "the known devices",
+        )
     }
 }
 
@@ -594,6 +557,76 @@ mod tests {
             let mode = std::fs::metadata(s.path()).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// The file's exact text: pretty JSON, entries sorted by hash, a final newline (QA-218
+    /// characterisation of the write shared with `sessions` through `opaque`).
+    #[test]
+    fn the_file_is_pretty_json_sorted_by_hash() {
+        let d = scratch();
+        let s = Devices::load(&d.0, T);
+        let mut want: Vec<(String, &str)> = ["alice", "bob", "carol", "dave"]
+            .into_iter()
+            .map(|u| (opaque::digest_hex(&s.issue(u, C, T).digest()), u))
+            .collect();
+        want.sort();
+        let entries: Vec<String> = want
+            .iter()
+            .map(|(hash, user)| {
+                format!(
+                    "    {{\n      \"hash\": \"{hash}\",\n      \"user\": \"{user}\",\n      \
+                     \"account_created\": {C},\n      \"failures\": 0,\n      \"expires\": {}\n    }}",
+                    T + MAX_AGE_SECS
+                )
+            })
+            .collect();
+        let expected = format!(
+            "{{\n  \"format\": 1,\n  \"devices\": [\n{}\n  ]\n}}\n",
+            entries.join(",\n")
+        );
+        assert_eq!(std::fs::read_to_string(s.path()).unwrap(), expected);
+    }
+
+    /// Unreadable or damaged files of every kind load as no devices and stay until a write;
+    /// entries over the failure budget or expired are left out at load.
+    #[test]
+    fn a_damaged_file_means_no_devices_and_stays_until_a_write() {
+        let d = scratch();
+        let auth = crate::private_dir::ensure(&d.0).unwrap();
+        let path = auth.join(FILE_NAME);
+        for junk in [
+            &b"{\"format\": 1, \"devices\": [{\"hash\": 5"[..],
+            b"{\"format\": 9, \"devices\": []}",
+            b"{\"format\": 1, \"devices\": [{\"hash\": \"zz\", \"user\": \"a\", \
+              \"account_created\": 1, \"failures\": 0, \"expires\": 1}]}",
+            b"\xff\xfe",
+        ] {
+            std::fs::write(&path, junk).unwrap();
+            let s = Devices::load(&d.0, T);
+            assert!(s.is_empty());
+            assert!(!s.flush(T + 10_000, true), "nothing to write");
+            assert_eq!(std::fs::read(&path).unwrap(), junk);
+            s.issue("alice", C, T);
+            assert_eq!(Devices::load(&d.0, T).len(), 1);
+        }
+        let s = Devices::load(&d.0, T);
+        let spent = s.issue("bob", C, T);
+        for _ in 0..DEVICE_FAILURE_BUDGET - 1 {
+            assert!(s.record_failure(spent.reveal().as_bytes(), "bob", C, T));
+        }
+        s.flush(T, true);
+        assert_eq!(Devices::load(&d.0, T).len(), 2, "within the budget");
+        assert_eq!(Devices::load(&d.0, T + MAX_AGE_SECS).len(), 0, "expired");
+        // A file holding a device at the budget (another version's, or a hand edit).
+        let mut f: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        for e in f["devices"].as_array_mut().unwrap() {
+            if e["user"] == "bob" {
+                e["failures"] = DEVICE_FAILURE_BUDGET.into();
+            }
+        }
+        std::fs::write(&path, f.to_string()).unwrap();
+        assert_eq!(Devices::load(&d.0, T).len(), 1, "over the budget");
     }
 
     fn users(list: &[(&str, u64)]) -> super::super::Users {

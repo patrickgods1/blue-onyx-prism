@@ -4,10 +4,12 @@
 //! folder under review ([`bulk`]); a `dry_run` only counts.
 
 use super::{
-    ACCEPT_AUTO_DEFAULT_LIMIT, ACCEPT_AUTO_MAX_LIMIT, Answer, AppState, blocking, bulk_filters,
-    bulk_limit, context, hidden, json_body, json_fail, now, push_failed, push_past_limit, success,
+    ACCEPT_AUTO_DEFAULT_LIMIT, ACCEPT_AUTO_MAX_LIMIT, Answer, AppState, Problem, blocking,
+    bulk_filters, bulk_limit, json_body, json_fail, now, push_failed, push_past_limit, review_ctx,
+    success,
 };
 use crate::collect::labels::bulk;
+use crate::collect::labels::queue::Filters;
 use crate::server::Shared;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -16,17 +18,46 @@ use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use std::sync::Arc;
 
-/// After a bulk write that changed `frames` frames: the Refine tab's caches read the label files,
-/// so they go ([`crate::server::refine::label_files_changed`], QA-091).
-pub(super) fn wrote(frames: usize) {
+/// After a bulk write that changed `frames` frames of the folder under review `dir`: the Refine
+/// tab's caches read the label files, so they go ([`crate::server::refine::label_files_changed`],
+/// QA-091). Tests count the calls per folder (`wrote_count`).
+pub(super) fn wrote(
+    #[cfg_attr(
+        not(test),
+        expect(unused_variables, reason = "only tests count per folder")
+    )]
+    dir: &std::path::Path,
+    frames: usize,
+) {
     if frames > 0 {
         crate::server::refine::label_files_changed();
+        #[cfg(test)]
+        {
+            use crate::sync::LockExt as _;
+            *WROTE.lock_recover().entry(dir.to_path_buf()).or_default() += 1;
+        }
     }
 }
 
+/// How many bulk writes of each folder dropped the Refine caches ([`wrote`]): a test's own count,
+/// whatever other tests drop meanwhile (the caches are the process's).
+#[cfg(test)]
+static WROTE: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// [`WROTE`] of `dir`.
+#[cfg(test)]
+pub(super) fn wrote_count(dir: &std::path::Path) -> usize {
+    use crate::sync::LockExt as _;
+    WROTE.lock_recover().get(dir).copied().unwrap_or(0)
+}
+
+/// The body of the bulk routes that take the queue's filters, `{bucket?, scene?, camera?, label?,
+/// source?, dry_run, limit?}` (empty = any). `reject-low` adds `min_score` ([`RejectLowBody`]:
+/// `flatten` does not mix with `deny_unknown_fields`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AcceptAutoBody {
+struct BulkBody {
     #[serde(default)]
     bucket: Option<String>,
     #[serde(default)]
@@ -43,6 +74,29 @@ struct AcceptAutoBody {
     limit: Option<usize>,
 }
 
+impl BulkBody {
+    /// The most frames the route changes: `limit`, else `default` ([`bulk_limit`], 400 out of
+    /// range).
+    fn limit(&self, default: usize) -> Result<usize, Problem> {
+        bulk_limit(self.limit, default)
+    }
+
+    /// The filters the body names with the route's `fixed` ones on top ([`bulk_filters`], 400
+    /// for a bad value).
+    fn filters(&self, fixed: &[(&str, &str)]) -> Result<Filters, Problem> {
+        bulk_filters(
+            [
+                self.bucket.clone(),
+                self.scene.clone(),
+                self.camera.clone(),
+                self.label.clone(),
+                self.source.clone(),
+            ],
+            fixed,
+        )
+    }
+}
+
 /// `POST /v1/review/accept-auto` with `{bucket?, scene?, camera?, label?, source?, dry_run,
 /// limit?}` (empty = any): the unreviewed frames of those filters whose auto-label triage alone
 /// settles them (`auto=accept`, [`labels::auto_accept_eligible`]) saved as reviewed, at most
@@ -52,17 +106,22 @@ pub(in crate::server) async fn accept_auto(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Answer {
-    let b: AcceptAutoBody = json_body(&headers, body)?;
-    let limit = bulk_limit(b.limit, ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let mut filters = bulk_filters(
-        [b.bucket, b.scene, b.camera, b.label, b.source],
-        &[("status", "unreviewed"), ("auto", "accept")],
-    )?;
+    let b: BulkBody = json_body(&headers, body)?;
+    let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
+    let mut filters = b.filters(&[("status", "unreviewed"), ("auto", "accept")])?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
-        let (dir, classes, _) = context(&state);
-        filters.wanted = Some((classes.clone(), hidden(&state)));
-        let o = bulk::bulk_accept(&dir, &filters, &classes, limit, &now(), dry_run, &|_| true);
+        let ctx = review_ctx(&state);
+        filters.wanted = Some((ctx.classes.clone(), ctx.hidden.clone()));
+        let o = bulk::bulk_accept(
+            &ctx.dir,
+            &filters,
+            &ctx.classes,
+            limit,
+            &now(),
+            dry_run,
+            &|_| true,
+        );
         let eligible = o.eligible;
         if dry_run {
             return success(serde_json::json!({
@@ -71,7 +130,7 @@ pub(in crate::server) async fn accept_auto(
                 "frames": o.done,
             }));
         }
-        wrote(o.done_count);
+        wrote(&ctx.dir, o.done_count);
         let mut message = format!(
             "Accepted {} frame(s) the auto-labelers settled (saved as reviewed).",
             o.done_count
@@ -139,7 +198,7 @@ pub(in crate::server) async fn reject_low(
     )?;
     let (dry_run, min) = (b.dry_run, b.min_score);
     Ok(blocking(move || {
-        let (dir, _, _) = context(&state);
+        let dir = review_ctx(&state).dir;
         let o = bulk::bulk_reject_below(&dir, &filters, min, limit, dry_run, &|_| true);
         let eligible = o.eligible;
         if dry_run {
@@ -150,7 +209,7 @@ pub(in crate::server) async fn reject_low(
                 "frames": o.done,
             }));
         }
-        wrote(o.done_count);
+        wrote(&dir, o.done_count);
         let mut message = format!(
             "Rejected {} auto box(es) scoring below {min} on {} frame(s) (kept as hard \
              negatives; the frames stay unreviewed).",
@@ -192,14 +251,21 @@ pub(in crate::server) async fn accept_repeats(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Answer {
-    let b: AcceptAutoBody = json_body(&headers, body)?;
-    let limit = bulk_limit(b.limit, ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let filters = bulk_filters([b.bucket, b.scene, b.camera, b.label, b.source], &[])?;
+    let b: BulkBody = json_body(&headers, body)?;
+    let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
+    let filters = b.filters(&[])?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let o =
-            bulk::bulk_accept_repeats(&dir, &filters, &classes, limit, &now(), dry_run, &|_| true);
+        let ctx = review_ctx(&state);
+        let o = bulk::bulk_accept_repeats(
+            &ctx.dir,
+            &filters,
+            &ctx.classes,
+            limit,
+            &now(),
+            dry_run,
+            &|_| true,
+        );
         if dry_run {
             return success(serde_json::json!({
                 "eligible": o.eligible,
@@ -207,7 +273,7 @@ pub(in crate::server) async fn accept_repeats(
                 "frames": o.done,
             }));
         }
-        wrote(o.done_count);
+        wrote(&ctx.dir, o.done_count);
         let mut message = format!("Saved {} repeat-only frame(s) as reviewed.", o.done_count);
         push_failed(&mut message, o.failed_count, "not saved", "review");
         push_past_limit(&mut message, o.eligible, limit, "more");
@@ -242,25 +308,21 @@ pub(in crate::server) async fn reject_stacked(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Answer {
-    let b: RejectOtherClassBody = json_body(&headers, body)?;
-    let limit = bulk_limit(b.limit, ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let filters = bulk_filters([b.bucket, b.scene, b.camera, b.label, b.source], &[])?;
+    let b: BulkBody = json_body(&headers, body)?;
+    let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
+    let filters = b.filters(&[])?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
-        let wanted = bulk::Wanted {
-            classes: &classes,
-            hidden: &hidden,
-        };
-        let done = bulk::bulk_reject_stacked(&dir, &filters, &wanted, limit, dry_run, &|_| true);
+        let ctx = review_ctx(&state);
+        let done =
+            bulk::bulk_reject_stacked(&ctx.dir, &filters, &ctx.wanted(), limit, dry_run, &|_| true);
         let (o, left, left_reviewed) = (
             done.outcome,
             done.overlaps_left,
             done.overlaps_left_reviewed,
         );
         if !dry_run {
-            wrote(o.done_count);
+            wrote(&ctx.dir, o.done_count);
         }
         let mut message = if o.boxes == 0 {
             "No stacked duplicates on the frames these filters select.".to_string()
@@ -329,15 +391,12 @@ pub(in crate::server) async fn restore_reopened(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Answer {
-    let b: RejectOtherClassBody = json_body(&headers, body)?;
-    let limit = bulk_limit(b.limit, ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let filters = bulk_filters(
-        [b.bucket, b.scene, b.camera, b.label, b.source],
-        &[("status", "unreviewed")],
-    )?;
+    let b: BulkBody = json_body(&headers, body)?;
+    let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
+    let filters = b.filters(&[("status", "unreviewed")])?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
-        let (dir, _, _) = context(&state);
+        let dir = review_ctx(&state).dir;
         let o = bulk::bulk_restore_reopened(&dir, &filters, limit, dry_run, &|_| true);
         let eligible = o.eligible;
         if dry_run {
@@ -347,7 +406,7 @@ pub(in crate::server) async fn restore_reopened(
                 "frames": o.done,
             }));
         }
-        wrote(o.done_count);
+        wrote(&dir, o.done_count);
         let mut message = format!(
             "Restored {} reopened frame(s) to reviewed (their boxes are unchanged; they are back \
              in exports).",
@@ -441,13 +500,8 @@ pub(in crate::server) async fn suggest_overlaps(
             return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}"));
         }
         if b.dry_run {
-            let (dir, classes, _) = context(&state);
-            let hidden = hidden(&state);
-            let wanted = bulk::Wanted {
-                classes: &classes,
-                hidden: &hidden,
-            };
-            let s = match select::select(&dir, &req.frames, &wanted) {
+            let ctx = review_ctx(&state);
+            let s = match select::select(&ctx.dir, &req.frames, &ctx.wanted()) {
                 Ok(s) => s,
                 Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
             };
@@ -513,25 +567,6 @@ pub(in crate::server) async fn suggest_overlaps(
     .await)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RejectOtherClassBody {
-    #[serde(default)]
-    bucket: Option<String>,
-    #[serde(default)]
-    scene: Option<String>,
-    #[serde(default)]
-    camera: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    dry_run: bool,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
 /// `POST /v1/review/reject-other-class` with `{bucket?, scene?, camera?, label?, source?,
 /// dry_run, limit?}`: on the unreviewed frames of those filters, the pending model and auto boxes
 /// of unwanted classes (not in `collect.classes`, or in `collect.hidden_classes`) rejected with
@@ -547,23 +582,16 @@ pub(in crate::server) async fn reject_other_class(
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Answer {
-    let b: RejectOtherClassBody = json_body(&headers, body)?;
-    let limit = bulk_limit(b.limit, ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let filters = bulk_filters(
-        [b.bucket, b.scene, b.camera, b.label, b.source],
-        &[("status", "unreviewed")],
-    )?;
+    let b: BulkBody = json_body(&headers, body)?;
+    let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
+    let filters = b.filters(&[("status", "unreviewed")])?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
-        let wanted = bulk::Wanted {
-            classes: &classes,
-            hidden: &hidden,
-        };
-        let o = bulk::bulk_reject_other_class(&dir, &filters, &wanted, limit, dry_run, &|_| true);
+        let ctx = review_ctx(&state);
+        let (dir, wanted) = (&ctx.dir, ctx.wanted());
+        let o = bulk::bulk_reject_other_class(dir, &filters, &wanted, limit, dry_run, &|_| true);
         let eligible = o.eligible;
-        let reviewed = bulk::reviewed_with_unwanted(&dir, &wanted);
+        let reviewed = bulk::reviewed_with_unwanted(dir, &wanted);
         if dry_run {
             return success(serde_json::json!({
                 "eligible": eligible,
@@ -574,7 +602,7 @@ pub(in crate::server) async fn reject_other_class(
                 "reviewed_with_unwanted": reviewed,
             }));
         }
-        wrote(o.done_count);
+        wrote(dir, o.done_count);
         let mut message = format!(
             "Rejected {} pending box(es) of unwanted classes on {} frame(s) (kept as evidence, \
              reason other_class; the frames stay unreviewed).",
@@ -640,14 +668,10 @@ pub(in crate::server) async fn reject_unwanted_reviewed(
     let limit = bulk_limit(b.limit, ACCEPT_AUTO_MAX_LIMIT)?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
-        let wanted = bulk::Wanted {
-            classes: &classes,
-            hidden: &hidden,
-        };
+        let ctx = review_ctx(&state);
+        let (dir, wanted) = (&ctx.dir, ctx.wanted());
         if dry_run {
-            let r = bulk::reviewed_with_unwanted(&dir, &wanted);
+            let r = bulk::reviewed_with_unwanted(dir, &wanted);
             return success(serde_json::json!({
                 "eligible": r.frames,
                 "boxes": r.boxes,
@@ -655,8 +679,8 @@ pub(in crate::server) async fn reject_unwanted_reviewed(
                 "rejected": 0,
             }));
         }
-        let o = bulk::bulk_reject_unwanted(&dir, &wanted, bulk::Scope::Reviewed, limit, false);
-        wrote(o.done_count);
+        let o = bulk::bulk_reject_unwanted(dir, &wanted, bulk::Scope::Reviewed, limit, false);
+        wrote(dir, o.done_count);
         let eligible = o.eligible;
         let mut message = format!(
             "Rejected {} accepted box(es) of unwanted classes on {} reviewed frame(s) (kept as \

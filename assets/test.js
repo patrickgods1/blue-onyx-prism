@@ -194,7 +194,7 @@
     function arm() {
       if (!ctl) return;
       timer = setTimeout(function () {
-        if (window.PrismPoll && PrismPoll.signingIn && PrismPoll.signingIn()) { arm(); return; }
+        if (PrismPoll.signingIn()) { arm(); return; }
         timedOut = true; ctl.abort();
       }, UPLOAD_TIMEOUT_MS);
     }

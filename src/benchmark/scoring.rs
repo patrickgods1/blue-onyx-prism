@@ -313,16 +313,10 @@ pub(super) fn all_classes_ap(
 /// [`AccuracyReport::ground_truth`]: "ground truth", or the pseudo ground truth references.
 pub(super) fn ground_truth_desc(all: &[(&ImageSet, &images::SetImage)], relative: bool) -> String {
     if relative {
-        let refs: Vec<String> = all
-            .iter()
-            .filter_map(|(s, _)| match &s.ground_truth {
-                GroundTruth::Pseudo(r) => Some(r.clone()),
-                _ => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        format!("relative to {}, not ground truth", refs.join(", "))
+        images::relative_desc(all.iter().filter_map(|(s, _)| match &s.ground_truth {
+            GroundTruth::Pseudo(r) => Some(r.clone()),
+            _ => None,
+        }))
     } else {
         "ground truth".to_string()
     }

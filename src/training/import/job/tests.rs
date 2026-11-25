@@ -106,6 +106,10 @@ struct ImportFake {
     refetch_peak: AtomicUsize,
     /// `fetch-url` reports its download's progress (half, then all of 3 MB) before `fetched`.
     url_progress: bool,
+    /// `embed` fails as PIL does on a truncated JPEG; or, with `embed_cancel`, the user cancels
+    /// while it runs.
+    embed_fails: bool,
+    embed_cancel: bool,
 }
 
 /// `k` of a fake video `v<k>.mp4` (0 for any other name).
@@ -322,6 +326,19 @@ impl CommandRunner for ImportFake {
                     "webpage_url": "https://example.org/v/1", "extractor": "generic"})
             ));
         } else if cmd.args.iter().any(|a| a == "embed") {
+            if self.embed_cancel {
+                cancel.store(true, Ordering::SeqCst);
+                crate::training::pyenv::check(cancel)?;
+            }
+            if self.embed_fails {
+                on_line("[import_footage] error: image file is truncated (3 bytes not processed)");
+                return Err(crate::resources::export::ChildFailed {
+                    program: "python".into(),
+                    status: "exit code: 1".into(),
+                    lines: vec!["OSError: image file is truncated (3 bytes not processed)".into()],
+                }
+                .into());
+            }
             let list = arg_after(cmd, "--list").unwrap();
             let out = arg_after(cmd, "--out").unwrap();
             let n = std::fs::read_to_string(&list).unwrap().lines().count();
@@ -593,6 +610,53 @@ fn duplicates_are_dropped_and_dhash_selection_runs_without_embeddings() {
             .license,
         "CC BY 4.0"
     );
+}
+
+/// Audit 2026-11 (QA-263): the SigLIP 2 embedder failing on one image (PIL refuses a truncated
+/// alert JPEG the Rust decoder reads) falls back to the dHash selection with a warning: the frames
+/// are still written. A Cancel while it runs still cancels the import.
+#[test]
+fn a_failed_embedding_falls_back_to_dhash_and_a_cancel_still_cancels() {
+    let t = tmp("embed-fails");
+    let root = &t.0;
+    std::fs::write(root.join("clip.mp4"), b"v").unwrap();
+    let mut req = ImportRequest::new(ImportSource::Path(root.join("clip.mp4")));
+    req.license_confirmed = true;
+    req.frames = 3;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(8, 3);
+    fake.embed_fails = true;
+    let (r, _) = run(&job, &fake);
+    let rep = r.unwrap().result;
+    assert_eq!(fake.script_cmds("embed").len(), 1, "SigLIP 2 was tried");
+    assert_eq!(rep["selection"], "dhash", "{rep}");
+    assert_eq!(rep["frames"], 3, "{rep}");
+    assert_eq!(records(&root.join("dataset")).len(), 3);
+    let warned = rep["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .find(|w| w.starts_with("the SigLIP 2 embeddings could not be computed ("))
+        .unwrap_or_else(|| panic!("no warning: {rep}"));
+    assert!(
+        warned.ends_with("; a damaged image?), so the frames were picked by dHash instead"),
+        "{warned}"
+    );
+
+    let t = tmp("embed-cancel");
+    let root = &t.0;
+    std::fs::write(root.join("clip.mp4"), b"v").unwrap();
+    let mut req = ImportRequest::new(ImportSource::Path(root.join("clip.mp4")));
+    req.license_confirmed = true;
+    req.frames = 3;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let mut fake = ImportFake::new(8, 3);
+    fake.embed_cancel = true;
+    let (r, _) = run(&job, &fake);
+    let e = r.unwrap_err();
+    assert!(crate::training::pyenv::is_cancel(&e), "{e:#}");
+    assert!(records(&root.join("dataset")).is_empty());
 }
 
 #[test]

@@ -1,5 +1,7 @@
 //! Random secrets from the operating system: the admin token ([`crate::admin_token`]), the
-//! setup code ([`crate::accounts::setup`]) and, later, session ids.
+//! setup code ([`crate::accounts::setup`]), session and device-cookie ids
+//! (`accounts::opaque`) and new accounts' first generation; plus [`digest_eq`], the one
+//! constant-time comparison of a presented secret with a kept one.
 //!
 //! `uuid` is this crate's source of randomness (`getrandom`, no userspace generator: the build
 //! has neither `fast-rng` nor `rng-rand`). One v4 UUID holds 122 random bits, so every 32 bytes
@@ -42,6 +44,18 @@ pub fn hex(bytes: &[u8]) -> String {
         })
 }
 
+/// Whether `a` and `b` are the same bytes, in time that depends on neither: both are hashed
+/// (SHA-256, so lengths do not show either) and the digests compared with no early exit.
+pub fn digest_eq(a: &[u8], b: &[u8]) -> bool {
+    let ours = Sha256::digest(a);
+    let theirs = Sha256::digest(b);
+    let diff = ours
+        .iter()
+        .zip(theirs.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,6 +72,16 @@ mod tests {
             );
         }
         assert_eq!(hex(&[0, 0xab, 0x0f]), "00ab0f");
+    }
+
+    #[test]
+    fn digest_eq_compares_whole_values() {
+        assert!(digest_eq(b"", b""));
+        assert!(digest_eq(b"abc", b"abc"));
+        assert!(!digest_eq(b"abc", b"abd"));
+        assert!(!digest_eq(b"abc", b"abcd"), "a prefix is not equal");
+        assert!(!digest_eq(b"abc", b""));
+        assert!(!digest_eq(b"ABC", b"abc"), "case counts");
     }
 
     #[test]

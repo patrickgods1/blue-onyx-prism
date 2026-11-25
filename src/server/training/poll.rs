@@ -1,4 +1,4 @@
-//! The light answer of `GET /v1/training?poll=1&have=...` that `assets/training.js` asks for every
+//! The light answer of `GET /v1/training?poll=1&have=...` that `TrainArea.follow` (`assets/train-area.js`) asks for every
 //! few seconds: the epochs a page already holds are not sent again.
 //!
 //! `have` lists what the page holds, one `<run id>:<last epoch>:<prefix key>:<full key>` per run,
@@ -98,14 +98,13 @@ pub(super) fn parse_have(raw: &str) -> HashMap<String, Have> {
 struct Fnv(u64);
 
 impl Fnv {
-    const START: Self = Self(0xcbf2_9ce4_8422_2325);
+    const START: Self = Self(crate::collect::hash::FNV_OFFSET);
 
-    fn bytes(mut self, b: &[u8]) -> Self {
-        for x in b {
-            self.0 ^= u64::from(*x);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        self
+    fn bytes(self, b: &[u8]) -> Self {
+        Self(crate::collect::hash::fnv1a64_from(
+            self.0,
+            b.iter().copied(),
+        ))
     }
 
     fn row(self, p: &EpochPoint) -> Self {

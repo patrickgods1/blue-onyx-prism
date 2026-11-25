@@ -13,11 +13,27 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Largest response read (the status JSON is a few KB).
 const MAX_RESPONSE: u64 = 1024 * 1024;
 
+/// The labels of `GET /v1/status`: its `status` and each model's `state`. The server writes them
+/// (`server::status`) and the tray ([`super::model`]) reads them, from this one list, so neither
+/// side can rename one alone.
+pub mod label {
+    /// Overall: every model usable; a model: loaded.
+    pub const READY: &str = "ready";
+    /// Overall: nothing usable yet, something loading; a model: downloading or compiling.
+    pub const INITIALIZING: &str = "initializing";
+    /// Overall only: something usable while another model failed or still loads.
+    pub const DEGRADED: &str = "degraded";
+    /// Overall: nothing usable or loading; a model: failed.
+    pub const FAILED: &str = "failed";
+    /// A model only: it loads on its first request (usable).
+    pub const LAZY: &str = "lazy";
+}
+
 /// One model in `/v1/status`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelStatus {
     pub name: String,
-    /// "ready", "lazy", "initializing" or "failed".
+    /// A [`label`]: "ready", "lazy", "initializing" or "failed".
     pub state: String,
     pub device: Option<String>,
     pub detail: Option<String>,
@@ -28,7 +44,7 @@ pub struct ModelStatus {
 pub struct StatusReport {
     pub http_code: u16,
     pub ready: bool,
-    /// "ready", "initializing", "degraded" or "failed".
+    /// A [`label`]: "ready", "initializing", "degraded" or "failed".
     pub status: String,
     pub models: Vec<ModelStatus>,
     pub version: Option<String>,

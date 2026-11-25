@@ -88,7 +88,7 @@ pub(crate) const ENOUGH_NEW_TO_AUTOLABEL: u64 = 200;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Job {
     /// "Training", "An import", ...
-    pub(crate) what: &'static str,
+    pub(crate) what: String,
     /// The tab with its progress.
     pub(crate) tab: &'static str,
     pub(crate) paused: bool,
@@ -886,23 +886,29 @@ pub(super) const fn task_tab(kind: TaskKind) -> &'static str {
     }
 }
 
+/// `noun` with its indefinite article, starting a sentence: "An auto-label run", "A dataset
+/// check".
+fn with_article(noun: &str) -> String {
+    let article = if noun.starts_with(['a', 'e', 'i', 'o', 'u']) {
+        "An"
+    } else {
+        "A"
+    };
+    format!("{article} {noun}")
+}
+
 /// The job the strip names: a running one, else the first queued; training runs before the rest.
 fn current_job(runs: &[RunRecord], tasks: &[crate::training::task::TaskRecord]) -> Option<Job> {
     let run = |s: RunState| {
-        runs.iter().any(|r| r.state == s).then_some(Job {
-            what: "Training",
+        runs.iter().any(|r| r.state == s).then(|| Job {
+            what: "Training".to_string(),
             tab: TRAIN,
             paused: s == RunState::Paused,
         })
     };
     let task = |s: RunState| {
         tasks.iter().find(|t| t.state == s).map(|t| Job {
-            what: match t.kind {
-                TaskKind::Import => "An import",
-                TaskKind::Autolabel => "An auto-label run",
-                TaskKind::Overlaps => "An overlap check",
-                TaskKind::Refine => "A dataset check",
-            },
+            what: with_article(t.kind.noun()),
             tab: task_tab(t.kind),
             paused: s == RunState::Paused,
         })
@@ -962,7 +968,7 @@ pub(super) fn summary_of(state: &AppState, wait: Duration) -> (Summary, Option<A
         .count();
     let t = tally.as_deref();
     let g = gap.as_deref();
-    let folder_problem = super::review::folder_problem(state, &review_dir);
+    let folder_problem = config.collect.review_folder_problem(&review_dir);
     // Nothing is read from a folder that is not there; the counts never wait for a walk.
     let (open, covered) = if folder_problem.is_none() {
         (
@@ -1254,7 +1260,7 @@ mod tests {
         let busy = Summary {
             job: Some(Job {
                 tab: IMPORT,
-                what: "An import",
+                what: "An import".to_string(),
                 paused: false,
             }),
             ..s
@@ -1754,7 +1760,7 @@ mod tests {
             frames_to_review: 5,
             unused_model: Some("m".into()),
             job: Some(Job {
-                what: "An import",
+                what: "An import".to_string(),
                 tab: IMPORT,
                 paused: true,
             }),
@@ -1863,7 +1869,7 @@ mod tests {
         // The strip's job link opens the tab with the progress row.
         let s = Summary {
             job: Some(Job {
-                what: "A dataset check",
+                what: "A dataset check".to_string(),
                 tab: task_tab(TaskKind::Refine),
                 paused: false,
             }),
@@ -1982,6 +1988,30 @@ mod tests {
             tally_of(&dir, Duration::from_secs(60)).is_some(),
             "no walk of {} in 60 s",
             dir.display()
+        );
+    }
+
+    /// QA-237: the strip's words for each job kind, derived from [`TaskKind::noun`], read as they
+    /// did when each was written out.
+    #[test]
+    fn each_job_kind_is_named_with_its_article() {
+        let words: Vec<String> = [
+            TaskKind::Import,
+            TaskKind::Autolabel,
+            TaskKind::Overlaps,
+            TaskKind::Refine,
+        ]
+        .into_iter()
+        .map(|k| with_article(k.noun()))
+        .collect();
+        assert_eq!(
+            words,
+            [
+                "An import",
+                "An auto-label run",
+                "An overlap check",
+                "A dataset check"
+            ]
         );
     }
 

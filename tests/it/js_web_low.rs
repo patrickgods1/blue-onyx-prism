@@ -7,7 +7,7 @@
 //!   (`assets/train-area.js`).
 //! - QA-117: a class name counts code points like the server (`assets/class-picker.js`).
 //! - Audit extras 37 / 38: a proxy's HTML answer reads "HTTP 502" on the Import preview, not
-//!   the parser's message (`assets/training.js`).
+//!   the parser's message (`assets/train-import.js`, `TrainArea.asJson` of `assets/train-area.js`).
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI).
 
@@ -272,8 +272,11 @@ const els = {'import-form': importForm, 'import-preview': preview};
 const sent = [];
 const document = {getElementById: id => els[id] || null, querySelector: () => null, querySelectorAll: () => [],
   addEventListener() {}, createElement: () => el(), readyState: 'complete', hidden: false};
+// live.js's pure part (no document) for the real PrismPoll.latest.
+const live = vm.createContext({});
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), live);
 const sandbox = {console, Promise, document, URLSearchParams, encodeURIComponent,
-  window: {PrismPoll: {create: () => ({kick() {}, start() {}})}, addEventListener() {}},
+  window: {PrismPoll: {create: () => ({kick() {}, start() {}}), latest: live.PrismPoll.latest}, addEventListener() {}},
   location: {search: '', hash: '', pathname: '/train/import'},
   sessionStorage: {getItem: () => null, setItem() {}, removeItem() {}},
   localStorage: {getItem: () => null, setItem() {}, removeItem() {}},
@@ -284,7 +287,8 @@ const sandbox = {console, Promise, document, URLSearchParams, encodeURIComponent
   }};
 sandbox.window.document = document; sandbox.window.location = sandbox.location;
 vm.createContext(sandbox);
-vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), sandbox);
+vm.runInContext(fs.readFileSync(process.argv[3], 'utf8'), sandbox);   // train-area.js: TrainArea
+vm.runInContext(fs.readFileSync(process.argv[4], 'utf8'), sandbox);   // train-import.js
 (async () => {
   for (let i = 0; i < 6; i++) await tick();
   assert.strictEqual(sent.length, 1);
@@ -299,6 +303,9 @@ vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), sandbox);
 fn the_import_preview_names_the_status_of_an_answer_that_is_not_json() {
     if have_node() {
         // Audit extras 37 / 38
-        run(IMPORT_PREVIEW, &["training.js"]);
+        run(
+            IMPORT_PREVIEW,
+            &["live.js", "train-area.js", "train-import.js"],
+        );
     }
 }

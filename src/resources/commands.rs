@@ -9,7 +9,7 @@ use crate::backend::detect::HardwareInfo;
 use crate::config::Config;
 use anyhow::{Result, bail};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// What `fetch` should download.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -383,11 +383,6 @@ fn state_of(res: &Resource, r: &Resolution, installed: &Installed, config: &Conf
         return "optional (large, --allow-large)".to_string();
     }
     "available".to_string()
-}
-
-/// Paths a model resource writes, for `download-models --add-to-config`.
-pub fn model_files(res: &Resource, dir: &Path) -> Vec<PathBuf> {
-    res.parts.iter().map(|p| dir.join(p.file_name)).collect()
 }
 
 /// Largest response [`remote_size`] counts byte by byte when the server sends no size.

@@ -35,27 +35,7 @@ pub const MAX_BOXES_PER_TRACK: usize = 64;
 /// dropped. A walk over every key's tracks (at most [`MAX_KEYS`] x [`MAX_TRACKS_PER_KEY`]), so
 /// not per request; 64 requests are seconds on a busy service and the memory is bounded anyway.
 pub const SWEEP_EVERY: u64 = 64;
-/// Longest client-chosen name kept, in bytes: an upload's `image_name` (cut at the request edge)
-/// and a [`camera_key`]. Both land in every dataset sidecar and in memory per camera; 255 bytes is
-/// what most file systems take as one file name.
-pub const MAX_NAME_BYTES: usize = 255;
-
-/// `s` cut to at most [`MAX_NAME_BYTES`] bytes, on a character boundary.
-pub fn cap_name(s: &str) -> &str {
-    cap_bytes(s, MAX_NAME_BYTES)
-}
-
-/// `s` cut to at most `max` bytes, on a character boundary.
-pub fn cap_bytes(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.get(..end).unwrap_or_default()
-}
+pub use crate::text::{MAX_NAME_BYTES, cap_name};
 
 /// `static_suppression` in the config.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -546,17 +526,8 @@ mod tests {
 
     /// M2: a client-chosen name cannot grow what is kept per camera and written per frame.
     #[test]
-    fn names_and_keys_are_capped_on_a_char_boundary() {
-        assert_eq!(cap_name("short.jpg"), "short.jpg");
-        let ascii = "a".repeat(1000);
-        assert_eq!(cap_name(&ascii).len(), MAX_NAME_BYTES);
-        // 'é' is two bytes: 255 falls inside the 128th, so the cut is at 254.
-        let wide = "é".repeat(200);
-        let cut = cap_name(&wide);
-        assert_eq!(cut.len(), 254);
-        assert!(cut.chars().all(|c| c == 'é'));
-        assert_eq!(cap_bytes("日本", 4), "日");
-        assert_eq!(cap_bytes("日本", 2), "");
+    fn camera_keys_are_capped_on_a_char_boundary() {
+        // The name caps themselves: `crate::text` (QA-272).
         let key = camera_key("model", &format!("{}.jpg", "x".repeat(10_000)), 1, 1);
         assert_eq!(key.len(), MAX_NAME_BYTES);
         assert!(key.starts_with("model|cam:xxx"));

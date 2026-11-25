@@ -188,6 +188,12 @@ impl TrainingConfig {
         *self == Self::default()
     }
 
+    /// The time limit of one queued job (a run, a retry export, an import, an auto-label, an
+    /// overlap or quick check): [`Self::timeout_hours`] as a duration.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.timeout_hours) * 3600)
+    }
+
     /// [`Self::static_cap`] as the plan takes it ([`super::dataset::Options::static_cap`]): None
     /// when 0 (off).
     pub fn static_cap_option(&self) -> Option<usize> {
@@ -808,5 +814,14 @@ mod tests {
         assert_eq!(c.dir_in(root), root.join("runs"));
         c.dir = Some("/abs/runs".into());
         assert_eq!(c.dir_in(root), PathBuf::from("/abs/runs"));
+    }
+
+    #[test]
+    fn the_job_timeout_is_the_hours_as_a_duration() {
+        let c = TrainingConfig {
+            timeout_hours: 3,
+            ..TrainingConfig::default()
+        };
+        assert_eq!(c.timeout(), std::time::Duration::from_secs(3 * 3600));
     }
 }

@@ -55,7 +55,7 @@ pub const FORM_FIELDS: &[&str] = &[
 ];
 
 /// The settings that decide which shared libraries the service loads. Whoever could change
-/// them could run code as the service, and the admin routes have no login, so only the config
+/// them could run code as the service, so even a signed-in web user may not: only the config
 /// file and the command line (people who already control the service) may set them; a form
 /// gets [`check_library_paths`].
 pub const LIBRARY_PATH_SETTINGS: [&str; 3] = ["download_dir", "onnxruntime_dir", "openvino_dir"];

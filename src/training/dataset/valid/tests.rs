@@ -102,7 +102,7 @@ fn split_warning(p: &Plan) -> Option<&String> {
 /// The frame split of a pool without guarded classes: the first `n` frames by seeded rank.
 fn frame_split(s: &Source, o: &Options, n: usize) -> Vec<FrameRef> {
     let mut v: Vec<FrameRef> = (0..s.frames.len()).map(|i| (0, i)).collect();
-    v.sort_by_cached_key(|r| rank(o.seed ^ VALID_SALT, &frame_key(s, &s.frames[r.1])));
+    v.sort_by_cached_key(|r| seeded_rank(o.seed ^ VALID_SALT, &frame_key(s, &s.frames[r.1])));
     v.truncate(n);
     v.sort_unstable();
     v

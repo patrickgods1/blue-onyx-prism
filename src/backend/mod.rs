@@ -41,6 +41,10 @@ pub mod memory;
 pub mod onnx_rewrite;
 #[cfg(feature = "onnxruntime")]
 pub mod ort;
+#[cfg(feature = "onnxruntime")]
+mod ort_plan;
+#[cfg(windows)]
+mod pdh;
 pub mod plan;
 pub mod priority;
 pub mod process;
@@ -57,7 +61,7 @@ pub use spec::{DeviceSpec, Runtime};
 
 use crate::model::{ExtraInput, NamedOutput, PortSpec};
 use crate::profile::{DeviceClass, DeviceTuning, PerfHint};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use spec::Device;
 use std::collections::HashMap;
 use std::fmt;
@@ -130,6 +134,22 @@ pub struct ModelInfo {
     pub input_size: (u32, u32),
     /// Wall time spent in read+compile, for logging/stats.
     pub compile_ms: u64,
+}
+
+impl ModelInfo {
+    /// Position of [`Self::image_input`] among [`Self::inputs`].
+    pub fn image_index(&self) -> Result<usize> {
+        self.inputs
+            .iter()
+            .position(|p| p.name == self.image_input)
+            .with_context(|| {
+                format!(
+                    "model {}: image input '{}' not among inputs",
+                    self.path.display(),
+                    self.image_input
+                )
+            })
+    }
 }
 
 /// Facts about the available runtimes, captured once at startup.
@@ -981,21 +1001,15 @@ impl Runtimes {
 }
 
 /// The probed OpenVINO GPU `openvino:gpu[.N]` compiles on: bare `GPU` via
-/// [`select::bare_gpu_device`] (the Intel preference of `load_model`), `GPU.N` by name (`GPU`
-/// for N = 0 when only one unnumbered GPU is listed). None when it is not listed.
+/// [`select::bare_gpu_device`] (the Intel preference of `load_model`), `GPU.N` by
+/// [`select::ov_gpu_name_matches`] (`GPU` for N = 0 when no numbered GPU is listed). None when
+/// it is not listed.
 fn ov_gpu_for(devices: &[select::OvDevice], index: Option<u32>) -> Option<&select::OvDevice> {
     match index {
         None => select::bare_gpu_device(devices),
         Some(n) => {
-            let want = format!("GPU.{n}");
-            devices
-                .iter()
-                .find(|d| d.name.eq_ignore_ascii_case(&want))
-                .or_else(|| {
-                    (n == 0)
-                        .then(|| devices.iter().find(|d| d.name == "GPU"))
-                        .flatten()
-                })
+            let name = select::ov_gpu_name_matches(devices.iter().map(|d| d.name.as_str()), n)?;
+            devices.iter().find(|d| d.name == name)
         }
     }
 }

@@ -256,11 +256,22 @@ mod tests {
         drop(r);
         let s = hold_for_start(&results).unwrap();
         drop(s);
+        // A start waits for another writer's save (QA-175): it returns only after the drop.
         let w = lock(&results, Holder::Writer).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
         let r2 = results.clone();
-        let t = std::thread::spawn(move || hold_for_start(&r2).map(drop));
-        std::thread::sleep(Duration::from_millis(100));
+        let t = std::thread::spawn(move || {
+            let held = hold_for_start(&r2).map(drop);
+            tx.send(Instant::now()).unwrap();
+            held
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(rx.try_recv().is_err(), "the start waits for the writer");
+        let released = Instant::now();
         drop(w);
+        // No deadline: a start that never returns hangs here, one that does not wait fails above.
+        let got = rx.recv().unwrap();
+        assert!(got >= released);
         assert_eq!(t.join().unwrap(), Ok(()));
         std::fs::remove_dir_all(&dir).ok();
     }

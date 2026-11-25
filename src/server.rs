@@ -154,8 +154,59 @@ impl std::fmt::Debug for AppState {
     }
 }
 
+/// The parts of [`AppState`] one run shares across its generations (each a handle the next
+/// generation's state gets too): what [`AppState::assemble`] takes besides a generation's own.
+pub(crate) struct ProcessParts {
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) config: Arc<crate::config_store::ConfigStore>,
+    pub(crate) config_path: PathBuf,
+    pub(crate) started: Instant,
+    pub(crate) log_reload: Option<LogReloadHandle>,
+    pub(crate) benchmark: Arc<crate::benchmark::service::BenchmarkService>,
+    pub(crate) side_jobs: Arc<side_jobs::SideJobs>,
+    pub(crate) admin_failures: Arc<std::sync::Mutex<FailureLimit>>,
+    pub(crate) login: Arc<Logins>,
+    pub(crate) auth: Arc<crate::accounts::Auth>,
+}
+
 impl AppState {
-    /// State without a log reload handle and with a fresh restart token.
+    /// A generation's state: `parts` shared with the run's other generations, its `registry`,
+    /// what it runs (`running`, normalized by the caller), its restart token, the run's stop
+    /// token and its resources (None in tests that do not exercise them). The one place an
+    /// [`AppState`] is made.
+    pub(crate) fn assemble(
+        parts: &ProcessParts,
+        registry: Arc<ModelRegistry>,
+        running: Config,
+        restart: CancellationToken,
+        shutdown: CancellationToken,
+        resources: Option<crate::resources::status::ResourcesCtx>,
+    ) -> Self {
+        Self {
+            registry,
+            metrics: parts.metrics.clone(),
+            config: parts.config.clone(),
+            running: arc_swap::ArcSwap::from_pointee(running),
+            apply_lock: std::sync::Mutex::new(()),
+            applied_revision: std::sync::atomic::AtomicU64::new(0),
+            started: parts.started,
+            config_path: parts.config_path.clone(),
+            log_reload: parts.log_reload.clone(),
+            restart,
+            shutdown,
+            resources,
+            benchmark: parts.benchmark.clone(),
+            side_jobs: parts.side_jobs.clone(),
+            admin_failures: parts.admin_failures.clone(),
+            login: parts.login.clone(),
+            auth: parts.auth.clone(),
+        }
+    }
+
+    /// For tests and the integration tests (`tests/common`): a state of its own, as if a run
+    /// had just started with `config` (fresh per-process parts, accounts loaded from its data
+    /// root), with no log reload handle, no resources and fresh restart and stop tokens.
+    #[doc(hidden)]
     pub fn new(
         registry: Arc<ModelRegistry>,
         metrics: Arc<Metrics>,
@@ -169,28 +220,29 @@ impl AppState {
         // otherwise (`test_util::from_peer`).
         #[cfg(test)]
         test_util::seed_tester(&running.data_root(), &auth);
-        Self {
-            registry,
+        let parts = ProcessParts {
             metrics,
             config: Arc::new(crate::config_store::ConfigStore::new(
                 config,
                 config_path.clone(),
             )),
-            running: arc_swap::ArcSwap::from_pointee(running),
-            apply_lock: std::sync::Mutex::new(()),
-            applied_revision: std::sync::atomic::AtomicU64::new(0),
-            started: Instant::now(),
             config_path,
+            started: Instant::now(),
             log_reload: None,
-            restart: CancellationToken::new(),
-            shutdown: CancellationToken::new(),
-            resources: None,
             benchmark: crate::benchmark::service::BenchmarkService::new(),
             side_jobs: Arc::default(),
             admin_failures: Arc::default(),
             login: Arc::default(),
             auth: Arc::new(auth),
-        }
+        };
+        Self::assemble(
+            &parts,
+            registry,
+            running,
+            CancellationToken::new(),
+            CancellationToken::new(),
+            None,
+        )
     }
 
     /// What this generation runs now (see [`AppState::running`](field@AppState::running)).
@@ -232,6 +284,19 @@ fn open_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     ]
 }
 
+/// `m` with the review routes' small body limit ([`review::SMALL_BODY_LIMIT`]): the bulk and
+/// settings posts of the Review tab, whose bodies are a few fields. Without a layer a route
+/// falls back to the router's [`BODY_LIMIT`] (an upload's).
+fn small(m: MethodRouter<Shared>) -> MethodRouter<Shared> {
+    m.layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT))
+}
+
+/// `m` with the sign-in forms' body limit ([`auth::LOGIN_BODY_LIMIT`]): `/login`, `/setup` and
+/// the Accounts card, whose bodies are a name and passwords.
+fn login_sized(m: MethodRouter<Shared>) -> MethodRouter<Shared> {
+    m.layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT))
+}
+
 /// Signing in, out and the first account: nobody is signed in yet, so they take no credential,
 /// but they are HTTPS only ([`plain_gate`]) and pass the admin routes' `Host` check
 /// ([`login_only`]) and the CSRF guard.
@@ -239,16 +304,12 @@ fn login_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
     vec![
         (
             "/login",
-            get(auth::login_page)
-                .post(auth::login_submit)
-                .layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+            login_sized(get(auth::login_page).post(auth::login_submit)),
         ),
         ("/logout", post(auth::logout)),
         (
             "/setup",
-            get(auth::setup_page)
-                .post(auth::setup_submit)
-                .layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+            login_sized(get(auth::setup_page).post(auth::setup_submit)),
         ),
     ]
 }
@@ -283,26 +344,22 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
         ("/config/restart", post(config_restart)),
         ("/config/loglevel", post(config_loglevel)),
         ("/config/admin-token/rotate", post(auth::rotate)),
-        (
-            "/config/accounts/add",
-            post(accounts::add).layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
-        ),
+        ("/config/accounts/add", login_sized(post(accounts::add))),
         (
             "/config/accounts/remove",
-            post(accounts::remove).layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+            login_sized(post(accounts::remove)),
         ),
         (
             "/config/accounts/unlock",
-            post(accounts::unlock).layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+            login_sized(post(accounts::unlock)),
         ),
         (
             "/config/accounts/password",
-            post(accounts::change_password).layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+            login_sized(post(accounts::change_password)),
         ),
         (
             "/config/accounts/sign-out-everywhere",
-            post(accounts::sign_out_everywhere)
-                .layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT)),
+            login_sized(post(accounts::sign_out_everywhere)),
         ),
         ("/train", get(train_area::entry)),
         ("/train/collect", get(dataset::page)),
@@ -362,82 +419,45 @@ fn admin_routes() -> Vec<(&'static str, MethodRouter<Shared>)> {
                 .post(review::labels_post)
                 .layer(DefaultBodyLimit::max(review::LABELS_BODY_LIMIT)),
         ),
-        (
-            "/v1/review/accept-auto",
-            post(review::accept_auto).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
-        (
-            "/v1/review/reject-low",
-            post(review::reject_low).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
+        ("/v1/review/accept-auto", small(post(review::accept_auto))),
+        ("/v1/review/reject-low", small(post(review::reject_low))),
         (
             "/v1/review/reject-other-class",
-            post(review::reject_other_class).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+            small(post(review::reject_other_class)),
         ),
         (
             "/v1/review/reject-unwanted-reviewed",
-            post(review::reject_unwanted_reviewed)
-                .layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+            small(post(review::reject_unwanted_reviewed)),
         ),
         (
             "/v1/review/reject-stacked",
-            post(review::reject_stacked).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+            small(post(review::reject_stacked)),
         ),
         (
             "/v1/review/restore-reopened",
-            post(review::restore_reopened).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+            small(post(review::restore_reopened)),
         ),
         (
             "/v1/review/suggest-overlaps",
-            post(review::suggest_overlaps).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+            small(post(review::suggest_overlaps)),
         ),
-        (
-            "/v1/review/export",
-            post(review::export).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
-        (
-            "/v1/review/import",
-            post(review::import).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
-        (
-            "/v1/review/classes",
-            post(review::classes).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
+        ("/v1/review/export", small(post(review::export))),
+        ("/v1/review/import", small(post(review::import))),
+        ("/v1/review/classes", small(post(review::classes))),
         ("/v1/review/class-catalog", get(review::class_catalog)),
         ("/v1/review/history", get(review::history)),
-        (
-            "/v1/review/reject-spot",
-            post(review::reject_spot).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
-        (
-            "/v1/review/accept-spot",
-            post(review::accept_spot).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
+        ("/v1/review/reject-spot", small(post(review::reject_spot))),
+        ("/v1/review/accept-spot", small(post(review::accept_spot))),
         (
             "/v1/review/accept-repeats",
-            post(review::accept_repeats).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
+            small(post(review::accept_repeats)),
         ),
         ("/v1/review/spots", get(review::spots)),
-        (
-            "/v1/review/spots/parked",
-            post(review::spots_parked).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
-        (
-            "/v1/review/spots/retire",
-            post(review::spots_retire).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
-        (
-            "/v1/review/spots/moved",
-            post(review::spots_moved).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
-        (
-            "/v1/review/folder",
-            post(review::folder).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
-        (
-            "/v1/review/rescan",
-            post(review::rescan).layer(DefaultBodyLimit::max(review::SMALL_BODY_LIMIT)),
-        ),
+        ("/v1/review/spots/parked", small(post(review::spots_parked))),
+        ("/v1/review/spots/retire", small(post(review::spots_retire))),
+        ("/v1/review/spots/moved", small(post(review::spots_moved))),
+        ("/v1/review/folder", small(post(review::folder))),
+        ("/v1/review/rescan", small(post(review::rescan))),
         ("/training", get(train_area::old_training)),
         ("/v1/training", get(training::json)),
         (
@@ -641,14 +661,6 @@ async fn test_blocking_panic() -> &'static str {
     blocking(|| std::panic::panic_any("test blocking panic")).await
 }
 
-/// The panic payload's message (`panic!` with a literal or a format string), else a placeholder.
-fn panic_message(p: &(dyn std::any::Any + Send)) -> &str {
-    p.downcast_ref::<&str>()
-        .copied()
-        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("non-string panic payload")
-}
-
 /// Outermost middleware: a panic in a handler (or in its [`blocking`] work) becomes a 500
 /// answer instead of a dropped connection. The panic message is logged with the method and
 /// path (never the request body). API clients get [`answer::json_error`] `internal error`,
@@ -667,7 +679,7 @@ async fn catch_panic(req: axum::extract::Request, next: axum::middleware::Next) 
             error!(
                 %method,
                 %path,
-                panic = panic_message(p.as_ref()),
+                panic = crate::panic::payload_message(p.as_ref()),
                 "request handler panicked; answering 500"
             );
             if html {
@@ -1068,6 +1080,41 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
 
+    // QA-229: the plain port's allow list matches whole segments, case and slashes included; a
+    // `{param}` takes exactly one non-empty segment. A prefix or case-folding "simplification"
+    // would open admin paths on plain HTTP.
+    #[test]
+    fn is_open_path_matches_whole_segments_only() {
+        for open in [
+            "/v1/status",
+            "/static/x.js",
+            "/v1/vision/custom/m",
+            "/v1/vision/custom/list",
+            "/v1/status/updateavailable",
+        ] {
+            assert!(is_open_path(open), "{open} should be open");
+        }
+        for closed in [
+            "/v1/status/",
+            "/v1/vision/custom/",
+            "/v1/vision/custom/a/b",
+            "/static/",
+            "/static/a/b",
+            "//v1/status",
+            "/V1/STATUS",
+            "/V1/status",
+            "/v1/statusx",
+            "/v1/status/updateavailable/x",
+            "/v1",
+            "/config",
+            "/",
+            "",
+            "v1/status",
+        ] {
+            assert!(!is_open_path(closed), "{closed:?} should not be open");
+        }
+    }
+
     // QA-121: the generation hand-over's placeholder was badged "Waiting for download" (every
     // detail but a compile's was); only a download wait's detail is that now.
     #[test]
@@ -1393,6 +1440,70 @@ mod tests {
         assert_eq!(h[header::LOCATION], "/login?next=%2Fconfig");
         let req = proxied(from("127.0.0.1:40000", "GET", "/config", true));
         assert_eq!(call(&state, req).await.0, StatusCode::OK);
+    }
+
+    /// QA-219: every review post with a few fields carries [`small`]'s body limit; a forgotten
+    /// layer would fall back to [`BODY_LIMIT`] (an upload's) and pass every other test. A new
+    /// `/v1/review/` route must be listed here, in one list or the other.
+    #[tokio::test]
+    async fn review_posts_refuse_bodies_over_the_small_limit() {
+        const SMALL: &[&str] = &[
+            "/v1/review/accept-auto",
+            "/v1/review/reject-low",
+            "/v1/review/reject-other-class",
+            "/v1/review/reject-unwanted-reviewed",
+            "/v1/review/reject-stacked",
+            "/v1/review/restore-reopened",
+            "/v1/review/suggest-overlaps",
+            "/v1/review/export",
+            "/v1/review/import",
+            "/v1/review/classes",
+            "/v1/review/reject-spot",
+            "/v1/review/accept-spot",
+            "/v1/review/accept-repeats",
+            "/v1/review/spots/parked",
+            "/v1/review/spots/retire",
+            "/v1/review/spots/moved",
+            "/v1/review/folder",
+            "/v1/review/rescan",
+        ];
+        // GET only, or (labels) a larger limit of its own, pinned in review.rs's tests.
+        const OTHER: &[&str] = &[
+            "/v1/review/next",
+            "/v1/review/labels",
+            "/v1/review/class-catalog",
+            "/v1/review/history",
+            "/v1/review/spots",
+        ];
+        for (path, _) in admin_routes() {
+            if path.starts_with("/v1/review/") {
+                assert!(
+                    SMALL.contains(&path) || OTHER.contains(&path),
+                    "{path}: add it to SMALL (with `small`) or OTHER"
+                );
+            }
+        }
+        let state = test_state();
+        let big = format!(r#"{{"pad": "{}"}}"#, "x".repeat(review::SMALL_BODY_LIMIT));
+        let fits = r#"{"pad": "x"}"#;
+        for path in SMALL {
+            let post = |body: &str| {
+                Request::post(*path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap()
+            };
+            let (s, _, b) = call(&state, post(&big)).await;
+            assert_eq!(
+                s,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path}: {}",
+                String::from_utf8_lossy(&b)
+            );
+            // The limit is the route's, not a refusal of every body.
+            let (s, _, _) = call(&state, post(fits)).await;
+            assert_ne!(s, StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        }
     }
 
     /// Every route of the router, classified. A new route must be added here: the test fails

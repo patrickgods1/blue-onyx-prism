@@ -402,11 +402,9 @@ impl AccuracyReport {
     /// is not graded ([`report::BenchmarkResults::regrade`]); new runs leave those sets out.
     pub fn scored_on_own_labels(&self, model: &str) -> bool {
         self.relative
-            && self
-                .ground_truth
-                .strip_prefix("relative to ")
-                .and_then(|r| r.strip_suffix(", not ground truth"))
-                .is_some_and(|refs| refs.split(", ").any(|r| is_reference(r, model)))
+            && images::is_relative_desc(&self.ground_truth)
+            && images::relative_refs(&self.ground_truth)
+                .is_some_and(|refs| refs.iter().any(|r| is_reference(r, model)))
     }
 }
 
@@ -1522,6 +1520,11 @@ mod tests {
         );
         assert!(two.scored_on_own_labels("b") && !two.scored_on_own_labels("c"));
         assert!(!acc(false, "ground truth").scored_on_own_labels("rt-detrv2-x"));
+        // Only a whole description counts (the trailing ", not ground truth" is required here).
+        assert!(
+            !acc(true, "relative to RT-DETRv2-X on openvino:cpu")
+                .scored_on_own_labels("rt-detrv2-x")
+        );
         // QA-027: the reference's As served and variant results are its own too.
         assert!(own.scored_on_own_labels("rt-detrv2-x+served"));
         assert!(own.scored_on_own_labels("RT-DETRv2-X.onnx+filters"));

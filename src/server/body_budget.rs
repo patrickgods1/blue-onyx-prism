@@ -54,7 +54,10 @@ impl UploadBudget {
         self.rejected.load(Ordering::Relaxed)
     }
 
-    /// Count one refusal.
+    /// Count one refusal in this budget's own count, which only tests read ([`Self::rejected`]):
+    /// a test-local budget counts its refusals apart from the process-wide metrics. The
+    /// operator-facing count is `requests_rejected_total` ([`REJECT_REASON`]), which the
+    /// detection route records separately.
     pub(crate) fn note_rejected(&self) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
     }

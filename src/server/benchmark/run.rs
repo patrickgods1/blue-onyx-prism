@@ -5,16 +5,16 @@
 //! (`/v1/benchmark/image`, only files listed in the saved results, through a cached index keyed
 //! by the results file stamp). File I/O runs in `server::blocking`.
 
-use super::{json_fail, loaded_devices};
+use super::{json_fail, run_context};
 use crate::benchmark::images;
 use crate::benchmark::search::file_stamp;
-use crate::benchmark::service::{RunContext, RunRequest, SEVERAL_GPUS_WARNING, parse_devices};
+use crate::benchmark::service::{RunRequest, SEVERAL_GPUS_WARNING, parse_devices};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::DatasetRef;
 use crate::server::form::truthy;
 use crate::server::{AppState, save_config};
 use crate::training::service::RunRecord;
-use crate::training::task::{TaskKind, TaskRecord};
+use crate::training::task::TaskRecord;
 use axum::Json;
 use axum::extract::rejection::{FormRejection, QueryRejection};
 use axum::extract::{Form, Query, State};
@@ -115,15 +115,18 @@ fn running_job(runs: &[RunRecord], tasks: &[TaskRecord]) -> Option<String> {
         .find(|r| r.state.is_active())
         .map(|r| format!("Training run '{}'", r.name));
     run.or_else(|| {
-        tasks.iter().find(|t| t.state.is_active()).map(|t| {
-            let kind = match t.kind {
-                TaskKind::Import => "Import",
-                TaskKind::Autolabel => "Auto-label run",
-                TaskKind::Overlaps => "Overlap check",
-                TaskKind::Refine => "Dataset check",
-            };
-            format!("{kind} '{}'", t.title)
-        })
+        tasks
+            .iter()
+            .find(|t| t.state.is_active())
+            .map(|t| format!("{} '{}'", sentence_start(t.kind.noun()), t.title))
+    })
+}
+
+/// `noun` starting a sentence: its first letter in upper case ("Auto-label run").
+fn sentence_start(noun: &str) -> String {
+    let mut chars = noun.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
     })
 }
 
@@ -189,15 +192,7 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
         )
             .into_response();
     }
-    let ctx = RunContext {
-        config: state.config_read().clone(),
-        results_path: results_path(&state.config_path),
-        runtimes: state.registry.runtimes().cloned(),
-        loaded: loaded_devices(state),
-        resources: state.resources.clone(),
-        profile: state.registry.profile().map(|(p, _)| p.clone()),
-        metrics: Some(state.metrics.clone()),
-    };
+    let ctx = run_context(state, results_path(&state.config_path));
     info!(
         models = ?req.models,
         devices = ?req.devices,
@@ -719,6 +714,7 @@ mod tests {
     use super::super::tests::{call, get, post, state};
     use super::*;
     use crate::server::router;
+    use crate::training::task::TaskKind;
     use std::time::Duration;
     use tower::ServiceExt;
     #[tokio::test]

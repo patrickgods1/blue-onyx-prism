@@ -317,6 +317,20 @@ impl Generation {
     }
 }
 
+/// A generation [`Process::build_generation`] made, not serving yet.
+struct Built {
+    /// Cancelled by `POST /config/restart` or an installed runtime: the loop builds the next one.
+    generation: CancellationToken,
+    /// Set by the resource watcher when what it installed needs a restart to load.
+    resources_restart: Arc<AtomicBool>,
+    /// The ONNX Runtime flavor the process has loaded (fixed once an earlier generation loaded
+    /// one; else this one's).
+    loaded_ort: Option<crate::resources::catalog::Flavor>,
+    /// Its state, registry, workers, watcher and supervisor. No disk watch yet: that starts once
+    /// the store has adopted this generation's config.
+    next: Generation,
+}
+
 /// The sessions' flusher ([`crate::accounts::Auth::spawn_flusher`]) of one run: cancelled and
 /// joined on drop, which makes it write once more, forced (a graceful shutdown keeps every
 /// session as it was). Without the thread (the OS refused one), the drop still flushes.
@@ -441,8 +455,6 @@ impl Drop for Sweeper {
 
 /// What lives for the whole run (every generation shares it).
 struct Process {
-    started: Instant,
-    config_path: PathBuf,
     log: LogReloadHandle,
     provisioner: Arc<Provisioner>,
     /// The address bound at process start (a changed port or address shows as pending until
@@ -452,21 +464,15 @@ struct Process {
     /// The HTTPS listener's settings at process start (`https_port`, `tls_cert_path`,
     /// `tls_key_path`): like the port, a change is pending until the process restarts.
     https: (u16, Option<PathBuf>, Option<PathBuf>),
-    /// One benchmark runner for the process, so its last results survive a restart.
-    benchmark: Arc<crate::benchmark::service::BenchmarkService>,
-    /// The running exports and imports the Jobs tab lists: a restart must not hide them.
-    side_jobs: Arc<server::side_jobs::SideJobs>,
-    /// Wrong API tokens per peer: a restart must not forgive them.
-    admin_failures: Arc<std::sync::Mutex<server::FailureLimit>>,
-    /// Wrong passwords and setup codes per peer and the hashing permits: the same.
-    login: Arc<server::Logins>,
-    /// Accounts, sessions and device cookies: a restart signs nobody out.
-    auth: Arc<crate::accounts::Auth>,
-    /// The live config (revision, change log) is shared by every generation; a restart that
-    /// reloads the file (or restores the previous config) adopts it as a logged change.
-    store: Arc<crate::config_store::ConfigStore>,
-    /// Process-lifetime metrics: counters and histograms survive generation restarts.
-    metrics: Arc<Metrics>,
+    /// What every generation's [`AppState`] shares ([`server::ProcessParts`]): the run's start,
+    /// the config path, the log handle, the process-lifetime metrics (counters and histograms
+    /// survive generation restarts), the live config store (revision, change log; a restart that
+    /// reloads the file, or restores the previous config, adopts it as a logged change), one
+    /// benchmark runner (its last results survive a restart), the running exports and imports
+    /// of the Jobs tab, wrong API tokens, passwords and setup codes per peer with the hashing
+    /// permits (a restart forgives none), and the accounts, sessions and device cookies (a
+    /// restart signs nobody out).
+    parts: server::ProcessParts,
 }
 
 impl Process {
@@ -481,8 +487,16 @@ impl Process {
         started: Instant,
         bound_port: u16,
     ) -> Self {
+        let config_store = Arc::new(crate::config_store::ConfigStore::new(
+            config.clone(),
+            config_path.clone(),
+        ));
+        let benchmark = crate::benchmark::service::BenchmarkService::new();
+        let auth = Arc::new(crate::accounts::Auth::load(
+            &config.data_root(),
+            crate::accounts::now(),
+        ));
         Self {
-            started,
             bound_address: config.bind_address,
             bound_port,
             https: (
@@ -490,22 +504,20 @@ impl Process {
                 config.tls_cert_path.clone(),
                 config.tls_key_path.clone(),
             ),
-            store: Arc::new(crate::config_store::ConfigStore::new(
-                config.clone(),
-                config_path.clone(),
-            )),
-            config_path,
+            parts: server::ProcessParts {
+                metrics: Arc::new(Metrics::new(crate::VERSION)),
+                config: config_store,
+                config_path,
+                started,
+                log_reload: Some(log.clone()),
+                benchmark,
+                side_jobs: Arc::default(),
+                admin_failures: Arc::default(),
+                login: Arc::default(),
+                auth,
+            },
             log,
             provisioner,
-            benchmark: crate::benchmark::service::BenchmarkService::new(),
-            side_jobs: Arc::default(),
-            admin_failures: Arc::default(),
-            login: Arc::default(),
-            auth: Arc::new(crate::accounts::Auth::load(
-                &config.data_root(),
-                crate::accounts::now(),
-            )),
-            metrics: Arc::new(Metrics::new(crate::VERSION)),
         }
     }
 
@@ -519,25 +531,85 @@ impl Process {
     ) -> Result<ModelRegistry> {
         ModelRegistry::start_replacing(
             config,
-            &self.metrics,
+            &self.parts.metrics,
             workers.clone(),
             Some(provision),
-            Some(&crate::benchmark::results_path(&self.config_path)),
+            Some(&crate::benchmark::results_path(&self.parts.config_path)),
             previous,
         )
+    }
+
+    /// Build a generation for `config`, in this order: the decode ceiling, the data root the
+    /// stop timeline sweeps, the generation and worker tokens, the provisioning plan, the
+    /// registry (models compile in the background), its `AppState`, the data-root warning, the
+    /// API token, the resource watcher and the model supervisor. `serving` is the registry of
+    /// the generation it replaces; `loaded_ort` the flavor an earlier generation loaded. An
+    /// error: the registry did not start (no thread was spawned; the caller decides what next).
+    fn build_generation(
+        &self,
+        config: &Config,
+        shutdown: &CancellationToken,
+        serving: Option<std::sync::Weak<ModelRegistry>>,
+        loaded_ort: Option<crate::resources::catalog::Flavor>,
+    ) -> Result<Built> {
+        // The decode ceiling follows the generation's config (and every later config change,
+        // see `ConfigStore`).
+        crate::image::set_max_pixels(config.max_image_pixels);
+        stop::remember_data_root(&config.data_root());
+        let generation = shutdown.child_token();
+        let workers = shutdown.child_token();
+        let provision = Arc::new(self.provisioner.prepare(config, loaded_ort));
+        let registry = Arc::new(self.start_registry(config, &workers, &provision, serving)?);
+        info!(models = ?registry.names(), "models registered (compiling in the background)");
+        let loaded_ort = loaded_ort.or_else(|| registry.loaded_runtimes().ort);
+        let state = self.state_for(
+            config,
+            &registry,
+            &provision,
+            &generation,
+            shutdown,
+            loaded_ort,
+        );
+        self.note_data_root(config);
+        // The token of the data root the process started with: the one the service checks.
+        crate::admin_token::ensure_for(&Config {
+            download_dir: Some(self.parts.auth.data_root().to_path_buf()),
+            ..config.clone()
+        });
+        let resources_restart = Arc::new(AtomicBool::new(false));
+        let watcher = spawn_watcher(
+            provision,
+            Arc::downgrade(&state),
+            generation.clone(),
+            resources_restart.clone(),
+        );
+        let supervisor = crate::supervisor::spawn(Arc::downgrade(&state), generation.clone());
+        Ok(Built {
+            generation,
+            resources_restart,
+            loaded_ort,
+            next: Generation {
+                state,
+                registry,
+                workers,
+                watcher,
+                supervisor,
+                disk_watch: None,
+            },
+        })
     }
 
     /// A restart: a benchmark still running uses the runtimes of the generation that is ending,
     /// so stop it and wait (up to `RESTART_BENCHMARK_WAIT`). A stop of the run does not come
     /// here: its timeline cancels the benchmark at t0 and waits later ([`stop`]).
     fn stop_benchmark(&self) {
-        if self.benchmark.cancel() {
+        if self.parts.benchmark.cancel() {
             info!("benchmark cancelled by the restart");
-            if !self.benchmark.wait_idle(RESTART_BENCHMARK_WAIT) {
+            if !self.parts.benchmark.wait_idle(RESTART_BENCHMARK_WAIT) {
                 warn!(
                     "{}",
                     stop::abandoned_benchmark(
-                        self.benchmark.running().as_ref(),
+                        self.parts.benchmark.running().as_ref(),
                         RESTART_BENCHMARK_WAIT
                     )
                 );
@@ -555,39 +627,31 @@ impl Process {
         shutdown: &CancellationToken,
         loaded_ort: Option<crate::resources::catalog::Flavor>,
     ) -> Arc<AppState> {
-        Arc::new(AppState {
-            registry: registry.clone(),
-            metrics: self.metrics.clone(),
-            config: self.store.clone(),
-            running: arc_swap::ArcSwap::from_pointee({
-                let mut c = config.clone();
-                c.normalize();
-                // What is running is the address bound at process start (a changed port or
-                // address shows as pending until the process restarts).
-                c.port = self.bound_port;
-                c.bind_address = self.bound_address;
-                (c.https_port, c.tls_cert_path, c.tls_key_path) = self.https.clone();
-                c
-            }),
-            apply_lock: std::sync::Mutex::new(()),
-            applied_revision: std::sync::atomic::AtomicU64::new(0),
-            started: self.started,
-            config_path: self.config_path.clone(),
-            log_reload: Some(self.log.clone()),
-            restart: generation.clone(),
-            shutdown: shutdown.clone(),
-            resources: Some(crate::resources::status::ResourcesCtx {
-                provisioner: self.provisioner.clone(),
-                provision: provision.clone(),
-                openvino_loaded: registry.loaded_runtimes().openvino,
-                ort_loaded: loaded_ort,
-            }),
-            benchmark: self.benchmark.clone(),
-            side_jobs: self.side_jobs.clone(),
-            admin_failures: self.admin_failures.clone(),
-            login: self.login.clone(),
-            auth: self.auth.clone(),
-        })
+        let mut running = config.clone();
+        running.normalize();
+        // What is running is the address bound at process start (a changed port or address
+        // shows as pending until the process restarts).
+        running.port = self.bound_port;
+        running.bind_address = self.bound_address;
+        (
+            running.https_port,
+            running.tls_cert_path,
+            running.tls_key_path,
+        ) = self.https.clone();
+        let resources = crate::resources::status::ResourcesCtx {
+            provisioner: self.provisioner.clone(),
+            provision: provision.clone(),
+            openvino_loaded: registry.loaded_runtimes().openvino,
+            ort_loaded: loaded_ort,
+        };
+        Arc::new(AppState::assemble(
+            &self.parts,
+            registry.clone(),
+            running,
+            generation.clone(),
+            shutdown.clone(),
+            Some(resources),
+        ))
     }
 
     /// Warn once when `config` names another data root than the one the accounts, sessions,
@@ -596,9 +660,9 @@ impl Process {
     fn note_data_root(&self, config: &Config) {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let now = config.data_root();
-        if now != self.auth.data_root() && !WARNED.swap(true, Ordering::Relaxed) {
+        if now != self.parts.auth.data_root() && !WARNED.swap(true, Ordering::Relaxed) {
             warn!(
-                accounts = %self.auth.data_root().display(),
+                accounts = %self.parts.auth.data_root().display(),
                 download_dir = %now.display(),
                 "download_dir changed: the web UI accounts, sessions and API token stay in the old \
                  data root until the process restarts (restart the service or the program, after \
@@ -611,8 +675,8 @@ impl Process {
     /// or `current` when it cannot be read or has no models. Applies a changed log level and
     /// warns about the fields that need a process restart.
     fn reload_config(&self, current: &Config) -> Config {
-        info!(config = %self.config_path.display(), "restarting: reloading the config file");
-        let next = match Config::load(&self.config_path) {
+        info!(config = %self.parts.config_path.display(), "restarting: reloading the config file");
+        let next = match Config::load(&self.parts.config_path) {
             Ok(c) if !c.models.is_empty() => c,
             Ok(_) => {
                 warn!(
@@ -1009,22 +1073,25 @@ fn run_server_inner(
         listeners.port(),
     );
     // A benchmark the machine died in names its last device at start, not at the next page view.
-    process.benchmark.claim_breadcrumb(&config.data_root());
+    process
+        .parts
+        .benchmark
+        .claim_breadcrumb(&config.data_root());
     // The one stop timeline of this run: started by the stop request itself, wherever the loop
     // below is then, and finished by `Run::finish`.
     let timeline = stop::Timeline::new(Arc::new(stop::ProcessTargets {
         provisioner: process.provisioner.clone(),
-        benchmark: process.benchmark.clone(),
-        auth: process.auth.clone(),
+        benchmark: process.parts.benchmark.clone(),
+        auth: process.parts.auth.clone(),
     }));
     stop::arm(rt, &timeline, &shutdown);
     // Disk retention (saved images, free-space warning): one sweeper per process, reading the
     // current settings on every tick; stopped and joined when this function returns.
-    let _sweeper = Sweeper::spawn(process.store.clone(), &shutdown);
+    let _sweeper = Sweeper::spawn(process.parts.config.clone(), &shutdown);
     // Sessions' lazy writes, and a forced one when this function returns (after `run` below
     // stopped the server, since locals drop in reverse order).
-    let _auth_flush = AuthFlusher::spawn(&process.auth, &shutdown);
-    prepare_sign_in(&config, &process.config_path);
+    let _auth_flush = AuthFlusher::spawn(&process.parts.auth, &shutdown);
+    prepare_sign_in(&config, &process.parts.config_path);
     let mut run = Run {
         rt,
         listeners: Some(listeners),
@@ -1041,26 +1108,23 @@ fn run_server_inner(
     let mut adopt: Option<&'static str> = None;
     // The store revision `config` was read at: a config saved while the next generation is being
     // built is newer, and wins over `config` (see `ConfigStore::adopt`).
-    let mut based_on = process.store.revision();
+    let mut based_on = process.parts.config.revision();
     let mut first = true;
     loop {
         if !first {
-            process.metrics.restarts.fetch_add(1, Ordering::Relaxed);
+            process
+                .parts
+                .metrics
+                .restarts
+                .fetch_add(1, Ordering::Relaxed);
         }
         // One generation = one registry + one `AppState`, served through `shared`.
         // `POST /config/restart` (or an installed runtime) cancels the generation token; the
         // next generation is built while the old one keeps answering, then swapped in, and the
         // old workers stop once its requests have drained. Cancelling `shutdown` stops all.
-        // The decode ceiling follows the generation's config (and every later config change,
-        // see `ConfigStore`).
-        crate::image::set_max_pixels(config.max_image_pixels);
-        stop::remember_data_root(&config.data_root());
-        let generation = shutdown.child_token();
-        let workers = shutdown.child_token();
-        let provision = Arc::new(process.provisioner.prepare(&config, loaded_ort));
         let serving = run.old.as_ref().map(|g| Arc::downgrade(&g.registry));
-        let registry = match process.start_registry(&config, &workers, &provision, serving) {
-            Ok(r) => Arc::new(r),
+        let built = match process.build_generation(&config, &shutdown, serving, loaded_ort) {
+            Ok(b) => b,
             Err(e) => match previous.take() {
                 Some(prev) => {
                     // The previous generation (if any) stays current meanwhile.
@@ -1074,32 +1138,13 @@ fn run_server_inner(
                 None => return run.finish(Err(e), &timeline),
             },
         };
-        info!(models = ?registry.names(), "models registered (compiling in the background)");
-        if loaded_ort.is_none() {
-            loaded_ort = registry.loaded_runtimes().ort;
-        }
-        let state = process.state_for(
-            &config,
-            &registry,
-            &provision,
-            &generation,
-            &shutdown,
-            loaded_ort,
-        );
-        process.note_data_root(&config);
-        // The token of the data root the process started with: the one the service checks.
-        crate::admin_token::ensure_for(&Config {
-            download_dir: Some(process.auth.data_root().to_path_buf()),
-            ..config.clone()
-        });
-        let resources_restart = Arc::new(AtomicBool::new(false));
-        let watcher = spawn_watcher(
-            provision.clone(),
-            Arc::downgrade(&state),
-            generation.clone(),
-            resources_restart.clone(),
-        );
-        let supervisor = crate::supervisor::spawn(Arc::downgrade(&state), generation.clone());
+        let Built {
+            generation,
+            resources_restart,
+            loaded_ort: now_loaded,
+            next: mut current,
+        } = built;
+        loaded_ort = now_loaded;
         // The store's generation (and adopted config) changes together with the swap, so pages
         // waiting for the restart see the new generation's models.
         let restarted = !first;
@@ -1107,18 +1152,11 @@ fn run_server_inner(
             // The old generation serves meanwhile and takes every save: what lands during the
             // wait reaches this one through the apply below, a disabled model included.
             if let Some(old) = &run.old {
-                wait_for_takeover(&old.registry, &registry, &generation, TAKEOVER_WAIT);
+                wait_for_takeover(&old.registry, &current.registry, &generation, TAKEOVER_WAIT);
             }
             if shutdown.is_cancelled() {
                 // The stop came while this generation loaded: it never serves.
-                run.abandoned = Some(Generation {
-                    state,
-                    registry,
-                    workers,
-                    watcher,
-                    supervisor,
-                    disk_watch: None,
-                });
+                run.abandoned = Some(current);
                 let r = run.finish(Ok(()), &timeline);
                 info!("bye");
                 return r;
@@ -1128,8 +1166,8 @@ fn run_server_inner(
         }
         // Applies the config file when it is edited on disk, with no page open. Not before the
         // store has adopted this generation's config: a sync would apply the old one to it.
-        let disk_watch = {
-            let weak = Arc::downgrade(&state);
+        current.disk_watch = {
+            let weak = Arc::downgrade(&current.state);
             crate::config_store::spawn_disk_watch(
                 crate::config_store::DISK_POLL,
                 generation.clone(),
@@ -1141,43 +1179,28 @@ fn run_server_inner(
             )
         };
         if restarted {
-            process.store.adopt(
+            process.parts.config.adopt(
                 adopt.map(|_| config.clone()),
                 adopt.unwrap_or("restart"),
                 based_on,
             );
             // A config saved while this generation was built went to the previous one: apply it
             // here too before serving, so a model switched off meanwhile never answers again.
-            server::apply_config(&state);
+            server::apply_config(&current.state);
         }
         first = false;
         adopt = None;
-        if let Err(e) = run.serve(state.clone()) {
+        if let Err(e) = run.serve(current.state.clone()) {
             run.retire_old();
-            run.old = Some(Generation {
-                state,
-                registry,
-                workers,
-                watcher,
-                supervisor,
-                disk_watch,
-            });
+            run.old = Some(current);
             return run.finish(Err(e), &timeline);
         }
         run.retire_old();
         if restarted {
             // Saves that reached the previous generation while it drained (after the apply
             // above): the previous generation is gone now, so this is the last one to catch.
-            server::apply_config(&state);
+            server::apply_config(&current.state);
         }
-        let current = Generation {
-            state,
-            registry,
-            workers,
-            watcher,
-            supervisor,
-            disk_watch,
-        };
 
         // Serve until a restart, a shutdown, or the server failing.
         let server_ended = run.serve_until_event(&generation);
@@ -1205,12 +1228,12 @@ fn run_server_inner(
 
         if resources_restart.load(Ordering::SeqCst) {
             info!("restarting the registry to load downloaded resources");
-            let (revision, next) = config_for_resources_restart(&process.store);
+            let (revision, next) = config_for_resources_restart(&process.parts.config);
             based_on = revision;
             previous = Some(std::mem::replace(&mut config, next));
             continue;
         }
-        based_on = process.store.revision();
+        based_on = process.parts.config.revision();
         let next = process.reload_config(&config);
         previous = Some(std::mem::replace(&mut config, next));
         adopt = Some("restart (config file reloaded)");

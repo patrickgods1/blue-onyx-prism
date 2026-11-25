@@ -746,40 +746,17 @@ pub fn classes_version(classes: &[String]) -> String {
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-/// Intersection over union of two `[x0, y0, x1, y1]` boxes (0 for empty boxes).
-pub fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    let iw = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
-    let ih = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
-    let inter = iw * ih;
-    let area = |r: &[f32; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
-    let union = area(a) + area(b) - inter;
-    if union > 0.0 { inter / union } else { 0.0 }
-}
-
-/// How much of the smaller of two `[x0, y0, x1, y1]` boxes lies inside the other: their
-/// intersection over the smaller area (0 for an empty box). 1 = one is wholly inside the other.
-pub fn inside_share(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    let iw = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
-    let ih = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
-    let area = |r: &[f32; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
-    let smaller = area(a).min(area(b));
-    if smaller > 0.0 {
-        iw * ih / smaller
-    } else {
-        0.0
-    }
-}
+// Box geometry of `[x0, y0, x1, y1]` boxes ([`crate::geom`], one copy for the inference path and
+// the labels): `iou` and `inside_share` keep their paths here (the page's twins are parity-tested
+// against `labels::iou` / `labels::inside_share`).
+pub(crate) use crate::geom::{area, cmp_box, proper_box};
+pub use crate::geom::{inside_share, iou};
 
 /// IoU at or above which a box covers a detection of its object ([`covers`]). Lower than
 /// [`MATCH_IOU`]: a loosely drawn box still labels the object.
 pub const COVER_IOU: f32 = 0.3;
 /// Share of a detection inside a box of its object at which that box covers it ([`covers`]).
 pub const COVER_INSIDE: f32 = 0.5;
-
-/// The area of a `[x0, y0, x1, y1]` box (0 for an empty one).
-fn area(b: &[f32; 4]) -> f32 {
-    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
-}
 
 /// Whether the box `b` covers the detection `p`: IoU >= [`COVER_IOU`], or at least
 /// [`COVER_INSIDE`] of `p` inside `b`. Only that direction: a small box inside a large detection

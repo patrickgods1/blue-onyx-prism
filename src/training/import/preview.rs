@@ -132,18 +132,8 @@ pub struct Preview {
     pub summary: String,
 }
 
-/// `n` with thousands separators (`1,500`).
-pub fn thousands(n: usize) -> String {
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
+/// `n` with thousands separators (`1,500`); lives in [`crate::training::text`].
+pub use crate::training::text::thousands;
 
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{} {}", thousands(n), if n == 1 { one } else { many })
@@ -301,15 +291,6 @@ pub fn preview_with(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn thousands_separators() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(999), "999");
-        assert_eq!(thousands(1500), "1,500");
-        assert_eq!(thousands(20_000), "20,000");
-        assert_eq!(thousands(1_234_567), "1,234,567");
-    }
 
     #[test]
     fn a_folder_preview_counts_cameras_bytes_and_skips() {

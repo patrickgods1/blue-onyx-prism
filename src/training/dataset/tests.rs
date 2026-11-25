@@ -4574,3 +4574,38 @@ fn a_cancel_while_the_images_are_written_stops_the_writers() {
 
 mod pins;
 mod steps;
+
+/// Audit 2026-11 (QA-256): the seeded rank decides held-out and validation days, balancing and the
+/// dataset check's folds (`refine::folds`), so a change of salt or byte order would silently
+/// reshuffle every split across versions. The first 8 bytes of SHA-256(`seed:key`), big-endian.
+#[test]
+fn the_seeded_rank_is_pinned() {
+    assert_eq!(seeded_rank(0, "a"), 11_381_658_363_930_578_919);
+    assert_eq!(seeded_rank(7, "cam/2026-01-01"), 8_963_472_944_147_007_300);
+}
+
+/// Audit 2026-11 (QA-257): one scene -> count rule for the inventory, the preflight report and the
+/// Train tab's frame counts; any other tag, or none, counts as unknown.
+#[test]
+fn a_scene_tag_picks_its_count() {
+    let mut c = SceneCounts::default();
+    for scene in [
+        Some("day"),
+        Some("night"),
+        Some("night"),
+        Some("ir"),
+        None,
+        Some("dusk"),
+    ] {
+        *c.slot_mut(scene) += 1;
+    }
+    assert_eq!(
+        c,
+        SceneCounts {
+            day: 1,
+            night: 2,
+            ir: 1,
+            unknown: 2
+        }
+    );
+}

@@ -12,6 +12,8 @@ use crate::metrics::RouteFallback;
 use crate::model::ModelFamilyKind;
 use tokio::sync::oneshot;
 
+mod lazy;
+
 /// Model input (width, height) of the fake model.
 const INPUT: (u32, u32) = (64, 64);
 /// Generous bound for anything that should happen "at once": a limit for a test that would

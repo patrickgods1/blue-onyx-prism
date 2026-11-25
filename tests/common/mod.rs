@@ -427,11 +427,7 @@ impl Server {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let mut headers = reqwest::header::HeaderMap::new();
-        let mut auth: reqwest::header::HeaderValue =
-            format!("Bearer {}", token.reveal()).parse().unwrap();
-        auth.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, auth);
+        let headers = blue_onyx_prism::tls::bearer_header(token.reveal()).expect("the header");
         let client = blue_onyx_prism::tls::pinned_client(&cert)
             .expect("pinned client")
             .default_headers(headers)

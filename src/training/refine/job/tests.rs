@@ -3452,3 +3452,44 @@ fn the_shared_write_step_keeps_each_checks_words() {
          get no better-fitting box in this check"
     );
 }
+
+/// Audit 2026-11 (QA-200): the two endings of a closer look after a failed fold that the whole-check
+/// test (`after_a_failed_fold_the_look_still_runs_on_the_finished_folds`) does not reach: a look
+/// that failed after it saved boxes, and one stopped by Cancel. The user's only account of what
+/// was saved, so each branch's words are pinned whole.
+#[test]
+fn the_failed_fold_error_says_how_the_look_ended() {
+    let recipe = report::RecipeInfo {
+        model: "rfdetr-nano".into(),
+        imgsz: 384,
+        epochs: 8,
+        batch: 4,
+        from: "default".into(),
+    };
+    let mut rep = RefineReport::new("r", 4, recipe);
+    rep.zoomed = 1_200;
+    rep.tighten_candidates = 2_500;
+    rep.found.tighten = 3;
+    let end = |cancelled: bool, failed: Option<&str>| tighten::ZoomEnd {
+        cancelled,
+        failed: failed.map(str::to_string),
+        done: 1_200,
+        crops: 2_500,
+    };
+    assert_eq!(look_after_failed_fold(None, &rep), "");
+    assert_eq!(
+        look_after_failed_fold(Some(&end(false, Some("boom"))), &rep),
+        ", and the closer look at their loose labels then failed (see the report's warnings) \
+         after saving 3 better-fitting boxes"
+    );
+    assert_eq!(
+        look_after_failed_fold(Some(&end(true, None)), &rep),
+        ", and the closer look at their loose labels was stopped by Cancel after 1,200 of 2,500 \
+         and saved 3 better-fitting boxes"
+    );
+    assert_eq!(
+        look_after_failed_fold(Some(&end(false, None)), &rep),
+        ", and the closer look at their loose labels then answered 1,200 of 2,500 and saved 3 \
+         better-fitting boxes"
+    );
+}

@@ -393,16 +393,15 @@ pub const RANDOM_EVERY: u64 = 5;
 /// for a reviewed reason (the frames already marked would no longer be pool frames).
 pub const RANDOM_SALT: &str = "bop-random-pick-v1/";
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+// The pin test below spells the hash out from its constants.
+#[cfg(test)]
+use crate::collect::hash::{FNV_OFFSET, FNV_PRIME};
 
 /// FNV-1a 64 of [`RANDOM_SALT`] and then the bytes `rel` of a frame's path
 /// (`<scene>/<camera>/<date>/<stem>.jpg`, forward slashes, as `Item.frame`), for a caller that
 /// builds no string: [`pool_hash`] of the same path.
 pub fn pool_hash_bytes(rel: impl IntoIterator<Item = u8>) -> u64 {
-    RANDOM_SALT.bytes().chain(rel).fold(FNV_OFFSET, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(FNV_PRIME)
-    })
+    crate::collect::hash::fnv1a64(RANDOM_SALT.bytes().chain(rel))
 }
 
 /// [`pool_hash_bytes`] of the frame path `rel`.

@@ -49,12 +49,21 @@ pub enum Scene {
 }
 
 impl Scene {
-    pub fn as_str(self) -> &'static str {
+    /// Every scene, in the order the dataset's scene folders are listed
+    /// ([`crate::collect::layout::SCENES`]).
+    pub const ALL: [Scene; 3] = [Scene::Day, Scene::Night, Scene::Ir];
+
+    pub const fn as_str(self) -> &'static str {
         match self {
             Scene::Day => "day",
             Scene::Night => "night",
             Scene::Ir => "ir",
         }
+    }
+
+    /// The scene [`Self::as_str`] spells `s`; None for anything else (exact, lowercase).
+    pub fn parse(s: &str) -> Option<Scene> {
+        Self::ALL.into_iter().find(|c| c.as_str() == s)
     }
 
     /// Night or IR: where the night rules apply.
@@ -348,5 +357,142 @@ mod tests {
         );
         assert_eq!(Scene::Day.to_string(), "day");
         assert!(Scene::Ir.is_night() && Scene::Night.is_night() && !Scene::Day.is_night());
+    }
+
+    #[test]
+    fn scene_parse_is_the_inverse_of_as_str() {
+        for s in Scene::ALL {
+            assert_eq!(Scene::parse(s.as_str()), Some(s));
+            // The serde spelling is the same one.
+            assert_eq!(
+                serde_json::to_string(&s).unwrap(),
+                format!("\"{}\"", s.as_str())
+            );
+        }
+        for bad in ["", "Day", "NIGHT", "dusk", " ir", "ir "] {
+            assert_eq!(Scene::parse(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            Scene::ALL.map(Scene::as_str),
+            crate::collect::layout::SCENES
+        );
+    }
+
+    /// The bench builder's twin of these rules (`scripts/build_bench_sets.py`).
+    const BENCH_SCRIPT: &str = include_str!("../scripts/build_bench_sets.py");
+
+    /// The value of the script's top-level `NAME = <number>` (a trailing comment ignored).
+    fn py_number(name: &str) -> f64 {
+        let prefix = format!("{name} = ");
+        let line = BENCH_SCRIPT
+            .lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("{name} not in build_bench_sets.py"));
+        let value = line.split('#').next().unwrap_or_default().trim();
+        value
+            .parse()
+            .unwrap_or_else(|e| panic!("{name} = {value:?}: {e}"))
+    }
+
+    // QA-159: the bench sets' day / night / IR tags come from the script, the service's scene from
+    // here: the constants must agree.
+    #[test]
+    fn the_bench_script_has_the_same_constants() {
+        assert_eq!(py_number("NIGHT_LUMA"), f64::from(DARK_LUMA_MAX));
+        assert_eq!(py_number("GRAY_SPREAD"), f64::from(IR_CHROMA_MAX));
+        assert_eq!(py_number("GRAY_GRID"), f64::from(SAMPLE_GRID));
+        assert_eq!(py_number("FLAT_LUMA_VAR"), FLAT_LUMA_VAR);
+    }
+
+    /// Runs the script's `chroma_spread` on `images` with a stub `PIL` (the script needs Pillow only
+    /// to open files; the rule reads `convert`, `size` and `load`), so no Pillow is needed.
+    const PY_DRIVER: &str = r#"
+import json, sys, types
+text = sys.stdin.read()
+script, images = text.split("\n#--IMAGES--\n")
+class Img:
+    def __init__(self, w, h, px):
+        self.size = (w, h)
+        self.px = px
+    def convert(self, mode):
+        assert mode == "RGB"
+        return self
+    def load(self):
+        return self
+    def __getitem__(self, xy):
+        x, y = xy
+        i = (y * self.size[0] + x) * 3
+        return tuple(self.px[i:i + 3])
+pil = types.ModuleType("PIL")
+pil.Image = types.ModuleType("PIL.Image")
+pil.ImageStat = types.ModuleType("PIL.ImageStat")
+sys.modules["PIL"] = pil
+sys.modules["PIL.Image"] = pil.Image
+sys.modules["PIL.ImageStat"] = pil.ImageStat
+ns = {"__name__": "build_bench_sets", "__file__": "scripts/build_bench_sets.py"}
+exec(compile(script, "build_bench_sets.py", "exec"), ns)
+out = [list(ns["chroma_spread"](Img(w, h, px))) for w, h, px in json.loads(images)]
+print("RESULT: " + json.dumps(out))
+"#;
+
+    // QA-159: the script's chroma and tint spreads equal `ImageStats::compute`'s on generated
+    // frames (grey ramp, offset and gain tints, colour, dark colour, flat colour, one pixel). Luma
+    // is not compared: the script's night test is Pillow's whole-image "L" mean, not this sample.
+    #[test]
+    fn the_bench_script_computes_the_same_spreads() {
+        let Some(python) = crate::training::progress::test_python::python3("bench image stats")
+        else {
+            return;
+        };
+        let images = [
+            image(100, 70, |x, y| {
+                let v = gray_level(x, y);
+                [v, v, v]
+            }),
+            image(90, 40, |x, y| {
+                let v = gray_level(x, y).min(200);
+                [v, v + 30, v]
+            }),
+            image(80, 66, |x, y| {
+                let v = f32::from(gray_level(x, y).min(190));
+                [v as u8, (v * 1.3) as u8, (v * 0.8) as u8]
+            }),
+            image(130, 50, colour),
+            image(70, 65, |x, y| {
+                let [r, g, b] = colour(x, y);
+                [r / 8, g / 8, b / 8]
+            }),
+            image(12, 9, |_, _| [0, 0, 255]),
+            image(1, 1, |_, _| [0, 255, 0]),
+        ];
+        let json: Vec<serde_json::Value> = images
+            .iter()
+            .map(|i| serde_json::json!([i.width, i.height, i.rgb]))
+            .collect();
+        let input = format!(
+            "{BENCH_SCRIPT}\n#--IMAGES--\n{}",
+            serde_json::to_string(&json).unwrap()
+        );
+        let out =
+            crate::training::progress::test_python::run(python, &["-I", "-c", PY_DRIVER], &input);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("RESULT: "))
+            .unwrap_or_else(|| panic!("no result in {stdout}"));
+        let py: Vec<[f64; 2]> = serde_json::from_str(line).unwrap();
+        assert_eq!(py.len(), images.len());
+        for (img, [chroma, tint]) in images.iter().zip(py) {
+            let s = ImageStats::compute(img);
+            let at = (img.width, img.height);
+            assert!(
+                (f64::from(s.chroma_spread) - chroma).abs() < 1e-4,
+                "{at:?}: {s:?} vs {chroma}"
+            );
+            assert!(
+                (f64::from(s.tint_spread) - tint).abs() < 1e-4,
+                "{at:?}: {s:?} vs {tint}"
+            );
+        }
     }
 }

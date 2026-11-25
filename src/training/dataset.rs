@@ -427,17 +427,11 @@ pub const MAX_FRAMES: usize = 500_000;
 /// Most frames with nothing but parked-spot boxes kept per spot, for training and validation.
 pub const PARKED_CAP: usize = 20;
 
-/// An image file by extension; hidden files (macOS AppleDouble `._x.jpg`) are not.
+/// An image file by extension; hidden files (macOS AppleDouble `._x.jpg`) are not. The
+/// benchmark loader's rule ([`crate::benchmark::images::is_image`]), so an export the benchmark
+/// then reads sees the same files.
 fn is_image(p: &Path) -> bool {
-    p.is_file()
-        && !p
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-        && p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-            ["jpg", "jpeg", "png"]
-                .iter()
-                .any(|x| x.eq_ignore_ascii_case(e))
-        })
+    p.is_file() && crate::benchmark::images::is_image(p)
 }
 
 fn images_in(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1241,8 +1235,10 @@ fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
-/// SHA-256 of `seed` and `key` as a number, for deterministic choices.
-fn rank(seed: u64, key: &str) -> u64 {
+/// SHA-256 of `seed` and `key` as a number (the first 8 bytes of SHA-256(`seed:key`), big-endian),
+/// for deterministic choices: held-out and validation days, balancing, and the dataset check's
+/// folds ([`crate::training::refine::folds`]). Pinned by a test: a change reshuffles every split.
+pub(crate) fn seeded_rank(seed: u64, key: &str) -> u64 {
     use sha2::Digest;
     let d = sha2::Sha256::digest(format!("{seed}:{key}").as_bytes());
     let mut b = [0u8; 8];
@@ -1364,7 +1360,7 @@ fn over_static_cap(
         let mut scenes: Vec<&str> = idx.iter().filter_map(|&i| at(i)).map(|f| f.scene).collect();
         scenes.sort_unstable();
         scenes.dedup();
-        scenes.sort_by_key(|s| (rank(seed, &format!("static-scene:{s}")), *s));
+        scenes.sort_by_key(|s| (seeded_rank(seed, &format!("static-scene:{s}")), *s));
         let mut groups: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
         for &i in idx {
             if let Some(f) = at(i) {
@@ -1378,19 +1374,30 @@ fn over_static_cap(
                 .filter(|(s, _)| s == scene)
                 .map(|(_, d)| *d)
                 .collect();
-            days.sort_by_key(|d| (rank(seed, &format!("static-day:{spot}/{scene}/{d}")), *d));
+            days.sort_by_key(|d| {
+                (
+                    seeded_rank(seed, &format!("static-day:{spot}/{scene}/{d}")),
+                    *d,
+                )
+            });
             for (n, d) in days.into_iter().enumerate() {
                 day_round.insert((scene, d), n);
             }
         }
         for (g, mut list) in groups {
-            let frame_rank = |i: &usize| at(*i).map_or(0, |f| rank(seed, &f.key));
+            let frame_rank = |i: &usize| at(*i).map_or(0, |f| seeded_rank(seed, &f.key));
             list.sort_by_key(|i| (frame_rank(i), at(*i).map(|f| f.key.clone())));
             let scene_pos = scenes.iter().position(|s| *s == g.0).unwrap_or(0);
             let day_pos = day_round.get(&g).copied().unwrap_or(0);
             for (round, i) in list.into_iter().enumerate() {
                 let Some(f) = at(i) else { continue };
-                let k: StaticKey = (round, day_pos, scene_pos, rank(seed, &f.key), f.key.clone());
+                let k: StaticKey = (
+                    round,
+                    day_pos,
+                    scene_pos,
+                    seeded_rank(seed, &f.key),
+                    f.key.clone(),
+                );
                 match best.get(&i) {
                     Some(b) if *b <= k => {}
                     _ => {
@@ -1963,7 +1970,7 @@ fn split_heldout(
         }
         if groups.len() >= 2 {
             let mut keys: Vec<&String> = groups.keys().collect();
-            keys.sort_by_key(|k| (rank(opts.seed, k), (*k).clone()));
+            keys.sort_by_key(|k| (seeded_rank(opts.seed, k), (*k).clone()));
             let want = share_of(open.len(), opts.heldout_share).max(1);
             let mut held = Vec::new();
             let mut held_groups = Vec::new();
@@ -1992,7 +1999,7 @@ fn split_heldout(
                     .into(),
             );
             let mut v = open.clone();
-            v.sort_by_key(|r| rank(opts.seed, &frames.key(*r)));
+            v.sort_by_key(|r| seeded_rank(opts.seed, &frames.key(*r)));
             let n = share_of(v.len(), opts.heldout_share)
                 .max(1)
                 .min(v.len().saturating_sub(1));
@@ -2123,7 +2130,7 @@ fn negative_order(frames: Frames<'_>, r: FrameRef, seed: u64) -> (bool, u64) {
     let f = frames.frame(r);
     (
         !f.is_some_and(|f| f.hard_negative || f.human_rejected),
-        rank(seed, &frames.key(r)),
+        seeded_rank(seed, &frames.key(r)),
     )
 }
 
@@ -2365,7 +2372,11 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         pos.iter()
             .filter_map(|&r| {
                 let f = frame(r).filter(|f| !f.parked.is_empty())?;
-                Some((rank(opts.seed, &frames.key(r)), r, f.parked.as_slice()))
+                Some((
+                    seeded_rank(opts.seed, &frames.key(r)),
+                    r,
+                    f.parked.as_slice(),
+                ))
             })
             .collect(),
     );
@@ -3643,6 +3654,19 @@ pub struct SceneCounts {
     pub unknown: usize,
 }
 
+impl SceneCounts {
+    /// The count of `scene` (a frame's tag): `day`, `night`, `ir`, anything else (or none) is
+    /// `unknown`.
+    pub fn slot_mut(&mut self, scene: Option<&str>) -> &mut usize {
+        match scene {
+            Some("day") => &mut self.day,
+            Some("night") => &mut self.night,
+            Some("ir") => &mut self.ir,
+            _ => &mut self.unknown,
+        }
+    }
+}
+
 /// One class of the chosen datasets (the Train tab's class picker, `train classes`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClassCount {
@@ -3679,13 +3703,7 @@ pub fn inventory(sources: &[Source], rename: &BTreeMap<String, String>) -> Vec<C
                 let Some(n) = renamed(&b.class) else { continue };
                 let cc = slot(&mut by, &n);
                 cc.boxes += 1;
-                let sc = &mut cc.by_scene;
-                *match f.scene.as_deref() {
-                    Some("day") => &mut sc.day,
-                    Some("night") => &mut sc.night,
-                    Some("ir") => &mut sc.ir,
-                    _ => &mut sc.unknown,
-                } += 1;
+                *cc.by_scene.slot_mut(f.scene.as_deref()) += 1;
                 if seen.insert(n) {
                     cc.frames += 1;
                 }

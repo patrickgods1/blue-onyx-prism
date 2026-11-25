@@ -1213,12 +1213,7 @@ where
     let mut items = Vec::with_capacity(entries.len());
     let mut warnings = Vec::new();
     for (i, e) in entries.into_iter().enumerate() {
-        let field = |k: &str| e.get(k).and_then(|x| x.as_str()).map(str::to_string);
-        let name = match (field("model"), field("device")) {
-            (Some(m), Some(d)) => format!("#{} ('{m}' on {d})", i + 1),
-            (Some(m), None) => format!("#{} ('{m}')", i + 1),
-            _ => format!("#{}", i + 1),
-        };
+        let name = entry_name(i + 1, &e);
         match serde_json::from_value::<E>(e) {
             Ok(x) => items.push(x),
             Err(err) => warnings.push(format!(
@@ -1228,6 +1223,17 @@ where
         }
     }
     Ok((head, items, warnings))
+}
+
+/// How a warning names entry `n` (1-based) of a results list that does not load: `#3 ('model'
+/// on device)`, `#3 ('model')` or `#3`, from the entry's `model` / `device` strings.
+pub(super) fn entry_name(n: usize, e: &serde_json::Value) -> String {
+    let field = |k: &str| e.get(k).and_then(|x| x.as_str());
+    match (field("model"), field("device")) {
+        (Some(m), Some(d)) => format!("#{n} ('{m}' on {d})"),
+        (Some(m), None) => format!("#{n} ('{m}')"),
+        _ => format!("#{n}"),
+    }
 }
 
 /// What a lenient load of a store read: the value (None: no file), its warnings, and how many
@@ -1594,9 +1600,27 @@ impl BenchmarkResults {
     /// keeps the previous images the kept models' runs still score ([`upsert_sets`]): a later
     /// run of fewer frames leaves the earlier runs their frames.
     pub fn merge(previous: Option<Self>, new: Self) -> Self {
-        let Some(prev) = previous else { return new };
+        let (mut merged, comparable) = Self::merge_parts(previous, new);
+        if comparable {
+            merged.retain_referenced_sets();
+        }
+        merged
+    }
+
+    /// [`Self::merge`] without dropping the image sets no model refers to: a run that saves
+    /// its models one at a time drops them after its last model ([`Self::retain_referenced_sets`]).
+    pub(super) fn merge_keep_sets(previous: Option<Self>, new: Self) -> Self {
+        Self::merge_parts(previous, new).0
+    }
+
+    /// The merged results with every image set kept, and whether `previous` was merged (it
+    /// existed and was comparable).
+    fn merge_parts(previous: Option<Self>, new: Self) -> (Self, bool) {
+        let Some(prev) = previous else {
+            return (new, false);
+        };
         if prev.incomparable(&new).is_some() {
-            return new;
+            return (new, false);
         }
         let key = |m: &ModelResult| crate::registry::normalize_name(&m.model);
         let mut models: Vec<ModelResult> = prev.models;
@@ -1606,14 +1630,20 @@ impl BenchmarkResults {
                 None => models.push(m),
             }
         }
-        let mut image_sets = upsert_sets(prev.image_sets, new.image_sets, &models);
-        // Keep only the sets some model still refers to.
-        image_sets.retain(|s| models.iter().any(|m| m.datasets.contains(&s.id)));
-        Self {
+        let image_sets = upsert_sets(prev.image_sets, new.image_sets, &models);
+        let merged = Self {
             models,
             image_sets,
             ..new
-        }
+        };
+        (merged, true)
+    }
+
+    /// Keep only the image sets some model still refers to.
+    pub(super) fn retain_referenced_sets(&mut self) {
+        let models = &self.models;
+        self.image_sets
+            .retain(|s| models.iter().any(|m| m.datasets.contains(&s.id)));
     }
 
     /// The latest result for model `name` (normalized match).
@@ -1695,6 +1725,21 @@ pub fn upsert_sets(
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// QA-174: the one naming of a dropped entry (benchmark.json's lists and
+    /// benchmark-preds.json's `runs`).
+    #[test]
+    fn entry_names() {
+        let v = |t: &str| serde_json::from_str::<serde_json::Value>(t).unwrap();
+        assert_eq!(
+            entry_name(3, &v(r#"{"model":"m","device":"ort:cpu"}"#)),
+            "#3 ('m' on ort:cpu)"
+        );
+        assert_eq!(entry_name(1, &v(r#"{"model":"m"}"#)), "#1 ('m')");
+        assert_eq!(entry_name(2, &v(r#"{"device":"ort:cpu"}"#)), "#2");
+        assert_eq!(entry_name(4, &v(r#"{"model":7,"device":"x"}"#)), "#4");
+        assert_eq!(entry_name(5, &v("[1]")), "#5");
+    }
 
     /// One image of a run with `dets` as its stored predictions.
     fn image_run(file: &str, dets: Vec<Detection>) -> super::super::ImageRun {

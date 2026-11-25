@@ -25,7 +25,6 @@ use crate::resources::catalog::{Platform, Trainer};
 use crate::resources::export::train::TrainPaths;
 use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// The checkpoint folder of a run.
 pub fn work_dir(run_dir: &Path) -> PathBuf {
@@ -148,7 +147,7 @@ pub fn plan_retry(config: &Config, r: &RunRecord, cap: &Capability) -> Result<Tr
             super::frozen_heldout(config).unwrap_or_default(),
         ),
         root: config.data_root(),
-        timeout: Duration::from_secs(u64::from(t.timeout_hours) * 3600),
+        timeout: t.timeout(),
         workers: t
             .workers
             .map_or(super::job::Workers::Auto, super::job::Workers::Fixed),
@@ -190,7 +189,7 @@ pub fn partial_note(r: &RunRecord) -> String {
 /// dataset's images are hard links to the export they came from, and deleting them frees nothing
 /// while the export stays. A file whose identity cannot be read counts in full.
 pub fn disk_use(dir: &Path) -> u64 {
-    let mut files: Vec<(Option<FileId>, u64)> = Vec::new();
+    let mut files: Vec<(Option<LinkId>, u64)> = Vec::new();
     let mut todo = vec![dir.to_path_buf()];
     while let Some(d) = todo.pop() {
         let Ok(rd) = std::fs::read_dir(&d) else {
@@ -201,7 +200,7 @@ pub fn disk_use(dir: &Path) -> u64 {
             if md.is_dir() {
                 todo.push(e.path());
             } else if md.is_file() {
-                files.push((file_id(&e.path(), &md), md.len()));
+                files.push((link_id(&e.path(), &md), md.len()));
             }
         }
     }
@@ -209,17 +208,18 @@ pub fn disk_use(dir: &Path) -> u64 {
 }
 
 /// Where a file's bytes live and how many names they have: (device or volume, file number, links).
+/// A hard-link identity, unlike [`super::file_id::FileId`] (size + modification time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FileId {
-    pub volume: u64,
-    pub index: u64,
-    pub links: u64,
+struct LinkId {
+    volume: u64,
+    index: u64,
+    links: u64,
 }
 
 /// What deleting every listed file frees: a file listed under several of its names counts once,
 /// and only when all its links are listed (no name outside keeps the bytes). `None` identities
 /// count in full.
-pub fn freed(files: impl IntoIterator<Item = (Option<FileId>, u64)>) -> u64 {
+fn freed(files: impl IntoIterator<Item = (Option<LinkId>, u64)>) -> u64 {
     let mut seen: std::collections::HashMap<(u64, u64), (u64, u64, u64)> =
         std::collections::HashMap::new();
     let mut total = 0u64;
@@ -243,9 +243,9 @@ pub fn freed(files: impl IntoIterator<Item = (Option<FileId>, u64)>) -> u64 {
 }
 
 #[cfg(unix)]
-fn file_id(_path: &Path, md: &std::fs::Metadata) -> Option<FileId> {
+fn link_id(_path: &Path, md: &std::fs::Metadata) -> Option<LinkId> {
     use std::os::unix::fs::MetadataExt;
-    Some(FileId {
+    Some(LinkId {
         volume: md.dev(),
         index: md.ino(),
         links: md.nlink(),
@@ -256,7 +256,7 @@ fn file_id(_path: &Path, md: &std::fs::Metadata) -> Option<FileId> {
 /// (`GetFileInformationByHandle` through `winapi-util`). Opened for attributes only, so a file
 /// another program holds open is read too.
 #[cfg(windows)]
-fn file_id(path: &Path, _md: &std::fs::Metadata) -> Option<FileId> {
+fn link_id(path: &Path, _md: &std::fs::Metadata) -> Option<LinkId> {
     use std::os::windows::fs::OpenOptionsExt;
     /// `FILE_READ_ATTRIBUTES`.
     const READ_ATTRIBUTES: u32 = 0x80;
@@ -265,7 +265,7 @@ fn file_id(path: &Path, _md: &std::fs::Metadata) -> Option<FileId> {
         .open(path)
         .ok()?;
     let info = winapi_util::file::information(&f).ok()?;
-    Some(FileId {
+    Some(LinkId {
         volume: info.volume_serial_number(),
         index: info.file_index(),
         links: info.number_of_links(),
@@ -273,7 +273,7 @@ fn file_id(path: &Path, _md: &std::fs::Metadata) -> Option<FileId> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_id(_path: &Path, _md: &std::fs::Metadata) -> Option<FileId> {
+fn link_id(_path: &Path, _md: &std::fs::Metadata) -> Option<LinkId> {
     None
 }
 
@@ -565,7 +565,7 @@ print("RESULT: " + json.dumps(out))
     #[test]
     fn freed_counts_a_linked_file_once_and_only_with_all_its_links() {
         let id = |index, links| {
-            Some(FileId {
+            Some(LinkId {
                 volume: 7,
                 index,
                 links,
@@ -579,7 +579,7 @@ print("RESULT: " + json.dumps(out))
             (id(2, 2), 300),
             (id(3, 1), 500),
             (
-                Some(FileId {
+                Some(LinkId {
                     volume: 8,
                     index: 1,
                     links: 1,

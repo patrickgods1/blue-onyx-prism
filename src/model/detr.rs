@@ -18,7 +18,7 @@
 
 use anyhow::{Result, bail};
 
-use super::yolo26::meets;
+use super::output::{find_output, meets};
 use super::{
     Detection, Family, ModelFamilyKind, NamedOutput, Normalization, PortSpec, PostParams,
     PreprocessCtx, ResizeMode, retain_finite,
@@ -91,18 +91,6 @@ impl Detr {
     }
 }
 
-fn find<'a>(outputs: &'a [NamedOutput], name: &str) -> Result<&'a NamedOutput> {
-    outputs.iter().find(|o| o.name == name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "detr: missing output `{name}`; got {:?}",
-            outputs
-                .iter()
-                .map(|o| (&o.name, &o.shape))
-                .collect::<Vec<_>>()
-        )
-    })
-}
-
 /// `(Q, last)` for `[1, Q, last]` or `[Q, last]`.
 fn dims(out: &NamedOutput, expected: &str) -> Result<(usize, usize)> {
     match out.shape.as_slice() {
@@ -144,8 +132,8 @@ impl Family for Detr {
         ctx: &PreprocessCtx,
         params: &PostParams,
     ) -> Result<Vec<Detection>> {
-        let logits_o = find(outputs, LOGITS)?;
-        let boxes_o = find(outputs, BOXES)?;
+        let logits_o = find_output("detr", outputs, LOGITS)?;
+        let boxes_o = find_output("detr", outputs, BOXES)?;
         let (q, c) = dims(logits_o, "[1, Q, C]")?;
         let (qb, four) = dims(boxes_o, "[1, Q, 4]")?;
         if four != 4 || qb != q {

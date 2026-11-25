@@ -793,7 +793,6 @@ fn ap_basis_note(b: &super::metrics::ApBasis) -> String {
     }
 }
 
-/// Speed per resolution bucket of `run` (every bucket; one without images is n/a).
 /// The burst test of each device of `m` that ran one ([`super::burst`]); None when none did.
 fn burst_table(m: &ModelResult) -> Option<Table> {
     let ran: Vec<(&str, &super::burst::BurstResult)> = m
@@ -870,6 +869,7 @@ fn burst_table(m: &ModelResult) -> Option<Table> {
     })
 }
 
+/// Speed per resolution bucket of `run` (every bucket; one without images is n/a).
 fn resolution_table(run: &RunResult) -> Table {
     Table {
         title: format!("Speed by resolution on {} (ms)", run.requested_device),

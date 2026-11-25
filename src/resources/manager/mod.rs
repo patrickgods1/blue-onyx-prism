@@ -546,27 +546,39 @@ impl State {
         match self {
             State::Queued => "queued".to_string(),
             State::Downloading { bytes, total } => {
-                let pct = if *total > 0 { bytes * 100 / total } else { 0 };
-                format!(
-                    "downloading {pct}% ({}/{} MB)",
-                    bytes / 1_000_000,
-                    total.div_ceil(1_000_000)
-                )
+                format!("downloading {}", downloading_text(*bytes, *total))
             }
             State::Verifying => "verifying".to_string(),
             State::Extracting => "extracting".to_string(),
             State::Installed => "installed".to_string(),
             State::Failed {
                 error, retry_at, ..
-            } => match retry_at.and_then(|t| {
-                let now = unix_now();
-                (t > now).then(|| t - now)
-            }) {
+            } => match retry_in(*retry_at) {
                 Some(s) => format!("failed: {error} (retrying in {s} s)"),
                 None => format!("failed: {error}"),
             },
         }
     }
+}
+
+/// "42% (35/83 MB)": `bytes` of `total` as [`percent`] and whole megabytes (the total rounded up).
+fn downloading_text(bytes: u64, total: u64) -> String {
+    format!(
+        "{}% ({}/{} MB)",
+        percent(bytes, total),
+        bytes / 1_000_000,
+        total.div_ceil(1_000_000)
+    )
+}
+
+/// Seconds until the retry at `retry_at` (Unix seconds); None without one, or once it is due.
+pub(crate) fn retry_in(retry_at: Option<u64>) -> Option<u64> {
+    retry_in_at(retry_at, unix_now())
+}
+
+/// [`retry_in`] at `now` (Unix seconds).
+fn retry_in_at(retry_at: Option<u64>, now: u64) -> Option<u64> {
+    retry_at.and_then(|t| t.checked_sub(now)).filter(|s| *s > 0)
 }
 
 impl State {
@@ -576,22 +588,14 @@ impl State {
         match self {
             State::Queued => format!("waiting to download {title}"),
             State::Downloading { bytes, total } => {
-                let pct = if *total > 0 { bytes * 100 / total } else { 0 };
-                format!(
-                    "downloading {title} {pct}% ({}/{} MB)",
-                    bytes / 1_000_000,
-                    total.div_ceil(1_000_000)
-                )
+                format!("downloading {title} {}", downloading_text(*bytes, *total))
             }
             State::Verifying => format!("verifying {title}"),
             State::Extracting => format!("installing {title}"),
             State::Installed => format!("{title} installed"),
             State::Failed {
                 error, retry_at, ..
-            } => match retry_at.and_then(|t| {
-                let now = unix_now();
-                Some(t.saturating_sub(now))
-            }) {
+            } => match retry_in(*retry_at) {
                 Some(s) => format!("download of {title} failed: {error}; retrying in {s} s"),
                 None => format!("download of {title} failed: {error}"),
             },
@@ -1375,5 +1379,94 @@ mod not_installed_tests {
         assert!(failed[2].starts_with("d@t: never started"), "{failed:?}");
         let done = vec![status("a@t", "a", State::Installed)];
         assert!(not_installed(&keys[..1], &done).is_empty());
+    }
+}
+
+/// The texts of a download's state: [`State::describe`] (resource rows), [`State::describe_for`]
+/// (model states) and [`retry_in`], which both describes and the resource rows share.
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    fn failed(retry_at: Option<u64>) -> State {
+        State::Failed {
+            error: "HTTP 404".into(),
+            retry_at,
+            attempts: 2,
+        }
+    }
+
+    #[test]
+    fn every_state_reads_the_same_in_both_texts() {
+        let dl = State::Downloading {
+            bytes: 18_500_000,
+            total: 44_000_001,
+        };
+        assert_eq!(dl.describe(), "downloading 42% (18/45 MB)");
+        assert_eq!(
+            dl.describe_for("OpenVINO runtime"),
+            "downloading OpenVINO runtime 42% (18/45 MB)"
+        );
+        let empty = State::Downloading { bytes: 0, total: 0 };
+        assert_eq!(empty.describe(), "downloading 0% (0/0 MB)");
+        let t = "OpenVINO runtime";
+        let cases = [
+            (
+                State::Queued,
+                "queued",
+                "waiting to download OpenVINO runtime",
+            ),
+            (State::Verifying, "verifying", "verifying OpenVINO runtime"),
+            (
+                State::Extracting,
+                "extracting",
+                "installing OpenVINO runtime",
+            ),
+            (State::Installed, "installed", "OpenVINO runtime installed"),
+            (
+                failed(None),
+                "failed: HTTP 404",
+                "download of OpenVINO runtime failed: HTTP 404",
+            ),
+            // A retry that is due (or past) is no longer announced, in either text.
+            (
+                failed(Some(1)),
+                "failed: HTTP 404",
+                "download of OpenVINO runtime failed: HTTP 404",
+            ),
+        ];
+        for (state, plain, named) in cases {
+            assert_eq!(state.describe(), plain, "{state:?}");
+            assert_eq!(state.describe_for(t), named, "{state:?}");
+        }
+        let later = failed(Some(unix_now() + 3600));
+        let text = later.describe();
+        assert!(
+            text.starts_with("failed: HTTP 404 (retrying in 3"),
+            "{text}"
+        );
+        assert!(text.ends_with(" s)"), "{text}");
+        let text = later.describe_for(t);
+        assert!(
+            text.starts_with("download of OpenVINO runtime failed: HTTP 404; retrying in 3"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_retry_counts_down_and_is_gone_once_due() {
+        assert_eq!(retry_in_at(Some(100), 40), Some(60));
+        assert_eq!(retry_in_at(Some(100), 99), Some(1));
+        assert_eq!(retry_in_at(Some(100), 100), None);
+        assert_eq!(retry_in_at(Some(5), 100), None);
+        assert_eq!(retry_in_at(None, 100), None);
+    }
+
+    /// Percent through [`percent`]: never above 100, even for a server that sent more than it
+    /// announced.
+    #[test]
+    fn the_download_text_caps_at_one_hundred_percent() {
+        assert_eq!(downloading_text(2_000_000, 1_000_000), "100% (2/1 MB)");
+        assert_eq!(downloading_text(999_999, 1_000_000), "99% (0/1 MB)");
     }
 }

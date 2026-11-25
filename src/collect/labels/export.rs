@@ -1037,17 +1037,8 @@ fn select_with(
             floor: None,
         });
     }
-    let groups: BTreeSet<Group> = frames
-        .iter()
-        .map(|f| (f.rel.camera.clone(), f.rel.date.clone()))
-        .collect();
-    let splits = assign_splits(&groups, split);
-    for f in &mut frames {
-        f.split = splits
-            .get(&(f.rel.camera.clone(), f.rel.date.clone()))
-            .copied()
-            .unwrap_or(Split::Train);
-    }
+    let splits = assign_splits(&groups_of(&frames), split);
+    set_splits(&mut frames, &splits);
     unsure.extend(lost.iter().filter_map(|rel| flat_of(rel)));
     if !lost.is_empty() {
         let w = lost_warning(&lost);
@@ -1514,10 +1505,7 @@ pub fn run_filtered_recorded(
     pending: Option<&Path>,
 ) -> Result<ExportReport> {
     let (progress, stop) = hooks;
-    if req.formats.is_empty() {
-        bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
-    }
-    filter.check(classes)?;
+    check_request(req, filter, classes)?;
     let mut selected = select_with(dir, classes, &req.split, filter, false, progress, stop);
     if stop() {
         return Err(Stopped.into());
@@ -1538,6 +1526,34 @@ pub fn run_filtered_recorded(
     )
 }
 
+/// The (camera, day) groups of `frames`: the unit a split assigns.
+fn groups_of(frames: &[ExportFrame]) -> BTreeSet<Group> {
+    frames.iter().map(group_of).collect()
+}
+
+/// The group of one frame ([`groups_of`]).
+fn group_of(f: &ExportFrame) -> Group {
+    (f.rel.camera.clone(), f.rel.date.clone())
+}
+
+/// Give each frame its group's split from `splits`; a frame whose group is not there trains.
+fn set_splits(frames: &mut [ExportFrame], splits: &BTreeMap<Group, Split>) {
+    for f in frames {
+        f.split = splits.get(&group_of(f)).copied().unwrap_or(Split::Train);
+    }
+}
+
+/// Refuse a request that names no format or a filter `classes` cannot satisfy. Called first by
+/// [`run_filtered_recorded`], before the walk and before [`heldout::apply`] (which may add days to
+/// the held-out list), so a refused request reads and writes nothing, and again by
+/// [`run_selected_with`] for callers that selected the frames themselves.
+fn check_request(req: &ExportRequest, filter: &ClassFilter, classes: &[String]) -> Result<()> {
+    if req.formats.is_empty() {
+        bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
+    }
+    filter.check(classes)
+}
+
 /// The split of `selected` by [`heldout::apply`] (the listed days held out, the list grown by an
 /// export of the default split): after the walk, under the list's lock for the decision only.
 fn frozen_split(
@@ -1546,19 +1562,10 @@ fn frozen_split(
     split: &SplitConfig,
     policy: &HeldoutPolicy,
 ) -> Result<HeldoutReport> {
-    let groups: BTreeSet<Group> = selected
-        .frames
-        .iter()
-        .map(|f| (f.rel.camera.clone(), f.rel.date.clone()))
-        .collect();
+    let groups = groups_of(&selected.frames);
     let (splits, report) =
         heldout::apply(dir, &groups, split, policy, std::time::SystemTime::now())?;
-    for f in &mut selected.frames {
-        f.split = splits
-            .get(&(f.rel.camera.clone(), f.rel.date.clone()))
-            .copied()
-            .unwrap_or(Split::Train);
-    }
+    set_splits(&mut selected.frames, &splits);
     if policy.seen.is_none() && heldout::is_default_split(split) {
         selected.warnings.push(
             "the frame lists of past training runs (<training dir>/<run>/data/train.txt, \
@@ -1615,10 +1622,7 @@ fn run_selected_with(
     pending: Option<&Path>,
 ) -> Result<ExportReport> {
     let (progress, stop) = hooks;
-    if req.formats.is_empty() {
-        bail!("no export format given (yolo, coco, xanylabeling, benchmark)");
-    }
-    filter.check(classes)?;
+    check_request(req, filter, classes)?;
     let mut selected = selected;
     let unreviewed: Vec<(Frame, LabelFile, u32, u32)> =
         if req.include_unreviewed && req.formats.contains(&Format::XAnyLabeling) {
@@ -3053,6 +3057,98 @@ mod tests {
             assert_eq!(names_in(&chosen), Vec::<String>::new(), "{name}");
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    // QA-184: a request refused up front (no format, a label not in the class list) is refused
+    // before the walk and before the held-out list is read or grown.
+    #[test]
+    fn a_refused_request_walks_nothing_and_leaves_the_list_alone() {
+        let root = std::env::temp_dir().join(format!("bop-export-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("dataset");
+        for (date, stem) in [("2026-10-21", "a"), ("2026-10-22", "b")] {
+            put_reviewed(
+                &dir,
+                "drive",
+                date,
+                stem,
+                vec![lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted)],
+                false,
+            );
+        }
+        let steps = std::sync::atomic::AtomicUsize::new(0);
+        let progress = |_: ExportStep| {
+            steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        };
+        let mut req = all_formats(root.join("out"));
+        req.heldout = Some(HeldoutPolicy { seen: None });
+        req.formats.clear();
+        let e = run_filtered_until(
+            &dir,
+            &classes(),
+            &req,
+            &ClassFilter::default(),
+            &progress,
+            &|| false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "no export format given (yolo, coco, xanylabeling, benchmark)"
+        );
+        req.formats = Format::ALL.to_vec();
+        let zebra = ClassFilter {
+            labels: vec!["zebra".into()],
+            ..ClassFilter::default()
+        };
+        let e =
+            run_filtered_until(&dir, &classes(), &req, &zebra, &progress, &|| false).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("'zebra' is not in the class list"),
+            "{e:#}"
+        );
+        assert_eq!(
+            steps.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no walk"
+        );
+        assert!(!dir.join(heldout::FILE).exists(), "the list is left alone");
+        assert!(!root.join("out").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // QA-184: a split goes by (camera, day) group; a frame whose group has none trains.
+    #[test]
+    fn splits_go_by_camera_day_and_default_to_train() {
+        let at = |rel: &str| ExportFrame {
+            rel: layout::parse_rel(rel).unwrap(),
+            ..frame(Vec::new(), true)
+        };
+        let mut frames = vec![
+            at("day/a/2026-10-21/20261021T010203004Z_x.jpg"),
+            at("ir/a/2026-10-21/20261021T020203004Z_y.jpg"),
+            at("day/a/2026-10-22/20261022T010203004Z_z.jpg"),
+            at("day/b/2026-10-21/20261021T010203004Z_w.jpg"),
+        ];
+        assert_eq!(
+            groups_of(&frames),
+            [
+                g("a", "2026-10-21"),
+                g("a", "2026-10-22"),
+                g("b", "2026-10-21")
+            ]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+            "scenes of one camera day are one group"
+        );
+        let splits: BTreeMap<Group, Split> = [
+            (g("a", "2026-10-21"), Split::Val),
+            (g("a", "2026-10-22"), Split::Train),
+        ]
+        .into_iter()
+        .collect();
+        set_splits(&mut frames, &splits);
+        let got: Vec<Split> = frames.iter().map(|f| f.split).collect();
+        assert_eq!(got, [Split::Val, Split::Val, Split::Train, Split::Train]);
     }
 
     /// Audit 2026-11 phase 1: an export stopped by the service, or cut by a panic, leaves no

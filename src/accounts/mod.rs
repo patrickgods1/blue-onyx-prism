@@ -1,6 +1,7 @@
 //! The web UI's accounts: `<data root>/auth/users.json`, its rules and the store that changes
-//! it. All accounts are full administrators. Nothing here is a route yet; the CLI
-//! (`blue-onyx-prism user ...`, [`commands`]) is the only writer so far.
+//! it. All accounts are full administrators. Two kinds of writer share the store: the CLI
+//! (`blue-onyx-prism user ...`, [`commands`]) and the service's routes (`/setup`, `/login` and the
+//! Config page's Accounts card in `server::auth` / `server::accounts`), all through [`Store`].
 //!
 //! - [`password`]: the password policy (NFC, 15 ..= 128 code points, blocklist, no name inside)
 //!   and Argon2id hashing behind a process-wide semaphore. [`blocklist`]: the common passwords.
@@ -13,7 +14,8 @@
 //! **The file** (`users.json`, format [`FORMAT`]):
 //! `{"format": 1, "users": [{"name", "hash", "created", "password_changed", "generation",
 //! "failures", "last_failure", "disabled"}]}`. Times are unix seconds (UTC), so lockout
-//! arithmetic needs no parsing; `user list` prints them as RFC 3339. `hash` is the PHC string of
+//! arithmetic needs no parsing; `user list` and the Accounts card show them in the configured
+//! zone ([`crate::clock::Zone::display_unix`]). `hash` is the PHC string of
 //! [`password::hash`]. `generation` starts at a random value ([`User::new`]) and is bumped by a
 //! password change or reset and by "sign out everywhere": sessions record it, so a change made by
 //! the CLI ends the live sessions of that account without touching them. Random, never 1: a new
@@ -69,17 +71,6 @@ pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-/// `secs` (unix) as RFC 3339 UTC, for people.
-pub fn rfc3339(secs: u64) -> String {
-    i64::try_from(secs)
-        .ok()
-        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
-        .map_or_else(
-            || secs.to_string(),
-            |t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        )
 }
 
 /// Why an account change was refused. Callers may downcast an `anyhow::Error` to it; the

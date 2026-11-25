@@ -28,6 +28,8 @@ pub const REPORT_FILE: &str = "report.json";
 pub const QUICK_REPORT_FILE: &str = "report-quick.json";
 /// Version of the report's layout.
 pub const REPORT_VERSION: u32 = 1;
+/// Largest `report.json` read (a report with this many recall rows is not one this build wrote).
+pub const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
 /// z of a two-sided 95% interval: the 0.975 quantile of the standard normal distribution.
 pub const Z95: f64 = 1.959_963_984_540_054;
 /// Upper edges (pixels, exclusive) of the size buckets of the short side at model input; the last
@@ -526,6 +528,70 @@ impl RefineReport {
     }
 }
 
+/// The report at `path` (a [`report_path`] or [`quick_report_path`]) and what is wrong with it:
+/// `(None, None)` when there is none (never an error), `(None, Some(why))` when it is larger than
+/// [`MAX_REPORT_BYTES`], does not read, or is a later build's (a newer format is "newer", never
+/// "damaged"). The one reader of the format: the Refine tab's (`server::refine::read_report`) and
+/// the quick check's pace ([`super::quick`]).
+pub fn read(path: &Path) -> (Option<RefineReport>, Option<String>) {
+    let bytes = match std::fs::metadata(path) {
+        Ok(m) if m.len() > MAX_REPORT_BYTES => {
+            return (
+                None,
+                Some(format!(
+                    "{} is too large to be a report of the dataset check ({} bytes)",
+                    path.display(),
+                    m.len()
+                )),
+            );
+        }
+        Ok(_) => match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    None,
+                    Some(format!("{} could not be read: {e}", path.display())),
+                );
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
+        Err(e) => {
+            return (
+                None,
+                Some(format!("{} could not be read: {e}", path.display())),
+            );
+        }
+    };
+    // The format first, alone: a later build's report may not parse as this build's at all, and
+    // is then newer, not damaged.
+    #[derive(Deserialize)]
+    struct Format {
+        version: u64,
+    }
+    if let Ok(Format { version }) = serde_json::from_slice::<Format>(&bytes)
+        && version > u64::from(REPORT_VERSION)
+    {
+        return (
+            None,
+            Some(format!(
+                "{} was written by a newer version of this program (report format {version}, \
+                 this one reads up to {REPORT_VERSION}); update to see it",
+                path.display(),
+            )),
+        );
+    }
+    match serde_json::from_slice::<RefineReport>(&bytes) {
+        Ok(r) => (Some(r), None),
+        Err(e) => (
+            None,
+            Some(format!(
+                "{} is damaged and was not read ({e}); the next check writes a new one",
+                path.display()
+            )),
+        ),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -749,5 +815,67 @@ mod tests {
             (2, 1),
             "the table a floor is chosen from keeps them"
         );
+    }
+
+    /// Audit 2026-11 (QA-202): the one reader of the report (the Refine tab's and the quick
+    /// check's pace): none for no file, refused past [`MAX_REPORT_BYTES`] before it is read, a
+    /// newer format "newer" even when it would not parse here, this format's broken file
+    /// "damaged", this format's report read.
+    #[test]
+    fn the_reader_refuses_too_large_newer_and_damaged_reports() {
+        let dir = crate::test_dirs::TempDir::new("refine-report-read");
+        let path = quick_report_path(&dir);
+        assert_eq!(read(&path), (None, None), "no file is no error");
+        std::fs::create_dir_all(dir.join(REPORT_DIR)).unwrap();
+        let mut r = RefineReport::new(
+            "20261111-120000-abcd",
+            4,
+            RecipeInfo {
+                model: "rfdetr-nano".into(),
+                imgsz: 384,
+                epochs: 8,
+                batch: 4,
+                from: "default".into(),
+            },
+        );
+        r.mode = Mode::Model;
+        assert_eq!(r.write(&dir).unwrap(), path);
+        assert_eq!(read(&path), (Some(r.clone()), None));
+
+        let mut newer = serde_json::to_value(&r).unwrap();
+        newer["version"] = (REPORT_VERSION + 1).into();
+        newer["folds"] = "a field of another shape".into();
+        std::fs::write(&path, newer.to_string()).unwrap();
+        let (none, why) = read(&path);
+        let why = why.unwrap();
+        assert!(none.is_none());
+        let words = format!(
+            "was written by a newer version of this program (report format {}, this one reads \
+             up to {REPORT_VERSION}); update to see it",
+            REPORT_VERSION + 1
+        );
+        assert!(why.ends_with(&words), "{why}");
+
+        newer["version"] = REPORT_VERSION.into();
+        std::fs::write(&path, newer.to_string()).unwrap();
+        let (none, why) = read(&path);
+        assert!(none.is_none());
+        let why = why.unwrap();
+        assert!(
+            why.contains("is damaged and was not read (")
+                && why.ends_with("); the next check writes a new one"),
+            "{why}"
+        );
+
+        // Sparse: the size is checked before a byte is read.
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_REPORT_BYTES + 1).unwrap();
+        drop(f);
+        let (none, why) = read(&path);
+        assert!(none.is_none());
+        assert!(why.unwrap().ends_with(&format!(
+            "is too large to be a report of the dataset check ({} bytes)",
+            MAX_REPORT_BYTES + 1
+        )));
     }
 }

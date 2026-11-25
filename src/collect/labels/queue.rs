@@ -918,10 +918,11 @@ impl Uncertainty {
             .min_by(f32::total_cmp);
         let disagreement = rec.buckets.contains(&Bucket::Disagreement)
             || rec.matched.contains(&Bucket::Disagreement)
-            || rec
-                .verify
-                .as_ref()
-                .is_some_and(|v| v.candidates.iter().any(|c| c.outcome == "rejected"));
+            || rec.verify.as_ref().is_some_and(|v| {
+                v.candidates
+                    .iter()
+                    .any(|c| c.is(crate::verify::Outcome::Rejected))
+            });
         Self {
             margin,
             disagreement,
@@ -1181,7 +1182,7 @@ pub(super) fn index_candidates(
     out: &mut Vec<Candidate>,
 ) {
     for line in lines {
-        let rel = format!("{}/{}/{date}/{}.jpg", line.scene, line.camera, line.id);
+        let rel = line.rel(date);
         if layout::parse_rel(&rel).is_some() && seen.insert(rel.clone()) {
             out.push(Candidate {
                 rel,

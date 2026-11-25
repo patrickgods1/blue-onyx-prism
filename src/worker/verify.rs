@@ -24,21 +24,20 @@
 //! order of the worker. The in-flight cap counts a request until its handler gets the reply,
 //! so verification time counts against it as it should.
 
-use super::run::{DoneLine, VerifyLog};
-use super::save::SaveJob;
-use super::{Decoded, LiveSettings, ORDER_TARGET, Peers, Purpose, Reply, WorkItem, ms};
+use super::run::{DoneLine, VerifyLog, send_reply};
+use super::save::{After, SaveJob};
+use super::{Decoded, LiveSettings, Peers, Purpose, Reply, WorkItem, ms};
 use crate::api::{Prediction, VisionDetectionResponse};
 use crate::image::RgbImage;
 use crate::image_stats::ImageStats;
 use crate::metrics::{DropReason, ModelMetrics};
 use crate::model::filters::{SuppressCounts, SuppressReason};
-use crate::startup::ModelState;
 use crate::verify::{Outcome, Plan, VerifyMode};
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tracing::{trace, warn};
+use tracing::warn;
 
 /// What the lane needs of its worker.
 #[derive(Debug, Clone)]
@@ -92,6 +91,16 @@ pub(super) enum Failure {
     Error,
     /// The frame was not kept.
     NoFrame,
+}
+
+impl From<super::PeerMiss> for Failure {
+    fn from(m: super::PeerMiss) -> Self {
+        match m {
+            super::PeerMiss::Unknown => Failure::Unknown,
+            super::PeerMiss::NotReady => Failure::NotReady,
+            super::PeerMiss::QueueFull => Failure::QueueFull,
+        }
+    }
 }
 
 impl Failure {
@@ -420,20 +429,7 @@ fn start(ctx: &LaneCtx, p: Box<Pending>, active: &mut Vec<Active>) {
 /// The served, ready verifier `name` (never this model), or why not (a lazy one is asked to
 /// compile).
 fn target(ctx: &LaneCtx, name: &str) -> Result<Arc<super::WorkerHandle>, Failure> {
-    use crate::registry::normalize_name;
-    let h = ctx
-        .peers
-        .get(name)
-        .filter(|h| normalize_name(&h.name) != normalize_name(&ctx.name))
-        .ok_or(Failure::Unknown)?;
-    if h.state.get() != ModelState::Ready {
-        h.trigger_load();
-        return Err(Failure::NotReady);
-    }
-    if h.is_full() {
-        return Err(Failure::QueueFull);
-    }
-    Ok(h)
+    Ok(ctx.peers.ready(name, &ctx.name)?)
 }
 
 fn finish(ctx: &LaneCtx, a: Active) {
@@ -544,36 +540,20 @@ fn complete(
         }),
     );
     // Drawn, encoded and written after the reply ([`super::save`]).
-    let save_job = match (&live.save_image_path, img) {
-        (Some(dir), Some(img)) => Some(SaveJob {
-            model: ctx.name.clone(),
-            dir: dir.clone(),
-            image_name: image_name.clone(),
+    let after = After {
+        save: SaveJob::for_answer(
+            &ctx.name,
+            &live,
+            &image_name,
             img,
-            predictions: resp.predictions.clone(),
-            save_ref: live.save_ref_image,
-            upload,
-        }),
-        _ => None,
+            &resp.predictions,
+            upload.as_ref(),
+        ),
+        collect: collect.map(|job| (job, resp.predictions.clone())),
     };
-    trace!(
-        target: ORDER_TARGET,
-        model = %ctx.name,
-        image = %image_name,
-        success = resp.success,
-        "replied"
-    );
-    let collect = collect.map(|job| (job, resp.predictions.clone()));
-    if !reply.send(resp) {
-        tracing::debug!(model = %ctx.name, "client went away before the response was sent");
-    }
+    send_reply(&ctx.name, &image_name, reply, resp);
     // After the reply (each a `try_send`, never waits).
-    if let Some((job, predictions)) = collect {
-        job.submit(&predictions);
-    }
-    if let Some(job) = save_job {
-        super::save::submit(ctx.saver.as_deref(), job);
-    }
+    after.run(ctx.saver.as_deref());
 }
 
 #[cfg(test)]

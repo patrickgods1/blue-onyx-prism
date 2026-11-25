@@ -29,14 +29,17 @@
 //! newer build's) loads as `Unknown`, is never live, and stays in the file. A frame holds at most
 //! [`MAX_SUGGESTIONS`], strongest first ([`strength`]).
 //!
-//! The Review tab will state [`live`], [`accept`] and [`dismiss`] in JavaScript: keep them in step.
+//! Twins: the Review tab's `liveRefine`, `acceptRefine` and `dismissRefine`
+//! (`assets/review-rules.js`) state [`live`], [`accept`] and [`dismiss`] in JavaScript, and
+//! [`live_json`] key for key; `tests/it/js_rules.rs` checks them against each other, so a
+//! change here is made there too.
 
 use super::bulk::Wanted;
 use super::repeats::same_object;
 use super::stacks;
 use super::{
-    BoxState, LabelBox, LabelFile, MATCH_IOU, MAX_BOXES, Source, Status, covers, iou,
-    rename_to_class, unjudged_reject,
+    BoxState, LabelBox, LabelFile, MATCH_IOU, MAX_BOXES, Source, Status, cmp_box, covers, iou,
+    proper_box, rename_to_class, unjudged_reject,
 };
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -168,11 +171,6 @@ pub struct Live<'a> {
     pub replaces: Vec<usize>,
 }
 
-/// Finite coordinates of a box with a positive size.
-fn proper(b: &[f32; 4]) -> bool {
-    b.iter().all(|v| v.is_finite()) && b[2] > b[0] && b[3] > b[1]
-}
-
 /// The class `label` names: with a class list, the list's spelling of a wanted class (None for an
 /// unwanted label); without one, the label itself (None when blank).
 fn class_of(label: &str, wanted: Option<&Wanted<'_>>) -> Option<String> {
@@ -228,7 +226,7 @@ const fn has_target(k: Kind) -> bool {
 
 /// Where an `add` goes: None when it is not live, else the rejects it replaces ([`Live::replaces`]).
 fn add_place(f: &LabelFile, s: &Suggestion, wanted: Option<&Wanted<'_>>) -> Option<Vec<usize>> {
-    let bbox = s.bbox.filter(proper)?;
+    let bbox = s.bbox.filter(proper_box)?;
     let class = class_of(s.label.as_deref()?, wanted)?;
     let mut replaces: Vec<(usize, f32)> = Vec::new();
     for (i, b) in f.boxes.iter().enumerate() {
@@ -268,7 +266,7 @@ fn place(
     match s.kind {
         Kind::Add => add_place(f, s, wanted).map(|r| (None, r)),
         Kind::Tighten => {
-            let bbox = s.bbox.filter(proper)?;
+            let bbox = s.bbox.filter(proper_box)?;
             target_box(f, s, |b| b.orig_bbox.is_none() && b.bbox != bbox).map(|t| (Some(t), vec![]))
         }
         Kind::Relabel => {
@@ -576,17 +574,13 @@ fn score_of(s: &Suggestion) -> f32 {
     s.score.filter(|v| v.is_finite()).unwrap_or(0.0)
 }
 
-fn cmp_box(a: &Option<[f32; 4]>, b: &Option<[f32; 4]>) -> Ordering {
+/// [`cmp_box`] of two optional boxes, no box first.
+fn cmp_opt_box(a: &Option<[f32; 4]>, b: &Option<[f32; 4]>) -> Ordering {
     match (a, b) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
-        (Some(x), Some(y)) => x
-            .iter()
-            .zip(y)
-            .map(|(p, q)| p.total_cmp(q))
-            .find(|o| o.is_ne())
-            .unwrap_or(Ordering::Equal),
+        (Some(x), Some(y)) => cmp_box(x, y),
     }
 }
 
@@ -597,9 +591,9 @@ fn order(a: &Suggestion, b: &Suggestion) -> Ordering {
         .cmp(&strength(a))
         .then_with(|| a.answered().cmp(&b.answered()))
         .then_with(|| a.kind.cmp(&b.kind))
-        .then_with(|| cmp_box(&a.target, &b.target))
+        .then_with(|| cmp_opt_box(&a.target, &b.target))
         .then_with(|| a.target_label.cmp(&b.target_label))
-        .then_with(|| cmp_box(&a.bbox, &b.bbox))
+        .then_with(|| cmp_opt_box(&a.bbox, &b.bbox))
         .then_with(|| a.label.cmp(&b.label))
         .then_with(|| a.answer.cmp(&b.answer))
         .then_with(|| a.spot.cmp(&b.spot))

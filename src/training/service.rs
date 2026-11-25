@@ -96,6 +96,13 @@ fn trim_finished_log(r: &mut RunRecord) {
 }
 /// Characters of a child's line kept on a record.
 const LOG_LINE_CHARS: usize = 300;
+/// Characters of a stage's detail kept on a record ([`detail_text`]).
+const DETAIL_CHARS: usize = 300;
+
+/// A stage report's detail as a record keeps it: its first [`DETAIL_CHARS`] characters.
+fn detail_text(detail: &str) -> String {
+    detail.chars().take(DETAIL_CHARS).collect()
+}
 
 /// Add `line` (its first [`LOG_LINE_CHARS`] characters) to the log tail `log`, dropping the oldest
 /// line once it holds [`LOG_TAIL`], and count it in `seq`: the number of lines ever pushed, which
@@ -321,32 +328,13 @@ impl RunRecord {
     pub fn describe(&self) -> String {
         match self.state {
             RunState::Queued => "queued".into(),
-            RunState::Running => match self.stage {
-                Some(s) if self.detail.is_empty() => {
-                    format!("{} ({}/{})", s.label(), self.step, self.steps)
-                }
-                Some(s) => format!(
-                    "{} ({}/{}): {}",
-                    s.label(),
-                    self.step,
-                    self.steps,
-                    self.detail
-                ),
-                None => "starting".into(),
-            },
-            RunState::Paused => match self.stage {
-                Some(s) if self.detail.is_empty() => {
-                    format!("paused ({} {}/{})", s.label(), self.step, self.steps)
-                }
-                Some(s) => format!(
-                    "paused ({} {}/{}): {}",
-                    s.label(),
-                    self.step,
-                    self.steps,
-                    self.detail
-                ),
-                None => "paused".into(),
-            },
+            RunState::Running | RunState::Paused => progress_text(
+                self.state == RunState::Paused,
+                self.stage.map(TrainStage::label),
+                self.step,
+                self.steps,
+                &self.detail,
+            ),
             RunState::Done => format!(
                 "done: {}",
                 self.output
@@ -368,6 +356,31 @@ impl RunRecord {
                 None => "cancelled".into(),
             },
         }
+    }
+}
+
+/// A busy job's line ([`RunRecord::describe`]'s and [`task::TaskRecord::describe`]'s running and
+/// paused arms): "<stage> (<step>/<steps>): <detail>", "paused (<stage> <step>/<steps>): <detail>"
+/// (no ": <detail>" when it is empty), "starting" / "paused" before the first stage.
+pub(crate) fn progress_text(
+    paused: bool,
+    stage: Option<&str>,
+    step: usize,
+    steps: usize,
+    detail: &str,
+) -> String {
+    let Some(s) = stage else {
+        return if paused { "paused" } else { "starting" }.into();
+    };
+    let head = if paused {
+        format!("paused ({s} {step}/{steps})")
+    } else {
+        format!("{s} ({step}/{steps})")
+    };
+    if detail.is_empty() {
+        head
+    } else {
+        format!("{head}: {detail}")
     }
 }
 
@@ -955,6 +968,58 @@ impl Inner {
 /// Clears the queue's `current` job (and the live epochs) when dropped: on the normal path, and
 /// while a panic unwinds out of the job.
 struct ClearCurrent<'a>(&'a Inner);
+
+/// A job the queue claimed ([`claim`]): its cancel and pause flags, and the guard that clears
+/// [`Inner::current`] when dropped.
+struct Claim<'a> {
+    cancel: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+    clear: ClearCurrent<'a>,
+}
+
+impl Claim<'_> {
+    /// The queue's runner, suspended while the job is paused.
+    fn runner(&self) -> PausableRunner<'_> {
+        PausableRunner {
+            inner: self.clear.0.runner.as_ref(),
+            pause: &self.pause,
+        }
+    }
+}
+
+/// Make `id` the queue's current job (fresh cancel and pause flags), then flip its record
+/// Queued -> Running through `start`, which hands the flip the record's state under its list's
+/// lock (`|flip| inner.update(id, |r| flip(&mut r.state))`): a cancel that marked it Cancelled
+/// after the caller's `cancelled` check wins, else Running would overwrite it and the cancel be
+/// lost. None when the record was no longer queued: `current` is cleared and `id` taken out of
+/// `cancelled`, nothing saved. The caller saves the Running state.
+fn claim<'a>(
+    inner: &'a Inner,
+    id: &str,
+    start: impl FnOnce(&mut dyn FnMut(&mut RunState)),
+) -> Option<Claim<'a>> {
+    let cur = Current::new(id);
+    let (cancel, pause) = (cur.cancel.clone(), cur.pause.clone());
+    *inner.current.lock_recover() = Some(cur);
+    let clear = ClearCurrent(inner);
+    let mut started = false;
+    start(&mut |state| {
+        if *state == RunState::Queued {
+            *state = RunState::Running;
+            started = true;
+        }
+    });
+    if !started {
+        drop(clear);
+        inner.cancelled.lock_recover().remove(id);
+        return None;
+    }
+    Some(Claim {
+        cancel,
+        pause,
+        clear,
+    })
+}
 
 impl Drop for ClearCurrent<'_> {
     fn drop(&mut self) {
@@ -2022,24 +2087,10 @@ fn run_job(inner: &Inner, mut job: TrainJob) {
         return;
     }
     let id = job.id.clone();
-    let cur = Current::new(&id);
-    let (flag, pause) = (cur.cancel.clone(), cur.pause.clone());
-    *inner.current.lock_recover() = Some(cur);
-    let clear = ClearCurrent(inner);
-    // Queued -> Running under the runs lock: a cancel that marked it Cancelled after the
-    // `cancelled` check above wins (else Running would overwrite it and the cancel be lost).
-    let mut start = false;
-    inner.update(&id, |r| {
-        if r.state == RunState::Queued {
-            r.state = RunState::Running;
-            start = true;
-        }
-    });
-    if !start {
-        drop(clear);
-        inner.cancelled.lock_recover().remove(&id);
+    // Queued -> Running under the runs lock.
+    let Some(claimed) = claim(inner, &id, |flip| inner.update(&id, |r| flip(&mut r.state))) else {
         return;
-    }
+    };
     inner.persist();
     job.reuse_from = group_data_dirs(&inner.runs.lock_recover(), &job);
     inner.start_clock(&id);
@@ -2078,7 +2129,7 @@ fn run_job(inner: &Inner, mut job: TrainJob) {
                 r.stage = Some(stage);
                 r.step = stage.number();
                 r.percent = stage.overall(percent);
-                r.detail = detail.chars().take(300).collect();
+                r.detail = detail_text(detail);
             });
             if progress_save_due(new_stage, last_save.elapsed()) {
                 inner.persist();
@@ -2122,10 +2173,8 @@ fn run_job(inner: &Inner, mut job: TrainJob) {
             inner.update_persist(&id, |r| r.resources = Some(x.clone()));
         }
     };
-    let runner = PausableRunner {
-        inner: inner.runner.as_ref(),
-        pause: &pause,
-    };
+    let flag = Arc::clone(&claimed.cancel);
+    let runner = claimed.runner();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         super::job::run_training_or_exit(
             &job,
@@ -2150,7 +2199,7 @@ fn run_job(inner: &Inner, mut job: TrainJob) {
     if let busy::State::Crashed(claim) = busy::probe(&job.run_dir) {
         claim.finish();
     }
-    drop(clear);
+    drop(claimed);
     match result {
         Ok(out) => {
             tracing::info!(run = %id, model = %job.name, "training finished in {:.0} s: {}", started.elapsed().as_secs_f64(), out.output.onnx.display());
@@ -2232,23 +2281,12 @@ fn run_task(inner: &Inner, t: &dyn Task) {
             return;
         }
     }
-    let cur = Current::new(&id);
-    let (flag, pause) = (cur.cancel.clone(), cur.pause.clone());
-    *inner.current.lock_recover() = Some(cur);
-    let clear = ClearCurrent(inner);
     // Queued -> Running under the tasks lock, so a cancel just before the start is not lost.
-    let mut start = false;
-    inner.update_task(&id, |r| {
-        if r.state == RunState::Queued {
-            r.state = RunState::Running;
-            start = true;
-        }
-    });
-    if !start {
-        drop(clear);
-        inner.cancelled.lock_recover().remove(&id);
+    let Some(claimed) = claim(inner, &id, |flip| {
+        inner.update_task(&id, |r| flip(&mut r.state));
+    }) else {
         return;
-    }
+    };
     inner.persist_tasks();
     inner.start_clock(&id);
     tracing::info!(job = %id, "{} started: {}", t.kind().as_str(), t.title());
@@ -2275,7 +2313,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
                 r.step = step;
                 r.steps = steps;
                 r.percent = percent;
-                r.detail = detail.chars().take(300).collect();
+                r.detail = detail_text(detail);
             });
             if progress_save_due(new_step, last_save.elapsed()) {
                 inner.persist_tasks();
@@ -2287,10 +2325,8 @@ fn run_task(inner: &Inner, t: &dyn Task) {
             inner.push_task_log(&id, l);
         }
     };
-    let runner = PausableRunner {
-        inner: inner.runner.as_ref(),
-        pause: &pause,
-    };
+    let flag = Arc::clone(&claimed.cancel);
+    let runner = claimed.runner();
     let ctx = TaskContext {
         runner: &runner,
         fetcher: inner.fetcher.as_ref(),
@@ -2303,7 +2339,7 @@ fn run_task(inner: &Inner, t: &dyn Task) {
         tracing::error!(job = %id, "{} panicked: {panic}", t.kind().as_str());
         Err(anyhow::anyhow!(internal_error(&panic, false)))
     });
-    drop(clear);
+    drop(claimed);
     match result {
         // Stopped for the process's exit: interrupted (what it kept, it keeps).
         Ok(out) if inner.exiting.load(Ordering::SeqCst) => {

@@ -326,6 +326,90 @@ async fn wrong_current_passwords_meet_the_address_limit() {
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
 }
 
+/// Set the test user's failure state on disk (as `users.json` would hold it) and drop the cache.
+fn set_lockout(state: &AppState, failures: u32, last_failure: Option<u64>, disabled: bool) {
+    store(state)
+        .locked(|_, cur| {
+            let mut users = cur.unwrap();
+            for u in users.users.iter_mut().filter(|u| u.name == TEST_USER) {
+                u.failures = failures;
+                u.last_failure = last_failure;
+                u.disabled = disabled;
+            }
+            Ok((Some(users), ()))
+        })
+        .unwrap();
+    state.auth.users.invalidate();
+}
+
+/// QA-230: the card's password check follows the account's lockout like `/login`: an account
+/// that waits gets 429 with `Retry-After` and no hash, even with the right password; a trusted
+/// device cookie of the account skips only that wait (checked, then the failures reset); a
+/// device of another account skips nothing. A disabled account's session is no session at all
+/// (401 at the sign-in layer, before any check), so the card never hashes for it.
+#[tokio::test]
+async fn the_current_password_follows_the_account_lockout() {
+    let state = two_accounts();
+    let now = crate::accounts::now();
+    let route = "/config/accounts/sign-out-everywhere";
+    let right = [("current", TEST_PASSWORD)];
+    let waits = crate::accounts::lockout::DELAY_AFTER + 2;
+    set_lockout(&state, waits, Some(now), false);
+    let before = hashed(&state);
+    let (s, h, b) = call(&state, post(route, &right, false)).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{}", text(&b));
+    let retry: u64 = h[header::RETRY_AFTER].to_str().unwrap().parse().unwrap();
+    assert!(
+        (1..=crate::accounts::lockout::delay(waits)).contains(&retry),
+        "{retry}"
+    );
+    assert_eq!(hashed(&state), before, "no hash while the account waits");
+    assert_eq!(
+        failures(&state, TEST_USER),
+        waits,
+        "a refusal counts nothing"
+    );
+    assert!(signed_in(&state, TEST_SESSION).await);
+
+    // Another account's device cookie skips nothing.
+    let with_device = |device: &str| {
+        with_header(
+            post(route, &right, false),
+            "cookie",
+            &format!(
+                "{}={TEST_SESSION}; {}={device}",
+                crate::accounts::cookies::SESSION,
+                crate::accounts::cookies::DEVICE
+            ),
+        )
+    };
+    let bob = account(&state, BOB).unwrap();
+    let bobs = state.auth.devices.issue(BOB, bob.created, now);
+    let (s, _, _) = call(&state, with_device(bobs.reveal())).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(hashed(&state), before);
+
+    // The account's own trusted device: checked at once, and the success clears the failures.
+    let me = account(&state, TEST_USER).unwrap();
+    let mine = state.auth.devices.issue(TEST_USER, me.created, now);
+    let (s, _, b) = call(&state, with_device(mine.reveal())).await;
+    assert_eq!(s, StatusCode::OK, "{}", text(&b));
+    assert_eq!(json(&b)["signed_out"], true);
+    assert_eq!(hashed(&state), before + 1, "one hash");
+    assert_eq!(failures(&state, TEST_USER), 0);
+    assert!(account(&state, TEST_USER).unwrap().last_failure.is_none());
+
+    // Disabled: the session itself ends, so nothing is checked or counted.
+    let session = session_of(&state, TEST_USER);
+    set_lockout(&state, 3, Some(now), true);
+    let before = hashed(&state);
+    let r = with_session(post(route, &right, false), &session);
+    let (s, _, _) = call(&state, r).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(hashed(&state), before, "no hash for a disabled account");
+    assert_eq!(failures(&state, TEST_USER), 3);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Remove
 // ---------------------------------------------------------------------------------------------

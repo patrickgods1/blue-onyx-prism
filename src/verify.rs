@@ -384,14 +384,9 @@ pub fn crop(img: &RgbImage, r: CropRect) -> RgbImage {
     }
 }
 
-/// IoU of two `[x1, y1, x2, y2]` boxes (0 for empty ones).
+/// IoU of two `[x1, y1, x2, y2]` boxes (0 for empty ones): [`crate::geom::iou`] by value.
 pub fn iou(a: [f32; 4], b: [f32; 4]) -> f32 {
-    let iw = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
-    let ih = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
-    let inter = iw * ih;
-    let area = |r: [f32; 4]| (r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0);
-    let union = area(a) + area(b) - inter;
-    if union > 0.0 { inter / union } else { 0.0 }
+    crate::geom::iou(&a, &b)
 }
 
 /// True when the verifier's `found` label names the candidate's `label` (case-insensitive;

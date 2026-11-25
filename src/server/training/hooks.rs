@@ -113,17 +113,10 @@ impl ServerHooks {
         let (target, held) = (self.target.clone(), held.clone());
         move || {
             let st = target.state().unwrap_or_else(|| held.clone());
-            crate::benchmark::service::RunContext {
-                config: st.config_read().clone(),
-                results_path: results_path
-                    .clone()
-                    .unwrap_or_else(|| crate::benchmark::results_path(&st.config_path)),
-                runtimes: st.registry.runtimes().cloned(),
-                loaded: crate::server::benchmark::loaded_devices(&st),
-                resources: st.resources.clone(),
-                profile: st.registry.profile().map(|(p, _)| p.clone()),
-                metrics: Some(st.metrics.clone()),
-            }
+            let path = results_path
+                .clone()
+                .unwrap_or_else(|| crate::benchmark::results_path(&st.config_path));
+            crate::server::benchmark::run_context(&st, path)
         }
     }
 }

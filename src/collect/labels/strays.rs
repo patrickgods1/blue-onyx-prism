@@ -190,7 +190,7 @@ fn in_day(dir: &Path, day: &Path, queued: &HashMap<String, HashSet<String>>) -> 
     let mut ids: HashSet<String> = HashSet::new();
     let mut foreign = Vec::new();
     for line in layout::read_index(&day.join(INDEX_FILE)) {
-        let rel = format!("{}/{}/{date}/{}.jpg", line.scene, line.camera, line.id);
+        let rel = line.rel(date);
         let Some(r) = layout::parse_rel(&rel) else {
             continue;
         };

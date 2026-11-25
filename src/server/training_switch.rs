@@ -5,8 +5,8 @@
 
 use super::form::field;
 use super::train_area::MODELS;
-use super::training::{records, view};
-use super::{AppState, blocking, devices_snapshot, render};
+use super::training::{flash, records};
+use super::{AppState, DevicesSnapshot, blocking, devices_snapshot};
 use crate::benchmark::{BenchmarkResults, configured_device, find_model, results_path};
 use crate::config::{Config, ModelConfig};
 use crate::training::autolabel::catalog::{ModelClasses, model_classes};
@@ -17,6 +17,8 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A model's name for the registry's map of loaded devices.
@@ -24,14 +26,34 @@ fn key(name: &str) -> String {
     crate::registry::normalize_name(name)
 }
 
-/// The device `m` runs on: the loaded one, else what the config resolves it to, else its spec.
-fn device_of(state: &AppState, cfg: &Config, m: &ModelConfig) -> String {
-    if let Some(d) = super::benchmark::loaded_devices(state).remove(&m.key()) {
-        return d;
+/// What [`Devices::device_of`] reads of the registry and the hardware, once per request: the
+/// loaded devices, and the device snapshot (it probes the installed runtimes), taken the first
+/// time a model is not loaded.
+struct Devices<'a> {
+    state: &'a AppState,
+    loaded: HashMap<String, String>,
+    snap: OnceCell<DevicesSnapshot>,
+}
+
+impl<'a> Devices<'a> {
+    fn of(state: &'a AppState) -> Self {
+        Self {
+            state,
+            loaded: super::benchmark::loaded_devices(state),
+            snap: OnceCell::new(),
+        }
     }
-    let snap = devices_snapshot(state);
-    configured_device(cfg, m, &snap.model_selection(state, cfg, m))
-        .unwrap_or_else(|| cfg.device_for(m))
+
+    /// The device `m` runs on: the loaded one, else what the config resolves it to, else its
+    /// spec.
+    fn device_of(&self, cfg: &Config, m: &ModelConfig) -> String {
+        if let Some(d) = self.loaded.get(&m.key()) {
+            return d.clone();
+        }
+        let snap = self.snap.get_or_init(|| devices_snapshot(self.state));
+        configured_device(cfg, m, &snap.model_selection(self.state, cfg, m))
+            .unwrap_or_else(|| cfg.device_for(m))
+    }
 }
 
 /// What the page's threshold line shows, and what "Use as" with `use_threshold` saves: the
@@ -43,8 +65,17 @@ pub(super) fn suggestion_for(
     cfg: &Config,
     m: &ModelConfig,
 ) -> Result<Suggestion, String> {
+    suggestion_on(state, cfg, m, &Devices::of(state).device_of(cfg, m))
+}
+
+/// [`suggestion_for`] of `m` on `device`, the device it runs on.
+fn suggestion_on(
+    state: &AppState,
+    cfg: &Config,
+    m: &ModelConfig,
+    device: &str,
+) -> Result<Suggestion, String> {
     let name = m.effective_name();
-    let device = device_of(state, cfg, m);
     let results = BenchmarkResults::load(&results_path(&state.config_path))
         .map_err(|e| format!("the saved benchmark results do not read: {e:#}"))?
         .ok_or_else(|| format!("{name} has no benchmark yet"))?;
@@ -65,7 +96,7 @@ pub(super) fn suggestion_for(
         cfg.benchmark.weights,
         Some(std::slice::from_ref(&name)),
     );
-    switch::suggest(r, &name, Some(&device), &picks)
+    switch::suggest(r, &name, Some(device), &picks)
 }
 
 /// `GET /v1/training/switch-preview` answer.
@@ -127,8 +158,9 @@ pub(super) fn preview_of(
     let classes = model_classes(&cfg);
     let (cur_classes, cur_unknown) = classes_of(&classes, &cur.effective_name(), &[]);
     let (new_classes, new_unknown) = classes_of(&classes, &out.name, &out.classes);
-    let cur_device = device_of(state, &cfg, &cur);
-    let new_device = device_of(state, &cfg, &new);
+    let devices = Devices::of(state);
+    let cur_device = devices.device_of(&cfg, &cur);
+    let new_device = devices.device_of(&cfg, &new);
     let diff = switch::diff(
         &cfg,
         &cur,
@@ -144,7 +176,7 @@ pub(super) fn preview_of(
             device: &new_device,
         },
     );
-    let (suggestion, no_suggestion) = match suggestion_for(state, &cfg, &new) {
+    let (suggestion, no_suggestion) = match suggestion_on(state, &cfg, &new, &new_device) {
         Ok(s) => (Some(s), None),
         Err(e) => (None, Some(e)),
     };
@@ -209,15 +241,10 @@ pub(super) async fn revert(
             }
             Ok(())
         });
-        match saved {
-            Ok(m) => render(&view(&state, MODELS, Some(format!("{message} {m}")), None)),
-            Err(e) => render(&view(
-                &state,
-                MODELS,
-                None,
-                Some(format!("Not reverted: {e:#}.")),
-            )),
-        }
+        let saved = saved
+            .map(|m| format!("{message} {m}"))
+            .map_err(|e| format!("Not reverted: {e:#}."));
+        flash(&state, MODELS, saved)
     })
     .await
 }

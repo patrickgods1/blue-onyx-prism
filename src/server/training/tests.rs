@@ -952,7 +952,7 @@ async fn the_page_and_json_render_and_bad_forms_say_why() {
         "nav"
     );
     assert!(page.contains("This machine"));
-    assert!(page.contains("/static/training.js"));
+    assert!(page.contains("/static/train-train.js"));
     let (s, json) = get_text(&state, "/v1/training").await;
     assert_eq!(s, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -3120,4 +3120,93 @@ fn remove_env_refuses_a_busy_queue() {
     q.cancel("holds");
     q.shutdown();
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// QA-243: the routes themselves, not only [`remove_env_in`]. While a job of this process's queue
+/// runs, `POST /training/remove-env` and `POST /training/dir` answer 409 and change nothing; while
+/// another process (here another handle) holds `tools/.train.lock`, remove-env answers 409 and
+/// removes nothing. Once both are gone, remove-env deletes the environment (200, the lock file
+/// stays) and the training folder saves.
+#[tokio::test]
+async fn remove_env_and_training_dir_routes_refuse_while_busy() {
+    use crate::server::test_util::{call, post_form, test_state_with};
+    let root = std::env::temp_dir().join(format!("bop-remove-env-route-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("my-runs")).unwrap();
+    let r2 = root.clone();
+    let state = test_state_with(move |c| c.download_dir = Some(r2));
+    let paths = TrainPaths::for_config(&state.config_read());
+    std::fs::create_dir_all(&paths.export.env).unwrap();
+    std::fs::write(paths.export.env.join("pyvenv.cfg"), b"home = x").unwrap();
+    let html = |b: Vec<u8>| String::from_utf8(b).unwrap();
+    async fn busy_until(want: bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while started_queue().is_some_and(|s| s.busy()) != want {
+            assert!(std::time::Instant::now() < deadline, "queue busy != {want}");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    let _queue = own_queue(&state).await;
+    let svc = service(&Shared::from(state.clone()));
+    let id = "remove-env-route-holds";
+    svc.enqueue_task(Box::new(EnvTask { id, hold: true }))
+        .unwrap();
+    busy_until(true).await;
+    let (s, _, b) = call(&state, post_form("/training/remove-env", "", true)).await;
+    let page = html(b);
+    assert_eq!(s, StatusCode::CONFLICT, "{page}");
+    assert!(
+        page.contains("A run is queued or running; cancel it first."),
+        "{page}"
+    );
+    assert!(
+        paths.export.env.join("pyvenv.cfg").exists(),
+        "nothing removed"
+    );
+    let (s, _, b) = call(
+        &state,
+        post_form("/training/dir", "training_dir=my-runs", true),
+    )
+    .await;
+    let page = html(b);
+    assert_eq!(s, StatusCode::CONFLICT, "{page}");
+    assert!(
+        page.contains("Not saved: a training run, import or auto-label job is queued or running"),
+        "{page}"
+    );
+    assert_eq!(state.config_read().training.dir, None, "nothing saved");
+    assert!(svc.cancel(id));
+    busy_until(false).await;
+
+    // A training of another process holds the tool lock.
+    let held = env::TrainLock::try_acquire(&paths.train_lock_file()).unwrap();
+    let (s, _, b) = call(&state, post_form("/training/remove-env", "", true)).await;
+    let page = html(b);
+    assert_eq!(s, StatusCode::CONFLICT, "{page}");
+    assert!(page.contains("wait for it to finish"), "{page}");
+    assert!(
+        paths.export.env.join("pyvenv.cfg").exists(),
+        "nothing removed"
+    );
+    drop(held);
+
+    let (s, _, b) = call(&state, post_form("/training/remove-env", "", true)).await;
+    let page = html(b);
+    assert_eq!(s, StatusCode::OK, "{page}");
+    assert!(page.contains("Removed the training environment."), "{page}");
+    assert!(!paths.export.env.exists());
+    assert!(paths.train_lock_file().is_file(), "the lock file stays");
+    let (s, _, b) = call(
+        &state,
+        post_form("/training/dir", "training_dir=my-runs", true),
+    )
+    .await;
+    let page = html(b);
+    assert_eq!(s, StatusCode::OK, "{page}");
+    assert!(page.contains("stay there (not moved)"), "{page}");
+    assert!(state.config_read().training.dir.is_some());
+    let (s, _, _) = call(&state, post_form("/training/dir", "training_dir=", true)).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(state.config_read().training.dir, None);
+    let _ = std::fs::remove_dir_all(&root);
 }

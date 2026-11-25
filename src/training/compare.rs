@@ -425,13 +425,49 @@ pub fn best_order(rows: &[Row]) -> Vec<usize> {
         .collect()
 }
 
+/// The values of `it` without repeats, in first-seen order (told apart by `==` on the values
+/// themselves, before any formatting).
+fn distinct<T: PartialEq>(it: impl IntoIterator<Item = T>) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    for v in it {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Push `msg(labels joined by " / ")` when there are two or more `labels` (distinct values).
+fn warn_if_mixed(warnings: &mut Vec<String>, labels: &[String], msg: impl FnOnce(&str) -> String) {
+    if labels.len() > 1 {
+        warnings.push(msg(&labels.join(" / ")));
+    }
+}
+
 /// Build the comparison of `runs` (in queue order).
 pub fn compare(runs: &[CompareRun]) -> Comparison {
+    let (comparable, mut warnings) = fingerprint_warnings(runs);
+    warnings.extend(setting_warnings(runs));
+    let rows: Vec<Row> = runs.iter().map(row_of).collect();
+    let (random_column, picks_warning) = random_picks(&rows, runs);
+    warnings.extend(picks_warning);
+    let best_per_column = best_per_column(&rows, random_column);
+    let seed_summaries = seed_summaries(&rows, random_column);
     let mut c = Comparison {
-        comparable: true,
-        ..Comparison::default()
+        comparable,
+        warnings,
+        rows,
+        best_per_column,
+        seed_summaries,
+        random_column,
     };
-    // Same held-out frames?
+    c.rows.extend(routed_rows(runs));
+    c
+}
+
+/// Whether the runs were benchmarked on the same held-out frames, and the warning when not (or
+/// when some recorded no fingerprint).
+fn fingerprint_warnings(runs: &[CompareRun]) -> (bool, Vec<String>) {
     let prints: Vec<(&str, Option<&str>)> = runs
         .iter()
         .filter_map(|r| {
@@ -442,256 +478,229 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
         .collect();
     let known: Vec<&str> = prints.iter().filter_map(|(_, f)| *f).collect();
     if known.iter().any(|f| Some(f) != known.first()) {
-        c.comparable = false;
-        c.warnings.push(
-            "the runs were benchmarked on different held-out frames (the exports changed between \
-             them), so their AP is not comparable; queue the comparison again"
-                .into(),
+        return (
+            false,
+            vec![
+                "the runs were benchmarked on different held-out frames (the exports changed \
+                 between them), so their AP is not comparable; queue the comparison again"
+                    .into(),
+            ],
         );
-    } else if !known.is_empty() && known.len() < prints.len() {
+    }
+    let mut warnings = Vec::new();
+    if !known.is_empty() && known.len() < prints.len() {
         let names: Vec<&str> = prints
             .iter()
             .filter(|(_, f)| f.is_none())
             .map(|(n, _)| *n)
             .collect();
-        c.warnings.push(format!(
+        warnings.push(format!(
             "{} recorded no held-out fingerprint (an older version): the held-out frames may \
              differ",
             names.join(", ")
         ));
     }
-    if let Some(first) = runs.first() {
-        if runs.iter().any(|r| r.classes != first.classes) {
-            c.warnings.push(
-                "the runs train different classes: AP is averaged over different classes".into(),
-            );
-        }
-        if runs.iter().any(|r| r.rename != first.rename) {
-            let mut seen: Vec<(&String, &String)> = Vec::new();
-            for r in runs {
-                for e in &r.rename {
-                    if !seen.contains(&e) {
-                        seen.push(e);
-                    }
-                }
-            }
-            let parts: Vec<String> = seen
-                .iter()
-                .filter_map(|(from, to)| {
-                    let n = runs
-                        .iter()
-                        .filter(|r| r.rename.get(*from) == Some(*to))
-                        .count();
-                    (n < runs.len()).then(|| {
-                        let to = if to.is_empty() {
-                            "dropped"
-                        } else {
-                            to.as_str()
-                        };
-                        format!("{from} \u{2192} {to} on {n} of {}", runs.len())
-                    })
-                })
-                .collect();
-            c.warnings.push(format!(
-                "the runs merge classes differently ({})",
-                parts.join(", ")
-            ));
-        }
-        if runs.iter().any(|r| r.excluded != first.excluded) {
-            c.warnings.push(
-                "the runs treat objects of untrained classes differently (background / frame \
-                 left out)"
-                    .into(),
-            );
-        }
-        let mut modes: Vec<IgnoreMode> = Vec::new();
-        for m in runs.iter().filter_map(|r| r.ignore) {
-            if !modes.contains(&m) {
-                modes.push(m);
-            }
-        }
-        if modes.len() > 1 {
-            let names: Vec<&str> = modes.iter().map(|m| m.as_str()).collect();
-            c.warnings.push(format!(
-                "the runs treat frames with an unsure or too-small object differently ({}): \
-                 their training and validation frames differ, so AP differences may come from \
-                 that",
-                names.join(" / ")
-            ));
-        }
-        let mut shares: Vec<String> = Vec::new();
-        for n in runs.iter().filter_map(|r| r.negative_share) {
-            let pct = format!("{:.0}%", n * 100.0);
-            if !shares.contains(&pct) {
-                shares.push(pct);
-            }
-        }
-        if shares.len() > 1 {
-            c.warnings.push(format!(
-                "the runs keep different shares of empty training frames ({}): their training frames differ, so differences in false alerts may come from that",
-                shares.join(" / ")
-            ));
-        }
-        let mut caps: Vec<u32> = Vec::new();
-        for n in runs.iter().filter_map(|r| r.static_cap) {
-            if !caps.contains(&n) {
-                caps.push(n);
-            }
-        }
-        if caps.len() > 1 {
-            let list: Vec<String> = caps
-                .iter()
-                .map(|n| {
-                    if *n == 0 {
-                        "off".to_string()
-                    } else {
-                        n.to_string()
-                    }
-                })
-                .collect();
-            c.warnings.push(format!(
-                "the runs cap static objects differently ({}): their training frames differ, so AP differences may come from that",
-                list.join(" / ")
-            ));
-        }
-        let mut thresholds: Vec<f32> = Vec::new();
-        for t in runs
-            .iter()
-            .filter_map(|r| r.bench.as_ref().and_then(|b| b.threshold))
-        {
-            if !thresholds.contains(&t) {
-                thresholds.push(t);
-            }
-        }
-        if thresholds.len() > 1 {
-            let list: Vec<String> = thresholds.iter().map(|t| format!("{t:.2}")).collect();
-            c.warnings.push(format!(
-                "the runs were benchmarked at different confidence thresholds ({}): their \
-                 recall and false alerts are not comparable",
-                list.join(" / ")
-            ));
-        }
-        if runs.iter().any(|r| r.balance != first.balance) {
-            let kinds = runs.iter().map(|r| r.balance.describe());
-            let mut uniq: Vec<String> = Vec::new();
-            for k in kinds {
-                if !uniq.contains(&k) {
-                    uniq.push(k);
-                }
-            }
-            c.warnings.push(format!(
-                "the runs balance their training frames differently ({}): AP differences may \
-                 come from the balancing",
-                uniq.join(" / ")
-            ));
-        }
-        // The classes each run's AP averages (only runs that recorded them).
-        let mut bases: Vec<String> = Vec::new();
-        for b in runs
-            .iter()
-            .filter_map(|r| r.bench.as_ref().and_then(|b| b.ap_basis.as_ref()))
-        {
-            let mut names = b.classes.clone();
-            names.sort();
-            let words = names.join(", ");
-            if !bases.contains(&words) {
-                bases.push(words);
-            }
-        }
-        if bases.len() > 1 {
-            c.warnings.push(format!(
-                "the runs' AP averages different classes ({}): a class counts in the average only \
-                 with at least {} held-out objects, so their AP columns are not comparable",
-                bases.join(" / "),
-                crate::benchmark::metrics::MIN_CLASS_GT
-            ));
-        }
-        let mut picked: Vec<String> = Vec::new();
-        for r in runs {
-            let v = r
-                .select_classes
-                .as_ref()
-                .map_or_else(|| "every class".to_string(), |c| c.join(", "));
-            if !picked.contains(&v) {
-                picked.push(v);
-            }
-        }
-        if picked.len() > 1 {
-            c.warnings.push(format!(
-                "the runs picked their best epoch over different classes ({}): a class counts \
-                 only with at least {} validation boxes, so their best epochs were chosen on \
-                 different evidence",
-                picked.join(" / "),
-                crate::benchmark::metrics::MIN_CLASS_GT
-            ));
-        }
-        // Each worker draws its own random augmentations: the same seed with another count is
-        // not the same run.
-        let mut counts: Vec<u32> = Vec::new();
-        for n in runs.iter().filter_map(|r| r.workers) {
-            if !counts.contains(&n) {
-                counts.push(n);
-            }
-        }
-        if counts.len() > 1 {
-            let list: Vec<String> = counts.iter().map(u32::to_string).collect();
-            c.warnings.push(format!(
-                "the runs used different numbers of data loader workers ({}): each worker draws \
-                 its own random augmentations, so even the same seed trained on other images; \
-                 small AP differences may come from that",
-                list.join(" / ")
-            ));
-        }
-        if runs.iter().any(|r| r.select_metric != first.select_metric) {
-            let mut names: Vec<&str> = Vec::new();
-            for m in runs.iter().map(|r| r.select_metric.short()) {
-                if !names.contains(&m) {
-                    names.push(m);
-                }
-            }
-            c.warnings.push(format!(
-                "the runs picked their best epoch by different metrics ({}): AP differences may \
-                 come from that choice",
-                names.join(" / ")
-            ));
-        }
+    (true, warnings)
+}
+
+/// The warnings on settings that differ between the runs, in this order: classes, merges,
+/// untrained classes, ignore mode, empty-frame share, static cap, threshold, balancing, AP
+/// classes, selection classes, workers, selection metric. Each set of values is told apart on
+/// the values themselves, except the empty-frame share (as printed, whole percent); balancing
+/// and the selection metric warn when any run differs from the first, even when their texts
+/// read the same.
+fn setting_warnings(runs: &[CompareRun]) -> Vec<String> {
+    let mut w = Vec::new();
+    let Some(first) = runs.first() else {
+        return w;
+    };
+    if runs.iter().any(|r| r.classes != first.classes) {
+        w.push("the runs train different classes: AP is averaged over different classes".into());
     }
-    c.rows = runs.iter().map(row_of).collect();
-    // The random picks: shown when every benchmarked run has enough; counts that differ mean
-    // the exports marked other frames as picks (the frames themselves are the fingerprint's).
-    let picks: Vec<Option<SubsetScore>> = c
-        .rows
+    if runs.iter().any(|r| r.rename != first.rename) {
+        w.push(rename_warning(runs));
+    }
+    if runs.iter().any(|r| r.excluded != first.excluded) {
+        w.push(
+            "the runs treat objects of untrained classes differently (background / frame left \
+             out)"
+                .into(),
+        );
+    }
+    let modes: Vec<String> = distinct(runs.iter().filter_map(|r| r.ignore))
+        .iter()
+        .map(|m| m.as_str().to_string())
+        .collect();
+    warn_if_mixed(&mut w, &modes, |l| {
+        format!(
+            "the runs treat frames with an unsure or too-small object differently ({l}): their \
+             training and validation frames differ, so AP differences may come from that"
+        )
+    });
+    let shares = distinct(
+        runs.iter()
+            .filter_map(|r| r.negative_share)
+            .map(|n| format!("{:.0}%", n * 100.0)),
+    );
+    warn_if_mixed(&mut w, &shares, |l| {
+        format!(
+            "the runs keep different shares of empty training frames ({l}): their training frames differ, so differences in false alerts may come from that"
+        )
+    });
+    let caps: Vec<String> = distinct(runs.iter().filter_map(|r| r.static_cap))
+        .iter()
+        .map(|n| {
+            if *n == 0 {
+                "off".to_string()
+            } else {
+                n.to_string()
+            }
+        })
+        .collect();
+    warn_if_mixed(&mut w, &caps, |l| {
+        format!(
+            "the runs cap static objects differently ({l}): their training frames differ, so AP differences may come from that"
+        )
+    });
+    let thresholds: Vec<String> = distinct(
+        runs.iter()
+            .filter_map(|r| r.bench.as_ref().and_then(|b| b.threshold)),
+    )
+    .iter()
+    .map(|t| format!("{t:.2}"))
+    .collect();
+    warn_if_mixed(&mut w, &thresholds, |l| {
+        format!(
+            "the runs were benchmarked at different confidence thresholds ({l}): their recall \
+             and false alerts are not comparable"
+        )
+    });
+    if runs.iter().any(|r| r.balance != first.balance) {
+        let kinds = distinct(runs.iter().map(|r| r.balance.describe()));
+        w.push(format!(
+            "the runs balance their training frames differently ({}): AP differences may come \
+             from the balancing",
+            kinds.join(" / ")
+        ));
+    }
+    // The classes each run's AP averages (only runs that recorded them).
+    let bases = distinct(
+        runs.iter()
+            .filter_map(|r| r.bench.as_ref().and_then(|b| b.ap_basis.as_ref()))
+            .map(|b| {
+                let mut names = b.classes.clone();
+                names.sort();
+                names.join(", ")
+            }),
+    );
+    warn_if_mixed(&mut w, &bases, |l| {
+        format!(
+            "the runs' AP averages different classes ({l}): a class counts in the average only \
+             with at least {} held-out objects, so their AP columns are not comparable",
+            crate::benchmark::metrics::MIN_CLASS_GT
+        )
+    });
+    let picked = distinct(runs.iter().map(|r| {
+        r.select_classes
+            .as_ref()
+            .map_or_else(|| "every class".to_string(), |c| c.join(", "))
+    }));
+    warn_if_mixed(&mut w, &picked, |l| {
+        format!(
+            "the runs picked their best epoch over different classes ({l}): a class counts only \
+             with at least {} validation boxes, so their best epochs were chosen on different \
+             evidence",
+            crate::benchmark::metrics::MIN_CLASS_GT
+        )
+    });
+    // Each worker draws its own random augmentations: the same seed with another count is not
+    // the same run.
+    let counts: Vec<String> = distinct(runs.iter().filter_map(|r| r.workers))
+        .iter()
+        .map(u32::to_string)
+        .collect();
+    warn_if_mixed(&mut w, &counts, |l| {
+        format!(
+            "the runs used different numbers of data loader workers ({l}): each worker draws its \
+             own random augmentations, so even the same seed trained on other images; small AP \
+             differences may come from that"
+        )
+    });
+    if runs.iter().any(|r| r.select_metric != first.select_metric) {
+        let names = distinct(runs.iter().map(|r| r.select_metric.short()));
+        w.push(format!(
+            "the runs picked their best epoch by different metrics ({}): AP differences may come \
+             from that choice",
+            names.join(" / ")
+        ));
+    }
+    w
+}
+
+/// "the runs merge classes differently (truck → car on 1 of 2, ...)": each merge not every run
+/// makes, in first-seen order.
+fn rename_warning(runs: &[CompareRun]) -> String {
+    let seen = distinct(runs.iter().flat_map(|r| r.rename.iter()));
+    let parts: Vec<String> = seen
+        .iter()
+        .filter_map(|(from, to)| {
+            let n = runs
+                .iter()
+                .filter(|r| r.rename.get(*from) == Some(*to))
+                .count();
+            (n < runs.len()).then(|| {
+                let to = if to.is_empty() {
+                    "dropped"
+                } else {
+                    to.as_str()
+                };
+                format!("{from} \u{2192} {to} on {n} of {}", runs.len())
+            })
+        })
+        .collect();
+    format!("the runs merge classes differently ({})", parts.join(", "))
+}
+
+/// Whether the random-picks column shows (every benchmarked run has enough), and the warning
+/// when the runs' pick counts differ (the exports marked other frames as picks; the frames
+/// themselves are the fingerprint's).
+fn random_picks(rows: &[Row], runs: &[CompareRun]) -> (bool, Option<String>) {
+    let picks: Vec<Option<SubsetScore>> = rows
         .iter()
         .zip(runs)
         .filter(|(_, r)| r.bench.is_some())
         .map(|(row, _)| row.random.clone())
         .collect();
-    c.random_column = !picks.is_empty()
+    let shown = !picks.is_empty()
         && picks
             .iter()
             .all(|p| p.as_ref().is_some_and(|p| p.images >= MIN_RANDOM_HELDOUT));
-    let mut counts: Vec<usize> = Vec::new();
-    for n in picks.iter().flatten().map(|p| p.images) {
-        if !counts.contains(&n) {
-            counts.push(n);
-        }
-    }
-    if counts.len() > 1 {
-        let list: Vec<String> = counts.iter().map(usize::to_string).collect();
-        c.warnings.push(format!(
+    let counts: Vec<String> = distinct(picks.iter().flatten().map(|p| p.images))
+        .iter()
+        .map(usize::to_string)
+        .collect();
+    let warning = (counts.len() > 1).then(|| {
+        format!(
             "the runs have different numbers of random picks among their held-out frames ({}): \
              the label files changed between their exports, so their random-pick scores are not \
              comparable; queue the comparison again",
-            list.join(" / ")
-        ));
-    }
+            counts.join(" / ")
+        )
+    });
+    (shown, warning)
+}
+
+/// Column id -> the best run row of each column ([`COLUMNS`]; ties: the first; `random` only
+/// when `random_column`).
+fn best_per_column(rows: &[Row], random_column: bool) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
     for (col, better) in COLUMNS {
-        if col == "random" && !c.random_column {
+        if col == "random" && !random_column {
             continue;
         }
         let lower = better == Better::Lower;
         let mut best: Option<(usize, f64)> = None;
-        for (i, r) in c.rows.iter().enumerate() {
+        for (i, r) in rows.iter().enumerate() {
             let Some(v) = value(r, col) else { continue };
             let better = match best {
                 None => true,
@@ -703,17 +712,17 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
             }
         }
         if let Some((i, _)) = best {
-            c.best_per_column.insert(col.to_string(), i);
+            out.insert(col.to_string(), i);
         }
     }
-    c.seed_summaries = seed_summaries(&c.rows, c.random_column);
-    // Routed rows, per model: the day run's day AP, the night run's night / IR AP.
-    let mut models: Vec<&str> = Vec::new();
-    for r in runs {
-        if !models.contains(&r.model.as_str()) {
-            models.push(&r.model);
-        }
-    }
+    out
+}
+
+/// One routed row per model with a benchmarked day run and night (or IR) run: the day run's day
+/// AP beside the night run's night / IR AP.
+fn routed_rows(runs: &[CompareRun]) -> Vec<Row> {
+    let models = distinct(runs.iter().map(|r| r.model.as_str()));
+    let mut out = Vec::new();
     for m in models {
         let of_model = || {
             runs.iter()
@@ -727,7 +736,7 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
             continue;
         };
         let (dr, nr) = (row_of(d), row_of(n));
-        c.rows.push(Row {
+        out.push(Row {
             name: format!("{} + {}", d.name, n.name),
             model: m.to_string(),
             scene: format!("day + {} routed", n.scene),
@@ -750,7 +759,7 @@ pub fn compare(runs: &[CompareRun]) -> Comparison {
             random: None,
         });
     }
-    c
+    out
 }
 
 fn fmt_ap(v: Option<f64>) -> String {
@@ -1497,6 +1506,134 @@ mod tests {
             .expect("a warning");
         assert!(w.contains("every class / car, person"), "{w}");
         assert!(w.contains("20 validation boxes"), "{w}");
+    }
+
+    #[test]
+    fn every_setting_warning_in_order_and_its_dedupe_rule() {
+        use crate::training::dataset::BalanceAxis;
+        let a = run("a", SceneFilter::DAY, 0.5, 0.5, 0.5, 10.0);
+        let mut b = run("b", SceneFilter::DAY, 0.4, 0.4, 0.4, 10.0);
+        b.bench.as_mut().unwrap().heldout_fingerprint = None;
+        b.classes.push("car".into());
+        b.rename.insert("truck".into(), "car".into());
+        b.rename.insert("bike".into(), String::new());
+        b.excluded = Excluded::DropFrame;
+        b.ignore = Some(IgnoreMode::DropFrame);
+        b.negative_share = Some(0.25);
+        b.static_cap = Some(0);
+        b.balance.axes.insert(BalanceAxis::Class);
+        b.balance.axes.insert(BalanceAxis::Camera);
+        b.select_classes = Some(vec!["person".into()]);
+        b.workers = Some(4);
+        b.select_metric = SelectMetric::F2;
+        let mut a = a;
+        a.bench.as_mut().unwrap().threshold = Some(0.4);
+        a.bench.as_mut().unwrap().ap_basis = Some(crate::benchmark::metrics::ApBasis {
+            min_gt: 10,
+            classes: vec!["person".into(), "car".into()],
+            fell_back: false,
+        });
+        b.bench.as_mut().unwrap().threshold = Some(0.55);
+        b.bench.as_mut().unwrap().ap_basis = Some(crate::benchmark::metrics::ApBasis {
+            min_gt: 10,
+            classes: vec!["person".into()],
+            fell_back: false,
+        });
+        let c = compare(&[a.clone(), b.clone()]);
+        assert!(c.comparable);
+        assert_eq!(c.warnings, every_warning(), "{:#?}", c.warnings);
+
+        // Thresholds are told apart as numbers, then printed to two places: 0.501 and 0.502
+        // warn as "0.50 / 0.50".
+        let (mut t1, mut t2) = (run("t1", SceneFilter::DAY, 0.5, 0.5, 0.5, 10.0), a.clone());
+        t2.name = "t2".into();
+        t1.bench.as_mut().unwrap().ap_basis = a.bench.as_ref().unwrap().ap_basis.clone();
+        t1.bench.as_mut().unwrap().threshold = Some(0.501);
+        t2.bench.as_mut().unwrap().threshold = Some(0.502);
+        assert_eq!(
+            compare(&[t1, t2]).warnings,
+            [
+                "the runs were benchmarked at different confidence thresholds (0.50 / 0.50): \
+                 their recall and false alerts are not comparable"
+            ]
+        );
+        // The empty-frame share is told apart as printed: 15.1% and 15.2% are both "15%".
+        let (mut n1, mut n2) = (a.clone(), a.clone());
+        n1.negative_share = Some(0.151);
+        n2.negative_share = Some(0.152);
+        assert!(compare(&[n1, n2]).warnings.is_empty());
+        // Balancing warns when the settings differ, even when they read the same ("off").
+        let (b1, mut b2) = (a.clone(), a.clone());
+        b2.balance.strength = 1.0;
+        assert_eq!(b1.balance.describe(), b2.balance.describe());
+        assert_eq!(
+            compare(&[b1, b2]).warnings,
+            [
+                "the runs balance their training frames differently (off): AP differences may \
+                 come from the balancing"
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_keeps_first_seen_order_and_warn_if_mixed_needs_two() {
+        assert_eq!(distinct([3, 1, 3, 2, 1]), [3, 1, 2]);
+        assert_eq!(distinct([0.501_f32, 0.502, 0.501]), [0.501, 0.502]);
+        assert!(distinct(Vec::<u8>::new()).is_empty());
+        let mut w = Vec::new();
+        warn_if_mixed(&mut w, &["a".into()], |l| format!("({l})"));
+        assert!(w.is_empty());
+        warn_if_mixed(&mut w, &["a".into(), "b".into()], |l| format!("({l})"));
+        assert_eq!(w, ["(a / b)"]);
+    }
+
+    /// What [`every_setting_warning_in_order_and_its_dedupe_rule`] pins: every warning of two
+    /// runs that differ in everything, in their order.
+    fn every_warning() -> Vec<String> {
+        let min = crate::benchmark::metrics::MIN_CLASS_GT;
+        vec![
+            "b recorded no held-out fingerprint (an older version): the held-out frames may differ"
+                .to_string(),
+            "the runs train different classes: AP is averaged over different classes".into(),
+            "the runs merge classes differently (bike \u{2192} dropped on 1 of 2, truck \u{2192} car \
+             on 1 of 2)"
+                .into(),
+            "the runs treat objects of untrained classes differently (background / frame left out)"
+                .into(),
+            "the runs treat frames with an unsure or too-small object differently (background / \
+             drop-frame): their training and validation frames differ, so AP differences may come \
+             from that"
+                .into(),
+            "the runs keep different shares of empty training frames (15% / 25%): their training \
+             frames differ, so differences in false alerts may come from that"
+                .into(),
+            "the runs cap static objects differently (20 / off): their training frames differ, so \
+             AP differences may come from that"
+                .into(),
+            "the runs were benchmarked at different confidence thresholds (0.40 / 0.55): their \
+             recall and false alerts are not comparable"
+                .into(),
+            "the runs balance their training frames differently (off / class+camera, strength \
+             0.5, max 4x): AP differences may come from the balancing"
+                .into(),
+            format!(
+                "the runs' AP averages different classes (car, person / person): a class counts in \
+                 the average only with at least {min} held-out objects, so their AP columns are \
+                 not comparable"
+            ),
+            format!(
+                "the runs picked their best epoch over different classes (every class / person): \
+                 a class counts only with at least {min} validation boxes, so their best epochs \
+                 were chosen on different evidence"
+            ),
+            "the runs used different numbers of data loader workers (2 / 4): each worker draws \
+             its own random augmentations, so even the same seed trained on other images; small \
+             AP differences may come from that"
+                .into(),
+            "the runs picked their best epoch by different metrics (mAP / F2): AP differences may \
+             come from that choice"
+                .into(),
+        ]
     }
 
     #[test]

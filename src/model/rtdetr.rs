@@ -7,10 +7,10 @@
 
 use anyhow::Result;
 
-use super::yolo26::meets;
+use super::output::{find_output, meets};
 use super::{
     Detection, ExtraData, ExtraInput, Family, ModelFamilyKind, NamedOutput, PostParams,
-    PreprocessCtx, ResizeMode, retain_finite,
+    PreprocessCtx, ResizeMode, class_index_i64, retain_finite,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,18 +22,6 @@ impl RtDetr {
     pub fn new(num_classes: usize) -> Self {
         Self { num_classes }
     }
-}
-
-fn find<'a>(outputs: &'a [NamedOutput], name: &str) -> Result<&'a NamedOutput> {
-    outputs.iter().find(|o| o.name == name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "rtdetr: missing output `{name}`; got {:?}",
-            outputs
-                .iter()
-                .map(|o| (&o.name, &o.shape))
-                .collect::<Vec<_>>()
-        )
-    })
 }
 
 /// Number of queries for `[1, N, ..tail]` or `[N, ..tail]`.
@@ -69,9 +57,9 @@ impl Family for RtDetr {
         ctx: &PreprocessCtx,
         params: &PostParams,
     ) -> Result<Vec<Detection>> {
-        let labels_o = find(outputs, "labels")?;
-        let boxes_o = find(outputs, "boxes")?;
-        let scores_o = find(outputs, "scores")?;
+        let labels_o = find_output("rtdetr", outputs, "labels")?;
+        let boxes_o = find_output("rtdetr", outputs, "boxes")?;
+        let scores_o = find_output("rtdetr", outputs, "scores")?;
 
         let n_labels = queries(labels_o, &[], "[1, N]")?;
         let n_boxes = queries(boxes_o, &[4], "[1, N, 4]")?;
@@ -115,7 +103,7 @@ impl Family for RtDetr {
                 continue;
             }
             // Negative labels (padding) and absurd ones are skipped.
-            let Some(class_id) = usize::try_from(label).ok().filter(|&c| c <= 1_000_000) else {
+            let Some(class_id) = class_index_i64(label) else {
                 continue;
             };
             let (x1, y1, x2, y2) = ctx.to_original(bx1, by1, bx2, by2);

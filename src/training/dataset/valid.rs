@@ -4,7 +4,7 @@
 //! holds that many of its boxes (a noisy checkpoint choice otherwise). Pure.
 
 use super::{
-    FrameRef, Options, Source, UNKNOWN, class_boxes, frame_key, group_key, rank, share_of,
+    FrameRef, Options, Source, UNKNOWN, class_boxes, frame_key, group_key, seeded_rank, share_of,
 };
 use std::collections::BTreeMap;
 
@@ -163,7 +163,7 @@ pub(super) fn pick_valid_groups(
                     .zip(frame(r))
                     .map(|(s, f)| frame_key(s, f))
                     .unwrap_or_default();
-                rank(opts.seed ^ VALID_SALT, &key)
+                seeded_rank(opts.seed ^ VALID_SALT, &key)
             });
             let mut left = pool_boxes.clone();
             let mut valid: Vec<FrameRef> = Vec::new();
@@ -303,7 +303,7 @@ fn whole_groups(
         ));
     }
     let mut groups: Vec<ValidGroup> = by_key.into_values().collect();
-    groups.sort_by_cached_key(|g| (rank(seed ^ VALID_SALT, &g.key), g.key.clone()));
+    groups.sort_by_cached_key(|g| (seeded_rank(seed ^ VALID_SALT, &g.key), g.key.clone()));
     let count = groups.len();
     let cap = n_val.max(cands / 4);
     let mut frames: Vec<FrameRef> = Vec::new();

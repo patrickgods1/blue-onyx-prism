@@ -10,6 +10,7 @@ pub mod enhance;
 pub mod filters;
 pub mod name;
 pub mod nms;
+mod output;
 pub mod preprocess;
 pub mod rtdetr;
 pub mod yolo26;
@@ -18,6 +19,7 @@ pub mod yolo8;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -287,11 +289,85 @@ pub struct ExtraInput {
     pub data: ExtraData,
 }
 
+impl ExtraInput {
+    /// The element count of `shape`, when `data` holds exactly that many values. Both backends
+    /// check this before building the tensor and word the mismatch themselves.
+    pub fn checked_len(&self) -> Result<usize, ExtraLenMismatch> {
+        let values = self.data.len();
+        let elements = self.shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d));
+        match elements {
+            Some(n) if n == values => Ok(n),
+            _ => Err(ExtraLenMismatch { values, elements }),
+        }
+    }
+}
+
+/// An [`ExtraInput`] whose data length differs from its shape's element count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtraLenMismatch {
+    /// Values in the data.
+    pub values: usize,
+    /// Elements the shape holds; None when the product overflows `usize`.
+    pub elements: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExtraData {
     I64(Vec<i64>),
     I32(Vec<i32>),
     F32(Vec<f32>),
+}
+
+// One copy of the conversion for both backends: a port whose element type differs from the
+// supplied data gets the values cast with ONNX Cast semantics (float -> int saturates and
+// truncates toward zero, NaN -> 0; int64 -> int32 wraps), which is what `as` does.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "extra inputs are small image-size values built by the model family code; `as` keeps ONNX Cast semantics (saturating float->int, wrapping int64->int32) when the port type differs"
+)]
+impl ExtraData {
+    /// Number of values.
+    pub fn len(&self) -> usize {
+        match self {
+            ExtraData::I64(v) => v.len(),
+            ExtraData::I32(v) => v.len(),
+            ExtraData::F32(v) => v.len(),
+        }
+    }
+
+    /// True when there are no values.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The values as i64 (borrowed when they already are).
+    pub fn to_i64(&self) -> Cow<'_, [i64]> {
+        match self {
+            ExtraData::I64(v) => Cow::Borrowed(v),
+            ExtraData::I32(v) => v.iter().map(|&x| i64::from(x)).collect(),
+            ExtraData::F32(v) => v.iter().map(|&x| x as i64).collect(),
+        }
+    }
+
+    /// The values as i32 (borrowed when they already are).
+    pub fn to_i32(&self) -> Cow<'_, [i32]> {
+        match self {
+            ExtraData::I64(v) => v.iter().map(|&x| x as i32).collect(),
+            ExtraData::I32(v) => Cow::Borrowed(v),
+            ExtraData::F32(v) => v.iter().map(|&x| x as i32).collect(),
+        }
+    }
+
+    /// The values as f32 (borrowed when they already are).
+    pub fn to_f32(&self) -> Cow<'_, [f32]> {
+        match self {
+            ExtraData::I64(v) => v.iter().map(|&x| x as f32).collect(),
+            ExtraData::I32(v) => v.iter().map(|&x| x as f32).collect(),
+            ExtraData::F32(v) => Cow::Borrowed(v),
+        }
+    }
 }
 
 /// Shape/type description of a model port, used for family auto-detection and validation.
@@ -340,7 +416,14 @@ pub fn retain_finite(dets: &mut Vec<Detection>) {
 }
 
 /// Largest class index a model output is allowed to name (anything above is a broken export).
-pub const MAX_CLASS_INDEX: f32 = 1_000_000.0;
+pub(crate) const MAX_CLASS_ID: usize = 1_000_000;
+
+/// [`MAX_CLASS_ID`] as a float, for class ids emitted as floats (exact: below 2^24).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "1_000_000 is below 2^24, so the f32 holds it exactly"
+)]
+pub const MAX_CLASS_INDEX: f32 = MAX_CLASS_ID as f32;
 
 /// A class id emitted as a float: finite, non-negative and plausible, else None.
 #[allow(
@@ -351,6 +434,21 @@ pub const MAX_CLASS_INDEX: f32 = 1_000_000.0;
 pub(crate) fn class_index(v: f32) -> Option<usize> {
     let r = v.round();
     (r.is_finite() && (0.0..=MAX_CLASS_INDEX).contains(&r)).then_some(r as u32 as usize)
+}
+
+/// A class id emitted as an integer: non-negative (negative ids are padding) and at most
+/// [`MAX_CLASS_ID`], else None.
+pub(crate) fn class_index_i64(v: i64) -> Option<usize> {
+    usize::try_from(v).ok().filter(|&c| c <= MAX_CLASS_ID)
+}
+
+/// The label of class `id` as the response reports it: its name, or `class_<id>` for an id
+/// the class list does not cover.
+pub fn label_of(class_names: &[String], id: usize) -> Cow<'_, str> {
+    match class_names.get(id) {
+        Some(s) => Cow::Borrowed(s.as_str()),
+        None => Cow::Owned(format!("class_{id}")),
+    }
 }
 
 /// Thresholds applied during post-processing.
@@ -541,16 +639,6 @@ pub fn to_predictions(
     let h = ctx.orig_h.max(1) as f32;
     dets.iter()
         .filter_map(|d| {
-            let label = class_names
-                .get(d.class_id)
-                .cloned()
-                .unwrap_or_else(|| format!("class_{}", d.class_id));
-            if let Some(f) = filter
-                && !f.is_empty()
-                && !f.iter().any(|x| x.eq_ignore_ascii_case(&label))
-            {
-                return None;
-            }
             if !d.is_finite() {
                 return None;
             }
@@ -561,13 +649,20 @@ pub fn to_predictions(
             if x2 <= x1 || y2 <= y1 {
                 return None;
             }
+            let label = label_of(class_names, d.class_id);
+            if let Some(f) = filter
+                && !f.is_empty()
+                && !f.iter().any(|x| x.eq_ignore_ascii_case(&label))
+            {
+                return None;
+            }
             Some(crate::api::Prediction {
                 x_min: pixel(x1),
                 y_min: pixel(y1),
                 x_max: pixel(x2),
                 y_max: pixel(y2),
                 confidence: d.score.clamp(0.0, 1.0),
-                label,
+                label: label.into_owned(),
             })
         })
         .collect()
@@ -935,5 +1030,108 @@ mod tests {
         let mut v = dets.clone();
         retain_finite(&mut v);
         assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn unknown_class_ids_get_the_fallback_label_and_the_filter_sees_it() {
+        let ctx = PreprocessCtx {
+            orig_w: 100,
+            orig_h: 100,
+            input_w: 640,
+            input_h: 640,
+            mode: ResizeMode::Stretch,
+            scale: 1.0,
+            pad_x: 0.0,
+            pad_y: 0.0,
+        };
+        let names = vec!["person".to_string()];
+        assert_eq!(label_of(&names, 0), "person");
+        assert!(matches!(label_of(&names, 0), Cow::Borrowed(_)));
+        assert_eq!(label_of(&names, 7), "class_7");
+        assert_eq!(filters::label_of(&names, 7), "class_7");
+        let d = |class_id, x2| Detection {
+            x1: 1.0,
+            y1: 1.0,
+            x2,
+            y2: 10.0,
+            score: 0.5,
+            class_id,
+        };
+        // An empty box is dropped whatever its label; the filter matches the fallback label.
+        let dets = vec![d(7, 10.0), d(0, 10.0), d(7, 1.0)];
+        let filt = vec!["CLASS_7".to_string()];
+        let p = to_predictions(&dets, &ctx, &names, Some(&filt));
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].label, "class_7");
+        let all = to_predictions(&dets, &ctx, &names, Some(&[]));
+        let labels: Vec<_> = all.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["class_7", "person"]);
+    }
+
+    #[test]
+    fn integer_class_ids_are_capped() {
+        assert_eq!(class_index_i64(0), Some(0));
+        assert_eq!(class_index_i64(-1), None);
+        assert_eq!(class_index_i64(1_000_000), Some(MAX_CLASS_ID));
+        assert_eq!(class_index_i64(1_000_001), None);
+        assert_eq!(class_index(MAX_CLASS_INDEX), Some(MAX_CLASS_ID));
+        assert_eq!(class_index(1_000_001.0), None);
+    }
+
+    fn extra(shape: &[usize], data: ExtraData) -> ExtraInput {
+        ExtraInput {
+            name: "orig_target_sizes".into(),
+            shape: shape.to_vec(),
+            data,
+        }
+    }
+
+    #[test]
+    fn extra_input_length_is_checked_against_the_shape() {
+        assert_eq!(
+            extra(&[1, 2], ExtraData::I64(vec![640, 480])).checked_len(),
+            Ok(2)
+        );
+        assert_eq!(extra(&[], ExtraData::F32(vec![1.0])).checked_len(), Ok(1));
+        assert_eq!(
+            extra(&[1, 2], ExtraData::I32(vec![640])).checked_len(),
+            Err(ExtraLenMismatch {
+                values: 1,
+                elements: Some(2)
+            })
+        );
+        assert_eq!(
+            extra(&[usize::MAX, 2], ExtraData::I64(vec![1, 2])).checked_len(),
+            Err(ExtraLenMismatch {
+                values: 2,
+                elements: None
+            })
+        );
+        assert_eq!(extra(&[0], ExtraData::I64(Vec::new())).checked_len(), Ok(0));
+    }
+
+    #[test]
+    fn extra_data_converts_with_onnx_cast_semantics() {
+        // Same type: borrowed, unchanged.
+        let i = ExtraData::I64(vec![640, -3]);
+        assert!(matches!(i.to_i64(), Cow::Borrowed(_)));
+        assert!(matches!(ExtraData::I32(vec![1]).to_i32(), Cow::Borrowed(_)));
+        assert!(matches!(
+            ExtraData::F32(vec![1.0]).to_f32(),
+            Cow::Borrowed(_)
+        ));
+        // int64 -> int32 wraps.
+        let big = ExtraData::I64(vec![5_000_000_000, -1, 640]);
+        assert_eq!(&*big.to_i32(), &[705_032_704, -1, 640]);
+        assert_eq!(&*big.to_f32(), &[5e9, -1.0, 640.0]);
+        // float -> int truncates toward zero, saturates, NaN -> 0.
+        let f = ExtraData::F32(vec![-1.5, 2.9, f32::NAN, 1e20, -1e20]);
+        assert_eq!(&*f.to_i64(), &[-1, 2, 0, i64::MAX, i64::MIN]);
+        assert_eq!(&*f.to_i32(), &[-1, 2, 0, i32::MAX, i32::MIN]);
+        let n = ExtraData::I32(vec![-7, 640]);
+        assert_eq!(&*n.to_i64(), &[-7, 640]);
+        assert_eq!(&*n.to_f32(), &[-7.0, 640.0]);
+        assert_eq!((f.len(), f.is_empty()), (5, false));
+        assert!(ExtraData::I32(Vec::new()).is_empty());
     }
 }

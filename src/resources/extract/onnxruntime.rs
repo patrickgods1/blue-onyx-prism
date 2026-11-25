@@ -8,9 +8,6 @@ use super::*;
 // ONNX Runtime / DirectML
 // ---------------------------------------------------------------------------------------------
 
-/// File naming the flavor in an ONNX Runtime install directory.
-pub(crate) const ORT_FLAVOR_FILE: &str = "flavor.txt";
-
 /// Library stem of a file name (`onnxruntime.dll` -> `onnxruntime`,
 /// `libonnxruntime.so.1.24.4` -> `onnxruntime`, `libonnxruntime.1.24.4.dylib` -> `onnxruntime`).
 /// None when the name is not a shared library of the target OS.
@@ -115,8 +112,8 @@ pub(crate) fn ort_wanted(
 /// True for a file a previous ONNX Runtime install may have left in a directory (removed before
 /// installing into a shared directory so flavors never mix).
 pub(crate) fn is_ort_file(name: &str, windows: bool) -> bool {
-    name == ORT_FLAVOR_FILE
-        || name == "VERSION"
+    name == FLAVOR_FILE
+        || name == VERSION_FILE
         || name == DIRECTML_DLL
         || lib_stem(name, windows)
             .is_some_and(|s| CORE_STEMS.contains(&s) || GPU_STEMS.contains(&s))

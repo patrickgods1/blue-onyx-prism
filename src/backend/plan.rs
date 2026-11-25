@@ -21,7 +21,7 @@
 //! ONNX Runtime lands on `ort:cpu`.
 
 use super::detect::HardwareInfo;
-use super::select::{RuntimeProbe, Selection, select};
+use super::select::{RuntimeProbe, Selection, is_ov_gpu, ov_gpu_name_matches, select};
 use super::spec::{Device, DeviceSpec, Runtime, Target};
 use anyhow::Result;
 use tracing::warn;
@@ -308,26 +308,13 @@ fn explicit_candidates(
     }
 }
 
-/// An OpenVINO GPU device name: `GPU` or `GPU.N`.
-fn is_ov_gpu(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    upper == "GPU" || upper.starts_with("GPU.")
-}
-
-/// Whether OpenVINO lists the GPU `index` asks for: any GPU for a bare `openvino:gpu`; `GPU.N`
-/// for `openvino:gpu.N`, or a bare `GPU` for N = 0 when OpenVINO lists no numbered GPU (one GPU
-/// is listed as `GPU`, which is `GPU.0`).
+/// Whether OpenVINO lists the GPU `index` asks for: any GPU for a bare `openvino:gpu`; for
+/// `openvino:gpu.N` the rule of [`ov_gpu_name_matches`].
 fn ov_gpu_listed(available: &[String], index: Option<u32>) -> bool {
-    let gpus: Vec<&String> = available.iter().filter(|d| is_ov_gpu(d)).collect();
+    let names = available.iter().map(String::as_str);
     match index {
-        None => !gpus.is_empty(),
-        Some(n) => {
-            let want = format!("GPU.{n}");
-            gpus.iter().any(|d| d.eq_ignore_ascii_case(&want))
-                || (n == 0
-                    && gpus.iter().any(|d| d.eq_ignore_ascii_case("GPU"))
-                    && !gpus.iter().any(|d| d.contains('.')))
-        }
+        None => available.iter().any(|d| is_ov_gpu(d)),
+        Some(n) => ov_gpu_name_matches(names, n).is_some(),
     }
 }
 

@@ -6,7 +6,8 @@
 //! - `port`, `device`, ... : top-level config fields (`benchmark.<field>` for the benchmark section);
 //! - `model::<name>`: the model exists (value `true`);
 //! - `model:<field>:<name>`: a field of a model entry (`device`, `confidence_threshold`, ...);
-//! - `default`: the model that serves `/v1/vision/detection` (the Models card's radio);
+//! - `default_model` (a top-level field): the model that serves `/v1/vision/detection` (the
+//!   Models card's radio); none = the first enabled model;
 //! - `models:order`: the models' order (normalized names).
 //!
 //! `<name>` is the model's normalized name ([`normalize_name`]), so entries are identified by
@@ -25,7 +26,6 @@ use std::collections::{BTreeMap, BTreeSet};
 pub type Fields = BTreeMap<String, Value>;
 
 pub const ORDER_KEY: &str = "models:order";
-pub const DEFAULT_KEY: &str = "default";
 
 pub fn model_key(field: &str, name: &str) -> String {
     format!("model:{field}:{}", normalize_name(name))
@@ -41,7 +41,6 @@ pub enum Key<'a> {
     Global(&'a str),
     Bench(&'a str),
     Order,
-    Default,
     Presence(&'a str),
     Model { field: &'a str, name: &'a str },
 }
@@ -49,9 +48,6 @@ pub enum Key<'a> {
 pub fn parse_key(k: &str) -> Key<'_> {
     if k == ORDER_KEY {
         return Key::Order;
-    }
-    if k == DEFAULT_KEY {
-        return Key::Default;
     }
     if let Some(rest) = k.strip_prefix("model:")
         && let Some((field, name)) = rest.split_once(':')
@@ -236,7 +232,6 @@ pub fn label(key: &str, names: &BTreeMap<String, String>) -> String {
         Key::Global(k) => global_label(k),
         Key::Bench(k) => format!("Benchmark {}", k.replace('_', " ")),
         Key::Order => "Models order".into(),
-        Key::Default => "Default model".into(),
         Key::Presence(n) => format!("Model {}", show(n)),
         Key::Model { field, name } => format!("{} \u{b7} {}", show(name), field_label(field)),
     }
@@ -266,7 +261,6 @@ pub fn value_text(key: &str, v: Option<&Value>) -> String {
         Key::Model { field, .. } => (field, false),
         Key::Presence(_) => ("", true),
         Key::Global(k) => (k, false),
-        Key::Default => ("default", false),
         _ => ("", false),
     };
     match v {
@@ -275,7 +269,7 @@ pub fn value_text(key: &str, v: Option<&Value>) -> String {
         Some(Value::Bool(true)) if presence => "present".into(),
         Some(Value::Null) => match field {
             "device" | "confidence_threshold" | "object_filter" => "global".into(),
-            "default" => "first enabled".into(),
+            "default_model" => "first enabled".into(),
             _ => "(none)".into(),
         },
         Some(Value::String(s)) if s.is_empty() => "(empty)".into(),
@@ -506,7 +500,6 @@ pub fn applied_live(changes: &[FieldChange]) -> Vec<String> {
         .iter()
         .filter(|c| match parse_key(&c.key) {
             Key::Global(g) => live_global(g),
-            Key::Default => true,
             Key::Model { field, .. } => LIVE_MODEL_FIELDS.contains(&field),
             _ => false,
         })
@@ -761,6 +754,22 @@ mod tests {
         });
         let (_, summary) = describe_changes(&a, &b);
         assert!(summary.contains("x added"), "{summary}");
+    }
+
+    /// QA-207: clearing the global `default_model` reads "first enabled" (the model that then
+    /// serves `/v1/vision/detection`), not "(none)"; setting it names the model.
+    #[test]
+    fn clearing_the_default_model_reads_first_enabled() {
+        let a = cfg();
+        assert!(a.default_model.is_some());
+        let mut b = a.clone();
+        b.default_model = None;
+        let (changes, summary) = describe_changes(&a, &b);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(summary, "Default model \u{2192} first enabled");
+        let (_, summary) = describe_changes(&b, &a);
+        assert_eq!(summary, "Default model \u{2192} IPcam-general");
+        assert_eq!(applied_live(&changes), ["Default model"]);
     }
 
     #[test]

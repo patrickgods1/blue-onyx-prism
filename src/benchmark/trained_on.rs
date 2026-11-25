@@ -1,8 +1,10 @@
 //! How much of a benchmark set a model trained on: a score on its own training frames says
 //! little about the frames it will see next. Frames are compared by identity
 //! (`<scene>/<camera>/<date>/<stem>.jpg`, [`frame_of_file`]) with the list of the run named by
-//! the model's `<model>.provenance.json` ([`trained_frames`]). Results of older versions get the
-//! share when they are served ([`backfill`]), from the image names they stored.
+//! the model's `<model>.provenance.json` ([`trained_frames`]), plus the frames its run's record
+//! of image sources names behind a renamed or cut list name (the step "Your cameras" uses,
+//! [`super::cameras::seen::by_source`]). Results of older versions get the share when they are
+//! served ([`backfill`]), from the image names they stored.
 
 use super::report::BenchmarkResults;
 use crate::config::{Config, ModelConfig};
@@ -41,7 +43,18 @@ pub fn of_model<'a>(
     match trained_frames(config, m, &mut unused) {
         // No record gives an empty list and a warning; a run with no frames does not exist.
         Ok(trained) if trained.is_empty() => (None, None),
-        Ok(trained) => (share(files, &trained), None),
+        Ok(mut trained) => {
+            let files: Vec<&str> = files.into_iter().collect();
+            // Only the trained frames count; validated ones are no unfairness here.
+            super::cameras::seen::by_source(
+                config,
+                m,
+                files.iter().copied(),
+                &mut trained,
+                &mut BTreeSet::new(),
+            );
+            (share(files, &trained), None)
+        }
         Err(e) => (
             None,
             Some(format!(
@@ -165,6 +178,44 @@ mod tests {
         assert_eq!(of(&[C]), (Some(0.0), None));
         assert_eq!(of(&[A, C]), (Some(0.5), None));
         assert_eq!(of(&[A, B]), (Some(1.0), None));
+    }
+
+    /// QA-171: a frame the run listed under another name (renamed or cut) counts through the
+    /// run's record of image sources, as it does on "Your cameras" (`cameras::seen`).
+    #[test]
+    fn a_frame_named_only_by_image_sources_counts() {
+        let f = fixture(Some("run-1"), &[A]);
+        let models = f.root.join("models");
+        // A record `quick::seen_of` can locate: model file, input size, classes.
+        write(&models.join("custom.onnx"), "");
+        write(
+            &models.join("custom.provenance.json"),
+            r#"{"run_id":"run-1","recipe":{"imgsz":640},"classes":["person"]}"#,
+        );
+        let data = crate::training::training_dir(&f.config)
+            .join("run-1")
+            .join("data");
+        // The run listed C as `s0-renamed-2.jpg`: no frame name in the list.
+        let renamed = "s0-renamed-2.jpg";
+        write(
+            &data.join("train.txt"),
+            &format!("./images/{A}\n./images/{renamed}\n"),
+        );
+        write(&data.join("valid.txt"), "");
+        let export = f.root.join("export").join("images").join("train");
+        let flat_a = A.strip_prefix("s0-").unwrap();
+        let sources: std::collections::BTreeMap<&str, PathBuf> =
+            [(A, export.join(flat_a)), (renamed, export.join(C))].into();
+        write(
+            &data.join(crate::training::dataset::IMAGE_SOURCES_FILE),
+            &serde_json::to_string(&sources).unwrap(),
+        );
+        let of = |files: &[&'static str]| of_model(&f.config, &f.model, files.iter().copied());
+        assert_eq!(of(&[C]), (Some(1.0), None));
+        assert_eq!(of(&[A, B, C]), (Some(2.0 / 3.0), None));
+        // Without the record only the list's names count.
+        std::fs::remove_file(data.join(crate::training::dataset::IMAGE_SOURCES_FILE)).unwrap();
+        assert_eq!(of(&[C]), (Some(0.0), None));
     }
 
     #[test]

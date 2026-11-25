@@ -9,6 +9,10 @@
 //! thread's own throttle, with the error of the save that gets through and the count held back:
 //! such a write fails at once, so the queue never fills and every frame would log.
 //!
+//! The worker and its verify lane both hand an answered request on through [`After`] (the
+//! collector's record first, then the save, both after the reply), and build the save with
+//! [`SaveJob::for_answer`].
+//!
 //! [`QUEUE`] bounds the memory: each queued save holds its decoded frame (12.3 MB for 2688x1520).
 //! The thread keeps the normal priority: a lowered one could starve under CPU inference and
 //! drop every save.
@@ -48,6 +52,53 @@ pub(super) struct SaveJob {
     /// The upload's encoded bytes, written as the reference when they are a JPEG (None: the
     /// frame is encoded instead).
     pub(super) upload: Option<bytes::Bytes>,
+}
+
+impl SaveJob {
+    /// The save of an answer with `predictions` when the model saves images
+    /// (`save_image_path`) and the frame was kept; None otherwise.
+    pub(super) fn for_answer(
+        model: &str,
+        live: &super::LiveSettings,
+        image_name: &str,
+        img: Option<RgbImage>,
+        predictions: &[Prediction],
+        upload: Option<&bytes::Bytes>,
+    ) -> Option<Self> {
+        let (Some(dir), Some(img)) = (&live.save_image_path, img) else {
+            return None;
+        };
+        Some(Self {
+            model: model.to_string(),
+            dir: dir.clone(),
+            image_name: image_name.to_string(),
+            img,
+            predictions: predictions.to_vec(),
+            save_ref: live.save_ref_image,
+            upload: upload.cloned(),
+        })
+    }
+}
+
+/// What an answered request still hands on once its reply went out: the collector's record
+/// (with the answer's predictions) and the annotated image. [`Self::run`] keeps the order
+/// (collector first, then the saver), each a `try_send` that never waits.
+#[derive(Debug)]
+pub(super) struct After {
+    pub(super) collect: Option<(super::collect::Job, Vec<Prediction>)>,
+    pub(super) save: Option<SaveJob>,
+}
+
+impl After {
+    /// Submit the collector record, then the save (to `saver`, else the process-wide one).
+    pub(super) fn run(self, saver: Option<&Saver>) {
+        if let Some((job, predictions)) = self.collect {
+            job.submit(&predictions);
+        }
+        if let Some(job) = self.save {
+            submit(saver, job);
+        }
+    }
 }
 
 /// What [`Saver::submit`] did with a save.

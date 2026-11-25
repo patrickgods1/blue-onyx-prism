@@ -23,10 +23,14 @@
 //! - **Writes** ([`write_file`]) go through a temporary file made inside the folder, never in the
 //!   data root (which Users can read on Windows), then a rename over the old file, retried for a
 //!   short while when Windows reports a sharing violation (an antivirus or indexer holding it).
+//!   The Hugging Face token's folder (`tools/hf`, [`crate::resources::hf_token`]) is written
+//!   the same way, and its Windows DACL comes from the same `acl` helpers.
 
-use crate::resources::hf_token;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+
+#[cfg(any(windows, test))]
+pub(crate) mod acl;
 
 /// Folder name under the data root.
 pub const DIR_NAME: &str = "auth";
@@ -165,13 +169,13 @@ fn repaired_warning(dir: &Path) -> String {
     )
 }
 
-/// Windows: protect the folder ([`hf_token::protect_private_folder`], the service gets modify;
+/// Windows: protect the folder ([`acl::protect_private_folder`], the service gets modify;
 /// `icacls /reset` then `/inheritance:r`, so it is safe to run again on a folder that has files).
 /// Elsewhere: nothing to do here (Unix uses modes, see `close_unix`).
 fn protect_new_folder(dir: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        hf_token::protect_private_folder(dir, hf_token::ServiceAccess::Modify)
+        acl::protect_private_folder(dir, acl::ServiceAccess::Modify)
     }
     #[cfg(not(windows))]
     {
@@ -197,7 +201,7 @@ fn close_unix(dir: &Path, parent: &Path) -> Result<()> {
     })?;
     let mine = std::fs::metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
     let up = std::fs::metadata(parent).with_context(|| format!("reading {}", parent.display()))?;
-    if let Some((uid, gid)) = hf_token::chown_to(mine.uid(), (up.uid(), up.gid())) {
+    if let Some((uid, gid)) = chown_to(mine.uid(), (up.uid(), up.gid())) {
         chown(dir, Some(uid), Some(gid))
             .with_context(|| format!("giving {} to uid {uid}", dir.display()))?;
     }
@@ -239,6 +243,15 @@ pub fn write_file(dir: &Path, name: &str, text: &str) -> Result<()> {
     })
 }
 
+/// Who should own what account `me` made, when its folder (or data root) is `owner`'s: the
+/// owner, only when this runs as root and the owner is not root. Run as root (a `sudo` CLI
+/// command), what is made is handed over, or the service could not read it (nor add its own
+/// files beside it).
+#[cfg(any(unix, test))]
+pub(crate) fn chown_to(me: u32, owner: (u32, u32)) -> Option<(u32, u32)> {
+    (me == 0 && owner.0 != 0).then_some(owner)
+}
+
 /// Run as root, `made` goes to the owner of `dir` (see `close_unix`).
 #[cfg(unix)]
 fn give_to_folder_owner(made: &Path, dir: &Path) -> Result<()> {
@@ -247,7 +260,7 @@ fn give_to_folder_owner(made: &Path, dir: &Path) -> Result<()> {
         .with_context(|| format!("reading {}", made.display()))?
         .uid();
     let owner = std::fs::metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
-    if let Some((uid, gid)) = hf_token::chown_to(me, (owner.uid(), owner.gid())) {
+    if let Some((uid, gid)) = chown_to(me, (owner.uid(), owner.gid())) {
         chown(made, Some(uid), Some(gid))
             .with_context(|| format!("giving {} to uid {uid}", made.display()))?;
     }
@@ -400,6 +413,14 @@ mod tests {
         assert!(w.contains("administrator"), "{w}");
         write_file(&dir, "x", "y").unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("x")).unwrap(), "y");
+    }
+
+    #[test]
+    fn only_root_hands_files_over_and_never_to_root() {
+        assert_eq!(chown_to(0, (1001, 1002)), Some((1001, 1002)));
+        assert_eq!(chown_to(0, (0, 0)), None);
+        assert_eq!(chown_to(1001, (1001, 1001)), None);
+        assert_eq!(chown_to(1000, (1001, 1001)), None);
     }
 
     #[test]

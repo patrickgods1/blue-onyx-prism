@@ -269,7 +269,7 @@ impl OverlapsJob {
             100,
             &format!("{} frames gained suggestions", w.frames),
         );
-        let n = crate::training::import::preview::thousands;
+        let n = crate::training::text::thousands;
         let mut summary = if stopped {
             format!(
                 "stopped by Cancel after {} of {} crops; those were saved and a rerun does the \

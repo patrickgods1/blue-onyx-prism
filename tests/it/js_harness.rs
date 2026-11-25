@@ -86,3 +86,42 @@ pub fn run_node_json(driver: &str, args: &[&OsStr], files: &[(&str, &[u8])]) -> 
         )
     })
 }
+
+/// The message of a caught panic.
+fn panic_text(e: &(dyn std::any::Any + Send)) -> String {
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default()
+}
+
+/// The harness itself (QA-147): a CommonJS driver whose `await` never settles exits 0 once node's
+/// event loop is empty, so only the final `ok` line tells it from one that ran to the end;
+/// [`run_node_ok`] fails it, and one that printed something after `ok`.
+#[test]
+fn a_driver_that_stops_early_fails() {
+    if !have_node() {
+        return;
+    }
+    let hung = "(async () => { await new Promise(() => {}); console.log('ok'); })();";
+    let out = run_node(hung, &[], &[]);
+    assert!(
+        out.status.success(),
+        "node exits 0 on a promise that never settles"
+    );
+    let Err(caught) = std::panic::catch_unwind(|| run_node_ok(hung, &[])) else {
+        panic!("a driver that never got to `ok` passed");
+    };
+    let text = panic_text(caught.as_ref());
+    assert!(text.contains("did not end with `ok`"), "{text}");
+    let late =
+        "(async () => { console.log('ok'); await Promise.resolve(); console.log('{}'); })();";
+    assert!(
+        std::panic::catch_unwind(|| run_node_ok(late, &[])).is_err(),
+        "`ok` must be the last line"
+    );
+    run_node_ok(
+        "(async () => { await Promise.resolve(); console.log('ok'); })();",
+        &[],
+    );
+}

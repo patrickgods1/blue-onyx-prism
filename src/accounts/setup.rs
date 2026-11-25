@@ -54,19 +54,12 @@ impl SetupCode {
     /// Whether `presented` is this code, ignoring case, whitespace and dashes; constant time in
     /// both values.
     pub fn matches(&self, presented: &str) -> bool {
-        use sha2::{Digest, Sha256};
         let typed: String = presented
             .chars()
             .filter(|c| !c.is_whitespace() && *c != '-')
             .map(|c| c.to_ascii_uppercase())
             .collect();
-        let ours = Sha256::digest(self.0.as_bytes());
-        let theirs = Sha256::digest(typed.as_bytes());
-        let diff = ours
-            .iter()
-            .zip(theirs.iter())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        std::hint::black_box(diff) == 0
+        crate::secret::digest_eq(self.0.as_bytes(), typed.as_bytes())
     }
 }
 

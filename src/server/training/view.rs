@@ -1055,6 +1055,19 @@ pub(super) fn latency_parts(hint: &'static str) -> (&'static str, &'static str) 
     hint.split_once(": ").unwrap_or(("", hint))
 }
 
+/// The page of `tab` with `r`'s message (`Ok`) or error (`Err`), in the caller's words: the end of
+/// a form action that answers with the page either way.
+pub(in crate::server) fn flash(
+    state: &AppState,
+    tab: &'static str,
+    r: Result<String, String>,
+) -> axum::response::Response {
+    match r {
+        Ok(m) => crate::server::render(&view(state, tab, Some(m), None)),
+        Err(e) => crate::server::render(&view(state, tab, None, Some(e))),
+    }
+}
+
 pub(in crate::server) fn view(
     state: &AppState,
     tab: &'static str,

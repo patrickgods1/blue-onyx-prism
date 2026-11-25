@@ -15,7 +15,7 @@
 
 use super::spec::{Runtime, Target};
 use super::{Candidate, Completion, CoreOptions, LoadRequest, ModelInfo, OvBackend, OvCompiled};
-use crate::model::{ExtraData, ExtraInput, NamedOutput, PortElem, PortSpec};
+use crate::model::{ExtraInput, NamedOutput, PortElem, PortSpec};
 use crate::profile::{DeviceTuning, PerfHint};
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
@@ -912,7 +912,8 @@ pub(crate) fn load_model(
         introspect(&model)
             .with_context(|| format!("introspecting reshaped model {}", path.display()))?
     } else {
-        introspect(&model).with_context(|| format!("introspecting model {}", path.display()))?
+        // Nothing was reshaped: the ports read above are still the model's.
+        (inputs, outputs)
     };
     let img = inputs.get(image_idx).with_context(|| {
         format!(
@@ -1004,20 +1005,6 @@ pub(crate) fn load_model(
             compile_ms,
         },
     })
-}
-
-fn image_index(model: &ModelInfo) -> Result<usize> {
-    model
-        .inputs
-        .iter()
-        .position(|p| p.name == model.image_input)
-        .with_context(|| {
-            format!(
-                "model {}: image input '{}' not among inputs",
-                model.path.display(),
-                model.image_input
-            )
-        })
 }
 
 /// Context of one slot's completion callback: boxed in the slot, so its address is stable for
@@ -1140,7 +1127,7 @@ pub(crate) fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
         streams,
         optimal_requests,
     } = compiled;
-    let idx = image_index(&model)?;
+    let idx = model.image_index()?;
     let spec = model.inputs.get(idx).with_context(|| {
         format!(
             "model {}: image input index out of range",
@@ -1221,11 +1208,6 @@ pub(crate) fn create_backend(compiled: OvCompiled) -> Result<OvBackend> {
     })
 }
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "extra inputs are small image-size values built by the model family code; `as` keeps ONNX Cast semantics (saturating float->int, wrapping int64->int32) when the port type differs"
-)]
 fn extra_tensor(model: &ModelInfo, port: &PortSpec, extra: &ExtraInput) -> Result<Tensor> {
     let ctx = || {
         format!(
@@ -1235,16 +1217,18 @@ fn extra_tensor(model: &ModelInfo, port: &PortSpec, extra: &ExtraInput) -> Resul
             extra.shape
         )
     };
-    let dims: Vec<i64> = extra.shape.iter().map(|&d| d as i64).collect();
-    let n: usize = extra.shape.iter().product();
-    let len = match &extra.data {
-        ExtraData::I64(v) => v.len(),
-        ExtraData::I32(v) => v.len(),
-        ExtraData::F32(v) => v.len(),
-    };
-    if len != n {
-        anyhow::bail!("{}: {len} values for {n} elements", ctx());
+    if let Err(m) = extra.checked_len() {
+        let n = m
+            .elements
+            .map_or_else(|| "too many".to_string(), |n| n.to_string());
+        anyhow::bail!("{}: {} values for {n} elements", ctx(), m.values);
     }
+    let dims = extra
+        .shape
+        .iter()
+        .map(|&d| i64::try_from(d))
+        .collect::<Result<Vec<i64>, _>>()
+        .with_context(ctx)?;
     let shape = Shape::new(&dims).with_context(ctx)?;
     // Convert to the port's element type when it differs from the supplied data.
     let target = match port.elem {
@@ -1254,31 +1238,20 @@ fn extra_tensor(model: &ModelInfo, port: &PortSpec, extra: &ExtraInput) -> Resul
         other => anyhow::bail!("{}: unsupported port element type {other:?}", ctx()),
     };
     let mut t = Tensor::new(target, &shape).with_context(ctx)?;
+    // `checked_len` proved the data fills the tensor, so the copies cannot panic.
     match target {
-        ElementType::I64 => {
-            let dst = t.get_data_mut::<i64>().with_context(ctx)?;
-            match &extra.data {
-                ExtraData::I64(v) => dst.copy_from_slice(v),
-                ExtraData::I32(v) => dst.iter_mut().zip(v).for_each(|(d, s)| *d = *s as i64),
-                ExtraData::F32(v) => dst.iter_mut().zip(v).for_each(|(d, s)| *d = *s as i64),
-            }
-        }
-        ElementType::I32 => {
-            let dst = t.get_data_mut::<i32>().with_context(ctx)?;
-            match &extra.data {
-                ExtraData::I64(v) => dst.iter_mut().zip(v).for_each(|(d, s)| *d = *s as i32),
-                ExtraData::I32(v) => dst.copy_from_slice(v),
-                ExtraData::F32(v) => dst.iter_mut().zip(v).for_each(|(d, s)| *d = *s as i32),
-            }
-        }
-        _ => {
-            let dst = t.get_data_mut::<f32>().with_context(ctx)?;
-            match &extra.data {
-                ExtraData::I64(v) => dst.iter_mut().zip(v).for_each(|(d, s)| *d = *s as f32),
-                ExtraData::I32(v) => dst.iter_mut().zip(v).for_each(|(d, s)| *d = *s as f32),
-                ExtraData::F32(v) => dst.copy_from_slice(v),
-            }
-        }
+        ElementType::I64 => t
+            .get_data_mut::<i64>()
+            .with_context(ctx)?
+            .copy_from_slice(&extra.data.to_i64()),
+        ElementType::I32 => t
+            .get_data_mut::<i32>()
+            .with_context(ctx)?
+            .copy_from_slice(&extra.data.to_i32()),
+        _ => t
+            .get_data_mut::<f32>()
+            .with_context(ctx)?
+            .copy_from_slice(&extra.data.to_f32()),
     }
     Ok(t)
 }
@@ -1397,7 +1370,7 @@ pub(crate) fn submit(
     if s.busy {
         anyhow::bail!("{}: infer request {slot} is busy", where_());
     }
-    let idx = image_index(model)?;
+    let idx = model.image_index()?;
     {
         let dst = s
             .input

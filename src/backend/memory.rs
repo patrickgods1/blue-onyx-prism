@@ -743,9 +743,7 @@ pub fn commit_bytes() -> Option<Commit> {
 /// handles are not `Send`).
 pub struct PageIns {
     #[cfg(windows)]
-    query: windows::Win32::System::Performance::PDH_HQUERY,
-    #[cfg(windows)]
-    counter: windows::Win32::System::Performance::PDH_HCOUNTER,
+    pdh: super::pdh::PdhQuery,
     #[cfg(target_os = "linux")]
     last: (u64, std::time::Instant),
 }
@@ -761,63 +759,33 @@ impl PageIns {
     /// Opens the counter and takes its first reading; None when PDH refuses (a broken
     /// performance counter registry).
     pub fn open() -> Option<Self> {
-        use windows::Win32::System::Performance::{
-            PDH_HCOUNTER, PDH_HQUERY, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-            PdhOpenQueryW,
-        };
-        use windows::core::{PCWSTR, w};
-        let mut query = PDH_HQUERY::default();
-        // SAFETY: a null data source = live data; `query` is a live out-parameter written only
-        // during the call.
-        if unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) } != 0 {
-            return None;
-        }
-        let mut counter = PDH_HCOUNTER::default();
-        // SAFETY: `query` was opened above; the path is a NUL-terminated wide string literal;
-        // `counter` is a live out-parameter written only during the call.
-        let added = unsafe {
-            PdhAddEnglishCounterW(query, w!(r"\Memory\Pages Input/sec"), 0, &mut counter)
-        };
-        // SAFETY: `query` is open; collecting fills the counter's first raw value (a rate
-        // needs two).
-        if added != 0 || unsafe { PdhCollectQueryData(query) } != 0 {
-            // SAFETY: `query` is open and closed once here; nothing uses it afterwards.
-            unsafe { PdhCloseQuery(query) };
-            return None;
-        }
-        Some(Self { query, counter })
+        // SAFETY: a NUL-terminated wide string literal.
+        let pdh =
+            unsafe { super::pdh::PdhQuery::open(windows::core::w!(r"\Memory\Pages Input/sec")) }?;
+        Some(Self { pdh })
     }
 
     /// Pages read in per second since the last call; None when a reading fails.
     pub fn rate(&mut self) -> Option<f64> {
         use windows::Win32::System::Performance::{
             PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE,
-            PdhCollectQueryData, PdhGetFormattedCounterValue,
+            PdhGetFormattedCounterValue,
         };
-        // SAFETY: `self.query` stays open until drop.
-        if unsafe { PdhCollectQueryData(self.query) } != 0 {
+        if !self.pdh.collect() {
             return None;
         }
         let mut value = PDH_FMT_COUNTERVALUE::default();
-        // SAFETY: `self.counter` belongs to the open query; `value` is a live out-parameter
+        // SAFETY: the counter belongs to the open query; `value` is a live out-parameter
         // written only during the call; the type out-parameter is not asked for.
-        let rc =
-            unsafe { PdhGetFormattedCounterValue(self.counter, PDH_FMT_DOUBLE, None, &mut value) };
+        let rc = unsafe {
+            PdhGetFormattedCounterValue(self.pdh.counter(), PDH_FMT_DOUBLE, None, &mut value)
+        };
         if rc != 0 || !matches!(value.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
             return None;
         }
         // SAFETY: PDH_FMT_DOUBLE asked for the `doubleValue` member, which the call filled.
         let v = unsafe { value.Anonymous.doubleValue };
         (v.is_finite() && v >= 0.0).then_some(v)
-    }
-}
-
-#[cfg(windows)]
-impl Drop for PageIns {
-    fn drop(&mut self) {
-        // SAFETY: the query was opened in `open` and is closed once, here (closing it also
-        // removes its counter).
-        unsafe { windows::Win32::System::Performance::PdhCloseQuery(self.query) };
     }
 }
 

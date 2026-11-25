@@ -695,10 +695,11 @@ impl Drop for OpensGate {
     }
 }
 
-/// Wait until `join`'s thread ended, at most until `deadline`.
+/// Wait until `join`'s thread ended, at most until `deadline`, looking every
+/// [`crate::worker::JOIN_POLL`].
 fn wait_finished(join: &JoinHandle<()>, deadline: Instant) {
     while !join.is_finished() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(crate::worker::JOIN_POLL);
     }
 }
 

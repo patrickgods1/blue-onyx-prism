@@ -30,7 +30,9 @@
 //! walked within the query's wait.
 //!
 //! Locks, outermost first: `Index::walk` (one walk at a time), `Index::drain`, `Index::state`,
-//! `Index::names`. [`HUB`] is a leaf: nothing is taken while holding it, so [`written`] taking it
+//! `Index::names`, `Index::need` (the need cache's mutex, `query::NeedCache`: taken under `state`,
+//! and under both the `state` and `names` read guards in `Index::bytes`; nothing is taken while
+//! holding it). [`HUB`] is a leaf: nothing is taken while holding it, so [`written`] taking it
 //! under the label write lock cannot deadlock, and nothing here takes the label write lock. File
 //! reads happen off `state`: what a drain or swap applies under it was read before.
 

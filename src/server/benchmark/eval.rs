@@ -81,10 +81,14 @@ fn stamp_of(state: &AppState, revision: u64, now: &HashMap<String, ModelNow>) ->
     )
 }
 
-/// Load what the views read; 404 without results or stored predictions.
-pub(super) fn load(state: &AppState) -> Result<Loaded, ApiError> {
-    let (_, cfg) = state.config.snapshot();
-    let now = now_of(state, &cfg);
+/// Load what the views read, seen through `cfg` and the models' state `now` (the snapshot the
+/// caller keyed its answer by, [`stamp_of`]: the key and the value come from one state); 404
+/// without results or stored predictions.
+pub(super) fn load(
+    state: &AppState,
+    cfg: Config,
+    now: HashMap<String, ModelNow>,
+) -> Result<Loaded, ApiError> {
     let mut results = BenchmarkResults::load_or_warn(&results_path(&state.config_path))
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no benchmark results yet"))?;
     let preds = StoredPreds::load_cached(&preds_path(&state.config_path))
@@ -225,13 +229,14 @@ fn compare_blocking(
             format!("scene '{s}': use all, day, night or ir"),
         ));
     }
+    let now = now_of(state, &cfg);
     let key = format!(
         "compare|{}|{}|{set:?}|{scene:?}",
-        stamp_of(state, revision, &now_of(state, &cfg)),
+        stamp_of(state, revision, &now),
         goal.key()
     );
     cached(key, || {
-        let l = load(state)?;
+        let l = load(state, cfg, now)?;
         let view = l.compare(&goal, set.as_deref(), scene.as_deref());
         Ok(serde_json::json!({ "success": true, "compare": view }))
     })
@@ -267,14 +272,15 @@ fn tune_blocking(
     let device = q(m, "device").map(str::to_string);
     let set = q(m, "set").map(str::to_string);
     let goal = goal_of(&cfg, m)?;
+    let now = now_of(state, &cfg);
     let key = format!(
         "tune|{}|{}|{}|{device:?}|{set:?}",
-        stamp_of(state, revision, &now_of(state, &cfg)),
+        stamp_of(state, revision, &now),
         goal.key(),
         tune::key_of(&model)
     );
     cached(key, || {
-        let l = load(state)?;
+        let l = load(state, cfg, now)?;
         let probe = tune::build(
             &l.results,
             &l.preds,
@@ -350,14 +356,15 @@ fn tune_images_blocking(
         return Err(bad(format!("scene '{s}': use all, day, night or ir")));
     }
     let goal = goal_of(&cfg, m)?;
+    let now = now_of(state, &cfg);
     let key = format!(
         "images|{}|{}|{}|{device:?}|{set:?}|{threshold}|{kind:?}|{limit}|{offset}|{camera:?}|{scene:?}",
-        stamp_of(state, revision, &now_of(state, &cfg)),
+        stamp_of(state, revision, &now),
         goal.key(),
         tune::key_of(&model)
     );
     cached(key, || {
-        let l = load(state)?;
+        let l = load(state, cfg, now)?;
         let ex = tune::images(
             &l.results,
             &l.preds,
@@ -430,7 +437,10 @@ fn goal_blocking(state: &AppState, form: &[(String, String)]) -> Response {
         Ok(msg) => msg,
         Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
-    let ranking = load(state)
+    // The config the save just published.
+    let (_, cfg) = state.config.snapshot();
+    let now = now_of(state, &cfg);
+    let ranking = load(state, cfg, now)
         .ok()
         .map(|l| ranking_summary(&l.compare(&goal, None, None)));
     Json(serde_json::json!({

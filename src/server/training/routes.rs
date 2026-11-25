@@ -9,7 +9,7 @@ use super::fields::{
     DatasetEdit, allow_in, checked_datasets, checked_folder, data_fields, dataset_edit,
     offered_datasets, rename_of, requests_from_form, unique_name,
 };
-use super::view::{SCENE_CHOICES, group_comparison, view};
+use super::view::{SCENE_CHOICES, flash, group_comparison, view};
 use super::{poll, records, runs, service, shown, started_queue, sync_store, tasks};
 use crate::resources::catalog::{self, Platform};
 use crate::resources::export::train::{self as env, TrainPaths};
@@ -164,12 +164,7 @@ pub(crate) fn dataset_inventory(
         .collect();
     let mut frames = dataset::SceneCounts::default();
     for f in sources.iter().flat_map(|s| s.frames.iter()) {
-        *match f.scene.as_deref() {
-            Some("day") => &mut frames.day,
-            Some("night") => &mut frames.night,
-            Some("ir") => &mut frames.ir,
-            _ => &mut frames.unknown,
-        } += 1;
+        *frames.slot_mut(f.scene.as_deref()) += 1;
     }
     serde_json::json!({
         "success": true,
@@ -682,15 +677,11 @@ pub(in crate::server) async fn queue(
             }
             Ok(format!("Queued: {}.", queued.join(", ")))
         })();
-        match result {
-            Ok(m) => render(&view(&state, TRAIN, Some(m), None)),
-            Err(e) => render(&view(
-                &state,
-                TRAIN,
-                None,
-                Some(format!("Not queued: {e:#}")),
-            )),
-        }
+        flash(
+            &state,
+            TRAIN,
+            result.map_err(|e| format!("Not queued: {e:#}")),
+        )
     })
     .await
 }
@@ -737,15 +728,7 @@ pub(in crate::server) async fn finish(
         let r = started_queue()
             .ok_or_else(|| format!("no run {id}"))
             .and_then(|s| s.finish(&id));
-        match r {
-            Ok(m) => render(&view(&state, tab, Some(m), None)),
-            Err(e) => render(&view(
-                &state,
-                tab,
-                None,
-                Some(format!("Not finished: {e}.")),
-            )),
-        }
+        flash(&state, tab, r.map_err(|e| format!("Not finished: {e}.")))
     })
     .await
 }
@@ -825,15 +808,11 @@ pub(in crate::server) async fn retry_export(
                 rec.name
             ))
         })();
-        match result {
-            Ok(m) => render(&view(&state, tab, Some(m), None)),
-            Err(e) => render(&view(
-                &state,
-                tab,
-                None,
-                Some(format!("Not queued: {e:#}.")),
-            )),
-        }
+        flash(
+            &state,
+            tab,
+            result.map_err(|e| format!("Not queued: {e:#}.")),
+        )
     })
     .await
 }
@@ -856,29 +835,19 @@ pub(in crate::server) async fn remove(
                 .map_or(0, |r| retry::disk_use(&r.run_dir));
             let done =
                 service(&shared).remove_with_files(&id, |r| retry::delete_files_of(&config, r));
-            return match done {
-                Ok(r) => render(&view(
-                    &state,
-                    tab,
-                    Some(format!(
-                        "Removed run {} and deleted its files ({}).",
-                        r.name,
-                        catalog::format_size(size)
-                    )),
-                    None,
-                )),
-                Err(e) => render(&view(&state, tab, None, Some(e))),
-            };
+            let done = done.map(|r| {
+                format!(
+                    "Removed run {} and deleted its files ({}).",
+                    r.name,
+                    catalog::format_size(size)
+                )
+            });
+            return flash(&state, tab, done);
         }
-        match service(&shared).remove(&id) {
-            Ok(()) => render(&view(
-                &state,
-                tab,
-                Some(format!("Removed run {id} from the list.")),
-                None,
-            )),
-            Err(e) => render(&view(&state, tab, None, Some(e))),
-        }
+        let removed = service(&shared)
+            .remove(&id)
+            .map(|()| format!("Removed run {id} from the list."));
+        flash(&state, tab, removed)
     })
     .await
 }
@@ -940,15 +909,10 @@ pub(in crate::server) async fn use_model(
                 Ok(())
             })
         })();
-        match result {
-            Ok(m) => render(&view(&state, MODELS, Some(format!("{message} {m}")), None)),
-            Err(e) => render(&view(
-                &state,
-                MODELS,
-                None,
-                Some(format!("Not saved: {e:#}")),
-            )),
-        }
+        let result = result
+            .map(|m| format!("{message} {m}"))
+            .map_err(|e| format!("Not saved: {e:#}"));
+        flash(&state, MODELS, result)
     })
     .await
 }
@@ -1093,15 +1057,11 @@ pub(in crate::server) async fn datasets(
                     c.training.validate()
                 })
             });
-        match result {
-            Ok(m) => render(&view(&state, TRAIN, Some(m), None)),
-            Err(e) => render(&view(
-                &state,
-                TRAIN,
-                None,
-                Some(format!("Not saved: {e:#}")),
-            )),
-        }
+        flash(
+            &state,
+            TRAIN,
+            result.map_err(|e| format!("Not saved: {e:#}")),
+        )
     })
     .await
 }
@@ -1177,13 +1137,11 @@ pub(in crate::server) async fn set_dir(
         };
         match while_queue_idle(started_queue().as_deref(), save) {
             Err(why) => refused(format!("Not saved: {why}.")),
-            Ok(Ok(m)) => render(&view(&state, TRAIN, Some(m), None)),
-            Ok(Err(e)) => render(&view(
+            Ok(saved) => flash(
                 &state,
                 TRAIN,
-                None,
-                Some(format!("Not saved: {e:#}")),
-            )),
+                saved.map_err(|e| format!("Not saved: {e:#}")),
+            ),
         }
     })
     .await

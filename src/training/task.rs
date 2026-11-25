@@ -77,6 +77,18 @@ impl TaskKind {
             TaskKind::Refine => "refine",
         }
     }
+
+    /// What the task is called in a sentence, lower case: "import", "auto-label run", "overlap
+    /// check", "dataset check". Pages derive the capitalized and article forms from it; the Jobs
+    /// tab's short column labels ("Auto-label") are their own.
+    pub const fn noun(self) -> &'static str {
+        match self {
+            TaskKind::Import => "import",
+            TaskKind::Autolabel => "auto-label run",
+            TaskKind::Overlaps => "overlap check",
+            TaskKind::Refine => "dataset check",
+        }
+    }
 }
 
 /// The seams a task runs on (the queue's).
@@ -228,18 +240,13 @@ impl TaskRecord {
                 Some(a) => format!("queued (after {a})"),
                 None => "queued".into(),
             },
-            RunState::Running => match &self.stage {
-                Some(s) if self.detail.is_empty() => format!("{s} ({}/{})", self.step, self.steps),
-                Some(s) => format!("{s} ({}/{}): {}", self.step, self.steps, self.detail),
-                None => "starting".into(),
-            },
-            RunState::Paused => match &self.stage {
-                Some(s) if self.detail.is_empty() => {
-                    format!("paused ({s} {}/{})", self.step, self.steps)
-                }
-                Some(s) => format!("paused ({s} {}/{}): {}", self.step, self.steps, self.detail),
-                None => "paused".into(),
-            },
+            RunState::Running | RunState::Paused => crate::training::service::progress_text(
+                self.state == RunState::Paused,
+                self.stage.as_deref(),
+                self.step,
+                self.steps,
+                &self.detail,
+            ),
             RunState::Done => format!("done: {}", self.summary.as_deref().unwrap_or("")),
             RunState::Failed => format!(
                 "failed{}: {}",

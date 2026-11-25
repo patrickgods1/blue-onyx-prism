@@ -40,7 +40,7 @@ use super::file_id::FileId;
 use super::job::{Baseline, BenchSummary, CameraSceneRecall, RecallCells, SceneAp, SubsetScore};
 use crate::backend::DeviceSpec;
 use crate::benchmark::report::ModelResult;
-use crate::benchmark::service::{BenchmarkService, RunContext, RunRequest, RunState};
+use crate::benchmark::service::{BenchmarkService, RunContext, RunRequest, RunState, StartError};
 use crate::benchmark::{Breakdown, ClassRecall};
 use crate::collect::labels::recall::{self, Measured};
 use crate::config::DatasetRef;
@@ -61,6 +61,34 @@ pub const BUSY_WAIT: Duration = Duration::from_secs(60 * 60);
 pub const STOP_WAIT: Duration = Duration::from_secs(10 * 60);
 /// How often that wait says it is still waiting.
 const STOP_LOG_EVERY: Duration = Duration::from_secs(30);
+
+/// The waits of [`run_with`] (tests shorten them).
+#[derive(Debug, Clone, Copy)]
+struct Waits {
+    /// Longest wait for another benchmark ([`BUSY_WAIT`]).
+    busy: Duration,
+    /// How often a busy service is asked again.
+    retry: Duration,
+    /// Longest wait for our cancelled benchmark to stop ([`STOP_WAIT`]).
+    stop: Duration,
+    /// How often our benchmark is checked while it runs.
+    poll: Duration,
+    /// How often the wait for a cancelled benchmark says it is still waiting.
+    log_every: Duration,
+}
+
+/// The waits of a run.
+const WAITS: Waits = Waits {
+    busy: BUSY_WAIT,
+    retry: Duration::from_secs(2),
+    stop: STOP_WAIT,
+    poll: Duration::from_millis(500),
+    log_every: STOP_LOG_EVERY,
+};
+
+/// How [`run_with`] starts its benchmark: [`BenchmarkService::start_run`] in a run, a fake job in
+/// tests. Answers the service's run id.
+type Start<'a> = dyn Fn(RunContext, RunRequest) -> Result<u64, StartError> + 'a;
 
 /// Wait while the benchmark run `ours` (its service run id) runs (checked every `poll`).
 /// `cancel` cancels it (only it: [`BenchmarkService::cancel_run`]), then waits for it to stop, up
@@ -167,6 +195,25 @@ pub fn run(
     devices: &[String],
     cancel: &AtomicBool,
 ) -> Result<Option<BenchSummary>> {
+    let start = |c: RunContext, req: RunRequest| svc.start_run(c, req);
+    run_with(svc, &start, ctx, name, sets, devices, cancel, WAITS)
+}
+
+/// [`run`] with its start and its waits as parameters (the tests' seam).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "run's parameters plus the two seams"
+)]
+fn run_with(
+    svc: &BenchmarkService,
+    start: &Start<'_>,
+    ctx: &dyn Fn() -> RunContext,
+    name: &str,
+    sets: Vec<DatasetRef>,
+    devices: &[String],
+    cancel: &AtomicBool,
+    waits: Waits,
+) -> Result<Option<BenchSummary>> {
     if sets.is_empty() {
         return Ok(None);
     }
@@ -196,29 +243,22 @@ pub fn run(
             Some(c) => c,
             None => ctx(),
         };
-        match svc.start_run(c, req.clone()) {
+        match start(c, req.clone()) {
             Ok(id) => break id,
             // Only a busy service is worth waiting for; a thread that could not start fails
             // now (QA-047).
-            Err(e @ crate::benchmark::service::StartError::Spawn(_)) => return Err(anyhow!(e)),
-            Err(crate::benchmark::service::StartError::Busy) if started.elapsed() < BUSY_WAIT => {
-                std::thread::sleep(Duration::from_secs(2));
+            Err(e @ StartError::Spawn(_)) => return Err(anyhow!(e)),
+            Err(StartError::Busy) if started.elapsed() < waits.busy => {
+                std::thread::sleep(waits.retry);
             }
-            Err(crate::benchmark::service::StartError::Busy) => bail!(
+            Err(StartError::Busy) => bail!(
                 "another benchmark kept running for {} min; benchmark the model from the \
                  Benchmark page",
-                BUSY_WAIT.as_secs() / 60
+                waits.busy.as_secs() / 60
             ),
         }
     };
-    wait_own(
-        svc,
-        ours,
-        cancel,
-        STOP_WAIT,
-        Duration::from_millis(500),
-        STOP_LOG_EVERY,
-    )?;
+    wait_own(svc, ours, cancel, waits.stop, waits.poll, waits.log_every)?;
     let st = own_status(svc, ours)?;
     if st.state == RunState::Failed {
         bail!(
@@ -848,6 +888,175 @@ mod tests {
             "{e:#}"
         );
         assert!(svc.status_of(theirs).is_some_and(|s| s.running));
+        assert!(svc.cancel_run(theirs));
+        assert!(svc.wait_idle(Duration::from_secs(10)));
+    }
+
+    /// Short waits for [`run_with`] tests.
+    fn quick(busy: Duration) -> Waits {
+        let ms = Duration::from_millis;
+        Waits {
+            busy,
+            retry: ms(10),
+            stop: ms(10_000),
+            poll: ms(5),
+            log_every: ms(50),
+        }
+    }
+
+    /// A fake benchmark of `model` that reports one result (its model only) and ends.
+    fn finishes(
+        svc: &Arc<BenchmarkService>,
+        req: RunRequest,
+        model: &str,
+    ) -> Result<u64, StartError> {
+        let m: ModelResult = serde_json::from_value(serde_json::json!({ "model": model })).unwrap();
+        svc.start_job_run(req, move |h| {
+            h.push_done(m);
+            Ok("ours".into())
+        })
+    }
+
+    /// [`run_with`] on `custom-1` (on its own device, no runtime) with one built-in set.
+    fn bench_custom(
+        svc: &Arc<BenchmarkService>,
+        start: &Start<'_>,
+        cancel: &AtomicBool,
+        waits: Waits,
+    ) -> Result<Option<BenchSummary>> {
+        run_with(
+            svc,
+            start,
+            &|| ctx_with(Some("openvino:cpu")),
+            "custom-1",
+            vec![DatasetRef::Id("coco-cctv".into())],
+            &[],
+            cancel,
+            waits,
+        )
+    }
+
+    /// Audit 2026-11 (QA-250): a benchmark already running is waited for, then ours starts
+    /// and its own result is read.
+    #[test]
+    fn run_waits_for_a_running_benchmark_then_starts_its_own() {
+        let svc = BenchmarkService::new();
+        let req = RunRequest::defaults(&crate::config::Config::default().benchmark);
+        let theirs = svc
+            .start_job_run(req, |_| {
+                std::thread::sleep(Duration::from_millis(200));
+                Ok("theirs".into())
+            })
+            .unwrap();
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        let start = |_c: RunContext, req: RunRequest| {
+            tries.fetch_add(1, Ordering::Relaxed);
+            let r = finishes(&svc, req.clone(), "custom-1");
+            if let Ok(id) = r {
+                // What it was asked to run: the model on its own device, the set, no burst.
+                assert_eq!(req.models, ["custom-1"]);
+                assert_eq!(req.devices, ["openvino:cpu"]);
+                assert!(!req.burst.enabled);
+                assert_ne!(id, theirs);
+            }
+            r
+        };
+        let cancel = AtomicBool::new(false);
+        let got = bench_custom(&svc, &start, &cancel, quick(Duration::from_secs(60)))
+            .unwrap()
+            .expect("a summary");
+        assert!(
+            tries.load(Ordering::Relaxed) > 1,
+            "started while another ran"
+        );
+        assert_eq!(got.heldout_fingerprint, None);
+        assert!(!svc.is_running());
+        // No set: nothing started.
+        let none = run_with(
+            &svc,
+            &start,
+            &|| ctx_with(Some("openvino:cpu")),
+            "custom-1",
+            Vec::new(),
+            &[],
+            &cancel,
+            quick(Duration::from_secs(60)),
+        );
+        assert!(none.unwrap().is_none());
+    }
+
+    /// A cancel while our benchmark runs cancels it, waits for it to stop and answers
+    /// [`Cancelled`]; the service is idle after.
+    #[test]
+    fn a_cancel_during_the_run_stops_its_benchmark() {
+        let svc = BenchmarkService::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let start = |_c: RunContext, req: RunRequest| {
+            let id = svc.start_job_run(req, |h| {
+                while !h.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(anyhow!(Cancelled))
+            });
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            id
+        };
+        let e = bench_custom(&svc, &start, &cancel, quick(Duration::from_secs(60))).unwrap_err();
+        assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+        assert!(!svc.is_running(), "the run's benchmark stopped first");
+        // Cancelled before it started: nothing starts.
+        let never = |_c: RunContext, _r: RunRequest| -> Result<u64, StartError> {
+            panic!("started after a cancel")
+        };
+        let e = bench_custom(&svc, &never, &cancel, quick(Duration::from_secs(60))).unwrap_err();
+        assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
+    }
+
+    /// Another benchmark that outlasts the busy wait: the run gives up with the "kept running"
+    /// error and leaves that benchmark running.
+    #[test]
+    fn a_benchmark_that_keeps_running_past_the_busy_wait_is_left_alone() {
+        let svc = BenchmarkService::new();
+        let theirs = compiling(&svc, Duration::ZERO);
+        let start = |_c: RunContext, req: RunRequest| finishes(&svc, req, "custom-1");
+        let cancel = AtomicBool::new(false);
+        let e = bench_custom(&svc, &start, &cancel, quick(Duration::from_millis(100))).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("another benchmark kept running for"),
+            "{e:#}"
+        );
+        assert!(svc.is_run_running(theirs), "theirs is not cancelled");
+        assert!(svc.cancel_run(theirs));
+        assert!(svc.wait_idle(Duration::from_secs(10)));
+    }
+
+    /// Our benchmark ended and another one started before the run read its result: the run
+    /// neither reads the other's result as its own nor cancels it.
+    #[test]
+    fn run_never_reads_or_cancels_a_benchmark_started_after_its_own() {
+        let svc = BenchmarkService::new();
+        let theirs = std::sync::Mutex::new(None);
+        let start = |_c: RunContext, req: RunRequest| {
+            let ours = finishes(&svc, req, "custom-1")?;
+            assert!(svc.wait_idle(Duration::from_secs(10)));
+            *theirs.lock().unwrap() = Some(compiling(&svc, Duration::ZERO));
+            Ok(ours)
+        };
+        let cancel = AtomicBool::new(false);
+        let e = bench_custom(&svc, &start, &cancel, quick(Duration::from_secs(60))).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("another benchmark started right after"),
+            "{e:#}"
+        );
+        let theirs = theirs.lock().unwrap().expect("the other benchmark started");
+        assert!(
+            svc.is_run_running(theirs),
+            "the later benchmark keeps running"
+        );
         assert!(svc.cancel_run(theirs));
         assert!(svc.wait_idle(Duration::from_secs(10)));
     }

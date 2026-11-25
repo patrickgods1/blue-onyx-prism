@@ -1580,7 +1580,7 @@ impl ServiceRun<'_> {
             return Ok(());
         };
         let before = r.image_sets.len();
-        retain_referenced_sets(&mut r);
+        r.retain_referenced_sets();
         if r.image_sets.len() != before {
             r.save(path)?;
         }
@@ -1622,29 +1622,13 @@ impl Saver {
             .as_ref()
             .is_some_and(|p| p.incomparable(&new).is_none());
         let retain = *self.retain_sets.get_or_insert(comparable);
-        // The sets before `merge` drops the unreferenced ones (kept until the end).
-        let prev_sets = prev
-            .as_ref()
-            .filter(|_| comparable)
-            .map(|p| p.image_sets.clone());
-        let new_sets = new.image_sets.clone();
-        let mut merged = BenchmarkResults::merge(prev, new);
-        merged.image_sets = match prev_sets {
-            Some(p) => super::report::upsert_sets(p, new_sets, &merged.models),
-            None => new_sets,
-        };
+        // The unreferenced sets are kept until the end.
+        let mut merged = BenchmarkResults::merge_keep_sets(prev, new);
         if last && retain {
-            retain_referenced_sets(&mut merged);
+            merged.retain_referenced_sets();
         }
         merged
     }
-}
-
-/// Keep only the image sets some model refers to (as [`BenchmarkResults::merge`] does).
-fn retain_referenced_sets(r: &mut BenchmarkResults) {
-    let models = &r.models;
-    r.image_sets
-        .retain(|s| models.iter().any(|m| m.datasets.contains(&s.id)));
 }
 
 fn phase_name(p: Phase) -> String {

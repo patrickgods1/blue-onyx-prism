@@ -3424,3 +3424,77 @@ fn a_finish_request_carries_over_to_the_out_of_memory_retry() {
 }
 
 mod transcript;
+
+/// The log cap: lines up to the cap are written, the line that crosses it becomes the one cut
+/// note, nothing follows it, and a reopened log (a retry export of the run) appends nothing more.
+#[test]
+fn the_log_is_cut_once_at_its_cap_and_stays_cut_when_reopened() {
+    let d = tmp("log-cap");
+    let path = d.0.join(LOG_FILE);
+    let cap = 100;
+    let note = cut_note(cap);
+    let mut log = Log::open_capped(&path, cap);
+    for i in 0..20 {
+        log.line(&format!("line {i:02} of the run"));
+    }
+    drop(log);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    // 17 bytes + newline each: five lines fit in 100, the sixth crosses it.
+    assert_eq!(lines.len(), 6, "{text}");
+    assert_eq!(lines[4], "line 04 of the run");
+    assert_eq!(lines[5], note);
+    assert_eq!(text.matches("[log cut at").count(), 1);
+
+    // Reopened: nothing appended, not even a second note.
+    let mut again = Log::open_capped(&path, cap);
+    again.line("after the retry");
+    drop(again);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
+
+/// A reopened log counts what it already holds: the retry's lines go on only up to the one cap.
+#[test]
+fn a_reopened_log_counts_its_size_toward_the_cap() {
+    let d = tmp("log-reopen");
+    let path = d.0.join(LOG_FILE);
+    let cap = 100;
+    let mut log = Log::open_capped(&path, cap);
+    for i in 0..3 {
+        log.line(&format!("line {i:02} of the run"));
+    }
+    drop(log);
+    let mut again = Log::open_capped(&path, cap);
+    for i in 3..20 {
+        again.line(&format!("line {i:02} of the run"));
+    }
+    drop(again);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 6, "{text}");
+    assert_eq!(lines[5], cut_note(cap));
+    // The production cap: whole megabytes in the note.
+    assert_eq!(cut_note(MAX_LOG_BYTES), "[log cut at 20 MB]");
+}
+
+/// A log cut by one long line can end under its cap (the dropped line is not in the file): the
+/// note at its end, not the size, keeps a reopened log closed.
+#[test]
+fn a_log_cut_under_its_cap_stays_cut_when_reopened() {
+    let d = tmp("log-short-cut");
+    let path = d.0.join(LOG_FILE);
+    let cap = 100;
+    let mut log = Log::open_capped(&path, cap);
+    for i in 0..3 {
+        log.line(&format!("line {i:02} of the run"));
+    }
+    log.line(&"x".repeat(60));
+    drop(log);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.len() < 100, "{text}");
+    assert!(text.ends_with(&format!("{}\n", cut_note(cap))), "{text}");
+    let mut again = Log::open_capped(&path, cap);
+    again.line("short");
+    drop(again);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
