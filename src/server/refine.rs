@@ -1841,7 +1841,10 @@ mod tests {
         );
         let classes = vec!["car".to_string()];
         let none: Vec<String> = Vec::new();
-        assert_eq!(open_counts(&review, &classes, &none, "").add, 1);
+        // A store of its own: every label write in other tests clears the process's
+        // (`label_files_changed`), which made the second read below walk again on main's macOS CI.
+        let store = store();
+        assert_eq!(open_counts_in(store, &review, &classes, &none, "").add, 1);
         // A second frame is not seen inside the 60 s with the same queue ...
         frame_with(
             &review,
@@ -1849,9 +1852,14 @@ mod tests {
             "a2",
             vec![suggestion(Kind::Add, None, Some(FAR))],
         );
-        assert_eq!(open_counts(&review, &classes, &none, "").add, 1);
+        // ... and the process's caches dropped meanwhile do not touch this one ...
+        label_files_changed();
+        assert_eq!(open_counts_in(store, &review, &classes, &none, "").add, 1);
         // ... but a check starting or ending drops it.
-        assert_eq!(open_counts(&review, &classes, &none, "t1:running").add, 2);
+        assert_eq!(
+            open_counts_in(store, &review, &classes, &none, "t1:running").add,
+            2
+        );
     }
 
     /// A store of its own: the process's is shared by every test.
