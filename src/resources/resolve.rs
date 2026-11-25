@@ -1383,7 +1383,7 @@ mod install_damage_tests {
     /// so the next provision downloads it again instead of reporting Installed.
     #[test]
     fn a_runtime_that_lost_a_file_is_not_installed() {
-        let root = std::env::temp_dir().join(format!("bop-resolve-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dirs::TempDir::new("resolve");
         let config = Config::default();
         let flavor = Flavor::Cpu;
         let installs = [
@@ -1406,7 +1406,6 @@ mod install_damage_tests {
         for (_, id) in &installs {
             assert!(!found.resources.contains(*id), "{id} lost its file");
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// One rule for OpenVINO and an ONNX Runtime flavor (audit 2026-11, QA-019): a manifest cut
@@ -1415,7 +1414,7 @@ mod install_damage_tests {
     /// manager.
     #[test]
     fn a_truncated_manifest_beside_version_is_not_installed() {
-        let root = std::env::temp_dir().join(format!("bop-resolve-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dirs::TempDir::new("resolve");
         let config = Config::default();
         let flavor = Flavor::Cpu;
         let installs = [
@@ -1450,13 +1449,12 @@ mod install_damage_tests {
         for (_, id) in &installs {
             assert!(found.resources.contains(*id), "{id}: legacy install");
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A flavor whose manifest names it but whose files went is never marked active.
     #[test]
     fn a_damaged_flavor_is_never_marked_active() {
-        let root = std::env::temp_dir().join(format!("bop-resolve-{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dirs::TempDir::new("resolve");
         let flavor = Flavor::Cpu;
         let dir = root.join(flavor.dest());
         let file = install(&dir, flavor.resource_id());
@@ -1486,6 +1484,5 @@ mod install_damage_tests {
             crate::backend::libs::read_active_flavor(&ort_root).as_deref(),
             Some(flavor.as_str())
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

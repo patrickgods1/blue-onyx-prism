@@ -27,12 +27,14 @@
 //! walkers accept) is in no row.
 
 use super::refine::{queue_stamp, recall_report};
+use super::walk_cache::{WalkCache, wanted_key};
 use super::{AppState, blocking, training};
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::queue::{self, Filters};
 use crate::collect::labels::repeats::VEHICLES;
 use crate::collect::labels::{LabelFile, Status};
 use crate::collect::layout::{self, SCENES};
+#[cfg(test)]
 use crate::sync::LockExt;
 use crate::training::refine::report::{self, RECALL_DECIMALS, RefineReport};
 use axum::Json;
@@ -41,8 +43,8 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// How long a walk's answer is kept.
 const KEEP_FOR: Duration = Duration::from_secs(60);
@@ -181,21 +183,17 @@ fn compute(dir: &Path, classes: &[String], hidden: &[String]) -> Vec<Row> {
     rows.into_values().collect()
 }
 
-struct Kept {
-    at: Instant,
-    stamp: String,
-    value: Arc<Vec<Row>>,
-}
-
 /// The walks' answers per folder and class list (one per process, [`CACHE`]; a test makes its
-/// own, so other tests clearing the process's cannot touch it).
-struct Cache {
-    kept: Mutex<BTreeMap<String, Kept>>,
-    /// One walk at a time: a second caller waits and finds the first one's answer.
-    walking: Mutex<()>,
-    /// Bumped by [`Self::forget`] under `kept`'s lock: a walk that began before a drop answers
-    /// its caller and keeps nothing (it may have read the files before the change).
-    generation: std::sync::atomic::AtomicU64,
+/// own, so other tests clearing the process's cannot touch it). Derefs to its [`WalkCache`]
+/// (`forget`, and what the tests look at).
+struct Cache(WalkCache<Arc<Vec<Row>>>);
+
+impl std::ops::Deref for Cache {
+    type Target = WalkCache<Arc<Vec<Row>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// The process's walk answers.
@@ -214,18 +212,7 @@ pub(super) fn forgotten() -> u64 {
 
 impl Cache {
     const fn new() -> Self {
-        Self {
-            kept: Mutex::new(BTreeMap::new()),
-            walking: Mutex::new(()),
-            generation: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    fn forget(&self) {
-        let mut kept = self.kept.lock_recover();
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        kept.clear();
+        Self(WalkCache::new(KEEP, KEEP_FOR, KEEP_FOR))
     }
 
     /// [`compute`], kept [`KEEP_FOR`]; `stamp` names the checks on the queue: when one starts,
@@ -237,43 +224,9 @@ impl Cache {
         hidden: &[String],
         stamp: &str,
     ) -> Arc<Vec<Row>> {
-        let key = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            dir.display(),
-            classes.join("\u{1e}"),
-            hidden.join("\u{1e}")
-        );
-        let fresh = |k: &Kept| k.at.elapsed() < KEEP_FOR && k.stamp == stamp;
-        if let Some(k) = self.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
-            return k.value.clone();
-        }
-        let _walking = self.walking.lock_recover();
-        if let Some(k) = self.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
-            return k.value.clone();
-        }
-        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
-        let value = Arc::new(compute(dir, classes, hidden));
-        let mut map = self.kept.lock_recover();
-        // A drop since the walk began: what it found may be the files before a change.
-        if self.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-            return value;
-        }
-        map.retain(|k, v| *k != key && v.at.elapsed() < KEEP_FOR);
-        while map.len() >= KEEP {
-            let Some(oldest) = map.iter().min_by_key(|(_, v)| v.at).map(|(k, _)| k.clone()) else {
-                break;
-            };
-            map.remove(&oldest);
-        }
-        map.insert(
-            key,
-            Kept {
-                at: Instant::now(),
-                stamp: stamp.to_string(),
-                value: value.clone(),
-            },
-        );
-        value
+        self.get_or_walk(wanted_key(dir, classes, hidden), stamp, || {
+            Arc::new(compute(dir, classes, hidden))
+        })
     }
 }
 

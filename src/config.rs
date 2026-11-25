@@ -1357,10 +1357,7 @@ impl Config {
     /// The model that serves `/v1/vision/detection`.
     pub fn default_model_index(&self) -> Option<usize> {
         match &self.default_model {
-            Some(name) => self.models.iter().position(|m| {
-                crate::registry::normalize_name(&m.effective_name())
-                    == crate::registry::normalize_name(name)
-            }),
+            Some(name) => self.model_index(name),
             None => (!self.models.is_empty()).then_some(0),
         }
     }
@@ -1381,13 +1378,12 @@ impl Config {
     /// Append `model` unless an entry with the same normalized name or the same path already
     /// exists. Returns whether it was added.
     pub fn add_model_if_absent(&mut self, model: ModelConfig) -> bool {
-        let norm = |m: &ModelConfig| crate::registry::normalize_name(&m.effective_name());
-        let new_name = norm(&model);
+        let new_name = model.key();
         let new_path = crate::resolve_path(&model.path);
         let exists = self
             .models
             .iter()
-            .any(|m| norm(m) == new_name || crate::resolve_path(&m.path) == new_path);
+            .any(|m| m.key() == new_name || crate::resolve_path(&m.path) == new_path);
         if !exists {
             self.models.push(model);
         }
@@ -1534,12 +1530,11 @@ impl Config {
         let default = self
             .effective_default_index()
             .and_then(|i| self.models.get(i))
-            .map(|d| crate::registry::normalize_name(&d.effective_name()));
+            .map(ModelConfig::key);
         crate::profile::Overrides {
             inflight: m.inflight.filter(|&n| n > 0).unwrap_or(self.inflight),
             ort_sessions: self.ort_sessions,
-            default_model: default
-                .is_some_and(|d| d == crate::registry::normalize_name(&m.effective_name())),
+            default_model: default.is_some_and(|d| d == m.key()),
             hint: self.hint_for(m),
         }
     }
@@ -1681,7 +1676,7 @@ pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
                  remove the entry"
             );
         }
-        let key = crate::registry::normalize_name(&m.effective_name());
+        let key = m.key();
         if !seen.insert(key.clone()) {
             bail!("models: duplicate model name '{key}'; set a distinct `name` for each entry");
         }
@@ -1721,11 +1716,11 @@ pub fn validate_model_entries(models: &[ModelConfig]) -> Result<()> {
     validate_night_models(models)?;
     for m in models {
         if let Some(t) = m.night_threshold {
-            let key = crate::registry::normalize_name(&m.effective_name());
+            let key = m.key();
             check_threshold(&format!("models: '{key}' night_threshold"), t)?;
         }
         if let Some(v) = &m.verify {
-            let key = crate::registry::normalize_name(&m.effective_name());
+            let key = m.key();
             let field = format!("models: '{key}' verify");
             v.validate(&field)?;
             if v.enabled && crate::registry::normalize_name(&v.model) == key {
@@ -1759,15 +1754,10 @@ fn check_verify_model(
     v: &crate::verify::VerifyConfig,
     models: &[ModelConfig],
 ) -> Result<()> {
-    use crate::registry::normalize_name;
     if !v.enabled {
         return Ok(());
     }
-    let key = normalize_name(&v.model);
-    if !models
-        .iter()
-        .any(|m| normalize_name(&m.effective_name()) == key)
-    {
+    if !models.iter().any(|m| m.is_named(&v.model)) {
         anyhow::bail!(
             "{field}.model: '{}' is not a configured model; add it to `models` first, or fix the \
              name (see the Models card)",
@@ -1783,16 +1773,12 @@ fn check_verify_model(
 pub fn validate_night_models(models: &[ModelConfig]) -> Result<()> {
     use crate::registry::normalize_name;
     use anyhow::bail;
-    let night_of = |key: &str| {
-        models
-            .iter()
-            .find(|m| normalize_name(&m.effective_name()) == key)
-    };
+    let night_of = |key: &str| models.iter().find(|m| m.key() == key);
     for m in models {
         let Some(night) = m.night_model.as_deref() else {
             continue;
         };
-        let key = normalize_name(&m.effective_name());
+        let key = m.key();
         let field = format!("models: '{key}' night_model");
         if night.trim().is_empty() {
             bail!("{field}: is empty; name another model or remove the key");

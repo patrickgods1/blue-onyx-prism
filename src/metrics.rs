@@ -164,6 +164,22 @@ impl RejectReason {
             RejectReason::UnknownModel => "unknown_model",
         }
     }
+
+    /// What the reason means, in the `requests_rejected_total` HELP text.
+    pub fn help(self) -> &'static str {
+        match self {
+            RejectReason::Overloaded => "the server-wide in-flight cap was reached",
+            RejectReason::BodyTooLarge => "the upload exceeded the body limit",
+            RejectReason::DecodeError => "the image could not be decoded",
+            RejectReason::BadRequest => "no usable multipart image upload",
+            RejectReason::PeerBodyReads => {
+                "one client had too many uploads still being read, a stalled or very slow sender"
+            }
+            RejectReason::BodyTimeout => "the upload was not received in time",
+            RejectReason::UploadBudget => "the uploads in flight held the most memory allowed",
+            RejectReason::UnknownModel => "the request named no enabled model",
+        }
+    }
 }
 
 /// Why a request was not served by inference.
@@ -490,22 +506,10 @@ pub struct Metrics {
     pub models: RwLock<Vec<Arc<ModelMetrics>>>,
     /// Registry generations started after the first one.
     pub restarts: AtomicU64,
-    /// Detection requests answered 503 because the server-wide in-flight cap was reached
-    /// (see [`Metrics::try_begin_detection`]).
-    pub rejected_overloaded: AtomicU64,
-    /// Detection uploads larger than the body limit.
-    pub rejected_body_too_large: AtomicU64,
-    /// Detection requests without a usable multipart body (see [`RejectReason::BadRequest`]).
-    pub rejected_bad_request: AtomicU64,
-    /// Detection requests answered 503 because their peer had its limit of uploads still being
-    /// read (see [`Metrics::try_begin_body_read`]).
-    pub rejected_peer_body_reads: AtomicU64,
-    /// Detection uploads not received within the read deadline.
-    pub rejected_body_timeout: AtomicU64,
-    /// Detection uploads refused by the upload byte budget ([`RejectReason::UploadBudget`]).
-    pub rejected_upload_budget: AtomicU64,
-    /// `/v1/vision/custom/<model>` requests for no enabled model ([`RejectReason::UnknownModel`]).
-    pub rejected_unknown_model: AtomicU64,
+    /// Rejected detection requests per [`RejectReason`] (`reason as usize`; read with
+    /// [`Metrics::rejected`], counted with [`Metrics::record_rejected`]). The
+    /// [`RejectReason::DecodeError`] slot stays 0: decode errors are counted per model.
+    rejected: [AtomicU64; RejectReason::ALL.len()],
     /// Fixed server-wide in-flight cap for detection requests; 0 (the default) derives it from
     /// the models' queue capacities on every request (see `server::detect::max_inflight`).
     pub inflight_limit: AtomicUsize,
@@ -574,13 +578,7 @@ impl Metrics {
             version: version.into(),
             models: RwLock::new(Vec::new()),
             restarts: AtomicU64::new(0),
-            rejected_overloaded: AtomicU64::new(0),
-            rejected_body_too_large: AtomicU64::new(0),
-            rejected_bad_request: AtomicU64::new(0),
-            rejected_peer_body_reads: AtomicU64::new(0),
-            rejected_body_timeout: AtomicU64::new(0),
-            rejected_upload_budget: AtomicU64::new(0),
-            rejected_unknown_model: AtomicU64::new(0),
+            rejected: std::array::from_fn(|_| AtomicU64::new(0)),
             inflight_limit: AtomicUsize::new(0),
             overload_log: LogThrottle::default(),
             peer_reads_log: LogThrottle::default(),
@@ -591,7 +589,7 @@ impl Metrics {
     }
 
     /// Admit one more detection request when fewer than `limit` are in flight; `None` when the
-    /// server is at its cap (the caller answers 503 and counts it in `rejected_overloaded`).
+    /// server is at its cap (the caller answers 503 and counts it as [`RejectReason::Overloaded`]).
     pub fn try_begin_detection(self: &Arc<Self>, limit: usize) -> Option<InflightPermit> {
         self.inflight
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -602,8 +600,8 @@ impl Metrics {
     }
 
     /// Start reading one more upload from `peer` when it has fewer than `limit` being read;
-    /// `None` when it has them all (the caller answers 503 and counts it in
-    /// `rejected_peer_body_reads`). An IPv4 client on a dual-stack socket is one peer with its
+    /// `None` when it has them all (the caller answers 503 and counts it as
+    /// [`RejectReason::PeerBodyReads`]). An IPv4 client on a dual-stack socket is one peer with its
     /// plain IPv4 address. The address is the whole key on purpose: a shared IPv6 /64 would tie
     /// a Blue Iris machine to whatever else sits on its LAN.
     pub fn try_begin_body_read(
@@ -638,36 +636,27 @@ impl Metrics {
     /// Count one rejected detection request ([`RejectReason::DecodeError`] is counted per
     /// model instead, see [`ModelMetrics::record_decode_error`]; recording it here is a no-op).
     pub fn record_rejected(&self, reason: RejectReason) {
-        let c = match reason {
-            RejectReason::Overloaded => &self.rejected_overloaded,
-            RejectReason::BodyTooLarge => &self.rejected_body_too_large,
-            RejectReason::BadRequest => &self.rejected_bad_request,
-            RejectReason::PeerBodyReads => &self.rejected_peer_body_reads,
-            RejectReason::BodyTimeout => &self.rejected_body_timeout,
-            RejectReason::UploadBudget => &self.rejected_upload_budget,
-            RejectReason::UnknownModel => &self.rejected_unknown_model,
-            RejectReason::DecodeError => return,
-        };
-        c.fetch_add(1, Ordering::Relaxed);
+        if reason == RejectReason::DecodeError {
+            return;
+        }
+        if let Some(c) = self.rejected.get(reason as usize) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Rejected detection requests for `reason` (decode errors summed over every model).
     pub fn rejected(&self, reason: RejectReason) -> u64 {
-        match reason {
-            RejectReason::Overloaded => self.rejected_overloaded.load(Ordering::Relaxed),
-            RejectReason::BodyTooLarge => self.rejected_body_too_large.load(Ordering::Relaxed),
-            RejectReason::BadRequest => self.rejected_bad_request.load(Ordering::Relaxed),
-            RejectReason::PeerBodyReads => self.rejected_peer_body_reads.load(Ordering::Relaxed),
-            RejectReason::BodyTimeout => self.rejected_body_timeout.load(Ordering::Relaxed),
-            RejectReason::UploadBudget => self.rejected_upload_budget.load(Ordering::Relaxed),
-            RejectReason::UnknownModel => self.rejected_unknown_model.load(Ordering::Relaxed),
-            RejectReason::DecodeError => self
+        if reason == RejectReason::DecodeError {
+            return self
                 .models
                 .read_recover()
                 .iter()
                 .map(|m| m.decode_errors())
-                .sum(),
+                .sum();
         }
+        self.rejected
+            .get(reason as usize)
+            .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
     /// Detection requests received so far over every model (`requests_total` summed): what a
@@ -816,8 +805,7 @@ fn render_gpu_memory(out: &mut String, readings: &[crate::backend::vram::VramRea
         ),
     ];
     for (name, help, get) in series {
-        let _ = writeln!(out, "# HELP {PREFIX}{name} {help}");
-        let _ = writeln!(out, "# TYPE {PREFIX}{name} gauge");
+        family(out, name, Kind::Gauge, help);
         for r in readings {
             let kind = match r.kind {
                 crate::backend::vram::MemoryKind::Dedicated => "dedicated",
@@ -843,24 +831,104 @@ fn escape_label(v: &str) -> String {
 
 const PREFIX: &str = "blue_onyx_prism_";
 
-/// Render all metrics in the Prometheus text exposition format. `gauges` adds the per-model
-/// `model_info`, `model_ready`, `queue_length` and `queue_capacity` series.
-pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
-    let models: Vec<Arc<ModelMetrics>> = m.models.read_recover().clone();
-    let mut out = String::new();
+/// Exposition type of a metric family (`# TYPE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Counter,
+    Gauge,
+    Histogram,
+}
 
-    let _ = writeln!(out, "# HELP {PREFIX}info Build information.");
-    let _ = writeln!(out, "# TYPE {PREFIX}info gauge");
+impl Kind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Kind::Counter => "counter",
+            Kind::Gauge => "gauge",
+            Kind::Histogram => "histogram",
+        }
+    }
+}
+
+/// The `# HELP` and `# TYPE` lines that open family `name` (without [`PREFIX`]).
+fn family(out: &mut String, name: &str, kind: Kind, help: &str) {
+    let _ = writeln!(out, "# HELP {PREFIX}{name} {help}");
+    let _ = writeln!(out, "# TYPE {PREFIX}{name} {}", kind.as_str());
+}
+
+/// One unlabelled sample of family `name`.
+fn sample(out: &mut String, name: &str, value: impl std::fmt::Display) {
+    let _ = writeln!(out, "{PREFIX}{name} {value}");
+}
+
+/// One sample of family `name` per model: `name{model="..."} value`.
+fn per_model<T: std::fmt::Display>(
+    out: &mut String,
+    name: &str,
+    models: &[Arc<ModelMetrics>],
+    get: impl Fn(&ModelMetrics) -> T,
+) {
+    for mm in models {
+        let _ = writeln!(
+            out,
+            "{PREFIX}{name}{{model=\"{}\"}} {}",
+            escape_label(&mm.name),
+            get(mm)
+        );
+    }
+}
+
+/// One sample of family `name` per model and value of `all`, model by model:
+/// `name{model="...",<label>="<as_str(r)>"} get(model, r)`.
+fn per_model_labeled<R: Copy>(
+    out: &mut String,
+    name: &str,
+    label: &str,
+    models: &[Arc<ModelMetrics>],
+    all: &[R],
+    as_str: fn(R) -> &'static str,
+    get: impl Fn(&ModelMetrics, R) -> u64,
+) {
+    for mm in models {
+        for &r in all {
+            let _ = writeln!(
+                out,
+                "{PREFIX}{name}{{model=\"{}\",{label}=\"{}\"}} {}",
+                escape_label(&mm.name),
+                as_str(r),
+                get(mm, r)
+            );
+        }
+    }
+}
+
+/// The `requests_rejected_total` HELP text, built from [`RejectReason::ALL`] so it names every
+/// reason the family is exported with.
+fn rejected_help() -> String {
+    let reasons: Vec<String> = RejectReason::ALL
+        .iter()
+        .map(|r| format!("{}: {}", r.as_str(), r.help()))
+        .collect();
+    format!(
+        "Detection requests rejected before inference, by reason ({}).",
+        reasons.join("; ")
+    )
+}
+
+/// The build and process-wide families: build info, uptime, restarts, rejections, downloads, the
+/// dataset collector, process resources, GPU memory and the in-flight gauge.
+fn render_process(out: &mut String, m: &Metrics) {
+    family(out, "info", Kind::Gauge, "Build information.");
     let _ = writeln!(
         out,
         "{PREFIX}info{{version=\"{}\"}} 1",
         escape_label(&m.version)
     );
-    let _ = writeln!(
+    family(
         out,
-        "# HELP {PREFIX}build_info Build information: version, git commit and build date; value is always 1."
+        "build_info",
+        Kind::Gauge,
+        "Build information: version, git commit and build date; value is always 1.",
     );
-    let _ = writeln!(out, "# TYPE {PREFIX}build_info gauge");
     let _ = writeln!(
         out,
         "{PREFIX}build_info{{version=\"{}\",git_sha=\"{}\",build_date=\"{}\"}} 1",
@@ -868,29 +936,28 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         escape_label(crate::GIT_SHA),
         escape_label(crate::BUILD_DATE)
     );
-    let _ = writeln!(
+    family(
         out,
-        "# HELP {PREFIX}uptime_seconds Seconds since the service started."
+        "uptime_seconds",
+        Kind::Gauge,
+        "Seconds since the service started.",
     );
-    let _ = writeln!(out, "# TYPE {PREFIX}uptime_seconds gauge");
-    let _ = writeln!(out, "{PREFIX}uptime_seconds {}", m.uptime().as_secs());
+    sample(out, "uptime_seconds", m.uptime().as_secs());
 
-    let _ = writeln!(
+    family(
         out,
-        "# HELP {PREFIX}restarts_total Registry restarts since the process started."
+        "restarts_total",
+        Kind::Counter,
+        "Registry restarts since the process started.",
     );
-    let _ = writeln!(out, "# TYPE {PREFIX}restarts_total counter");
-    let _ = writeln!(
-        out,
-        "{PREFIX}restarts_total {}",
-        m.restarts.load(Ordering::Relaxed)
-    );
+    sample(out, "restarts_total", m.restarts.load(Ordering::Relaxed));
 
-    let _ = writeln!(
+    family(
         out,
-        "# HELP {PREFIX}requests_rejected_total Detection requests rejected before inference, by reason (overloaded: the server-wide in-flight cap was reached; body_too_large: the upload exceeded the body limit; decode_error: the image could not be decoded; bad_request: no usable multipart image upload; peer_body_reads: one client had too many uploads still being read, a stalled or very slow sender; body_timeout: the upload was not received in time; upload_budget: the uploads in flight held the most memory allowed; unknown_model: the request named no enabled model)."
+        "requests_rejected_total",
+        Kind::Counter,
+        &rejected_help(),
     );
-    let _ = writeln!(out, "# TYPE {PREFIX}requests_rejected_total counter");
     for reason in RejectReason::ALL {
         let _ = writeln!(
             out,
@@ -912,146 +979,137 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
         ),
     ];
     for (name, help, counter) in downloads {
-        let _ = writeln!(out, "# HELP {PREFIX}{name} {help}");
-        let _ = writeln!(out, "# TYPE {PREFIX}{name} counter");
-        let _ = writeln!(out, "{PREFIX}{name} {}", counter.load(Ordering::Relaxed));
+        family(out, name, Kind::Counter, help);
+        sample(out, name, counter.load(Ordering::Relaxed));
     }
-    crate::collect::metrics::render_prometheus(&mut out, PREFIX);
+    crate::collect::metrics::render_prometheus(out, PREFIX);
     let p = ProcessStats::read();
-    if let Some(rss) = p.resident_memory_bytes {
-        let _ = writeln!(
-            out,
-            "# HELP {PREFIX}process_resident_memory_bytes Resident memory of the process in bytes."
-        );
-        let _ = writeln!(out, "# TYPE {PREFIX}process_resident_memory_bytes gauge");
-        let _ = writeln!(out, "{PREFIX}process_resident_memory_bytes {rss}");
-    }
-    if let Some(private) = p.private_memory_bytes {
-        let _ = writeln!(
-            out,
-            "# HELP {PREFIX}process_private_bytes Memory the process owns alone in bytes (Windows: private bytes, the commit; macOS: the footprint; Linux: RssAnon)."
-        );
-        let _ = writeln!(out, "# TYPE {PREFIX}process_private_bytes gauge");
-        let _ = writeln!(out, "{PREFIX}process_private_bytes {private}");
-    }
-    if let Some(footprint) = p.memory_footprint_bytes {
-        let _ = writeln!(
-            out,
-            "# HELP {PREFIX}process_memory_footprint_bytes Physical footprint of the process in bytes (macOS: counts compressed and GPU-backed memory)."
-        );
-        let _ = writeln!(out, "# TYPE {PREFIX}process_memory_footprint_bytes gauge");
-        let _ = writeln!(out, "{PREFIX}process_memory_footprint_bytes {footprint}");
-    }
-    if let Some(fds) = p.open_fds {
-        let _ = writeln!(
-            out,
-            "# HELP {PREFIX}process_open_fds Open file descriptors of the process."
-        );
-        let _ = writeln!(out, "# TYPE {PREFIX}process_open_fds gauge");
-        let _ = writeln!(out, "{PREFIX}process_open_fds {fds}");
-    }
-    render_gpu_memory(&mut out, &crate::backend::vram::readings());
-    let _ = writeln!(
-        out,
-        "# HELP {PREFIX}inflight_requests Detection requests being handled now (body read, queue wait, inference)."
-    );
-    let _ = writeln!(out, "# TYPE {PREFIX}inflight_requests gauge");
-    let _ = writeln!(out, "{PREFIX}inflight_requests {}", m.inflight());
-
-    let _ = writeln!(
-        out,
-        "# HELP {PREFIX}requests_total Detection requests received."
-    );
-    let _ = writeln!(out, "# TYPE {PREFIX}requests_total counter");
-    for mm in &models {
-        let _ = writeln!(
-            out,
-            "{PREFIX}requests_total{{model=\"{}\"}} {}",
-            escape_label(&mm.name),
-            mm.requests.load(Ordering::Relaxed)
-        );
-    }
-    let _ = writeln!(
-        out,
-        "# HELP {PREFIX}dropped_total Requests not served by inference, by reason (queue_full|timeout|initializing|failed|worker_gone)."
-    );
-    let _ = writeln!(out, "# TYPE {PREFIX}dropped_total counter");
-    for mm in &models {
-        for reason in DropReason::ALL {
-            let _ = writeln!(
-                out,
-                "{PREFIX}dropped_total{{model=\"{}\",reason=\"{}\"}} {}",
-                escape_label(&mm.name),
-                reason.as_str(),
-                mm.dropped(reason)
-            );
+    let process: [(&str, &str, Option<u64>); 4] = [
+        (
+            "process_resident_memory_bytes",
+            "Resident memory of the process in bytes.",
+            p.resident_memory_bytes,
+        ),
+        (
+            "process_private_bytes",
+            "Memory the process owns alone in bytes (Windows: private bytes, the commit; macOS: the footprint; Linux: RssAnon).",
+            p.private_memory_bytes,
+        ),
+        (
+            "process_memory_footprint_bytes",
+            "Physical footprint of the process in bytes (macOS: counts compressed and GPU-backed memory).",
+            p.memory_footprint_bytes,
+        ),
+        (
+            "process_open_fds",
+            "Open file descriptors of the process.",
+            p.open_fds,
+        ),
+    ];
+    for (name, help, value) in process {
+        if let Some(v) = value {
+            family(out, name, Kind::Gauge, help);
+            sample(out, name, v);
         }
     }
-
-    let _ = writeln!(
+    render_gpu_memory(out, &crate::backend::vram::readings());
+    family(
         out,
-        "# HELP {PREFIX}detections_suppressed_total Detections removed by the night / IR rules and the verifier, by reason (night_threshold|label_threshold|aspect|min_area|overlap|static|verify)."
+        "inflight_requests",
+        Kind::Gauge,
+        "Detection requests being handled now (body read, queue wait, inference).",
     );
-    let _ = writeln!(out, "# TYPE {PREFIX}detections_suppressed_total counter");
-    for mm in &models {
-        for reason in SuppressReason::ALL {
-            let _ = writeln!(
-                out,
-                "{PREFIX}detections_suppressed_total{{model=\"{}\",reason=\"{}\"}} {}",
-                escape_label(&mm.name),
-                reason.as_str(),
-                mm.suppressed(reason)
-            );
-        }
-    }
+    sample(out, "inflight_requests", m.inflight());
+}
 
-    let _ = writeln!(
+/// The per-model counters: requests, drops, suppressed detections, night-model routing and the
+/// verifier's outcomes.
+fn render_model_counters(out: &mut String, models: &[Arc<ModelMetrics>]) {
+    family(
         out,
-        "# HELP {PREFIX}night_model_routed_total Night / IR frames forwarded to the model's night_model."
+        "requests_total",
+        Kind::Counter,
+        "Detection requests received.",
     );
-    let _ = writeln!(out, "# TYPE {PREFIX}night_model_routed_total counter");
-    for mm in &models {
-        let _ = writeln!(
-            out,
-            "{PREFIX}night_model_routed_total{{model=\"{}\"}} {}",
-            escape_label(&mm.name),
-            mm.night_routed()
-        );
-    }
-    let _ = writeln!(
+    per_model(out, "requests_total", models, |mm| {
+        mm.requests.load(Ordering::Relaxed)
+    });
+    family(
         out,
-        "# HELP {PREFIX}night_model_fallback_total Night / IR frames that ran on the model itself because its night_model was unavailable, by reason (unknown|not_ready|queue_full|stopped)."
+        "dropped_total",
+        Kind::Counter,
+        "Requests not served by inference, by reason (queue_full|timeout|initializing|failed|worker_gone).",
     );
-    let _ = writeln!(out, "# TYPE {PREFIX}night_model_fallback_total counter");
-    for mm in &models {
-        for reason in RouteFallback::ALL {
-            let _ = writeln!(
-                out,
-                "{PREFIX}night_model_fallback_total{{model=\"{}\",reason=\"{}\"}} {}",
-                escape_label(&mm.name),
-                reason.as_str(),
-                mm.night_fallback(reason)
-            );
-        }
-    }
+    per_model_labeled(
+        out,
+        "dropped_total",
+        "reason",
+        models,
+        &DropReason::ALL,
+        DropReason::as_str,
+        ModelMetrics::dropped,
+    );
 
-    let _ = writeln!(
+    family(
         out,
-        "# HELP {PREFIX}verify_total Candidate boxes checked by the model's verifier (verify), by outcome (kept|rejected|unverified; unverified = the verifier was unavailable, busy, late or failed, or over max_crops, and the box was kept)."
+        "detections_suppressed_total",
+        Kind::Counter,
+        "Detections removed by the night / IR rules and the verifier, by reason (night_threshold|label_threshold|aspect|min_area|overlap|static|verify).",
     );
-    let _ = writeln!(out, "# TYPE {PREFIX}verify_total counter");
-    for mm in &models {
-        for o in crate::verify::Outcome::ALL {
-            let _ = writeln!(
-                out,
-                "{PREFIX}verify_total{{model=\"{}\",outcome=\"{}\"}} {}",
-                escape_label(&mm.name),
-                o.as_str(),
-                mm.verified(o)
-            );
-        }
-    }
+    per_model_labeled(
+        out,
+        "detections_suppressed_total",
+        "reason",
+        models,
+        &SuppressReason::ALL,
+        SuppressReason::as_str,
+        ModelMetrics::suppressed,
+    );
 
+    family(
+        out,
+        "night_model_routed_total",
+        Kind::Counter,
+        "Night / IR frames forwarded to the model's night_model.",
+    );
+    per_model(out, "night_model_routed_total", models, |mm| {
+        mm.night_routed()
+    });
+    family(
+        out,
+        "night_model_fallback_total",
+        Kind::Counter,
+        "Night / IR frames that ran on the model itself because its night_model was unavailable, by reason (unknown|not_ready|queue_full|stopped).",
+    );
+    per_model_labeled(
+        out,
+        "night_model_fallback_total",
+        "reason",
+        models,
+        &RouteFallback::ALL,
+        RouteFallback::as_str,
+        ModelMetrics::night_fallback,
+    );
+
+    family(
+        out,
+        "verify_total",
+        Kind::Counter,
+        "Candidate boxes checked by the model's verifier (verify), by outcome (kept|rejected|unverified; unverified = the verifier was unavailable, busy, late or failed, or over max_crops, and the box was kept).",
+    );
+    per_model_labeled(
+        out,
+        "verify_total",
+        "outcome",
+        models,
+        &crate::verify::Outcome::ALL,
+        crate::verify::Outcome::as_str,
+        ModelMetrics::verified,
+    );
+}
+
+/// The latency histograms per model, each followed by its `_avg`, `_min` and `_max` gauges.
+fn render_latency(out: &mut String, models: &[Arc<ModelMetrics>]) {
     type Getter = fn(&ModelMetrics) -> &Histogram;
     let stats: [(&str, &str, Getter); 3] = [
         ("inference_ms", "Model inference time in ms", |mm| {
@@ -1066,9 +1124,8 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
     ];
     for (base, help, get) in stats {
         // The histogram keeps the `_ms` unit in its name (blue-onyx dashboard compatibility).
-        let _ = writeln!(out, "# HELP {PREFIX}{base} {help} (histogram).");
-        let _ = writeln!(out, "# TYPE {PREFIX}{base} histogram");
-        for mm in &models {
+        family(out, base, Kind::Histogram, &format!("{help} (histogram)."));
+        for mm in models {
             let h = get(mm);
             let label = escape_label(&mm.name);
             let counts = h.bucket_counts();
@@ -1086,30 +1143,38 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
             let _ = writeln!(out, "{PREFIX}{base}_sum{{model=\"{label}\"}} {}", h.sum());
             let _ = writeln!(out, "{PREFIX}{base}_count{{model=\"{label}\"}} {cum}");
         }
-        for suffix in ["avg", "min", "max"] {
-            let name = format!("{base}_{suffix}");
-            let _ = writeln!(out, "# HELP {PREFIX}{name} {help} ({suffix}).");
-            let _ = writeln!(out, "# TYPE {PREFIX}{name} gauge");
-            for mm in &models {
-                let s = get(mm);
-                let label = escape_label(&mm.name);
-                let value = match suffix {
-                    "avg" => format!("{:.3}", s.avg()),
-                    "min" => s.min().to_string(),
-                    _ => s.max().to_string(),
-                };
-                let _ = writeln!(out, "{PREFIX}{name}{{model=\"{label}\"}} {value}");
-            }
-        }
+        family(
+            out,
+            &format!("{base}_avg"),
+            Kind::Gauge,
+            &format!("{help} (avg)."),
+        );
+        per_model(out, &format!("{base}_avg"), models, |mm| {
+            format!("{:.3}", get(mm).avg())
+        });
+        family(
+            out,
+            &format!("{base}_min"),
+            Kind::Gauge,
+            &format!("{help} (min)."),
+        );
+        per_model(out, &format!("{base}_min"), models, |mm| get(mm).min());
+        family(
+            out,
+            &format!("{base}_max"),
+            Kind::Gauge,
+            &format!("{help} (max)."),
+        );
+        per_model(out, &format!("{base}_max"), models, |mm| get(mm).max());
     }
+}
 
-    let gauge_header = |out: &mut String, name: &str, help: &str| {
-        let _ = writeln!(out, "# HELP {PREFIX}{name} {help}");
-        let _ = writeln!(out, "# TYPE {PREFIX}{name} gauge");
-    };
-    gauge_header(
-        &mut out,
+/// The per-model gauges the registry reads at the scrape ([`ModelGauges`]).
+fn render_gauges(out: &mut String, gauges: &[ModelGauges]) {
+    family(
+        out,
         "model_info",
+        Kind::Gauge,
         "Model device, execution provider and state (initializing|ready|failed|lazy); value is always 1.",
     );
     for g in gauges {
@@ -1122,45 +1187,46 @@ pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
             g.state.as_str()
         );
     }
-    gauge_header(
-        &mut out,
-        "model_ready",
-        "1 when the model is compiled and serving requests, else 0.",
-    );
-    for g in gauges {
-        let ready = u8::from(g.state == ModelStateLabel::Ready);
-        let _ = writeln!(
-            out,
-            "{PREFIX}model_ready{{model=\"{}\"}} {ready}",
-            escape_label(&g.name)
-        );
+    type Value = fn(&ModelGauges) -> usize;
+    let series: [(&str, &str, Value); 3] = [
+        (
+            "model_ready",
+            "1 when the model is compiled and serving requests, else 0.",
+            |g| usize::from(g.state == ModelStateLabel::Ready),
+        ),
+        (
+            "queue_length",
+            "Requests waiting in the worker queue.",
+            |g| g.queue_length,
+        ),
+        (
+            "queue_capacity",
+            "Effective worker queue depth limit (sized after warm-up).",
+            |g| g.queue_capacity,
+        ),
+    ];
+    for (name, help, value) in series {
+        family(out, name, Kind::Gauge, help);
+        for g in gauges {
+            let _ = writeln!(
+                out,
+                "{PREFIX}{name}{{model=\"{}\"}} {}",
+                escape_label(&g.name),
+                value(g)
+            );
+        }
     }
-    gauge_header(
-        &mut out,
-        "queue_length",
-        "Requests waiting in the worker queue.",
-    );
-    for g in gauges {
-        let _ = writeln!(
-            out,
-            "{PREFIX}queue_length{{model=\"{}\"}} {}",
-            escape_label(&g.name),
-            g.queue_length
-        );
-    }
-    gauge_header(
-        &mut out,
-        "queue_capacity",
-        "Effective worker queue depth limit (sized after warm-up).",
-    );
-    for g in gauges {
-        let _ = writeln!(
-            out,
-            "{PREFIX}queue_capacity{{model=\"{}\"}} {}",
-            escape_label(&g.name),
-            g.queue_capacity
-        );
-    }
+}
+
+/// Render all metrics in the Prometheus text exposition format. `gauges` adds the per-model
+/// `model_info`, `model_ready`, `queue_length` and `queue_capacity` series.
+pub fn render_prometheus(m: &Metrics, gauges: &[ModelGauges]) -> String {
+    let models: Vec<Arc<ModelMetrics>> = m.models.read_recover().clone();
+    let mut out = String::new();
+    render_process(&mut out, m);
+    render_model_counters(&mut out, &models);
+    render_latency(&mut out, &models);
+    render_gauges(&mut out, gauges);
     out
 }
 
@@ -1325,7 +1391,9 @@ mod tests {
     #[test]
     fn prometheus_rejected_and_inflight() {
         let m = Arc::new(Metrics::new("0"));
-        m.rejected_overloaded.store(3, Ordering::Relaxed);
+        for _ in 0..3 {
+            m.record_rejected(RejectReason::Overloaded);
+        }
         let _p = m.try_begin_detection(5).unwrap();
         let text = render_prometheus(&m, &[]);
         assert!(text.contains("blue_onyx_prism_requests_rejected_total{reason=\"overloaded\"} 3"));
@@ -1406,6 +1474,458 @@ mod tests {
             let v = l.rsplit(' ').next().unwrap();
             assert!(v.parse::<f64>().is_ok(), "bad sample line {l:?}");
         }
+    }
+
+    /// A [`Metrics`] with every series it renders holding a distinct, non-zero value where it
+    /// can (two models, one with a label to escape), and gauges in every state.
+    fn populated() -> (Arc<Metrics>, Vec<ModelGauges>, InflightPermit) {
+        let m = Arc::new(Metrics::new("1.2.\"3\""));
+        m.restarts.store(2, Ordering::Relaxed);
+        for (i, r) in RejectReason::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                m.record_rejected(r);
+            }
+        }
+        let permit = m.try_begin_detection(4).unwrap();
+        for (ku, name) in ["a", "b\"q"].into_iter().enumerate() {
+            let k = u32::try_from(ku).unwrap();
+            let mm = m.model(name);
+            mm.requests.store(10 + u64::from(k), Ordering::Relaxed);
+            for (i, r) in DropReason::ALL.into_iter().enumerate() {
+                for _ in 0..=(i + ku) {
+                    mm.record_drop(r);
+                }
+            }
+            for _ in 0..=k {
+                mm.record_decode_error();
+            }
+            let mut c = SuppressCounts::default();
+            for (i, r) in SuppressReason::ALL.into_iter().enumerate() {
+                c.add(r, u32::try_from(i).unwrap() + k + 1);
+            }
+            mm.record_suppressed(&c);
+            for _ in 0..=k {
+                mm.record_night_routed();
+            }
+            for (i, r) in RouteFallback::ALL.into_iter().enumerate() {
+                for _ in 0..=(i + ku) {
+                    mm.record_night_fallback(r);
+                }
+            }
+            mm.record_verify(&crate::verify::Counts {
+                kept: 1 + k,
+                rejected: 2 + k,
+                unverified: 3 + k,
+            });
+            for ms in [0, 3, 15, 700, 9000] {
+                mm.inference_ms.record(ms + u64::from(k));
+                mm.process_ms.record(ms * 2 + 1);
+                mm.round_trip_ms.record(ms * 3 + 2);
+            }
+        }
+        let g = |name: &str, state, queue_length, queue_capacity| ModelGauges {
+            name: name.into(),
+            device: "GPU.\"1\"".into(),
+            provider: "OpenVINO GPU (x)".into(),
+            state,
+            queue_length,
+            queue_capacity,
+        };
+        let gauges = vec![
+            g("a", ModelStateLabel::Ready, 2, 30),
+            g("b\"q", ModelStateLabel::Initializing, 0, 64),
+            g("c", ModelStateLabel::Failed, 0, 0),
+            g("d", ModelStateLabel::Lazy, 1, 8),
+        ];
+        (m, gauges, permit)
+    }
+
+    /// The family a line of the exposition belongs to (`# HELP`/`# TYPE` name, else the sample
+    /// name before its labels).
+    fn family_of(line: &str) -> &str {
+        if let Some(rest) = line
+            .strip_prefix("# HELP ")
+            .or_else(|| line.strip_prefix("# TYPE "))
+        {
+            return rest.split(' ').next().unwrap();
+        }
+        line.split(['{', ' ']).next().unwrap()
+    }
+
+    /// The exposition without what depends on the host or on other tests: the process and GPU
+    /// families are dropped (they vary by platform and machine), and the values of the uptime,
+    /// download and dataset samples (process-wide counters) are masked.
+    fn stable(text: &str) -> String {
+        let mut out = String::new();
+        for line in text.lines() {
+            let fam = family_of(line);
+            if fam.starts_with("blue_onyx_prism_process_")
+                || fam.starts_with("blue_onyx_prism_gpu_memory_")
+            {
+                continue;
+            }
+            let masked = !line.starts_with('#')
+                && (fam == "blue_onyx_prism_uptime_seconds"
+                    || fam.starts_with("blue_onyx_prism_download_")
+                    || fam.starts_with("blue_onyx_prism_dataset_"));
+            if masked {
+                let (sample, _) = line.rsplit_once(' ').unwrap();
+                out.push_str(sample);
+                out.push_str(" <v>\n");
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Exposition-format structure: every family has one `# HELP` then one `# TYPE` before its
+    /// samples, and a family's lines are contiguous (a histogram's `_bucket`/`_sum`/`_count`
+    /// belong to it).
+    fn assert_well_formed(text: &str) {
+        let mut seen = std::collections::HashSet::new();
+        let mut current: Option<(String, String)> = None; // (family, type)
+        let mut lines = text.lines().peekable();
+        while let Some(line) = lines.next() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let name = rest.split(' ').next().unwrap().to_string();
+                assert!(seen.insert(name.clone()), "family {name} twice");
+                let ty = lines.next().unwrap();
+                let kind = ty
+                    .strip_prefix(&format!("# TYPE {name} "))
+                    .unwrap_or_else(|| panic!("HELP of {name} not followed by its TYPE: {ty}"));
+                assert!(["counter", "gauge", "histogram"].contains(&kind), "{kind}");
+                current = Some((name, kind.to_string()));
+                continue;
+            }
+            assert!(!line.starts_with('#'), "TYPE without HELP: {line}");
+            let (fam, kind) = current.as_ref().expect("sample before any HELP");
+            let name = family_of(line);
+            let ok = name == fam
+                || (kind == "histogram"
+                    && ["_bucket", "_sum", "_count"]
+                        .iter()
+                        .any(|s| name.strip_suffix(s) == Some(fam.as_str())));
+            assert!(ok, "sample {line:?} outside its family {fam}");
+        }
+    }
+
+    /// Golden: the whole exposition of a fully populated [`Metrics`] plus gauges (audit 2026-11,
+    /// QA-217: pinned before the renderer was split into helpers).
+    #[test]
+    fn prometheus_golden_text() {
+        let (m, gauges, _permit) = populated();
+        let text = render_prometheus(&m, &gauges);
+        assert_well_formed(&text);
+        let got = stable(&text);
+        let want = GOLDEN
+            .replace("@SHA@", crate::GIT_SHA)
+            .replace("@DATE@", crate::BUILD_DATE);
+        assert_eq!(got, want);
+    }
+
+    /// [`prometheus_golden_text`]'s expected text (`@SHA@` / `@DATE@`: the build's
+    /// [`crate::GIT_SHA`] / [`crate::BUILD_DATE`]).
+    const GOLDEN: &str = r#"# HELP blue_onyx_prism_info Build information.
+# TYPE blue_onyx_prism_info gauge
+blue_onyx_prism_info{version="1.2.\"3\""} 1
+# HELP blue_onyx_prism_build_info Build information: version, git commit and build date; value is always 1.
+# TYPE blue_onyx_prism_build_info gauge
+blue_onyx_prism_build_info{version="1.2.\"3\"",git_sha="@SHA@",build_date="@DATE@"} 1
+# HELP blue_onyx_prism_uptime_seconds Seconds since the service started.
+# TYPE blue_onyx_prism_uptime_seconds gauge
+blue_onyx_prism_uptime_seconds <v>
+# HELP blue_onyx_prism_restarts_total Registry restarts since the process started.
+# TYPE blue_onyx_prism_restarts_total counter
+blue_onyx_prism_restarts_total 2
+# HELP blue_onyx_prism_requests_rejected_total Detection requests rejected before inference, by reason (overloaded: the server-wide in-flight cap was reached; body_too_large: the upload exceeded the body limit; decode_error: the image could not be decoded; bad_request: no usable multipart image upload; peer_body_reads: one client had too many uploads still being read, a stalled or very slow sender; body_timeout: the upload was not received in time; upload_budget: the uploads in flight held the most memory allowed; unknown_model: the request named no enabled model).
+# TYPE blue_onyx_prism_requests_rejected_total counter
+blue_onyx_prism_requests_rejected_total{reason="overloaded"} 1
+blue_onyx_prism_requests_rejected_total{reason="body_too_large"} 2
+blue_onyx_prism_requests_rejected_total{reason="decode_error"} 3
+blue_onyx_prism_requests_rejected_total{reason="bad_request"} 4
+blue_onyx_prism_requests_rejected_total{reason="peer_body_reads"} 5
+blue_onyx_prism_requests_rejected_total{reason="body_timeout"} 6
+blue_onyx_prism_requests_rejected_total{reason="upload_budget"} 7
+blue_onyx_prism_requests_rejected_total{reason="unknown_model"} 8
+# HELP blue_onyx_prism_download_bytes_total Bytes received by on-demand resource downloads.
+# TYPE blue_onyx_prism_download_bytes_total counter
+blue_onyx_prism_download_bytes_total <v>
+# HELP blue_onyx_prism_download_failures_total On-demand resource download jobs that failed.
+# TYPE blue_onyx_prism_download_failures_total counter
+blue_onyx_prism_download_failures_total <v>
+# HELP blue_onyx_prism_dataset_requests_total Detection requests received since the service started (test page uploads excluded).
+# TYPE blue_onyx_prism_dataset_requests_total counter
+blue_onyx_prism_dataset_requests_total <v>
+# HELP blue_onyx_prism_dataset_offered_total Answered requests handed to the dataset collector.
+# TYPE blue_onyx_prism_dataset_offered_total counter
+blue_onyx_prism_dataset_offered_total <v>
+# HELP blue_onyx_prism_dataset_saved_total Frames the dataset collector saved.
+# TYPE blue_onyx_prism_dataset_saved_total counter
+blue_onyx_prism_dataset_saved_total <v>
+# HELP blue_onyx_prism_dataset_no_bucket_total Frames the dataset collector skipped because they matched no enabled bucket.
+# TYPE blue_onyx_prism_dataset_no_bucket_total counter
+blue_onyx_prism_dataset_no_bucket_total <v>
+# HELP blue_onyx_prism_dataset_frames_total Frames saved by the dataset collector, by bucket (a frame counts once in each bucket it was kept for).
+# TYPE blue_onyx_prism_dataset_frames_total counter
+blue_onyx_prism_dataset_frames_total{bucket="positive"} <v>
+blue_onyx_prism_dataset_frames_total{bucket="empty"} <v>
+blue_onyx_prism_dataset_frames_total{bucket="suppressed"} <v>
+blue_onyx_prism_dataset_frames_total{bucket="verify_rejected"} <v>
+blue_onyx_prism_dataset_frames_total{bucket="verify_kept"} <v>
+blue_onyx_prism_dataset_frames_total{bucket="near_threshold"} <v>
+blue_onyx_prism_dataset_frames_total{bucket="disagreement"} <v>
+# HELP blue_onyx_prism_dataset_dropped_total Frames the dataset collector did not save, by reason (queue_full|rate|dup|disk|error).
+# TYPE blue_onyx_prism_dataset_dropped_total counter
+blue_onyx_prism_dataset_dropped_total{reason="queue_full"} <v>
+blue_onyx_prism_dataset_dropped_total{reason="rate"} <v>
+blue_onyx_prism_dataset_dropped_total{reason="dup"} <v>
+blue_onyx_prism_dataset_dropped_total{reason="disk"} <v>
+blue_onyx_prism_dataset_dropped_total{reason="error"} <v>
+# HELP blue_onyx_prism_dataset_bytes Bytes of the frames and sidecars in the dataset folder.
+# TYPE blue_onyx_prism_dataset_bytes gauge
+blue_onyx_prism_dataset_bytes <v>
+# HELP blue_onyx_prism_dataset_collect_disabled 1 while the collector is disabled for low disk space or a full disk.
+# TYPE blue_onyx_prism_dataset_collect_disabled gauge
+blue_onyx_prism_dataset_collect_disabled <v>
+# HELP blue_onyx_prism_inflight_requests Detection requests being handled now (body read, queue wait, inference).
+# TYPE blue_onyx_prism_inflight_requests gauge
+blue_onyx_prism_inflight_requests 1
+# HELP blue_onyx_prism_requests_total Detection requests received.
+# TYPE blue_onyx_prism_requests_total counter
+blue_onyx_prism_requests_total{model="a"} 10
+blue_onyx_prism_requests_total{model="b\"q"} 11
+# HELP blue_onyx_prism_dropped_total Requests not served by inference, by reason (queue_full|timeout|initializing|failed|worker_gone).
+# TYPE blue_onyx_prism_dropped_total counter
+blue_onyx_prism_dropped_total{model="a",reason="queue_full"} 1
+blue_onyx_prism_dropped_total{model="a",reason="timeout"} 2
+blue_onyx_prism_dropped_total{model="a",reason="initializing"} 3
+blue_onyx_prism_dropped_total{model="a",reason="failed"} 4
+blue_onyx_prism_dropped_total{model="a",reason="worker_gone"} 5
+blue_onyx_prism_dropped_total{model="b\"q",reason="queue_full"} 2
+blue_onyx_prism_dropped_total{model="b\"q",reason="timeout"} 3
+blue_onyx_prism_dropped_total{model="b\"q",reason="initializing"} 4
+blue_onyx_prism_dropped_total{model="b\"q",reason="failed"} 5
+blue_onyx_prism_dropped_total{model="b\"q",reason="worker_gone"} 6
+# HELP blue_onyx_prism_detections_suppressed_total Detections removed by the night / IR rules and the verifier, by reason (night_threshold|label_threshold|aspect|min_area|overlap|static|verify).
+# TYPE blue_onyx_prism_detections_suppressed_total counter
+blue_onyx_prism_detections_suppressed_total{model="a",reason="night_threshold"} 1
+blue_onyx_prism_detections_suppressed_total{model="a",reason="label_threshold"} 2
+blue_onyx_prism_detections_suppressed_total{model="a",reason="aspect"} 3
+blue_onyx_prism_detections_suppressed_total{model="a",reason="min_area"} 4
+blue_onyx_prism_detections_suppressed_total{model="a",reason="overlap"} 5
+blue_onyx_prism_detections_suppressed_total{model="a",reason="static"} 6
+blue_onyx_prism_detections_suppressed_total{model="a",reason="verify"} 7
+blue_onyx_prism_detections_suppressed_total{model="b\"q",reason="night_threshold"} 2
+blue_onyx_prism_detections_suppressed_total{model="b\"q",reason="label_threshold"} 3
+blue_onyx_prism_detections_suppressed_total{model="b\"q",reason="aspect"} 4
+blue_onyx_prism_detections_suppressed_total{model="b\"q",reason="min_area"} 5
+blue_onyx_prism_detections_suppressed_total{model="b\"q",reason="overlap"} 6
+blue_onyx_prism_detections_suppressed_total{model="b\"q",reason="static"} 7
+blue_onyx_prism_detections_suppressed_total{model="b\"q",reason="verify"} 8
+# HELP blue_onyx_prism_night_model_routed_total Night / IR frames forwarded to the model's night_model.
+# TYPE blue_onyx_prism_night_model_routed_total counter
+blue_onyx_prism_night_model_routed_total{model="a"} 1
+blue_onyx_prism_night_model_routed_total{model="b\"q"} 2
+# HELP blue_onyx_prism_night_model_fallback_total Night / IR frames that ran on the model itself because its night_model was unavailable, by reason (unknown|not_ready|queue_full|stopped).
+# TYPE blue_onyx_prism_night_model_fallback_total counter
+blue_onyx_prism_night_model_fallback_total{model="a",reason="unknown"} 1
+blue_onyx_prism_night_model_fallback_total{model="a",reason="not_ready"} 2
+blue_onyx_prism_night_model_fallback_total{model="a",reason="queue_full"} 3
+blue_onyx_prism_night_model_fallback_total{model="a",reason="stopped"} 4
+blue_onyx_prism_night_model_fallback_total{model="b\"q",reason="unknown"} 2
+blue_onyx_prism_night_model_fallback_total{model="b\"q",reason="not_ready"} 3
+blue_onyx_prism_night_model_fallback_total{model="b\"q",reason="queue_full"} 4
+blue_onyx_prism_night_model_fallback_total{model="b\"q",reason="stopped"} 5
+# HELP blue_onyx_prism_verify_total Candidate boxes checked by the model's verifier (verify), by outcome (kept|rejected|unverified; unverified = the verifier was unavailable, busy, late or failed, or over max_crops, and the box was kept).
+# TYPE blue_onyx_prism_verify_total counter
+blue_onyx_prism_verify_total{model="a",outcome="kept"} 1
+blue_onyx_prism_verify_total{model="a",outcome="rejected"} 2
+blue_onyx_prism_verify_total{model="a",outcome="unverified"} 3
+blue_onyx_prism_verify_total{model="b\"q",outcome="kept"} 2
+blue_onyx_prism_verify_total{model="b\"q",outcome="rejected"} 3
+blue_onyx_prism_verify_total{model="b\"q",outcome="unverified"} 4
+# HELP blue_onyx_prism_inference_ms Model inference time in ms (histogram).
+# TYPE blue_onyx_prism_inference_ms histogram
+blue_onyx_prism_inference_ms_bucket{model="a",le="1"} 1
+blue_onyx_prism_inference_ms_bucket{model="a",le="2"} 1
+blue_onyx_prism_inference_ms_bucket{model="a",le="5"} 2
+blue_onyx_prism_inference_ms_bucket{model="a",le="10"} 2
+blue_onyx_prism_inference_ms_bucket{model="a",le="20"} 3
+blue_onyx_prism_inference_ms_bucket{model="a",le="50"} 3
+blue_onyx_prism_inference_ms_bucket{model="a",le="100"} 3
+blue_onyx_prism_inference_ms_bucket{model="a",le="200"} 3
+blue_onyx_prism_inference_ms_bucket{model="a",le="500"} 3
+blue_onyx_prism_inference_ms_bucket{model="a",le="1000"} 4
+blue_onyx_prism_inference_ms_bucket{model="a",le="2000"} 4
+blue_onyx_prism_inference_ms_bucket{model="a",le="5000"} 4
+blue_onyx_prism_inference_ms_bucket{model="a",le="+Inf"} 5
+blue_onyx_prism_inference_ms_sum{model="a"} 9718
+blue_onyx_prism_inference_ms_count{model="a"} 5
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="1"} 1
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="2"} 1
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="5"} 2
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="10"} 2
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="20"} 3
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="50"} 3
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="100"} 3
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="200"} 3
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="500"} 3
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="1000"} 4
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="2000"} 4
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="5000"} 4
+blue_onyx_prism_inference_ms_bucket{model="b\"q",le="+Inf"} 5
+blue_onyx_prism_inference_ms_sum{model="b\"q"} 9723
+blue_onyx_prism_inference_ms_count{model="b\"q"} 5
+# HELP blue_onyx_prism_inference_ms_avg Model inference time in ms (avg).
+# TYPE blue_onyx_prism_inference_ms_avg gauge
+blue_onyx_prism_inference_ms_avg{model="a"} 1943.600
+blue_onyx_prism_inference_ms_avg{model="b\"q"} 1944.600
+# HELP blue_onyx_prism_inference_ms_min Model inference time in ms (min).
+# TYPE blue_onyx_prism_inference_ms_min gauge
+blue_onyx_prism_inference_ms_min{model="a"} 0
+blue_onyx_prism_inference_ms_min{model="b\"q"} 1
+# HELP blue_onyx_prism_inference_ms_max Model inference time in ms (max).
+# TYPE blue_onyx_prism_inference_ms_max gauge
+blue_onyx_prism_inference_ms_max{model="a"} 9000
+blue_onyx_prism_inference_ms_max{model="b\"q"} 9001
+# HELP blue_onyx_prism_round_trip_ms Request round trip time in ms (histogram).
+# TYPE blue_onyx_prism_round_trip_ms histogram
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="1"} 0
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="2"} 1
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="5"} 1
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="10"} 1
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="20"} 2
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="50"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="100"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="200"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="500"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="1000"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="2000"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="5000"} 4
+blue_onyx_prism_round_trip_ms_bucket{model="a",le="+Inf"} 5
+blue_onyx_prism_round_trip_ms_sum{model="a"} 29164
+blue_onyx_prism_round_trip_ms_count{model="a"} 5
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="1"} 0
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="2"} 1
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="5"} 1
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="10"} 1
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="20"} 2
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="50"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="100"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="200"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="500"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="1000"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="2000"} 3
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="5000"} 4
+blue_onyx_prism_round_trip_ms_bucket{model="b\"q",le="+Inf"} 5
+blue_onyx_prism_round_trip_ms_sum{model="b\"q"} 29164
+blue_onyx_prism_round_trip_ms_count{model="b\"q"} 5
+# HELP blue_onyx_prism_round_trip_ms_avg Request round trip time in ms (avg).
+# TYPE blue_onyx_prism_round_trip_ms_avg gauge
+blue_onyx_prism_round_trip_ms_avg{model="a"} 5832.800
+blue_onyx_prism_round_trip_ms_avg{model="b\"q"} 5832.800
+# HELP blue_onyx_prism_round_trip_ms_min Request round trip time in ms (min).
+# TYPE blue_onyx_prism_round_trip_ms_min gauge
+blue_onyx_prism_round_trip_ms_min{model="a"} 2
+blue_onyx_prism_round_trip_ms_min{model="b\"q"} 2
+# HELP blue_onyx_prism_round_trip_ms_max Request round trip time in ms (max).
+# TYPE blue_onyx_prism_round_trip_ms_max gauge
+blue_onyx_prism_round_trip_ms_max{model="a"} 27002
+blue_onyx_prism_round_trip_ms_max{model="b\"q"} 27002
+# HELP blue_onyx_prism_model_info Model device, execution provider and state (initializing|ready|failed|lazy); value is always 1.
+# TYPE blue_onyx_prism_model_info gauge
+blue_onyx_prism_model_info{model="a",device="GPU.\"1\"",provider="OpenVINO GPU (x)",state="ready"} 1
+blue_onyx_prism_model_info{model="b\"q",device="GPU.\"1\"",provider="OpenVINO GPU (x)",state="initializing"} 1
+blue_onyx_prism_model_info{model="c",device="GPU.\"1\"",provider="OpenVINO GPU (x)",state="failed"} 1
+blue_onyx_prism_model_info{model="d",device="GPU.\"1\"",provider="OpenVINO GPU (x)",state="lazy"} 1
+# HELP blue_onyx_prism_model_ready 1 when the model is compiled and serving requests, else 0.
+# TYPE blue_onyx_prism_model_ready gauge
+blue_onyx_prism_model_ready{model="a"} 1
+blue_onyx_prism_model_ready{model="b\"q"} 0
+blue_onyx_prism_model_ready{model="c"} 0
+blue_onyx_prism_model_ready{model="d"} 0
+# HELP blue_onyx_prism_queue_length Requests waiting in the worker queue.
+# TYPE blue_onyx_prism_queue_length gauge
+blue_onyx_prism_queue_length{model="a"} 2
+blue_onyx_prism_queue_length{model="b\"q"} 0
+blue_onyx_prism_queue_length{model="c"} 0
+blue_onyx_prism_queue_length{model="d"} 1
+# HELP blue_onyx_prism_queue_capacity Effective worker queue depth limit (sized after warm-up).
+# TYPE blue_onyx_prism_queue_capacity gauge
+blue_onyx_prism_queue_capacity{model="a"} 30
+blue_onyx_prism_queue_capacity{model="b\"q"} 64
+blue_onyx_prism_queue_capacity{model="c"} 0
+blue_onyx_prism_queue_capacity{model="d"} 8
+"#;
+
+    /// The counters are indexed by `reason as usize`: [`RejectReason::ALL`] lists the reasons in
+    /// declaration order (likewise the per-model label enums).
+    #[test]
+    fn reason_lists_follow_declaration_order() {
+        for (i, r) in RejectReason::ALL.into_iter().enumerate() {
+            assert_eq!(r as usize, i, "{r:?}");
+        }
+        for (i, r) in DropReason::ALL.into_iter().enumerate() {
+            assert_eq!(r as usize, i, "{r:?}");
+        }
+        for (i, r) in RouteFallback::ALL.into_iter().enumerate() {
+            assert_eq!(r as usize, i, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn rejected_counts_each_reason_apart() {
+        let m = Metrics::new("0");
+        for (i, r) in RejectReason::ALL.into_iter().enumerate() {
+            for _ in 0..=i {
+                m.record_rejected(r);
+            }
+        }
+        for (i, r) in RejectReason::ALL.into_iter().enumerate() {
+            let want = if r == RejectReason::DecodeError {
+                0
+            } else {
+                u64::try_from(i).unwrap() + 1
+            };
+            assert_eq!(m.rejected(r), want, "{r:?}");
+        }
+    }
+
+    #[test]
+    fn family_and_per_model_helpers() {
+        let mut out = String::new();
+        family(&mut out, "x_total", Kind::Counter, "Some help.");
+        sample(&mut out, "x_total", 7);
+        let models = vec![
+            Arc::new(ModelMetrics::new("a", "", "")),
+            Arc::new(ModelMetrics::new("b\"c", "", "")),
+        ];
+        models[1].record_drop(DropReason::Timeout);
+        per_model(&mut out, "y", &models, |mm| mm.name.len());
+        per_model_labeled(
+            &mut out,
+            "z",
+            "reason",
+            &models,
+            &[DropReason::QueueFull, DropReason::Timeout],
+            DropReason::as_str,
+            ModelMetrics::dropped,
+        );
+        assert_eq!(
+            out,
+            r#"# HELP blue_onyx_prism_x_total Some help.
+# TYPE blue_onyx_prism_x_total counter
+blue_onyx_prism_x_total 7
+blue_onyx_prism_y{model="a"} 1
+blue_onyx_prism_y{model="b\"c"} 3
+blue_onyx_prism_z{model="a",reason="queue_full"} 0
+blue_onyx_prism_z{model="a",reason="timeout"} 0
+blue_onyx_prism_z{model="b\"c",reason="queue_full"} 0
+blue_onyx_prism_z{model="b\"c",reason="timeout"} 1
+"#
+        );
     }
 
     #[test]

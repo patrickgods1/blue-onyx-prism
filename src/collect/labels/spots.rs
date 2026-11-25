@@ -22,6 +22,7 @@ use super::repeats::{
 use super::{BoxState, LabelBox, iou, read_capped};
 use crate::clock::Zone;
 use crate::collect::layout;
+use crate::sync::LockExt as _;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate};
 use serde::{Deserialize, Serialize};
@@ -152,7 +153,7 @@ pub fn update<T>(
     camera: &str,
     edit: impl FnOnce(&mut CameraSpots) -> Result<T>,
 ) -> Result<T> {
-    let _held = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _held = STORE_LOCK.lock_recover();
     let before = read(dir, camera)?;
     let mut spots = before.clone();
     let out = edit(&mut spots)?;

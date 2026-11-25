@@ -219,10 +219,15 @@ pub fn setup(
     Ok(())
 }
 
-/// The JSON of an event line `@<tag> {json}` (None for other lines).
+/// The JSON of an event `@<tag> {json}` in `line` (None for other lines and bad JSON): the one
+/// rule of the scripts' event lines, also the training's ([`super::progress::parse_line`]). The
+/// marker `@<tag> ` may be anywhere in the line (a progress bar can precede it); the JSON is the
+/// rest of the line after its first marker. The scripts print each event on a line of its own
+/// (`"\n@<tag> " + json`), so for them this is the line-start rule.
 pub fn parse_event(line: &str, tag: &str) -> Option<serde_json::Value> {
-    let rest = line.trim_start().strip_prefix('@')?.strip_prefix(tag)?;
-    let json = rest.strip_prefix(' ')?;
+    let json = line
+        .match_indices('@')
+        .find_map(|(at, _)| line.get(at + 1..)?.strip_prefix(tag)?.strip_prefix(' '))?;
     serde_json::from_str(json.trim()).ok()
 }
 
@@ -341,6 +346,24 @@ fn gpu_failure(lines: &[String], tag: &str, sam3: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit 2026-11 phase 9 (Q:gap-6): one rule for every tag, the training's: the marker
+    /// anywhere in the line, the JSON after its first one.
+    #[test]
+    fn events_parse_after_any_prefix_and_only_whole_markers() {
+        let v = parse_event("50% |###| @import {\"event\":\"progress\"}  ", "import").unwrap();
+        assert_eq!(v["event"], "progress");
+        let v = parse_event("a@b @autolabel {\"event\":\"done\"}", "autolabel").unwrap();
+        assert_eq!(v["event"], "done");
+        // The first marker decides: bad JSON after it is no event.
+        assert!(parse_event("@import {bad @import {}", "import").is_none());
+        assert!(parse_event("x@importx {} @import", "import").is_none());
+        assert!(parse_event("@import{}", "import").is_none());
+        assert_eq!(
+            parse_event("@train {\"event\":\"x\"}", "train").unwrap()["event"],
+            "x"
+        );
+    }
 
     #[test]
     fn events_parse_by_tag() {

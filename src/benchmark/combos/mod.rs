@@ -441,21 +441,20 @@ impl Parts {
             .models
             .iter()
             .filter_map(|r| super::variant::owner(cfg, &r.model))
-            .map(|m| normalize_name(&m.effective_name()))
+            .map(|m| m.key())
             .collect();
-        let in_results = |name: &str| owners.contains(&normalize_name(name));
+        let in_results = |m: &crate::config::ModelConfig| owners.contains(&m.key());
         let trained = cfg
             .models
             .iter()
             .filter_map(|m| {
-                let name = m.effective_name();
-                if !in_results(&name) {
+                if !in_results(m) {
                     return None;
                 }
                 // Its As served and variant results trained on the same frames.
                 let frames =
                     crate::training::autolabel::trained_frames(cfg, m, &mut Vec::new()).ok()?;
-                (!frames.is_empty()).then(|| (normalize_name(&name), frames))
+                (!frames.is_empty()).then(|| (m.key(), frames))
             })
             .collect();
         let seen = results
@@ -464,13 +463,12 @@ impl Parts {
                 cfg.models
                     .iter()
                     .filter_map(|m| {
-                        let name = m.effective_name();
-                        if !in_results(&name) {
+                        if !in_results(m) {
                             return None;
                         }
                         let files = set.images.iter().map(|i| i.file.as_str());
                         let s = super::cameras::seen::of_model(cfg, m, files);
-                        (s != Seen::NoRecord).then(|| (normalize_name(&name), s))
+                        (s != Seen::NoRecord).then(|| (m.key(), s))
                     })
                     .collect()
             })

@@ -46,7 +46,8 @@
 //! frames its model never trained or validated on (one snapshot), take the training lock, run the
 //! model over them once, judge and write them as a fold's frames ([`write::write_fold`]: the frames
 //! it trained on are never passed, so their suggestions stay exactly as they are), then the closer
-//! look (when on) and the report (`mode: model`). Steps: 3, or 4 with the look. A Cancel during the
+//! look (when on) and the report (`mode: model`): the same write, look and report steps as a fold
+//! check's, worded for the model ([`Who`]). Steps: 3, or 4 with the look. A Cancel during the
 //! model's pass writes nothing (a plain cancel, as a cancel before any fold finished); a failed pass
 //! fails the check with nothing written; a Cancel during the closer look keeps what the pass wrote.
 //! Pause holds the closer look's helper only: the model's pass runs in this process.
@@ -151,6 +152,109 @@ pub struct RefineResult {
 enum Stop {
     Cancelled,
     Failed(anyhow::Error),
+}
+
+/// Whose pass wrote a set of suggestions, as the check's messages name it.
+#[derive(Debug, Clone, Copy)]
+enum Who<'a> {
+    /// Fold `n` of `k` of the full check.
+    Fold { n: usize, k: usize },
+    /// A quick check's model, by name.
+    Model(&'a str),
+}
+
+impl Who<'_> {
+    /// The warning for `missing` frames the model gave no result.
+    fn missing(self, missing: usize) -> String {
+        match self {
+            Who::Fold { n, k } => format!(
+                "fold {n} of {k}: {missing} frame(s) got no result from the fold model (the image \
+                 is gone or cannot be read); they were not checked"
+            ),
+            Who::Model(name) => format!(
+                "{missing} frame(s) got no result from {name} (the image is gone or cannot be \
+                 read); they were not checked"
+            ),
+        }
+    }
+
+    /// The error when none of the `attempted` frames could be written (`why`: the first failure).
+    fn none_written(self, attempted: usize, why: &str) -> String {
+        match self {
+            Who::Fold { n, k } => format!(
+                "fold {n} of {k}: none of its {attempted} frames could be written ({why}); nothing \
+                 of this fold was saved"
+            ),
+            Who::Model(name) => format!(
+                "none of the {attempted} frames {name} checked could be written ({why}); nothing \
+                 was saved"
+            ),
+        }
+    }
+
+    /// The warning when the pass's loose labels could not be kept for the closer look (`e`).
+    fn not_kept(self, e: &anyhow::Error) -> String {
+        let prefix = match self {
+            Who::Fold { n, k } => format!("fold {n} of {k}: "),
+            Who::Model(_) => String::new(),
+        };
+        format!(
+            "{prefix}its loose labels could not be kept for the closer look ({e:#}); they get no \
+             better-fitting box in this check"
+        )
+    }
+}
+
+/// A check's report once written ([`RefineJob::finish_report`]): the report, where it went (None
+/// when it could not be written), the first frames written.
+struct Finished {
+    rep: RefineReport,
+    report_path: Option<PathBuf>,
+    sample: Vec<String>,
+}
+
+impl Finished {
+    /// The summary's parts on the suggestions found: the missing boxes at static spots, and the
+    /// better-fitting boxes when the check took a closer look (`look`).
+    fn found_parts(&self, look: bool) -> (String, String) {
+        let n = crate::training::import::preview::thousands;
+        let at_spots = if self.rep.adds_at_spots > 0 {
+            format!(" ({} at static spots)", n(self.rep.adds_at_spots))
+        } else {
+            String::new()
+        };
+        let better = if look {
+            format!(
+                ", {} better-fitting boxes for loose labels",
+                n(self.rep.found.tighten)
+            )
+        } else {
+            String::new()
+        };
+        (at_spots, better)
+    }
+
+    /// The summary's end: where the report is, and how many warnings it has.
+    fn summary_end(&self) -> String {
+        let mut out = String::new();
+        if let Some(p) = &self.report_path {
+            out.push_str(&format!("; report: {}", p.display()));
+        }
+        if !self.rep.warnings.is_empty() {
+            out.push_str(&format!("; {} warnings", self.rep.warnings.len()));
+        }
+        out
+    }
+
+    /// The task's result, `started` being when the check began (seconds to a tenth).
+    fn result(self, started: Instant) -> RefineResult {
+        RefineResult {
+            report: self.rep,
+            report_path: self.report_path,
+            sample: self.sample,
+            seconds: (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+        }
+    }
 }
 
 /// What a fold calls the end of its training run: the model files go into the fold's folder.
@@ -422,21 +526,19 @@ impl Acc {
         );
         self.changed.extend(w.changed.iter().cloned());
         self.rep.frames_written = self.changed.len();
-        for f in &w.failures {
-            if self.failures_shown < write::MAX_FAILURES {
-                self.rep.warnings.push(f.clone());
-                self.failures_shown += 1;
-            } else {
-                self.failures_more += 1;
-            }
-        }
-        self.failures_more += w.failed.saturating_sub(w.failures.len());
+        self.push_failures(&w.failures, w.failed);
     }
 
     /// Name the write failures of `w` in the report while fewer than [`write::MAX_FAILURES`] are,
     /// count the others.
     pub fn note_failures(&mut self, w: &write::Written) {
-        for f in &w.failures {
+        self.push_failures(&w.failures, w.failed);
+    }
+
+    /// Name the failures `shown` (of `failed` in all) in the report while fewer than
+    /// [`write::MAX_FAILURES`] are, count the others.
+    fn push_failures(&mut self, shown: &[String], failed: usize) {
+        for f in shown {
             if self.failures_shown < write::MAX_FAILURES {
                 self.rep.warnings.push(f.clone());
                 self.failures_shown += 1;
@@ -444,7 +546,7 @@ impl Acc {
                 self.failures_more += 1;
             }
         }
-        self.failures_more += w.failed.saturating_sub(w.failures.len());
+        self.failures_more += failed.saturating_sub(shown.len());
     }
 
     /// The one line for the failures not named, when there are any (at the end of a check).
@@ -632,17 +734,19 @@ impl RefineJob {
         s: &'s Selected,
         i: usize,
     ) -> (Vec<&'s ExportFrame>, Vec<&'s ExportFrame>, usize) {
-        let present = |f: &&ExportFrame| {
-            f.image.is_file()
-                && Frame::resolve(&self.dataset_dir, &f.rel.jpg())
-                    .is_some_and(|fr| fr.labels.is_file())
-        };
         let (held, train) = s.fold_frames(i);
         let all = held.len() + train.len();
-        let held: Vec<&ExportFrame> = held.into_iter().filter(present).collect();
-        let train: Vec<&ExportFrame> = train.into_iter().filter(present).collect();
+        let held: Vec<&ExportFrame> = held.into_iter().filter(|f| self.present(f)).collect();
+        let train: Vec<&ExportFrame> = train.into_iter().filter(|f| self.present(f)).collect();
         let gone = all - held.len() - train.len();
         (held, train, gone)
+    }
+
+    /// Whether the selected frame `f` is still on disk as a check uses it: its image and its label
+    /// file (one deleted or moved since the selection is left out, and counted).
+    fn present(&self, f: &ExportFrame) -> bool {
+        f.image.is_file()
+            && Frame::resolve(&self.dataset_dir, &f.rel.jpg()).is_some_and(|fr| fr.labels.is_file())
     }
 
     /// The report of a check over the selection `s` before any fold of `train` ran.
@@ -674,14 +778,33 @@ impl RefineJob {
     }
 
     /// Write fold `n` of `k`'s suggestions for its `held` frames from `found` (judged with `jctx`)
-    /// and count them into `acc`; an error when every frame with a result failed to write (then
-    /// nothing of the fold was saved, and it does not count as done). The real fold and the replay
-    /// test share it.
+    /// and count them into `acc` ([`Self::write_into`]). The real fold and the replay test share
+    /// it.
     #[allow(clippy::too_many_arguments)]
     fn write_fold_into(
         &self,
         n: usize,
         k: usize,
+        held: &[&ExportFrame],
+        found: &Detections,
+        jctx: &Context<'_>,
+        acc: &mut Acc,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<write::Written> {
+        self.write_into(Who::Fold { n, k }, held, found, jctx, acc, progress)
+    }
+
+    /// Write the suggestions `who` found (`found`, judged with `jctx`) for the frames `held` and
+    /// count them into `acc`; an error when every frame with a result failed to write (then nothing
+    /// of the pass was saved: a fold does not count as done, a quick check fails). Frames that got
+    /// no result are a warning unless the pass was cancelled.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "who wrote, the frames, the results, the judge, the tally and the progress"
+    )]
+    fn write_into(
+        &self,
+        who: Who<'_>,
         held: &[&ExportFrame],
         found: &Detections,
         jctx: &Context<'_>,
@@ -698,22 +821,100 @@ impl RefineJob {
         );
         acc.note_failures(&w);
         if w.missing > 0 && !found.cancelled {
-            acc.rep.warnings.push(format!(
-                "fold {n} of {k}: {} frame(s) got no result from the fold model (the image is \
-                 gone or cannot be read); they were not checked",
-                w.missing
-            ));
+            acc.rep.warnings.push(who.missing(w.missing));
         }
         if w.all_failed() {
             bail!(
-                "fold {n} of {k}: none of its {} frames could be written ({}); nothing of this \
-                 fold was saved",
-                w.attempted,
-                w.failures.first().map_or("no reason given", String::as_str)
+                "{}",
+                who.none_written(
+                    w.attempted,
+                    w.failures.first().map_or("no reason given", String::as_str)
+                )
             );
         }
         count_written(acc, &w);
         Ok(w)
+    }
+
+    /// Keep the loose labels of a pass (`w`) for the closer look after it, when this check takes
+    /// one; a failure is a warning in `who`'s words (they get no better-fitting box).
+    fn keep_loose(&self, who: Who<'_>, w: &write::Written, acc: &mut Acc) {
+        if self.tighten()
+            && let Err(e) = tighten::append(&self.work, &w.candidates)
+        {
+            acc.rep.warnings.push(who.not_kept(&e));
+        }
+    }
+
+    /// The closer look at the loose labels the passes kept ([`tighten::run_stage`]) as step `at` of
+    /// `steps`; a kept list that cannot be read is a warning, and the look then has nothing to do.
+    fn run_look(
+        &self,
+        ctx: TaskContext<'_>,
+        report: &mut dyn FnMut(TaskReport<'_>),
+        at: (usize, usize),
+        cancel: &AtomicBool,
+        acc: &mut Acc,
+    ) -> tighten::ZoomEnd {
+        let frames = match tighten::read(&self.work, &mut acc.rep.warnings) {
+            Ok(f) => f,
+            Err(e) => {
+                acc.rep.warnings.push(format!(
+                    "the loose labels kept for the closer look could not be read ({e:#}); they \
+                     get no better-fitting box in this check"
+                ));
+                Vec::new()
+            }
+        };
+        tighten::run_stage(self, &frames, ctx, report, at, cancel, acc)
+    }
+
+    /// The end of every check, once the training lock is released: the report step, the line for
+    /// the write failures not named, how it ended (`cancelled`: by a Cancel before the closer look;
+    /// `failed`: why the folds stopped; the look's own Cancel from `zoom`), the report's totals and
+    /// its file (a failed write is one more warning).
+    fn finish_report(
+        &self,
+        mut acc: Acc,
+        zoom: Option<&tighten::ZoomEnd>,
+        (cancelled, failed): (bool, Option<&anyhow::Error>),
+        steps: usize,
+        report: &mut dyn FnMut(TaskReport<'_>),
+    ) -> Finished {
+        let zoom_cancelled = zoom.is_some_and(|z| z.cancelled);
+        Self::step(report, REPORTING, steps, steps, 0, "");
+        acc.close_failures();
+        let Acc {
+            mut rep,
+            tally,
+            sample,
+            ..
+        } = acc;
+        rep.cancelled = cancelled || zoom_cancelled;
+        if let Some(e) = failed {
+            rep.warnings.push(format!("the check stopped: {e:#}"));
+        }
+        if zoom_cancelled {
+            rep.warnings.push(format!(
+                "the closer look at loose labels was stopped by Cancel after {} of {} crops; the \
+                 better-fitting boxes of those were saved",
+                rep.zoomed, rep.tighten_candidates
+            ));
+        }
+        rep.finish(&tally);
+        let report_path = match rep.write(&self.dataset_dir) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                rep.warnings.push(format!("{e:#}"));
+                None
+            }
+        };
+        Self::step(report, REPORTING, steps, steps, 100, "done");
+        Finished {
+            rep,
+            report_path,
+            sample,
+        }
     }
 
     /// Where this check's fold folders go ([`place::FoldRoot::choose`]): the selected frames'
@@ -987,14 +1188,7 @@ impl RefineJob {
             );
         })?;
         // Its loose labels wait for the closer look after the last fold.
-        if self.tighten()
-            && let Err(e) = tighten::append(&self.work, &w.candidates)
-        {
-            acc.rep.warnings.push(format!(
-                "fold {n} of {k}: its loose labels could not be kept for the closer look \
-                 ({e:#}); they get no better-fitting box in this check"
-            ));
-        }
+        self.keep_loose(Who::Fold { n, k }, &w, acc);
         Self::step(
             report,
             &name,
@@ -1124,58 +1318,19 @@ impl RefineJob {
                     "the closer look at loose labels did not run: the check was cancelled".into(),
                 );
             } else {
-                let frames = match tighten::read(&self.work, &mut acc.rep.warnings) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        acc.rep.warnings.push(format!(
-                            "the loose labels kept for the closer look could not be read ({e:#}); \
-                             they get no better-fitting box in this check"
-                        ));
-                        Vec::new()
-                    }
-                };
-                zoom = Some(tighten::run_stage(
-                    self,
-                    &frames,
-                    ctx,
-                    report,
-                    (k + 2, steps),
-                    cancel,
-                    &mut acc,
-                ));
+                zoom = Some(self.run_look(ctx, report, (k + 2, steps), cancel, &mut acc));
             }
         }
         drop(lock);
         let zoom_cancelled = zoom.as_ref().is_some_and(|z| z.cancelled);
         // 4. The report (also of a stopped check: what its finished folds found).
-        Self::step(report, REPORTING, steps, steps, 0, "");
-        acc.close_failures();
-        let Acc {
-            mut rep,
-            tally,
-            sample,
-            ..
-        } = acc;
-        rep.cancelled = matches!(stop, Some(Stop::Cancelled)) || zoom_cancelled;
-        if let Some(Stop::Failed(e)) = &stop {
-            rep.warnings.push(format!("the check stopped: {e:#}"));
-        }
-        if zoom_cancelled {
-            rep.warnings.push(format!(
-                "the closer look at loose labels was stopped by Cancel after {} of {} crops; the \
-                 better-fitting boxes of those were saved",
-                rep.zoomed, rep.tighten_candidates
-            ));
-        }
-        rep.finish(&tally);
-        let report_path = match rep.write(&self.dataset_dir) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                rep.warnings.push(format!("{e:#}"));
-                None
-            }
+        let failed = match &stop {
+            Some(Stop::Failed(e)) => Some(e),
+            _ => None,
         };
-        Self::step(report, REPORTING, steps, steps, 100, "done");
+        let cancelled = matches!(stop, Some(Stop::Cancelled));
+        let end = self.finish_report(acc, zoom.as_ref(), (cancelled, failed), steps, report);
+        let rep = &end.rep;
         let n = crate::training::import::preview::thousands;
         let w = &rep.written;
         let f = &rep.found;
@@ -1193,17 +1348,8 @@ impl RefineJob {
             ),
             _ => String::new(),
         };
-        let at_spots = if rep.adds_at_spots > 0 {
-            format!(" ({} at static spots)", n(rep.adds_at_spots))
-        } else {
-            String::new()
-        };
-        let better = if look {
-            format!(", {} better-fitting boxes for loose labels", n(f.tighten))
-        } else {
-            String::new()
-        };
-        let looked = looked_text(zoom.as_ref(), &rep);
+        let (at_spots, better) = end.found_parts(look);
+        let looked = looked_text(zoom.as_ref(), rep);
         summary.push_str(&format!(
             "{} frames checked by {} fold models; suggested: {} missing boxes{at_spots}, {} labels \
              to verify, {} other classes{better} ({} of these suggestions new since the last \
@@ -1218,18 +1364,8 @@ impl RefineJob {
             n(rep.frames_written),
             n(rep.loose),
         ));
-        if let Some(p) = &report_path {
-            summary.push_str(&format!("; report: {}", p.display()));
-        }
-        if !rep.warnings.is_empty() {
-            summary.push_str(&format!("; {} warnings", rep.warnings.len()));
-        }
-        let result = RefineResult {
-            report: rep,
-            report_path,
-            sample,
-            seconds: (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
-        };
+        summary.push_str(&end.summary_end());
+        let result = end.result(started);
         if let Some(Stop::Failed(e)) = stop {
             return Err(e.context(format!(
                 "the suggestions of the {} finished fold(s) were saved{}{}",
@@ -1395,12 +1531,7 @@ impl RefineJob {
         // 2. The model's pass, then the judge and the writes (no cancel checks there: the pass is
         // written whole).
         let stage = format!("checking with {name}");
-        let present = |f: &&ExportFrame| {
-            f.image.is_file()
-                && Frame::resolve(&self.dataset_dir, &f.rel.jpg())
-                    .is_some_and(|fr| fr.labels.is_file())
-        };
-        let frames: Vec<&ExportFrame> = qs.s.frames.iter().filter(present).collect();
+        let frames: Vec<&ExportFrame> = qs.s.frames.iter().filter(|f| self.present(f)).collect();
         let gone = qs.s.frames.len() - frames.len();
         if gone > 0 {
             acc.rep.warnings.push(format!(
@@ -1468,46 +1599,19 @@ impl RefineJob {
             floor: self.config.collect.size_floor,
             model: Some(&q.judge),
         };
-        let w = write::write_fold(
-            &self.dataset_dir,
-            &frames,
-            &found,
-            &jctx,
-            &mut acc.tally,
-            &mut |d, total| {
-                let pct = 50 + d * 50 / total.max(1);
-                Self::step(
-                    report,
-                    &stage,
-                    2,
-                    steps,
-                    u8::try_from(pct).unwrap_or(99),
-                    &format!("writing suggestions: {d} of {total} frames"),
-                );
-            },
-        );
-        acc.note_failures(&w);
-        if w.missing > 0 {
-            acc.rep.warnings.push(format!(
-                "{} frame(s) got no result from {name} (the image is gone or cannot be read); \
-                 they were not checked",
-                w.missing
-            ));
-        }
-        if w.all_failed() {
-            bail!(
-                "none of the {} frames {name} checked could be written ({}); nothing was saved",
-                w.attempted,
-                w.failures.first().map_or("no reason given", String::as_str)
+        let who = Who::Model(&name);
+        let w = self.write_into(who, &frames, &found, &jctx, &mut acc, &mut |d, total| {
+            let pct = 50 + d * 50 / total.max(1);
+            Self::step(
+                report,
+                &stage,
+                2,
+                steps,
+                u8::try_from(pct).unwrap_or(99),
+                &format!("writing suggestions: {d} of {total} frames"),
             );
-        }
-        count_written(&mut acc, &w);
-        if look && let Err(e) = tighten::append(&self.work, &w.candidates) {
-            acc.rep.warnings.push(format!(
-                "its loose labels could not be kept for the closer look ({e:#}); they get no \
-                 better-fitting box in this check"
-            ));
-        }
+        })?;
+        self.keep_loose(who, &w, &mut acc);
         Self::step(
             report,
             &stage,
@@ -1517,57 +1621,13 @@ impl RefineJob {
             &format!("{} frames checked, {} changed", w.checked, w.frames),
         );
         // 3. The closer look, still under the training lock.
-        let mut zoom = None;
-        if look {
-            let frames = match tighten::read(&self.work, &mut acc.rep.warnings) {
-                Ok(f) => f,
-                Err(e) => {
-                    acc.rep.warnings.push(format!(
-                        "the loose labels kept for the closer look could not be read ({e:#}); \
-                         they get no better-fitting box in this check"
-                    ));
-                    Vec::new()
-                }
-            };
-            zoom = Some(tighten::run_stage(
-                self,
-                &frames,
-                ctx,
-                report,
-                (3, steps),
-                cancel,
-                &mut acc,
-            ));
-        }
+        let zoom = look.then(|| self.run_look(ctx, report, (3, steps), cancel, &mut acc));
         drop(lock);
-        let zoom_cancelled = zoom.as_ref().is_some_and(|z| z.cancelled);
         // 4. The report.
-        Self::step(report, REPORTING, steps, steps, 0, "");
-        acc.close_failures();
-        let Acc {
-            mut rep,
-            tally,
-            sample,
-            ..
-        } = acc;
-        rep.cancelled = zoom_cancelled;
-        if zoom_cancelled {
-            rep.warnings.push(format!(
-                "the closer look at loose labels was stopped by Cancel after {} of {} crops; the \
-                 better-fitting boxes of those were saved",
-                rep.zoomed, rep.tighten_candidates
-            ));
-        }
-        rep.finish(&tally);
-        let report_path = match rep.write(&self.dataset_dir) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                rep.warnings.push(format!("{e:#}"));
-                None
-            }
-        };
-        Self::step(report, REPORTING, steps, steps, 100, "done");
+        let end = self.finish_report(acc, zoom.as_ref(), (false, None), steps, report);
+        let rep = &end.rep;
         let f = &rep.found;
+        let zoom_cancelled = zoom.as_ref().is_some_and(|z| z.cancelled);
         let mut summary = if zoom_cancelled {
             format!(
                 "stopped by Cancel during the closer look at loose labels, after {} of {} crops; \
@@ -1578,16 +1638,7 @@ impl RefineJob {
         } else {
             String::new()
         };
-        let at_spots = if rep.adds_at_spots > 0 {
-            format!(" ({} at static spots)", n(rep.adds_at_spots))
-        } else {
-            String::new()
-        };
-        let better = if look {
-            format!(", {} better-fitting boxes for loose labels", n(f.tighten))
-        } else {
-            String::new()
-        };
+        let (at_spots, better) = end.found_parts(look);
         summary.push_str(&format!(
             "{} frames {name} never saw checked ({} it trained on and {} it validated on left \
              out); suggested: {} missing boxes{at_spots}, {} labels to verify, {} other \
@@ -1603,20 +1654,10 @@ impl RefineJob {
             n(rep.written.total()),
             n(rep.frames_written),
             n(rep.loose),
-            looked_text(zoom.as_ref(), &rep),
+            looked_text(zoom.as_ref(), rep),
         ));
-        if let Some(p) = &report_path {
-            summary.push_str(&format!("; report: {}", p.display()));
-        }
-        if !rep.warnings.is_empty() {
-            summary.push_str(&format!("; {} warnings", rep.warnings.len()));
-        }
-        let result = RefineResult {
-            report: rep,
-            report_path,
-            sample,
-            seconds: (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
-        };
+        summary.push_str(&end.summary_end());
+        let result = end.result(started);
         Ok(TaskOutcome {
             summary,
             result: serde_json::to_value(&result)?,

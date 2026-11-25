@@ -1859,75 +1859,54 @@ fn restored_note(s: &Stats, sources: &[Source], opts: &Options) -> Option<String
     ))
 }
 
-/// Decide the splits (see the module docs). Pure and deterministic for a given `seed`.
-pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
-    // 1. Classes.
-    let classes = match &opts.classes {
-        Some(c) => c.clone(),
-        None => {
-            let mut v: Vec<String> = Vec::new();
-            for s in sources {
-                for c in &s.classes {
-                    let name = opts.rename.get(c).unwrap_or(c);
-                    if !name.is_empty() && !v.contains(name) {
-                        v.push(name.clone());
-                    }
-                }
-            }
-            v
-        }
-    };
-    let mut p = Plan {
-        classes,
-        ..Plan::default()
-    };
-    if p.classes.is_empty() {
-        bail!("no class to train: the class list is empty");
+/// The frames of a plan's sources by [`FrameRef`]. [`plan`] builds one over the sources as read
+/// (held-out split) and another over the sources at the run's input ([`restore_floor`]), on
+/// purpose: every step after the held-out split reads the latter.
+#[derive(Debug, Clone, Copy)]
+struct Frames<'a> {
+    sources: &'a [Source],
+}
+
+impl<'a> Frames<'a> {
+    fn frame(&self, r: FrameRef) -> Option<&'a Frame> {
+        self.sources.get(r.0)?.frames.get(r.1)
     }
-    let unique: BTreeSet<&String> = p.classes.iter().collect();
-    if unique.len() != p.classes.len() || p.classes.iter().any(|c| c.trim().is_empty()) {
-        bail!(
-            "the class list has duplicate or empty names: {:?}",
-            p.classes
-        );
-    }
-    // 2. Every frame, review and public apart.
-    let mut review: Vec<FrameRef> = Vec::new();
-    let mut public: Vec<FrameRef> = Vec::new();
-    for (si, s) in sources.iter().enumerate() {
-        for fi in 0..s.frames.len() {
-            p.stats.frames_read += 1;
-            if s.public.is_some() {
-                public.push((si, fi));
-            } else {
-                review.push((si, fi));
-            }
-        }
-    }
-    let (review, duplicates) = without_duplicates(sources, review);
-    p.stats.duplicates_dropped = duplicates;
-    if duplicates > 0 {
-        p.warnings.push(format!(
-            "{duplicates} frame(s) are in more than one of the ticked exports: one copy of each \
-             stays (the held-out copy when there is one, so no frame both trains and is measured \
-             on). Tick one export per set of frames to avoid this"
-        ));
-    }
-    let frame = |r: FrameRef| -> Option<&Frame> { sources.get(r.0)?.frames.get(r.1) };
-    let key_of = |r: FrameRef| -> String {
-        sources
+
+    /// [`frame_key`], or empty for a reference to no frame.
+    fn key(&self, r: FrameRef) -> String {
+        self.sources
             .get(r.0)
-            .zip(frame(r))
+            .zip(self.frame(r))
             .map(|(s, f)| frame_key(s, f))
             .unwrap_or_default()
-    };
-    // 3. Held out, from every review frame before the scene filter, so that runs with other
-    // scene filters are benchmarked on the same frames (every scene). The sources' split when it
-    // leaves both sides; else the same held-out share as a folder without a split: an export of
-    // one camera day has nothing to split, and its one group goes all to train or (by its hash)
-    // all to val. All held out stays as it is when public frames train.
-    // A camera day held out for good (`heldout-days.json`) is held out whatever split its export
-    // gave it: an export older than the day's listing has it in train.
+    }
+
+    /// The frame `r`, which a plan must refer to.
+    fn planned(&self, r: FrameRef) -> Result<&'a Frame> {
+        self.frame(r)
+            .ok_or_else(|| anyhow::anyhow!("plan refers to a missing frame {r:?}"))
+    }
+}
+
+/// Step 3: the held-out frames, from every review frame before the scene filter, so that runs
+/// with other scene filters are benchmarked on the same frames (every scene). The sources' split
+/// when it leaves both sides; else the same held-out share as a folder without a split: an export
+/// of one camera day has nothing to split, and its one group goes all to train or (by its hash)
+/// all to val. All held out stays as it is when public frames train. A camera day held out for
+/// good (`heldout-days.json`) is held out whatever split its export gave it: an export older than
+/// the day's listing has it in train.
+///
+/// Sets `p.heldout`, its fingerprint, `frozen_moved` and `heldout_groups`, and adds the step's
+/// warnings. Returns the review frames left for training and validation, and whether the sources'
+/// split was used.
+fn split_heldout(
+    frames: Frames<'_>,
+    review: &[FrameRef],
+    public: &[FrameRef],
+    opts: &Options,
+    p: &mut Plan,
+) -> (Vec<FrameRef>, bool) {
+    let frame = |r: FrameRef| frames.frame(r);
     let frozen = |r: FrameRef| {
         !opts.frozen_heldout.is_empty()
             && frame(r).is_some_and(|f| opts.frozen_heldout.contains(&group_key(f)))
@@ -2013,7 +1992,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
                     .into(),
             );
             let mut v = open.clone();
-            v.sort_by_key(|r| rank(opts.seed, &key_of(*r)));
+            v.sort_by_key(|r| rank(opts.seed, &frames.key(*r)));
             let n = share_of(v.len(), opts.heldout_share)
                 .max(1)
                 .min(v.len().saturating_sub(1));
@@ -2027,14 +2006,263 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     p.heldout = heldout;
     p.heldout.sort_unstable();
     p.heldout_fingerprint = fingerprint(p.heldout.iter().map(|&r| match frame(r) {
-        Some(f) => heldout_key(key_of(r), f),
-        None => key_of(r),
+        Some(f) => heldout_key(frames.key(r), f),
+        None => frames.key(r),
     }));
     if p.heldout.is_empty() {
         p.warnings.push(
             "no frame is held out: the trained model is not benchmarked on your own frames".into(),
         );
     }
+    (pool, hinted)
+}
+
+/// Step 5's static cap at `cap`, on the positive frames `pos` the parked cap left. The spots are
+/// found by geometry over the whole train / valid `pool`'s own review frames (exports of any
+/// version are capped): also the frames the parked cap took out, which are looks at the place
+/// like any other, and the frames with only untrained labels (their boxes are not the run's, so
+/// they give no observation). Only frames whose every box of the run's classes lies at a spot are
+/// capped, per (spot, class of the box there).
+///
+/// Returns the frames of `pos` over the cap and sets the static counts of `stats`.
+fn cap_static(
+    frames: Frames<'_>,
+    pool: &[FrameRef],
+    pos: &[FrameRef],
+    cap: usize,
+    opts: &Options,
+    classes: &[String],
+    stats: &mut Stats,
+) -> BTreeSet<FrameRef> {
+    let own = |r: &FrameRef| -> Option<&Frame> {
+        frames
+            .sources
+            .get(r.0)
+            .filter(|s| s.public.is_none())
+            .and_then(|s| s.frames.get(r.1))
+            .filter(|f| f.camera != UNKNOWN)
+    };
+    let table = statics::Table::build(pool.iter().flat_map(|r| {
+        let key = frames.key(*r);
+        own(r).into_iter().flat_map(move |f| {
+            let key = key.clone();
+            static_boxes(f, opts, classes).map(move |(c, bbox)| statics::Obs {
+                camera: f.camera.clone(),
+                frame: key.clone(),
+                day: f.day.clone(),
+                scene: scene_name(f).to_string(),
+                label: c.to_string(),
+                bbox,
+            })
+        })
+    }));
+    let candidates: Vec<StaticFrame<'_>> = pos
+        .iter()
+        .filter_map(|r| {
+            let f = own(r)?;
+            let mut keys: BTreeSet<CapKey> = BTreeSet::new();
+            for (class, b) in static_boxes(f, opts, classes) {
+                let s = table.spot_at(&f.camera, class, &b)?;
+                keys.insert((s.id.clone(), class.to_string()));
+            }
+            (!keys.is_empty()).then(|| StaticFrame {
+                r: *r,
+                key: frames.key(*r),
+                scene: scene_name(f),
+                day: &f.day,
+                spots: keys.into_iter().collect(),
+            })
+        })
+        .collect();
+    let (over, counts) = over_static_cap(&candidates, cap, opts.seed);
+    stats.static_capped = over.len();
+    stats.static_spots = table.len();
+    for r in &over {
+        if let Some(f) = frames.frame(*r) {
+            for (i, _) in mapped_boxes(f, opts, classes) {
+                if let Some(c) = classes.get(i) {
+                    *stats.static_capped_boxes.entry(c.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+    let mut caps: Vec<StaticCap> = counts
+        .into_iter()
+        .filter_map(|((id, class), (n, kept))| {
+            let s = table.get(&id)?;
+            Some(StaticCap {
+                camera: s.camera.clone(),
+                label: class,
+                id,
+                frames: n,
+                kept,
+            })
+        })
+        .collect();
+    caps.sort_by(|a, b| {
+        b.frames
+            .cmp(&a.frames)
+            .then_with(|| a.id.cmp(&b.id))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    stats.static_caps = caps;
+    over
+}
+
+/// The negatives wanted for `positives` training frames at `negative_share` (clamped to 0..0.9):
+/// about that share of the training pool.
+fn negatives_for(positives: usize, negative_share: f32) -> usize {
+    let share = f64::from(negative_share.clamp(0.0, 0.9));
+    let n = super::estimate::to_u64(positives as f64 * share / (1.0 - share));
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+/// The order negatives are kept in: frames a reviewer confirmed empty or rejected a box on first,
+/// then by their seeded rank.
+fn negative_order(frames: Frames<'_>, r: FrameRef, seed: u64) -> (bool, u64) {
+    let f = frames.frame(r);
+    (
+        !f.is_some_and(|f| f.hard_negative || f.human_rejected),
+        rank(seed, &frames.key(r)),
+    )
+}
+
+/// Step 5's negatives: `neg` cut to [`negatives_for`] the `positives` ([`negative_order`]), the
+/// cut counted in `stats.negatives_dropped`; too few for a share above 0 is a warning.
+fn pick_negatives(
+    frames: Frames<'_>,
+    neg: &mut Vec<FrameRef>,
+    positives: usize,
+    opts: &Options,
+    stats: &mut Stats,
+    warnings: &mut Vec<String>,
+) {
+    let want_neg = negatives_for(positives, opts.negative_share);
+    if neg.len() > want_neg {
+        neg.sort_by_key(|r| negative_order(frames, *r, opts.seed));
+        stats.negatives_dropped = neg.len() - want_neg;
+        neg.truncate(want_neg);
+    } else if opts.negative_share > 0.0 && neg.len() < want_neg {
+        let share = f64::from(opts.negative_share.clamp(0.0, 0.9));
+        warnings.push(format!(
+            "only {} frame(s) without objects for {} with objects ({:.0}%, target {:.0}%): add \
+             empty frames (hard negatives) to cut false positives",
+            neg.len(),
+            positives,
+            100.0 * neg.len() as f64 / (positives + neg.len()) as f64,
+            share * 100.0
+        ));
+    }
+}
+
+/// The warning for each class of `p` without a training box: where its boxes are (only held
+/// out, by the sources' split when `hinted`, or nowhere), with the static cap's clause.
+fn class_warnings(frames: Frames<'_>, p: &Plan, opts: &Options, hinted: bool) -> Vec<String> {
+    let mut heldout_boxes: BTreeMap<&str, usize> = BTreeMap::new();
+    for &r in &p.heldout {
+        if let Some(f) = frames.frame(r) {
+            for (i, _) in mapped_boxes(f, opts, &p.classes) {
+                if let Some(c) = p.classes.get(i) {
+                    *heldout_boxes.entry(c.as_str()).or_default() += 1;
+                }
+            }
+        }
+    }
+    let mut warnings = Vec::new();
+    for c in &p.classes {
+        if p.stats.train_boxes.contains_key(c) {
+            continue;
+        }
+        // Each (spot, class) keeps min(cap, its frames), so the cap alone never takes a class's
+        // last frame; the validation split can take what it kept. Said all the same.
+        let capped = static_cap_clause(&p.stats, c)
+            .map(|clause| format!("; {clause}"))
+            .unwrap_or_default();
+        warnings.push(match heldout_boxes.get(c.as_str()) {
+            Some(n) if hinted => format!(
+                "class '{c}' has no training box: its {n} box(es) are only in the held-out split \
+                 (the export's val split: camera days held out for the benchmark), so the model \
+                 cannot learn it; export again and hold out other cameras or days (Dataset tab \
+                 export: holdout cameras / days), or review frames with it from the camera days \
+                 that train{capped}"
+            ),
+            Some(n) => format!(
+                "class '{c}' has no training box: its {n} box(es) are only in the held-out \
+                 frames{}, so the model cannot learn it; review frames with it from other \
+                 cameras or days, or hold out fewer frames (training.heldout_share){capped}",
+                if p.stats.heldout_groups.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", p.stats.heldout_groups.join(", "))
+                }
+            ),
+            None => format!(
+                "class '{c}' has no training box: no frame has a box of it (after the scene \
+                 filter, the frames left out for unsure or too-small boxes and the caps on parked \
+                 and static frames), so the model cannot learn it; review frames with it or drop \
+                 the class{capped}"
+            ),
+        });
+    }
+    warnings
+}
+
+/// Decide the splits (see the module docs). Pure and deterministic for a given `seed`.
+pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
+    // 1. Classes.
+    let classes = match &opts.classes {
+        Some(c) => c.clone(),
+        None => {
+            let mut v: Vec<String> = Vec::new();
+            for s in sources {
+                for c in &s.classes {
+                    let name = opts.rename.get(c).unwrap_or(c);
+                    if !name.is_empty() && !v.contains(name) {
+                        v.push(name.clone());
+                    }
+                }
+            }
+            v
+        }
+    };
+    let mut p = Plan {
+        classes,
+        ..Plan::default()
+    };
+    if p.classes.is_empty() {
+        bail!("no class to train: the class list is empty");
+    }
+    let unique: BTreeSet<&String> = p.classes.iter().collect();
+    if unique.len() != p.classes.len() || p.classes.iter().any(|c| c.trim().is_empty()) {
+        bail!(
+            "the class list has duplicate or empty names: {:?}",
+            p.classes
+        );
+    }
+    // 2. Every frame, review and public apart.
+    let mut review: Vec<FrameRef> = Vec::new();
+    let mut public: Vec<FrameRef> = Vec::new();
+    for (si, s) in sources.iter().enumerate() {
+        for fi in 0..s.frames.len() {
+            p.stats.frames_read += 1;
+            if s.public.is_some() {
+                public.push((si, fi));
+            } else {
+                review.push((si, fi));
+            }
+        }
+    }
+    let (review, duplicates) = without_duplicates(sources, review);
+    p.stats.duplicates_dropped = duplicates;
+    if duplicates > 0 {
+        p.warnings.push(format!(
+            "{duplicates} frame(s) are in more than one of the ticked exports: one copy of each \
+             stays (the held-out copy when there is one, so no frame both trains and is measured \
+             on). Tick one export per set of frames to avoid this"
+        ));
+    }
+    // 3. Held out.
+    let (pool, hinted) = split_heldout(Frames { sources }, &review, &public, opts, &mut p);
     // The train / valid pool at the run's input size: size floor regions it can learn are given
     // back as boxes (held-out frames keep theirs), and the exports' floors are compared. From here
     // on the plan reads these sources; `write` and the pre-flight make the same (`at_run_input`).
@@ -2046,14 +2274,8 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         .map(|a| a.restored.clone())
         .unwrap_or_default();
     let sources: &[Source] = at_input.as_ref().map_or(sources, |a| a.sources.as_slice());
-    let frame = |r: FrameRef| -> Option<&Frame> { sources.get(r.0)?.frames.get(r.1) };
-    let key_of = |r: FrameRef| -> String {
-        sources
-            .get(r.0)
-            .zip(frame(r))
-            .map(|(s, f)| frame_key(s, f))
-            .unwrap_or_default()
-    };
+    let frames = Frames { sources };
+    let frame = |r: FrameRef| frames.frame(r);
     let positive = |r: FrameRef| -> bool {
         frame(r).is_some_and(|f| mapped_boxes(f, opts, &p.classes).next().is_some())
     };
@@ -2143,7 +2365,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
         pos.iter()
             .filter_map(|&r| {
                 let f = frame(r).filter(|f| !f.parked.is_empty())?;
-                Some((rank(opts.seed, &key_of(r)), r, f.parked.as_slice()))
+                Some((rank(opts.seed, &frames.key(r)), r, f.parked.as_slice()))
             })
             .collect(),
     );
@@ -2156,86 +2378,10 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             over.len()
         ));
     }
-    // The static cap, on the positive frames the parked cap left. The spots are found by geometry
-    // over the whole train / valid pool's own review frames (exports of any version are capped):
-    // also the frames the parked cap took out, which are looks at the place like any other, and
-    // the frames with only untrained labels (their boxes are not the run's, so they give no
-    // observation). Only frames whose every box of the run's classes lies at a spot are capped,
-    // per (spot, class of the box there).
+    // The static cap, on the positive frames the parked cap left.
     if let Some(cap) = opts.static_cap.filter(|&c| c > 0) {
-        let own = |r: &FrameRef| -> Option<&Frame> {
-            sources
-                .get(r.0)
-                .filter(|s| s.public.is_none())
-                .and_then(|s| s.frames.get(r.1))
-                .filter(|f| f.camera != UNKNOWN)
-        };
-        let classes = &p.classes;
-        let table = statics::Table::build(pool.iter().flat_map(|r| {
-            let key = key_of(*r);
-            own(r).into_iter().flat_map(move |f| {
-                let key = key.clone();
-                static_boxes(f, opts, classes).map(move |(c, bbox)| statics::Obs {
-                    camera: f.camera.clone(),
-                    frame: key.clone(),
-                    day: f.day.clone(),
-                    scene: scene_name(f).to_string(),
-                    label: c.to_string(),
-                    bbox,
-                })
-            })
-        }));
-        let candidates: Vec<StaticFrame<'_>> = pos
-            .iter()
-            .filter_map(|r| {
-                let f = own(r)?;
-                let mut keys: BTreeSet<CapKey> = BTreeSet::new();
-                for (class, b) in static_boxes(f, opts, classes) {
-                    let s = table.spot_at(&f.camera, class, &b)?;
-                    keys.insert((s.id.clone(), class.to_string()));
-                }
-                (!keys.is_empty()).then(|| StaticFrame {
-                    r: *r,
-                    key: key_of(*r),
-                    scene: scene_name(f),
-                    day: &f.day,
-                    spots: keys.into_iter().collect(),
-                })
-            })
-            .collect();
-        let (over, counts) = over_static_cap(&candidates, cap, opts.seed);
+        let over = cap_static(frames, &pool, &pos, cap, opts, &p.classes, &mut p.stats);
         pos.retain(|r| !over.contains(r));
-        p.stats.static_capped = over.len();
-        p.stats.static_spots = table.len();
-        for r in &over {
-            if let Some(f) = frame(*r) {
-                for (i, _) in mapped_boxes(f, opts, classes) {
-                    if let Some(c) = classes.get(i) {
-                        *p.stats.static_capped_boxes.entry(c.clone()).or_default() += 1;
-                    }
-                }
-            }
-        }
-        let mut caps: Vec<StaticCap> = counts
-            .into_iter()
-            .filter_map(|((id, class), (frames, kept))| {
-                let s = table.get(&id)?;
-                Some(StaticCap {
-                    camera: s.camera.clone(),
-                    label: class,
-                    id,
-                    frames,
-                    kept,
-                })
-            })
-            .collect();
-        caps.sort_by(|a, b| {
-            b.frames
-                .cmp(&a.frames)
-                .then_with(|| a.id.cmp(&b.id))
-                .then_with(|| a.label.cmp(&b.label))
-        });
-        p.stats.static_caps = caps;
     }
     if pos.is_empty() {
         bail!(
@@ -2245,35 +2391,15 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             p.classes
         );
     }
-    let share = f64::from(opts.negative_share.clamp(0.0, 0.9));
-    let want_for = |positives: usize| -> usize {
-        let n = super::estimate::to_u64(positives as f64 * share / (1.0 - share));
-        usize::try_from(n).unwrap_or(usize::MAX)
-    };
-    let want_neg = want_for(pos.len());
-    // Frames a reviewer confirmed empty or rejected a box on first, then by rank.
-    let neg_key = |r: &FrameRef| {
-        let f = frame(*r);
-        (
-            !f.is_some_and(|f| f.hard_negative || f.human_rejected),
-            rank(opts.seed, &key_of(*r)),
-        )
-    };
     let positives = pos.len();
-    if neg.len() > want_neg {
-        neg.sort_by_key(neg_key);
-        p.stats.negatives_dropped = neg.len() - want_neg;
-        neg.truncate(want_neg);
-    } else if opts.negative_share > 0.0 && neg.len() < want_neg {
-        p.warnings.push(format!(
-            "only {} frame(s) without objects for {} with objects ({:.0}%, target {:.0}%): add \
-             empty frames (hard negatives) to cut false positives",
-            neg.len(),
-            pos.len(),
-            100.0 * neg.len() as f64 / (pos.len() + neg.len()) as f64,
-            share * 100.0
-        ));
-    }
+    pick_negatives(
+        frames,
+        &mut neg,
+        positives,
+        opts,
+        &mut p.stats,
+        &mut p.warnings,
+    );
     let mut pool: Vec<FrameRef> = pos.into_iter().chain(neg.iter().copied()).collect();
     pool.sort_unstable();
     // 6. Validation (the trainer's checkpoint choice).
@@ -2306,7 +2432,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     // drop-frame plan) is the same as before. The caps above are not run again: a capped spot may
     // keep a frame fewer.
     let leaving = valid_day.iter().filter(|r| positive(**r)).count();
-    let want_now = want_for(positives.saturating_sub(leaving));
+    let want_now = negatives_for(positives.saturating_sub(leaving), opts.negative_share);
     let mut trimmed: BTreeSet<FrameRef> = BTreeSet::new();
     if leaving > 0 && neg.len() > want_now {
         let mut spare: Vec<FrameRef> = neg
@@ -2314,7 +2440,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             .copied()
             .filter(|r| !val_set.contains(r))
             .collect();
-        spare.sort_by_key(neg_key);
+        spare.sort_by_key(|r| negative_order(frames, *r, opts.seed));
         let excess = neg.len() - want_now;
         trimmed.extend(spare.iter().rev().take(excess).copied());
         p.stats.negatives_trimmed = trimmed.len();
@@ -2342,7 +2468,7 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
             .map(|&r| {
                 let f = frame(r);
                 balance::Item {
-                    key: key_of(r),
+                    key: frames.key(r),
                     base: base(r),
                     scene: f
                         .and_then(|f| f.scene.clone())
@@ -2439,51 +2565,8 @@ pub fn plan(sources: &[Source], opts: &Options) -> Result<Plan> {
     if let Some(w) = restored_note(&p.stats, sources, opts) {
         p.warnings.push(w);
     }
-    let mut heldout_boxes: BTreeMap<&str, usize> = BTreeMap::new();
-    for &r in &p.heldout {
-        if let Some(f) = frame(r) {
-            for (i, _) in mapped_boxes(f, opts, &p.classes) {
-                if let Some(c) = p.classes.get(i) {
-                    *heldout_boxes.entry(c.as_str()).or_default() += 1;
-                }
-            }
-        }
-    }
-    for c in &p.classes {
-        if p.stats.train_boxes.contains_key(c) {
-            continue;
-        }
-        // Each (spot, class) keeps min(cap, its frames), so the cap alone never takes a class's
-        // last frame; the validation split can take what it kept. Said all the same.
-        let capped = static_cap_clause(&p.stats, c)
-            .map(|clause| format!("; {clause}"))
-            .unwrap_or_default();
-        p.warnings.push(match heldout_boxes.get(c.as_str()) {
-            Some(n) if hinted => format!(
-                "class '{c}' has no training box: its {n} box(es) are only in the held-out split \
-                 (the export's val split: camera days held out for the benchmark), so the model \
-                 cannot learn it; export again and hold out other cameras or days (Dataset tab \
-                 export: holdout cameras / days), or review frames with it from the camera days \
-                 that train{capped}"
-            ),
-            Some(n) => format!(
-                "class '{c}' has no training box: its {n} box(es) are only in the held-out \
-                 frames{}, so the model cannot learn it; review frames with it from other \
-                 cameras or days, or hold out fewer frames (training.heldout_share){capped}",
-                if p.stats.heldout_groups.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", p.stats.heldout_groups.join(", "))
-                }
-            ),
-            None => format!(
-                "class '{c}' has no training box: no frame has a box of it (after the scene \
-                 filter, the frames left out for unsure or too-small boxes and the caps on parked \
-                 and static frames), so the model cannot learn it; review frames with it or drop \
-                 the class{capped}"
-            ),
-        });
-    }
+    let warnings = class_warnings(frames, &p, opts, hinted);
+    p.warnings.extend(warnings);
     Ok(p)
 }
 
@@ -2897,6 +2980,223 @@ impl Reused {
     }
 }
 
+/// The unique file names of a written dataset's frames (`s<source>-<name>`, [`names`]), each
+/// frame named once.
+#[derive(Default)]
+struct Naming {
+    named: BTreeMap<FrameRef, names::ImageName>,
+    used: BTreeSet<String>,
+}
+
+impl Naming {
+    fn of(&mut self, r: FrameRef, f: &Frame) -> names::ImageName {
+        let used = &mut self.used;
+        self.named
+            .entry(r)
+            .or_insert_with(|| names::image_name(r.0, &file_name(&f.image), used))
+            .clone()
+    }
+}
+
+/// The sizes of a written dataset's frames: the source's when it knows it, else read from the
+/// image, each once.
+#[derive(Default)]
+struct Sizes(BTreeMap<FrameRef, (u32, u32)>);
+
+impl Sizes {
+    fn of(&mut self, r: FrameRef, f: &Frame) -> Result<(u32, u32)> {
+        if let Some(s) = self.0.get(&r) {
+            return Ok(*s);
+        }
+        let s = match f.size {
+            Some(s) => s,
+            None => image::image_dimensions(&f.image)
+                .with_context(|| format!("reading the size of {}", f.image.display()))?,
+        };
+        self.0.insert(r, s);
+        Ok(s)
+    }
+}
+
+/// The YOLO label file of `f`: its boxes in the run's `classes`.
+fn label_text(f: &Frame, opts: &Options, classes: &[String]) -> String {
+    mapped_boxes(f, opts, classes)
+        .map(|(i, b)| yolo_line(i, b))
+        .collect()
+}
+
+/// A held-out frame's ground truth: read back from the very lines [`label_text`] writes, as the
+/// benchmark reads YOLO labels, so an ordinary box scores as it would from `labels/`. Ignore
+/// regions follow, through the same class map.
+fn ground_truth(
+    f: &Frame,
+    (w, h): (u32, u32),
+    opts: &Options,
+    classes: &[String],
+) -> Result<Vec<ManifestObject>> {
+    let regions: String = mapped(&f.ignore, opts, classes)
+        .map(|(i, b)| yolo_line(i, b))
+        .collect();
+    let mut objects = Vec::new();
+    for (text, ignore) in [(label_text(f, opts, classes), false), (regions, true)] {
+        for g in images::parse_yolo(&text, classes, w, h)? {
+            objects.push(ManifestObject {
+                label: g.label,
+                bbox: g.bbox,
+                ignore,
+                crowd: false,
+            });
+        }
+    }
+    Ok(objects)
+}
+
+/// The COCO JSON of a split's image `entries` (frame, file name, written size): one image entry
+/// each, its boxes in the run's `classes` in pixels (rounded to 0.01), category ids 0..C-1.
+fn coco_json(
+    frames: Frames<'_>,
+    entries: &[(FrameRef, String, (u32, u32))],
+    opts: &Options,
+    classes: &[String],
+) -> Result<serde_json::Value> {
+    let mut imgs = Vec::new();
+    let mut anns = Vec::new();
+    for (id, (r, n, (w, h))) in entries.iter().enumerate() {
+        imgs.push(serde_json::json!({
+            "id": id,
+            "file_name": format!("images/{n}"),
+            "width": w,
+            "height": h,
+        }));
+        let f = frames.planned(*r)?;
+        let (wf, hf) = (f64::from(*w), f64::from(*h));
+        for (ci, b) in mapped_boxes(f, opts, classes) {
+            let bw = f64::from(b.w) * wf;
+            let bh = f64::from(b.h) * hf;
+            let x = f64::from(b.cx) * wf - bw / 2.0;
+            let y = f64::from(b.cy) * hf - bh / 2.0;
+            let r2 = |v: f64| (v * 100.0).round() / 100.0;
+            anns.push(serde_json::json!({
+                "id": anns.len(),
+                "image_id": id,
+                "category_id": ci,
+                "bbox": [r2(x.max(0.0)), r2(y.max(0.0)), r2(bw), r2(bh)],
+                "area": r2(bw * bh),
+                "iscrowd": 0,
+            }));
+        }
+    }
+    let cats: Vec<serde_json::Value> = classes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| serde_json::json!({"id": i, "name": c, "supercategory": "object"}))
+        .collect();
+    Ok(serde_json::json!({"images": imgs, "annotations": anns, "categories": cats}))
+}
+
+/// `<out>/<file>`: the COCO JSON of a split ([`coco_json`]).
+fn write_coco(
+    out: &Path,
+    file: &str,
+    frames: Frames<'_>,
+    entries: &[(FrameRef, String, (u32, u32))],
+    opts: &Options,
+    classes: &[String],
+) -> Result<()> {
+    let text = serde_json::to_string(&coco_json(frames, entries, opts, classes)?)?;
+    std::fs::write(out.join(file), text)
+        .with_context(|| format!("writing {}", out.join(file).display()))
+}
+
+/// What [`write_reusing`] reads while it writes: the frames, the options and classes, the donor
+/// and the cancel flag.
+#[derive(Clone, Copy)]
+struct Writing<'a> {
+    frames: Frames<'a>,
+    opts: &'a Options,
+    classes: &'a [String],
+    donor: Option<&'a reuse::Donor>,
+    cancel: &'a AtomicBool,
+}
+
+/// What [`write_reusing`] keeps track of as it writes.
+#[derive(Default)]
+struct Written {
+    naming: Naming,
+    sizes: Sizes,
+    reused: Reused,
+    recorder: reuse::Recorder,
+}
+
+/// The held-out benchmark set in `hd` (`images/`, `labels/`, `classes.txt` = `class_text`,
+/// `manifest.json` with each frame's tags and ground truth): every frame of `heldout` at full
+/// size, linked from the donor or the source. A frame whose size cannot be read is left out (its
+/// boxes cannot be placed, as the benchmark always did); returns how many were.
+fn write_heldout(
+    hd: &Path,
+    w: Writing<'_>,
+    heldout: &[FrameRef],
+    class_text: &str,
+    state: &mut Written,
+) -> Result<usize> {
+    let (opts, classes) = (w.opts, w.classes);
+    let mut unreadable = 0usize;
+    std::fs::create_dir_all(hd.join("images"))?;
+    std::fs::create_dir_all(hd.join("labels"))?;
+    let mut m = Manifest {
+        id: "heldout".into(),
+        title: "Held-out frames of this training run".into(),
+        description: "Your own frames, held out of training. Whole camera days when there \
+                      are several (other days of the same camera may train), else a share of \
+                      the one camera day."
+            .into(),
+        license: "private: your own camera footage, do not share".into(),
+        scored_labels: Some(classes.to_vec()),
+        ..Manifest::default()
+    };
+    for &r in heldout {
+        check_cancel(w.cancel)?;
+        let f = w.frames.planned(r)?;
+        // Boxes cannot be placed without the size: left out, as the benchmark always did.
+        let Some(size) = state.sizes.of(r, f).ok().filter(|s| s.0 > 0 && s.1 > 0) else {
+            unreadable += 1;
+            continue;
+        };
+        let named = state.naming.of(r, f);
+        let n = named.image.clone();
+        let dst = hd.join("images").join(&n);
+        let rel = format!("heldout/images/{n}");
+        let before = file_id::FileId::of(&f.image);
+        state.reused.images += 1;
+        match w.donor.and_then(|d| d.link(&rel, &f.image, &dst)) {
+            Some(_) => state.reused.linked += 1,
+            None => link_or_copy(&f.image, &dst)?,
+        }
+        state.recorder.add(rel, &f.image, before, &dst, None);
+        let txt = hd.join("labels").join(named.label());
+        std::fs::write(&txt, label_text(f, opts, classes))?;
+        let mut tags = heldout_tags(f.scene.as_deref(), &f.camera, opts.scene, f.random_pick);
+        tags.push(format!("camera:{}", f.camera));
+        tags.push(format!("date:{}", f.day));
+        if f.hard_negative {
+            tags.push("hard-negative".into());
+        }
+        m.images.push(images::ManifestImage {
+            file: n,
+            url: None,
+            sha256: None,
+            size: None,
+            width: Some(size.0),
+            height: Some(size.1),
+            tags,
+            objects: Some(ground_truth(f, size, opts, classes)?),
+        });
+    }
+    std::fs::write(hd.join("classes.txt"), class_text)?;
+    std::fs::write(hd.join("manifest.json"), serde_json::to_vec_pretty(&m)?)?;
+    Ok(unreadable)
+}
+
 /// [`write`], hard-linking the images of the first of `donors` (dataset folders of earlier runs)
 /// whose plan is the same instead of writing them again, where that is safe ([`reuse`]); every
 /// image it cannot link is written from its source as by [`write`]. Records its own images
@@ -2917,10 +3217,12 @@ pub fn write_reusing(
     let sources: &[Source] = &at_input;
     let plan_fp = reuse::plan_fingerprint(sources, plan, opts);
     let donor = reuse::find_donor(donors, &plan_fp);
-    let mut recorder = reuse::Recorder::default();
-    let mut reused = Reused {
-        from: donor.as_ref().map(|d| d.dir.clone()),
-        ..Reused::default()
+    let mut state = Written {
+        reused: Reused {
+            from: donor.as_ref().map(|d| d.dir.clone()),
+            ..Reused::default()
+        },
+        ..Written::default()
     };
     if out.exists()
         && std::fs::read_dir(out)
@@ -2934,59 +3236,14 @@ pub fn write_reusing(
         std::fs::create_dir_all(out.join(d))
             .with_context(|| format!("creating {}", out.join(d).display()))?;
     }
-    let frame = |r: FrameRef| -> Result<&Frame> {
-        sources
-            .get(r.0)
-            .and_then(|s| s.frames.get(r.1))
-            .ok_or_else(|| anyhow::anyhow!("plan refers to a missing frame {r:?}"))
-    };
-    // Unique file names: `s<source>-<name>` ([`names`]).
-    let mut named: BTreeMap<FrameRef, names::ImageName> = BTreeMap::new();
-    let mut used: BTreeSet<String> = BTreeSet::new();
-    let mut name_of = |r: FrameRef, f: &Frame| -> names::ImageName {
-        named
-            .entry(r)
-            .or_insert_with(|| names::image_name(r.0, &file_name(&f.image), &mut used))
-            .clone()
-    };
-    let mut sizes: BTreeMap<FrameRef, (u32, u32)> = BTreeMap::new();
-    let mut size_of = |r: FrameRef, f: &Frame| -> Result<(u32, u32)> {
-        if let Some(s) = sizes.get(&r) {
-            return Ok(*s);
-        }
-        let s = match f.size {
-            Some(s) => s,
-            None => image::image_dimensions(&f.image)
-                .with_context(|| format!("reading the size of {}", f.image.display()))?,
-        };
-        sizes.insert(r, s);
-        Ok(s)
-    };
+    let frames = Frames { sources };
     let classes = &plan.classes;
-    let label_text = |f: &Frame| -> String {
-        mapped_boxes(f, opts, classes)
-            .map(|(i, b)| yolo_line(i, b))
-            .collect()
-    };
-    // A held-out frame's ground truth: read back from the very lines `label_text` writes, as the
-    // benchmark reads YOLO labels, so an ordinary box scores as it would from `labels/`. Ignore
-    // regions follow, through the same class map.
-    let ground_truth = |f: &Frame, (w, h): (u32, u32)| -> Result<Vec<ManifestObject>> {
-        let regions: String = mapped(&f.ignore, opts, classes)
-            .map(|(i, b)| yolo_line(i, b))
-            .collect();
-        let mut objects = Vec::new();
-        for (text, ignore) in [(label_text(f), false), (regions, true)] {
-            for g in images::parse_yolo(&text, classes, w, h)? {
-                objects.push(ManifestObject {
-                    label: g.label,
-                    bbox: g.bbox,
-                    ignore,
-                    crowd: false,
-                });
-            }
-        }
-        Ok(objects)
+    let w = Writing {
+        frames,
+        opts,
+        classes,
+        donor: donor.as_ref(),
+        cancel,
     };
     // The train / valid images to write (each once), in plan order; written together below.
     let mut written: BTreeSet<FrameRef> = BTreeSet::new();
@@ -2996,54 +3253,18 @@ pub fn write_reusing(
         if written.insert(r) {
             to_write.push((r, n.image.clone()));
             let txt = out.join("labels").join(n.label());
-            std::fs::write(&txt, label_text(f))
+            std::fs::write(&txt, label_text(f, opts, classes))
                 .with_context(|| format!("writing {}", txt.display()))?;
         }
         Ok(())
-    };
-    // COCO image entries per split.
-    let coco = |entries: &[(FrameRef, String, (u32, u32))]| -> Result<serde_json::Value> {
-        let mut imgs = Vec::new();
-        let mut anns = Vec::new();
-        for (id, (r, n, (w, h))) in entries.iter().enumerate() {
-            imgs.push(serde_json::json!({
-                "id": id,
-                "file_name": format!("images/{n}"),
-                "width": w,
-                "height": h,
-            }));
-            let f = frame(*r)?;
-            let (wf, hf) = (f64::from(*w), f64::from(*h));
-            for (ci, b) in mapped_boxes(f, opts, classes) {
-                let bw = f64::from(b.w) * wf;
-                let bh = f64::from(b.h) * hf;
-                let x = f64::from(b.cx) * wf - bw / 2.0;
-                let y = f64::from(b.cy) * hf - bh / 2.0;
-                let r2 = |v: f64| (v * 100.0).round() / 100.0;
-                anns.push(serde_json::json!({
-                    "id": anns.len(),
-                    "image_id": id,
-                    "category_id": ci,
-                    "bbox": [r2(x.max(0.0)), r2(y.max(0.0)), r2(bw), r2(bh)],
-                    "area": r2(bw * bh),
-                    "iscrowd": 0,
-                }));
-            }
-        }
-        let cats: Vec<serde_json::Value> = classes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| serde_json::json!({"id": i, "name": c, "supercategory": "object"}))
-            .collect();
-        Ok(serde_json::json!({"images": imgs, "annotations": anns, "categories": cats}))
     };
     // Where each image of `images/` came from ([`IMAGE_SOURCES_FILE`]).
     let mut image_sources: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut train_lines = String::new();
     let mut train_refs = Vec::new();
     for &(r, repeats) in &plan.train {
-        let f = frame(r)?;
-        let named = name_of(r, f);
+        let f = frames.planned(r)?;
+        let named = state.naming.of(r, f);
         put(r, f, &named)?;
         let n = named.image;
         image_sources.insert(n.clone(), f.image.clone());
@@ -3055,8 +3276,8 @@ pub fn write_reusing(
     let mut valid_lines = String::new();
     let mut valid_refs = Vec::new();
     for &r in &plan.valid {
-        let f = frame(r)?;
-        let named = name_of(r, f);
+        let f = frames.planned(r)?;
+        let named = state.naming.of(r, f);
         put(r, f, &named)?;
         let n = named.image;
         image_sources.insert(n.clone(), f.image.clone());
@@ -3066,9 +3287,9 @@ pub fn write_reusing(
     // The images (downscaled to the run's need, or linked), in parallel.
     let jobs: Vec<(FrameRef, &Path, &str)> = to_write
         .iter()
-        .map(|(r, n)| Ok((*r, frame(*r)?.image.as_path(), n.as_str())))
+        .map(|(r, n)| Ok((*r, frames.planned(*r)?.image.as_path(), n.as_str())))
         .collect::<Result<_>>()?;
-    let written = write_images(
+    let images_written = write_images(
         &jobs,
         opts.prepared_short_side,
         &out.join("images"),
@@ -3076,20 +3297,23 @@ pub fn write_reusing(
         cancel,
     )?;
     let mut resized: BTreeMap<FrameRef, (u32, u32)> = BTreeMap::new();
-    for (&(r, src, n), w) in jobs.iter().zip(&written) {
-        if let Some(s) = w.resized {
+    for (&(r, src, n), wi) in jobs.iter().zip(&images_written) {
+        if let Some(s) = wi.resized {
             resized.insert(r, s);
         }
-        reused.images += 1;
-        reused.linked += usize::from(w.linked);
+        state.reused.images += 1;
+        state.reused.linked += usize::from(wi.linked);
         let dst = out.join("images").join(n);
-        recorder.add(format!("images/{n}"), src, w.before, &dst, w.resized);
+        state
+            .recorder
+            .add(format!("images/{n}"), src, wi.before, &dst, wi.resized);
     }
     // COCO sizes: the written image's (labels are normalized, so they hold either way).
+    let sizes = &mut state.sizes;
     let mut entry = |(r, n): (FrameRef, String)| -> Result<(FrameRef, String, (u32, u32))> {
         let s = match resized.get(&r) {
             Some(s) => *s,
-            None => size_of(r, frame(r)?)?,
+            None => sizes.of(r, frames.planned(r)?)?,
         };
         Ok((r, n, s))
     };
@@ -3123,72 +3347,28 @@ pub fn write_reusing(
         yaml.push_str(&format!("  {i}: {}\n", serde_json::to_string(c)?));
     }
     write_text("data.yaml", &yaml)?;
-    write_text(
+    write_coco(
+        out,
         "train.coco.json",
-        &serde_json::to_string(&coco(&train_entries)?)?,
+        frames,
+        &train_entries,
+        opts,
+        classes,
     )?;
-    write_text(
+    write_coco(
+        out,
         "valid.coco.json",
-        &serde_json::to_string(&coco(&valid_entries)?)?,
+        frames,
+        &valid_entries,
+        opts,
+        classes,
     )?;
     // Held-out benchmark set.
-    let mut unreadable = 0usize;
     let heldout_dir = (!plan.heldout.is_empty()).then(|| out.join("heldout"));
-    if let Some(hd) = &heldout_dir {
-        std::fs::create_dir_all(hd.join("images"))?;
-        std::fs::create_dir_all(hd.join("labels"))?;
-        let mut m = Manifest {
-            id: "heldout".into(),
-            title: "Held-out frames of this training run".into(),
-            description: "Your own frames, held out of training. Whole camera days when there \
-                          are several (other days of the same camera may train), else a share of \
-                          the one camera day."
-                .into(),
-            license: "private: your own camera footage, do not share".into(),
-            scored_labels: Some(classes.clone()),
-            ..Manifest::default()
-        };
-        for &r in &plan.heldout {
-            check_cancel(cancel)?;
-            let f = frame(r)?;
-            // Boxes cannot be placed without the size: left out, as the benchmark always did.
-            let Some(size) = size_of(r, f).ok().filter(|s| s.0 > 0 && s.1 > 0) else {
-                unreadable += 1;
-                continue;
-            };
-            let named = name_of(r, f);
-            let n = named.image.clone();
-            let dst = hd.join("images").join(&n);
-            let rel = format!("heldout/images/{n}");
-            let before = file_id::FileId::of(&f.image);
-            reused.images += 1;
-            match donor.as_ref().and_then(|d| d.link(&rel, &f.image, &dst)) {
-                Some(_) => reused.linked += 1,
-                None => link_or_copy(&f.image, &dst)?,
-            }
-            recorder.add(rel, &f.image, before, &dst, None);
-            let txt = hd.join("labels").join(named.label());
-            std::fs::write(&txt, label_text(f))?;
-            let mut tags = heldout_tags(f.scene.as_deref(), &f.camera, opts.scene, f.random_pick);
-            tags.push(format!("camera:{}", f.camera));
-            tags.push(format!("date:{}", f.day));
-            if f.hard_negative {
-                tags.push("hard-negative".into());
-            }
-            m.images.push(images::ManifestImage {
-                file: n,
-                url: None,
-                sha256: None,
-                size: None,
-                width: Some(size.0),
-                height: Some(size.1),
-                tags,
-                objects: Some(ground_truth(f, size)?),
-            });
-        }
-        std::fs::write(hd.join("classes.txt"), &class_text)?;
-        std::fs::write(hd.join("manifest.json"), serde_json::to_vec_pretty(&m)?)?;
-    }
+    let unreadable = match &heldout_dir {
+        Some(hd) => write_heldout(hd, w, &plan.heldout, &class_text, &mut state)?,
+        None => 0,
+    };
     let mut sources_summary = Vec::new();
     for (si, s) in sources.iter().enumerate() {
         sources_summary.push(SourceSummary {
@@ -3234,7 +3414,7 @@ pub fn write_reusing(
     };
     write_text("dataset.json", &serde_json::to_string_pretty(&summary)?)?;
     // Last: its presence says the folder is whole (a later run may link from it).
-    recorder.write(out, plan_fp)?;
+    state.recorder.write(out, plan_fp)?;
     let prepared = Prepared {
         dir: out.to_path_buf(),
         classes: classes.clone(),
@@ -3248,7 +3428,7 @@ pub fn write_reusing(
         warnings,
         balance_summary: plan.balance.as_ref().map(BalanceReport::summary),
     };
-    Ok((prepared, reused))
+    Ok((prepared, state.reused))
 }
 
 /// How [`write_images`] wrote one image.

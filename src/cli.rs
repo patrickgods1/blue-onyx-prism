@@ -530,13 +530,7 @@ fn same_model_file(a: &Path, b: &Path) -> bool {
 
 /// `stem`, or `stem-2`, `stem-3`, ... : the first name no entry of `config` uses.
 fn unique_model_name(config: &Config, stem: &str) -> String {
-    use crate::registry::normalize_name;
-    let taken = |n: &str| {
-        config
-            .models
-            .iter()
-            .any(|m| normalize_name(&m.effective_name()) == normalize_name(n))
-    };
+    let taken = |n: &str| config.model_index(n).is_some();
     let mut name = stem.to_string();
     let mut k = 2u32;
     while taken(&name) {

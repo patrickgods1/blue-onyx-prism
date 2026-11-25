@@ -5,7 +5,7 @@
 //! [`crate::benchmark::cameras::live`]: a poll never walks the review folder.
 
 use super::pages::DatasetRow;
-use super::{AppState, json_error, raw};
+use super::{AppState, json_fail, raw};
 use crate::benchmark::cameras::live::{self, Found};
 use crate::benchmark::cameras::snapshot::{self, GtSnapshot};
 use crate::benchmark::cameras::{ID, Source, TITLE};
@@ -128,7 +128,7 @@ fn recorded_snapshot(results: &std::path::Path) -> Option<(Option<snapshot::Snap
 pub(super) fn labels_changed(state: &AppState, c: &Config) -> Arc<RawValue> {
     let results = results_path(&state.config_path);
     let gt = snapshot::path_beside(&results);
-    let stamp = super::file_stamp(&gt);
+    let stamp = crate::benchmark::search::file_stamp(&gt);
     if stamp.is_none() {
         return RawValue::NULL.to_owned().into();
     }
@@ -137,7 +137,7 @@ pub(super) fn labels_changed(state: &AppState, c: &Config) -> Arc<RawValue> {
     let key = format!(
         "{}|{stamp:?}|{:?}|{}|{:?}",
         gt.display(),
-        super::file_stamp(&results),
+        crate::benchmark::search::file_stamp(&results),
         src.key(),
         current.as_ref().map(|c| c.at)
     );
@@ -195,13 +195,13 @@ pub(in crate::server) async fn rescore(State(state): State<Arc<AppState>>) -> Re
         ) {
             Ok(h) => h,
             Err(e) => {
-                return json_error(StatusCode::CONFLICT, format!("Not re-scored: {e:#}"));
+                return json_fail(StatusCode::CONFLICT, format!("Not re-scored: {e:#}"));
             }
         };
         if state.benchmark.is_running() {
-            return json_error(
+            return json_fail(
                 StatusCode::CONFLICT,
-                "a benchmark is running; re-score once it has finished".into(),
+                "a benchmark is running; re-score once it has finished",
             );
         }
         let cfg = state.config_read().clone();
@@ -233,7 +233,7 @@ pub(in crate::server) async fn rescore(State(state): State<Arc<AppState>>) -> Re
                 live::walk(&src);
                 Json(serde_json::json!({ "success": true, "rescored": r })).into_response()
             }
-            Err(e) => json_error(
+            Err(e) => json_fail(
                 if e.downcast_ref::<crate::benchmark::cameras::rescore::SourceChanged>()
                     .is_some()
                 {

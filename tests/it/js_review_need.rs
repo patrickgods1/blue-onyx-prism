@@ -6,10 +6,9 @@
 //! makes a missing `node` a failure: a skip must not read as a pass there.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+use crate::js_harness::{asset, have_node, run_node_json};
 use blue_onyx_prism::collect::labels::need::{NeedCounts, RecallNeed};
 use serde_json::{Value, json};
-use std::path::PathBuf;
-use std::process::Command;
 
 /// Runs each request through `ReviewNeed` and prints the answers as one JSON array.
 /// `process.argv`: this script, the module, the request file.
@@ -21,44 +20,14 @@ const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
 console.log(JSON.stringify(req.map((r) => r.op === 'counts' ? N.counts(r.c) : N.note(r.item))));
 "#;
 
-/// Whether `node` runs here. Missing: a skip, or with `BOP_REQUIRE_NODE=1` a failure.
-fn have_node() -> bool {
-    let ok = Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
-            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
-        );
-        println!("skipped: no node");
-    }
-    ok
-}
-
 /// Run [`DRIVER`] on `requests`, in a folder of its own, and read its answers.
 fn node(requests: &Value) -> Vec<String> {
-    let dir = std::env::temp_dir().join(format!("bop-js-need-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (driver, cases) = (dir.join("driver.js"), dir.join("request.json"));
-    std::fs::write(&driver, DRIVER).unwrap();
-    std::fs::write(&cases, serde_json::to_vec(requests).unwrap()).unwrap();
-    let module = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/review-need.js");
-    let out = Command::new("node")
-        .arg(&driver)
-        .arg(module)
-        .arg(&cases)
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "node failed ({}): {}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+    let got = run_node_json(
+        DRIVER,
+        &[asset("review-need.js").as_os_str()],
+        &[("request.json", &serde_json::to_vec(requests).unwrap())],
     );
-    serde_json::from_slice(&out.stdout).unwrap()
+    serde_json::from_value(got).unwrap()
 }
 
 /// A queue item as `GET /v1/review/next` sends it: its `camera`, `scene`, `event_rank` and need.

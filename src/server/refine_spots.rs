@@ -21,15 +21,16 @@
 //!   training run keeps of those showing nothing else (0 = off), saved through the one config
 //!   writer like the other settings routes.
 
-use super::refine::{fail, json_body, label_files_changed, queue_stamp};
+use super::answer::{json_body, json_fail};
+use super::refine::{label_files_changed, queue_stamp};
 use super::review::{push_failed, push_past_limit};
+use super::walk_cache::{WalkCache, wanted_key};
 use super::{AppState, blocking, save_config, training};
 use crate::collect::labels::bulk::{LISTED, Wanted};
 use crate::collect::labels::export::{self, ClassFilter, ExportFrame, SplitConfig};
 use crate::collect::labels::refine as suggestions;
 use crate::collect::labels::statics::{self, SPOT_IOU, SpotSummary};
 use crate::collect::labels::{self, Frame, LabelFile, Status};
-use crate::sync::LockExt;
 use crate::training::config::{DEFAULT_STATIC_CAP, MAX_STATIC_CAP};
 use axum::Json;
 use axum::body::Bytes;
@@ -38,10 +39,10 @@ use axum::extract::rejection::BytesRejection;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Largest request body of the two POST routes.
 pub(super) const BODY_LIMIT: usize = 4 * 1024;
@@ -149,21 +150,17 @@ fn compute(dir: &Path, classes: &[String], hidden: &[String]) -> Computed {
     }
 }
 
-struct Kept {
-    at: Instant,
-    stamp: String,
-    value: Arc<Computed>,
-}
-
 /// The walks' answers per folder and class list (one per process, [`CACHE`]; a test makes its
-/// own, so other tests clearing the process's cannot touch it).
-struct Cache {
-    kept: Mutex<BTreeMap<String, Kept>>,
-    /// One walk at a time: a second caller waits and finds the first one's answer.
-    walking: Mutex<()>,
-    /// Bumped by [`Self::forget`] under `kept`'s lock: a walk that began before a drop answers
-    /// its caller and keeps nothing (it may have read the files before the change).
-    generation: std::sync::atomic::AtomicU64,
+/// own, so other tests clearing the process's cannot touch it). Derefs to its [`WalkCache`]
+/// (`forget`, and what the tests look at).
+struct Cache(WalkCache<Arc<Computed>>);
+
+impl std::ops::Deref for Cache {
+    type Target = WalkCache<Arc<Computed>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// The process's walk answers.
@@ -187,18 +184,7 @@ fn computed(dir: &Path, classes: &[String], hidden: &[String], stamp: &str) -> A
 
 impl Cache {
     const fn new() -> Self {
-        Self {
-            kept: Mutex::new(BTreeMap::new()),
-            walking: Mutex::new(()),
-            generation: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    fn forget(&self) {
-        let mut kept = self.kept.lock_recover();
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        kept.clear();
+        Self(WalkCache::new(KEEP, KEEP_FOR, KEEP_FOR))
     }
 
     /// [`compute`], kept [`KEEP_FOR`]; `stamp` names the checks on the queue: when one starts,
@@ -210,43 +196,9 @@ impl Cache {
         hidden: &[String],
         stamp: &str,
     ) -> Arc<Computed> {
-        let key = format!(
-            "{}\u{1f}{}\u{1f}{}",
-            dir.display(),
-            classes.join("\u{1e}"),
-            hidden.join("\u{1e}")
-        );
-        let fresh = |k: &Kept| k.at.elapsed() < KEEP_FOR && k.stamp == stamp;
-        if let Some(k) = self.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
-            return k.value.clone();
-        }
-        let _walking = self.walking.lock_recover();
-        if let Some(k) = self.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
-            return k.value.clone();
-        }
-        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
-        let value = Arc::new(compute(dir, classes, hidden));
-        let mut map = self.kept.lock_recover();
-        // A drop since the walk began: what it found may be the files before a change.
-        if self.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-            return value;
-        }
-        map.retain(|k, v| *k != key && v.at.elapsed() < KEEP_FOR);
-        while map.len() >= KEEP {
-            let Some(oldest) = map.iter().min_by_key(|(_, v)| v.at).map(|(k, _)| k.clone()) else {
-                break;
-            };
-            map.remove(&oldest);
-        }
-        map.insert(
-            key,
-            Kept {
-                at: Instant::now(),
-                stamp: stamp.to_string(),
-                value: value.clone(),
-            },
-        );
-        value
+        self.get_or_walk(wanted_key(dir, classes, hidden), stamp, || {
+            Arc::new(compute(dir, classes, hidden))
+        })
     }
 }
 
@@ -588,24 +540,24 @@ pub(super) async fn accept_spot_route(
 ) -> Response {
     let b: AcceptBody = match json_body(&headers, body) {
         Ok(b) => b,
-        Err((status, message)) => return fail(status, message),
+        Err((status, message)) => return json_fail(status, message),
     };
     let min = b.min_score.unwrap_or(DEFAULT_MIN_SCORE);
     if !(0.0..=1.0).contains(&min) {
-        return fail(
+        return json_fail(
             StatusCode::BAD_REQUEST,
             format!("min_score: must be between 0 and 1, got {min}"),
         );
     }
     let limit = b.limit.unwrap_or(ACCEPT_LIMIT);
     if !(1..=ACCEPT_LIMIT).contains(&limit) {
-        return fail(
+        return json_fail(
             StatusCode::BAD_REQUEST,
             format!("limit: must be between 1 and {ACCEPT_LIMIT}, got {limit}"),
         );
     }
     if b.spot.trim().is_empty() || b.spot.len() > suggestions::MAX_SPOT_LEN {
-        return fail(
+        return json_fail(
             StatusCode::BAD_REQUEST,
             "spot: name a spot of the list (its id)",
         );
@@ -630,7 +582,7 @@ pub(super) async fn accept_spot_route(
         let o = match accept_spot(&dir, &wanted, &b.spot, min, limit, dry_run) {
             Ok(o) => o,
             Err(Refusal::NoSuchSpot) => {
-                return fail(
+                return json_fail(
                     StatusCode::NOT_FOUND,
                     "No static spot with this id on the reviewed frames: a label change can move \
                      or drop a spot. Reload the card and choose again.",
@@ -731,10 +683,10 @@ pub(super) async fn static_cap(
 ) -> Response {
     let b: CapBody = match json_body(&headers, body) {
         Ok(b) => b,
-        Err((status, message)) => return fail(status, message),
+        Err((status, message)) => return json_fail(status, message),
     };
     let Some(cap) = usize::try_from(b.cap).ok().filter(|c| *c <= MAX_STATIC_CAP) else {
-        return fail(
+        return json_fail(
             StatusCode::BAD_REQUEST,
             format!(
                 "Not saved: the cap must be a whole number from 0 (off) to {MAX_STATIC_CAP}, got {}",
@@ -754,7 +706,7 @@ pub(super) async fn static_cap(
                 "cap": cap,
             }))
             .into_response(),
-            Err(e) => fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
+            Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
         }
     })
     .await

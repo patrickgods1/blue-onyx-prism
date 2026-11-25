@@ -3,8 +3,9 @@
 //! Two shapes, on purpose: [`json_fail`] (`{success: false, message}`) is what the page routes
 //! (review, refine, training, benchmark, ...) answer and what their scripts read; [`json_error`]
 //! (`{success: false, message, error}`) is the server core's refusals (sign-in, network and host
-//! rules, fallback, panics, static files) and the benchmark history routes, whose callers read
-//! `error`. Both carry `message`, so a client that reads `message` reads either.
+//! rules, fallback, panics, static files), the Config page's live errors, `/logs.json` and the
+//! benchmark history routes, whose callers read `error`. Both carry `message`, so a client that
+//! reads `message` reads either.
 //!
 //! [`Refused`] is a refusal not built yet: a route returning [`Answer`] checks with `?`.
 //! [`json_body`] reads a POST's JSON body: 413 over the route's cap, 415 without a JSON content

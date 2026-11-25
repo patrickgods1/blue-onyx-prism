@@ -318,8 +318,7 @@ fn history_with(key: Key, scan: &dyn Fn() -> History) -> Arc<History> {
     static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut started_since_arrival = false;
     loop {
-        if let Ok(c) = cache().lock()
-            && let Some((at, h)) = c.get(&key)
+        if let Some((at, h)) = cache().lock_recover().get(&key)
             && at.elapsed() < HISTORY_TTL
         {
             return h.clone();
@@ -392,14 +391,10 @@ fn cache_insert(c: &mut Cache, key: Key, h: Arc<History>, now: Instant) {
 /// may have read the files before what made the caller drop them), as [`written`] does.
 pub fn invalidate(dir: &Path) {
     let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    if let Ok(mut s) = scanning().lock() {
-        for (d, dirty) in s.values_mut() {
-            *dirty |= *d == root;
-        }
+    for (d, dirty) in scanning().lock_recover().values_mut() {
+        *dirty |= *d == root;
     }
-    if let Ok(mut c) = cache().lock() {
-        c.retain(|(d, _), _| *d != root);
-    }
+    cache().lock_recover().retain(|(d, _), _| *d != root);
 }
 
 /// A label file at `path` was written: drop the cached histories of the folders holding it, and
@@ -408,14 +403,11 @@ pub fn invalidate(dir: &Path) {
 pub fn written(path: &Path) {
     let canon = path.canonicalize().ok();
     let under = |d: &Path| path.starts_with(d) || canon.as_ref().is_some_and(|c| c.starts_with(d));
-    if let Ok(mut s) = scanning().lock() {
-        for (d, dirty) in s.values_mut() {
-            *dirty |= under(d);
-        }
+    for (d, dirty) in scanning().lock_recover().values_mut() {
+        *dirty |= under(d);
     }
-    if let Ok(mut c) = cache().lock()
-        && !c.is_empty()
-    {
+    let mut c = cache().lock_recover();
+    if !c.is_empty() {
         c.retain(|(d, _), _| !under(d));
     }
 }
@@ -898,6 +890,41 @@ mod tests {
             assert_eq!(w.join().unwrap().camera, "scan 2");
         }
         assert_eq!(g.scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Audit 2026-11 phase 9 (Q:collect-14): a lock poisoned by a panic elsewhere is used as any
+    /// other: the cache still answers, and a label write still drops what it holds (every site
+    /// goes through `lock_recover`; a skipped `if let Ok(..)` used to rescan on every call and
+    /// leave the entry for a write to miss).
+    #[test]
+    fn a_poisoned_lock_still_caches_and_a_write_still_drops_the_history() {
+        let _ = std::thread::spawn(|| {
+            let _held = cache().lock_recover();
+            panic!("poisons the cache");
+        })
+        .join();
+        let _ = std::thread::spawn(|| {
+            let _held = scanning().lock_recover();
+            panic!("poisons the running scans");
+        })
+        .join();
+        assert!(cache().is_poisoned() && scanning().is_poisoned());
+        let key = fresh_key();
+        let scans = std::sync::atomic::AtomicUsize::new(0);
+        let scan = || History {
+            camera: format!(
+                "scan {}",
+                scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+            ),
+            ..History::default()
+        };
+        assert_eq!(history_with(key.clone(), &scan).camera, "scan 1");
+        assert_eq!(history_with(key.clone(), &scan).camera, "scan 1", "cached");
+        written(&key.0.join("ir/cam/2026-10-21/a.labels.json"));
+        assert!(!cache().lock_recover().contains_key(&key), "dropped");
+        assert_eq!(history_with(key.clone(), &scan).camera, "scan 2");
+        invalidate(&key.0);
+        assert_eq!(history_with(key, &scan).camera, "scan 3");
     }
 
     #[test]

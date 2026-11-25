@@ -305,12 +305,7 @@ fn config_entry_for<'a>(config: &'a Config, res: &Resource) -> Option<&'a ModelC
             let p = config.data_path(&m.path);
             files.iter().any(|f| same_file(f, &p))
         })
-        .or_else(|| {
-            config
-                .models
-                .iter()
-                .find(|m| crate::registry::normalize_name(&m.effective_name()) == name)
-        })
+        .or_else(|| config.models.iter().find(|m| m.key() == name))
 }
 
 /// Whether `res`'s model files are installed (exports: the current version).
@@ -437,11 +432,7 @@ pub fn canonical_device(s: &str) -> Result<String> {
 
 /// The entry named `name` (matched like `/v1/vision/custom/{model}`).
 fn find_entry<'a>(config: &'a Config, name: &str) -> Option<&'a ModelConfig> {
-    let key = crate::registry::normalize_name(name);
-    config
-        .models
-        .iter()
-        .find(|m| crate::registry::normalize_name(&m.effective_name()) == key)
+    config.model(name)
 }
 
 /// A plain file name (no folder part).

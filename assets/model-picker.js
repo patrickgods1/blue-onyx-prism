@@ -153,24 +153,14 @@
   // ---- fetch ---------------------------------------------------------------------------------
 
   function fetchModels() {
-    return fetch('/v1/autolabel/models', { headers: { Accept: 'application/json' } }).then(function (r) {
-      return r.json().catch(function () { return null; }).then(function (j) {
-        if (!r.ok || !j || j.success === false) throw new Error((j && j.message) || ('HTTP ' + r.status));
-        return j;
-      });
-    });
+    return PrismFetch.json('/v1/autolabel/models', { headers: { Accept: 'application/json' } });
   }
 
   // ---- widget --------------------------------------------------------------------------------
 
   var seq = 0;
 
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
-    return e;
-  }
+  var el = PrismDom.el;
 
   function create(container, opts) {
     opts = opts || {};

@@ -1203,7 +1203,7 @@ offered it (`training.datasets` or an export under `<training dir>/exports`); an
 
 **The results list** (Models tab, *Use a trained model*) groups the finished runs by what makes their
 held-out scores comparable: the held-out fingerprint of their benchmark, their trained classes and
-their class merges (`server::training::result_groups`). Each group starts with a header row ("Held-out
+their class merges (`server::training::view::result_groups`). Each group starts with a header row ("Held-out
 set 3f2a1c…, 4 runs — scores compare only inside a group"; a held-out set two groups share names their
 classes and merges); a run without a benchmark is its own group ("Not benchmarked"), and so is a run
 of an older version without a fingerprint. Groups come newest first (by their newest run); inside a

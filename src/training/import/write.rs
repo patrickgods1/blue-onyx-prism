@@ -2,22 +2,23 @@
 //! (`<dir>/<scene>/<camera>/<date>/<stem>.{jpg,json}` + `index.jsonl`, `docs/DATASET.md`): a
 //! version-1 sidecar without detections, `source: "import:<id>"` and its provenance; then the
 //! frames are queued for review (`review-queue.jsonl`) and the import is listed in
-//! `<dir>/imports.jsonl`. Each file is written atomically, image first, then sidecar, then the
-//! index line, like the collector does; when the sidecar or the index line fails (a full disk),
-//! the frame's files are removed again, so a frame is either complete or absent. A write that
+//! `<dir>/imports.jsonl`. Each frame goes in through the writer the collector uses too,
+//! [`layout::write_frame`]: each file atomically, image first, then sidecar, then the index line;
+//! when the sidecar or the index line fails (a full disk), the frame's files are removed again, so
+//! a frame is either complete or absent. A write that
 //! stops part way ([`write_frames_with`]) answers the frames written so far. A frame already
 //! imported (the same camera, millisecond and dHash) is skipped; each day folder that check needs
 //! is listed once per write ([`Imported`]), not once per frame.
 //!
 //! The dataset folder is shared with the collector thread, whose retention rewrites day indexes and
-//! removes emptied folders: index lines go through [`layout::append_index`] (the dataset's
-//! cross-process index lock), and the image through [`layout::write_in_day`], which makes the day
-//! folder again when retention removed it, still empty, after this made it (why a retry rather than
-//! holding the lock across the frame's decode: its doc).
+//! removes emptied folders: the frame writer appends index lines through [`layout::append_index`]
+//! (the dataset's cross-process index lock), and writes the image through [`layout::write_in_day`],
+//! which makes the day folder again when retention removed it, still empty, after this made it
+//! (why a retry rather than holding the lock across the frame's decode: its doc).
 
 use crate::clock::Zone;
-use crate::collect::layout::{self, Rel};
-use crate::collect::record::{self, ImageInfo, IndexLine, Provenance, Record, Stats};
+use crate::collect::layout::{self, FrameStep, FrameWriteError, Rel};
+use crate::collect::record::{self, Provenance, Record, Stats};
 use crate::image_stats::ImageStats;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -93,10 +94,10 @@ fn stem_of(zone: Zone, time: SystemTime, id4: &str, n: usize) -> String {
     format!("{}_imp-{id4}-{n:05}", stamp(zone, time))
 }
 
-/// The record of an imported frame (no detections).
-fn record_of(f: &Frame, rel: &Rel, import_id: &str, bytes: u64, original: bool) -> Record {
+/// The record of an imported frame (no detections); [`layout::write_frame`] sets its `id` and
+/// `image`.
+fn record_of(f: &Frame, rel: &Rel, import_id: &str) -> Record {
     let mut r = record::empty_record();
-    r.id = rel.stem.clone();
     r.request_id = rel
         .stem
         .split_once('_')
@@ -110,11 +111,6 @@ fn record_of(f: &Frame, rel: &Rel, import_id: &str, bytes: u64, original: bool) 
     r.stats = Stats::from(f.stats);
     r.width = f.width;
     r.height = f.height;
-    r.image = ImageInfo {
-        file: format!("{}.jpg", rel.stem),
-        bytes,
-        original,
-    };
     r.threshold = 0.0;
     r.dhash = crate::collect::dhash::hex(f.dhash);
     r.source = Some(format!("import:{import_id}"));
@@ -324,37 +320,35 @@ fn write_into(
         let day = dir.join(&rel.scene).join(&rel.camera).join(&rel.date);
         let raw =
             std::fs::read(&f.file).with_context(|| format!("reading {}", f.file.display()))?;
-        let (bytes, original) = if raw.starts_with(&[0xFF, 0xD8]) {
-            (raw, true)
-        } else {
-            let img = crate::image::decode(&raw)
-                .with_context(|| format!("decoding {}", f.file.display()))?;
-            (crate::image::encode_jpeg(&img, 92)?, false)
-        };
-        // Made after the decode, right before the image goes in: the folder is empty until then.
-        std::fs::create_dir_all(&day).with_context(|| format!("creating {}", day.display()))?;
-        let jpg = rel.to_path(dir, "jpg");
-        layout::write_in_day(&day, &jpg, &bytes)
-            .with_context(|| format!("writing {}", jpg.display()))?;
-        let rec = record_of(f, &rel, import_id, bytes.len() as u64, original);
-        let json = serde_json::to_vec_pretty(&rec)?;
-        let side = rel.to_path(dir, "json");
-        if let Err(e) = layout::write_atomic(&side, &json) {
-            let _ = std::fs::remove_file(&jpg);
-            return Err(e).with_context(|| format!("writing {}", side.display()));
-        }
-        imported.add(&side);
-        let line = IndexLine::of(&rec, (bytes.len() + json.len()) as u64);
-        if let Err(e) = layout::append_index(&day, &line) {
-            let _ = std::fs::remove_file(&side);
-            let _ = std::fs::remove_file(&jpg);
-            return Err(e)
-                .with_context(|| format!("writing {}", day.join(layout::INDEX_FILE).display()));
-        }
+        let mut rec = record_of(f, &rel, import_id);
+        layout::write_frame(&day, &rel.stem, &raw, &mut rec)
+            .map_err(|e| frame_error(e, f, dir, &rel))?;
+        imported.add(&rel.to_path(dir, "json"));
         out.push(rel.jpg());
         hook(Step::Written(n))?;
     }
     Ok(())
+}
+
+/// A failed [`layout::write_frame`] of `f` (as `rel` under `dir`) with the import's context: the
+/// file it decoded, or the folder or file it could not write.
+fn frame_error(e: FrameWriteError, f: &Frame, dir: &Path, rel: &Rel) -> anyhow::Error {
+    let day = || dir.join(&rel.scene).join(&rel.camera).join(&rel.date);
+    match e {
+        FrameWriteError::Decode(e) => e.context(format!("decoding {}", f.file.display())),
+        FrameWriteError::Encode(e) => e,
+        FrameWriteError::Io { step, error } => {
+            let what = match step {
+                FrameStep::Folder => format!("creating {}", day().display()),
+                FrameStep::Image => format!("writing {}", rel.to_path(dir, "jpg").display()),
+                FrameStep::Sidecar => format!("writing {}", rel.to_path(dir, "json").display()),
+                FrameStep::Index => {
+                    format!("writing {}", day().join(layout::INDEX_FILE).display())
+                }
+            };
+            anyhow::Error::from(error).context(what)
+        }
+    }
 }
 
 /// Append `line` to `<dir>/imports.jsonl`.
@@ -377,6 +371,7 @@ pub fn frame_time(base: SystemTime, offset_s: Option<f64>) -> SystemTime {
 mod tests {
     use super::*;
     use crate::collect::labels::Frame as LabelFrame;
+    use crate::collect::record::IndexLine;
 
     fn jpeg(gray: bool) -> Vec<u8> {
         let mut img = crate::image::RgbImage {
@@ -744,6 +739,125 @@ mod tests {
         let ids: Vec<String> = read_imports(&dir).into_iter().map(|l| l.id).collect();
         assert_eq!(ids, ["a", "b"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A frame of the import at a fixed time, from the image file `src` (phase 9 characterisation
+    /// of the frame writer).
+    fn fixed_frame(src: &Path, width: u32, height: u32, stats: ImageStats) -> Frame {
+        Frame {
+            file: src.to_path_buf(),
+            image_name: "clip.mp4".into(),
+            camera: "cam".into(),
+            time: SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_250),
+            width,
+            height,
+            stats,
+            dhash: 0x0123_4567_89ab_cdef,
+            provenance: Provenance {
+                import_id: "20261022-120000-ab12".into(),
+                kind: "video".into(),
+                license: "CC BY 4.0".into(),
+                license_confirmed: true,
+                ..Provenance::default()
+            },
+        }
+    }
+
+    /// Audit 2026-11 phase 9 (Q:collect-7), pinned before the shared frame writer: a frame that is
+    /// not a JPEG is re-encoded at quality 92 and written as exactly this sidecar and index line.
+    #[test]
+    fn a_png_frame_is_written_as_this_jpeg_sidecar_and_index_line() {
+        let root = crate::test_dirs::TempDir::new("import-png");
+        let dir = root.join("dataset");
+        let img = crate::image::RgbImage {
+            width: 8,
+            height: 6,
+            rgb: vec![200; 8 * 6 * 3],
+        };
+        let mut png = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut png),
+            &img.rgb,
+            8,
+            6,
+            image::ExtendedColorType::Rgb8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        let src = root.join("f.png");
+        std::fs::write(&src, &png).unwrap();
+        let f = fixed_frame(&src, 8, 6, ImageStats::compute(&img));
+        let (rels, _) = utc(&dir, "20261022-120000-ab12", &[f]).unwrap();
+        assert_eq!(
+            rels,
+            ["ir/cam/2023-11-14/20231114T221320250Z_imp-ab12-00000.jpg"]
+        );
+        let day = dir.join("ir/cam/2023-11-14");
+        let jpg = std::fs::read(day.join("20231114T221320250Z_imp-ab12-00000.jpg")).unwrap();
+        let expected = crate::image::encode_jpeg(&crate::image::decode(&png).unwrap(), 92).unwrap();
+        assert_eq!(jpg, expected);
+        let side = std::fs::read(day.join("20231114T221320250Z_imp-ab12-00000.json")).unwrap();
+        let rec: Record = serde_json::from_slice(&side).unwrap();
+        assert_eq!(rec.id, "20231114T221320250Z_imp-ab12-00000");
+        assert_eq!(rec.request_id, "imp-ab12-00000");
+        assert_eq!(
+            rec.image,
+            crate::collect::record::ImageInfo {
+                file: "20231114T221320250Z_imp-ab12-00000.jpg".into(),
+                bytes: jpg.len() as u64,
+                original: false,
+            }
+        );
+        assert_eq!(side, serde_json::to_vec_pretty(&rec).unwrap());
+        let index = std::fs::read_to_string(day.join(layout::INDEX_FILE)).unwrap();
+        assert_eq!(
+            index,
+            format!(
+                "{{\"id\":\"20231114T221320250Z_imp-ab12-00000\",\
+                 \"timestamp\":\"2023-11-14T22:13:20.250Z\",\"scene\":\"ir\",\"camera\":\"cam\",\
+                 \"model\":\"import\",\"buckets\":[],\"labels\":[],\"bytes\":{}}}\n",
+                jpg.len() + side.len()
+            )
+        );
+        let names: std::collections::BTreeSet<String> = std::fs::read_dir(&day)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
+
+    /// Audit 2026-11 phase 9, pinned before the shared frame writer: what a frame that cannot be
+    /// read or decoded answers, and that it leaves no folder behind.
+    #[test]
+    fn a_frame_that_cannot_be_read_or_decoded_names_its_file_and_leaves_nothing() {
+        let root = crate::test_dirs::TempDir::new("import-bad");
+        let dir = root.join("dataset");
+        let src = root.join("f.jpg");
+        let stats = ImageStats::compute(&crate::image::RgbImage {
+            width: 1,
+            height: 1,
+            rgb: vec![0; 3],
+        });
+        let err = utc(
+            &dir,
+            "20261022-120000-ab12",
+            &[fixed_frame(&src, 1, 1, stats)],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with(&format!("reading {}: ", src.display())),
+            "{err:#}"
+        );
+        std::fs::write(&src, b"not an image").unwrap();
+        let err = utc(
+            &dir,
+            "20261022-120000-ab12",
+            &[fixed_frame(&src, 1, 1, stats)],
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), format!("decoding {}", src.display()));
+        assert_eq!(err.chain().count(), 2, "{err:#}");
+        assert!(!dir.exists(), "no folder for a frame that is not written");
     }
 
     #[test]

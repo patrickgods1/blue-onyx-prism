@@ -6,48 +6,16 @@
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI).
 #![allow(clippy::unwrap_used)]
 
-use std::path::PathBuf;
-use std::process::Command;
-
-fn have_node() -> bool {
-    let ok = Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
-            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
-        );
-        println!("skipped: no node");
-    }
-    ok
-}
+use crate::js_harness::{asset, have_node, run_node_ok};
+use std::ffi::OsStr;
 
 #[test]
 fn prism_time_formats_in_the_zone() {
     if !have_node() {
         return;
     }
-    let time_js = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/time.js");
-    let dir = std::env::temp_dir().join(format!("bop-js-time-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let driver = dir.join("driver.js");
-    std::fs::write(&driver, DRIVER).unwrap();
-    let out = Command::new("node")
-        .arg(&driver)
-        .arg(&time_js)
-        .arg(parity_cases())
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "node failed ({}): {}{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let cases = parity_cases();
+    run_node_ok(DRIVER, &[asset("time.js").as_os_str(), OsStr::new(&cases)]);
 }
 
 /// QA-111: the server's `Zone::display` and the abbreviation map it writes on the page, for

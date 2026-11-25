@@ -2954,7 +2954,7 @@ mod tests {
             .unwrap_or_else(|| repo.join("target/release/onnxruntime/coreml"));
         let src = repo.join("models").join("IPcam-general.onnx");
         assert!(src.is_file() && lib_dir.is_dir(), "fixtures missing");
-        let dir = std::env::temp_dir().join(format!("bop-ort-nocache-{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dirs::TempDir::unmade("ort-nocache");
         let fold = dir.join("fold-0").join("model");
         std::fs::create_dir_all(&fold).unwrap();
         let model = fold.join("refine-fold-0.onnx");
@@ -3040,6 +3040,5 @@ mod tests {
         assert_eq!(thrown.len(), cached.len());
         assert!(diff < 1e-2, "{diff}");
         drop(rt);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

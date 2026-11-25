@@ -149,13 +149,11 @@ mod tests {
 
     #[test]
     fn from_file_and_errors() {
-        let dir = std::env::temp_dir().join(format!("bo-classes-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dirs::TempDir::new("classes");
         let p = dir.join("c.yaml");
         std::fs::write(&p, "names:\n  0: a\n  1: b\n").unwrap();
         assert_eq!(load_class_names(&p).unwrap(), ["a", "b"]);
         assert!(load_class_names(&dir.join("missing.yaml")).is_err());
-        std::fs::remove_dir_all(&dir).ok();
         assert!(parse_class_names("other: 1\n").is_err());
         assert!(parse_class_names("names: 5\n").is_err());
         let e = parse_class_names("names:\n  0: a\n  99999999999: b\n")
@@ -175,10 +173,8 @@ mod tests {
 
     #[test]
     fn sidecar_classes_absent_falls_back() {
-        let dir = std::env::temp_dir().join(format!("bo_reg_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dirs::TempDir::new("classes-sidecar");
         let names = resolve_class_names(&dir.join("m.onnx"), None).unwrap();
         assert_eq!(names, coco80());
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -13,48 +13,24 @@
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI).
 #![allow(clippy::unwrap_used)]
 
+use crate::js_harness::{asset, have_node, run_node_json, run_node_ok};
 use serde_json::{Value, json};
-use std::path::PathBuf;
-use std::process::Command;
-
-fn have_node() -> bool {
-    let ok = Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
-            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
-        );
-        println!("skipped: no node");
-    }
-    ok
-}
 
 /// `expr` evaluated in a context that loaded bench-core.js (`BC` = BenchCore), as JSON.
 fn eval(expr: &str) -> Value {
-    let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/bench-core.js");
     let driver = r#"
 const fs = require('fs'), vm = require('vm');
 const ctx = vm.createContext({});
-vm.runInContext(fs.readFileSync(process.env.BOP_BENCH_CORE_JS, 'utf8'), ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
 vm.runInContext('var BC = BenchCore;', ctx);
-const out = vm.runInContext('(' + process.env.BOP_EXPR + ')', ctx);
+const out = vm.runInContext('(' + fs.readFileSync(process.argv[3], 'utf8') + ')', ctx);
 process.stdout.write(JSON.stringify(out === undefined ? null : out));
 "#;
-    let out = Command::new("node")
-        .args(["-e", driver])
-        .env("BOP_BENCH_CORE_JS", core)
-        .env("BOP_EXPR", expr)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "node: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).unwrap()
+    run_node_json(
+        driver,
+        &[asset("bench-core.js").as_os_str()],
+        &[("expr.js", expr.as_bytes())],
+    )
 }
 
 #[test]
@@ -785,25 +761,11 @@ function benchPage(o, scripts) {
 const q = (req, k) => new URL(req.url, 'https://h').searchParams.get(k);
 "##;
 
-/// Run `PAGE` + `driver` in node (it asserts and exits non-zero on a failure).
+/// Run `PAGE` + `driver` in node (it asserts, exits non-zero on a failure and prints `ok` at the
+/// end).
 fn run_page(driver: &str) {
-    let dir = std::env::temp_dir().join(format!("bop-js-bench-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("driver.js");
-    std::fs::write(&file, format!("{PAGE}\n{driver}\n")).unwrap();
-    let out = Command::new("node")
-        .arg(&file)
-        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"))
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "node failed ({}): {}{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let assets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+    run_node_ok(&format!("{PAGE}\n{driver}\n"), &[assets.as_os_str()]);
 }
 
 /// F1: while a run goes the shell polls `?only=run` once per 1.5 s period (it kicked the fast loop

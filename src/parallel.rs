@@ -231,6 +231,21 @@ pub fn map_all_at<T: Send>(
 mod tests {
     use super::*;
 
+    /// Start of a test item: on a spawned thread it notes that one took an item; on the calling
+    /// thread `me` it first waits until one has (at most 5 s, so a map that runs inline cannot
+    /// hang), so "spawned threads take items too" does not depend on how fast threads start
+    /// (QA-274).
+    fn after_a_spawned_item(me: std::thread::ThreadId, taken: &AtomicBool) {
+        if std::thread::current().id() != me {
+            taken.store(true, Ordering::Release);
+            return;
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !taken.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Background maps lower the threads they spawn and never the calling thread; normal maps
     /// lower nothing.
     #[test]
@@ -239,8 +254,9 @@ mod tests {
         let me = std::thread::current().id();
         let before = thread_level();
         for spawned in [Spawned::Normal, Spawned::Background] {
+            let taken = AtomicBool::new(false);
             let seen = map_all_at(64, 4, spawned, &|_| {
-                // Long enough that the spawned threads take items too.
+                after_a_spawned_item(me, &taken);
                 std::thread::sleep(Duration::from_millis(2));
                 (std::thread::current().id() == me, thread_level())
             });
@@ -266,7 +282,9 @@ mod tests {
     fn background_workers_call_the_priority_helper_and_the_caller_does_not() {
         let me = std::thread::current().id();
         let cancel = AtomicBool::new(false);
+        let taken = AtomicBool::new(false);
         let item = |_: usize| {
+            after_a_spawned_item(me, &taken);
             // Long enough that several workers take items.
             std::thread::sleep(Duration::from_millis(2));
             (
@@ -286,6 +304,7 @@ mod tests {
             )
             .unwrap();
             assert!(seen.iter().all(|(caller, _)| !caller), "map's caller polls");
+            taken.store(false, Ordering::Release);
             let all = map_all_at(64, 4, spawned, &item);
             assert!(
                 all.iter().any(|(caller, _)| *caller),

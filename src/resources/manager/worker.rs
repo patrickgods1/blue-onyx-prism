@@ -890,10 +890,9 @@ mod tests {
         assert_eq!(backoff(u32::MAX), BACKOFF_MAX);
     }
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("bop-mgr-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// A scratch folder `bop-mgr-<tag>-<uuid>`, removed on drop (also when the test fails).
+    fn tmp(tag: &str) -> crate::test_dirs::TempDir {
+        crate::test_dirs::TempDir::new(&format!("mgr-{tag}"))
     }
 
     fn leak(s: String) -> &'static str {
@@ -1103,7 +1102,7 @@ mod tests {
         let opts = ManagerOptions {
             backoff: |_| Duration::from_millis(10),
             retry: true,
-            ..ManagerOptions::new(&root)
+            ..ManagerOptions::new(root.to_path_buf())
         };
         let m = Manager::start(opts);
         let events = m.subscribe();
@@ -1144,7 +1143,6 @@ mod tests {
         m.enqueue(Job::into_dir(res, root.join("models")));
         m.shutdown();
         assert_eq!(server.requests.load(Ordering::SeqCst), before);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1155,7 +1153,7 @@ mod tests {
         let root = tmp("hash");
         let opts = ManagerOptions {
             retry: true,
-            ..ManagerOptions::new(&root)
+            ..ManagerOptions::new(root.to_path_buf())
         };
         let m = Manager::start(opts);
         let key = m.enqueue(Job::into_dir(res, root.join("models")));
@@ -1173,7 +1171,6 @@ mod tests {
         assert!(!models.join("test-model.onnx").exists());
         assert!(!models.join("test-model.onnx.partial").exists());
         assert!(!is_installed(res, &models));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1197,7 +1194,7 @@ mod tests {
         let res = model_resource(&server.url, &data, None);
         let opts = ManagerOptions {
             lock_wait: Some(Duration::from_millis(300)),
-            ..ManagerOptions::new(&root)
+            ..ManagerOptions::new(root.to_path_buf())
         };
         let err = install_all(opts.clone(), vec![Job::into_dir(res, root.join("m"))]).unwrap_err();
         assert!(format!("{err:#}").contains("download lock"), "{err:#}");
@@ -1205,7 +1202,6 @@ mod tests {
         drop(held);
         let st = install_all(opts, vec![Job::into_dir(res, root.join("m"))]).unwrap();
         assert_eq!(st[0].state, State::Installed);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1265,7 +1261,6 @@ mod tests {
         failed_permanently(&run_once(res, &root), "redirect");
         nothing_left(&root);
         assert_eq!(server.requests.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(&root);
 
         // Loopback http is allowed in this build; the final URL is checked too.
         let target = serve(data.clone(), false);
@@ -1280,7 +1275,6 @@ mod tests {
         let root = tmp("redirect-ok");
         assert_eq!(run_once(res, &root), State::Installed);
         assert_eq!(target.requests.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(&root);
         assert!(url_allowed("https://x/y") && !url_allowed("http://x/y"));
         assert!(!url_allowed("ftp://127.0.0.1:1/x"));
     }
@@ -1308,7 +1302,6 @@ mod tests {
             failed_permanently(&run_once(res, &root), "size mismatch");
             nothing_left(&root);
             assert_eq!(server.requests.load(Ordering::SeqCst), 1, "no retry");
-            let _ = std::fs::remove_dir_all(&root);
         }
         // A pin smaller than the file: Content-Length catches it before any byte is read.
         let server = serve(data.clone(), false);
@@ -1324,7 +1317,6 @@ mod tests {
         let root = tmp("oversize-pin");
         failed_permanently(&run_once(res, &root), "size mismatch");
         nothing_left(&root);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// RS-15: a resumed download is hashed as a whole; when the upstream file changed between
@@ -1350,7 +1342,6 @@ mod tests {
         failed_permanently(&run_once(res, &root), "hash mismatch");
         nothing_left(&root);
         assert_eq!(server.ranged.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(&root);
 
         // Another total in the Content-Range: refused before streaming, partial removed.
         let mut longer = data.clone();
@@ -1367,7 +1358,6 @@ mod tests {
         let root = tmp("resume-size");
         failed_permanently(&run_once(res, &root), "size mismatch");
         nothing_left(&root);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// RS-04: a worker that dies (here: panics on a job) fails every job it will never run,
@@ -1383,7 +1373,7 @@ mod tests {
         let other = model_resource("http://127.0.0.1:9/y", &data, None);
         let m = Manager::start(ManagerOptions {
             retry: true,
-            ..ManagerOptions::new(&root)
+            ..ManagerOptions::new(root.to_path_buf())
         });
         let events = m.subscribe();
         let k1 = m.enqueue(Job::into_dir(panicking, root.join("a")));
@@ -1412,7 +1402,6 @@ mod tests {
             State::Failed { retry_at: None, .. }
         ));
         m.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// RS-06: with `max_attempts` the service stops retrying an unreachable URL and names the
@@ -1440,7 +1429,7 @@ mod tests {
             retry: true,
             backoff: |_| Duration::from_millis(10),
             max_attempts: Some(3),
-            ..ManagerOptions::new(&root)
+            ..ManagerOptions::new(root.to_path_buf())
         });
         let events = m.subscribe();
         let key = m.enqueue(Job::into_dir(res, root.join("models")));
@@ -1478,7 +1467,6 @@ mod tests {
         m.enqueue(Job::into_dir(res, root.join("models")));
         assert!(!m.status(&key).unwrap().state.is_final());
         m.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     const TOKEN: &str = "hf_NotARealTokenOnlyForManagerTests";
@@ -1552,7 +1540,6 @@ mod tests {
             assert_eq!(*attempts, 1);
             assert!(error.contains(next), "{error}");
             assert!(!error.contains(TOKEN), "{error}");
-            let _ = std::fs::remove_dir_all(&root);
         }
     }
 
@@ -1577,7 +1564,6 @@ mod tests {
         assert_eq!(server.requests.load(Ordering::SeqCst), 1);
         let heads = server.heads.lock_recover();
         assert!(!heads[0].to_ascii_lowercase().contains("authorization"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The same statuses from a host that is not Hugging Face count only with the header.
@@ -1596,7 +1582,6 @@ mod tests {
         let state = run_with(gated_opts(&root, "huggingface.co"), res, &root);
         failed_permanently(&state, "no access");
         assert_eq!(server.requests.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An expired signed URL: the CDN's plain 403 is an ordinary failure, retried up to the limit,
@@ -1640,7 +1625,6 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(cdn.requests.load(Ordering::SeqCst), 3);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The token goes to the Hugging Face host and stops at the redirect to the CDN.
@@ -1672,7 +1656,6 @@ mod tests {
             "{}",
             got[0]
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Same host name, other port: reqwest counts that as another host too.
@@ -1695,7 +1678,6 @@ mod tests {
         );
         assert!(front.heads.lock_recover()[0].contains(TOKEN));
         assert!(!cdn.heads.lock_recover()[0].contains(TOKEN));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1710,7 +1692,6 @@ mod tests {
             State::Installed
         );
         assert!(!server.heads.lock_recover()[0].contains(TOKEN));
-        let _ = std::fs::remove_dir_all(&root);
 
         // A gated resource on another host.
         let server = serve(data.clone(), false);
@@ -1721,7 +1702,6 @@ mod tests {
             State::Installed
         );
         assert!(!server.heads.lock_recover()[0].contains(TOKEN));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A login made between two attempts counts on the second.
@@ -1743,7 +1723,6 @@ mod tests {
         let heads = server.heads.lock_recover();
         assert!(heads[0].contains("Bearer token-0"), "{}", heads[0]);
         assert!(heads[1].contains("Bearer token-1"), "{}", heads[1]);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A folder already holding the files is adopted by hash: no request and no token read, and
@@ -1776,7 +1755,6 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no token needed");
         assert_eq!(verifying.load(Ordering::SeqCst), 1);
         assert!(is_installed(res, &models));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A wrong file at the pinned size is not adopted: it goes to the download, here refused.
@@ -1799,7 +1777,6 @@ mod tests {
         failed_permanently(&state, "hf-login");
         assert_eq!(server.requests.load(Ordering::SeqCst), 1);
         assert!(!is_installed(res, &models));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1828,7 +1805,6 @@ mod tests {
             panic!("{state:?}")
         };
         assert!(!error.contains("X-Amz"), "{error}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The give-up text never offers a command that would answer "unknown resource".
@@ -1860,7 +1836,6 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         let e = sha256_file_until(&f, &stop).unwrap_err();
         assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1943,7 +1918,7 @@ mod tests {
         let root = tmp("repair");
         let dir = root.join("onnxruntime/cpu");
         let library = dir.join("libonnxruntime.so");
-        let m = Manager::start(ManagerOptions::new(&root));
+        let m = Manager::start(ManagerOptions::new(root.to_path_buf()));
         let install = || {
             let key = m.enqueue(Job::new(res, &root));
             let done = m.wait(std::slice::from_ref(&key), Some(Duration::from_secs(20)));
@@ -1980,7 +1955,6 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
         assert!(is_installed(res, &dir));
         m.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// RA resources-11: an update staged beside an install that is gone (deleted by hand) is no
@@ -2006,7 +1980,7 @@ mod tests {
         write_manifest(&pending.join(MANIFEST_FILE), &m, &pending).unwrap();
         let mut job = Job::new(res, &root);
         job.keep_downloads = true;
-        let st = install_all(ManagerOptions::new(&root), vec![job]).unwrap();
+        let st = install_all(ManagerOptions::new(root.to_path_buf()), vec![job]).unwrap();
         assert_eq!(st[0].state, State::Installed);
         assert_eq!(server.requests.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -2017,7 +1991,6 @@ mod tests {
         let kept = root.join(DOWNLOADS_DIR).join(res.parts[0].file_name);
         assert!(kept.is_file());
         assert!(super::super::leftovers::keep_marker(&kept).is_file());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Manifests from before the sizes: every listed file must exist, any size goes; one that
@@ -2052,7 +2025,6 @@ mod tests {
         assert!(is_installed(res, &dir));
         assert_eq!(install_damage(&path, &dir), None);
         assert_eq!(install_damage(&dir.join("absent.json"), &dir), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The sizes are extra data in the file: [`read_manifest`] and the older struct read it, an
@@ -2066,7 +2038,7 @@ mod tests {
         let root = tmp("sizes");
         let models = root.join("models");
         install_all(
-            ManagerOptions::new(&root),
+            ManagerOptions::new(root.to_path_buf()),
             vec![Job::into_dir(res, models.clone())],
         )
         .unwrap();
@@ -2081,7 +2053,6 @@ mod tests {
         assert_eq!(read_manifest(&path).unwrap().files, ["test-model.onnx"]);
         std::fs::write(models.join("test-model.onnx"), b"short").unwrap();
         assert!(!is_installed(res, &models));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An ONNX Runtime archive from local files: extracted into staging, swapped into place,
@@ -2119,7 +2090,7 @@ mod tests {
             ..Job::new(res, &root)
         };
         make(b"v1");
-        install_all(ManagerOptions::new(&root), vec![job()]).unwrap();
+        install_all(ManagerOptions::new(root.to_path_buf()), vec![job()]).unwrap();
         let dir = root.join("onnxruntime/cpu");
         assert_eq!(std::fs::read(dir.join("libonnxruntime.so")).unwrap(), b"v1");
         assert_eq!(
@@ -2141,7 +2112,7 @@ mod tests {
         );
         assert!(!is_merged(&dir.join(MANIFEST_FILE)));
         make(b"v2");
-        install_all(ManagerOptions::new(&root), vec![job()]).unwrap();
+        install_all(ManagerOptions::new(root.to_path_buf()), vec![job()]).unwrap();
         assert_eq!(std::fs::read(dir.join("libonnxruntime.so")).unwrap(), b"v2");
         assert!(!is_merged(&dir.join(MANIFEST_FILE)), "swapped, not merged");
         let leftovers: Vec<_> = std::fs::read_dir(root.join("onnxruntime"))
@@ -2152,7 +2123,6 @@ mod tests {
             .filter(|n| n.starts_with('.') && n != ".cpu.in-use")
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// QA-025: an ONNX Runtime installed twice (a pin bump) into a user `--dir` that holds other
@@ -2311,7 +2281,7 @@ mod tests {
         let root = tmp("cancel-running");
         let m = Manager::start(ManagerOptions {
             retry: true,
-            ..ManagerOptions::new(&root)
+            ..ManagerOptions::new(root.to_path_buf())
         });
         let dir = root.join("models");
         let key = m.enqueue(Job::into_dir(res, dir.clone()));
@@ -2340,7 +2310,6 @@ mod tests {
         assert!(server.ranged.load(Ordering::SeqCst) >= 1);
         assert_eq!(std::fs::read(dir.join("test-model.onnx")).unwrap(), data);
         m.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A dead port: every attempt fails, retried after `backoff`. Returns the port and the
@@ -2369,7 +2338,7 @@ mod tests {
         let m = Manager::start(ManagerOptions {
             retry: true,
             backoff: |_| Duration::from_millis(300),
-            ..ManagerOptions::new(&root)
+            ..ManagerOptions::new(root.to_path_buf())
         });
         let key = m.enqueue(Job::into_dir(res, root.join("models")));
         wait_state(&m, &key, "retrying", |s| {
@@ -2392,7 +2361,6 @@ mod tests {
         );
         assert!(is_cancelled(&m.status(&key).unwrap().state));
         m.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A waiter's give-up cancels only a job nobody else wants: not while another waiter or a
@@ -2406,7 +2374,7 @@ mod tests {
         let m = Manager::start(ManagerOptions {
             retry: true,
             backoff: |_| Duration::from_secs(60),
-            ..ManagerOptions::new(&root)
+            ..ManagerOptions::new(root.to_path_buf())
         });
         let job = || Job::into_dir(res, root.join("models"));
         let live = |key: &str| !m.status(key).unwrap().state.is_final();
@@ -2429,6 +2397,5 @@ mod tests {
         drop(w);
         assert!(live(&key));
         m.shutdown();
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

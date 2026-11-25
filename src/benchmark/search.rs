@@ -407,6 +407,63 @@ impl StoredPreds {
             .filter(|r| crate::registry::normalize_name(&r.model) == key)
             .collect()
     }
+
+    /// The stored run of `model` that Search and Tune open: on `device` when one is given (its
+    /// canonical spec, or the same device spelled otherwise, [`crate::config::same_device`]:
+    /// `openvino:gpu` finds an `openvino:gpu.0` run), else on the `recommended` device, else on
+    /// a CPU reference device ([`super::REFERENCE_DEVICES`]), else the first stored run.
+    pub(crate) fn run_for(
+        &self,
+        model: &str,
+        device: Option<&str>,
+        recommended: Option<&str>,
+    ) -> std::result::Result<&StoredRun, NoRun> {
+        let runs = self.runs_of(model);
+        if let Some(d) = device {
+            let want = crate::backend::spec::parse(d)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| d.to_string());
+            return runs
+                .iter()
+                .find(|r| r.device == want || crate::config::same_device(&r.device, &want))
+                .copied()
+                .ok_or_else(|| NoRun::NotOn {
+                    stored: runs
+                        .iter()
+                        .map(|r| r.device.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    want,
+                });
+        }
+        let reference = super::REFERENCE_DEVICES.map(|d| d.to_string());
+        recommended
+            .into_iter()
+            .chain(reference.iter().map(String::as_str))
+            .find_map(|d| runs.iter().find(|r| r.device == d).copied())
+            .or_else(|| runs.first().copied())
+            .ok_or(NoRun::Empty)
+    }
+}
+
+/// Why [`StoredPreds::run_for`] found no run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NoRun {
+    /// The model has no stored run.
+    Empty,
+    /// None on the device asked for (`want`, canonical); `stored`: the devices it has.
+    NotOn { want: String, stored: String },
+}
+
+impl std::fmt::Display for NoRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("no stored predictions"),
+            Self::NotOn { want, stored } => {
+                write!(f, "no stored predictions on {want} (stored: {stored})")
+            }
+        }
+    }
 }
 
 /// (modified, length) of a file; None when it does not exist.
@@ -903,41 +960,6 @@ pub fn options(results: &BenchmarkResults, preds: &StoredPreds) -> SearchOptions
     }
 }
 
-/// The run of `model` to search: on `device`, else the recommended device, else the CPU
-/// reference, else the first stored one.
-fn pick_run<'a>(
-    results: &BenchmarkResults,
-    runs: &[&'a StoredRun],
-    model: &str,
-    device: Option<&str>,
-) -> Result<&'a StoredRun> {
-    if let Some(d) = device {
-        let want = crate::backend::spec::parse(d)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| d.to_string());
-        return runs
-            .iter()
-            .find(|r| r.device == want)
-            .copied()
-            .with_context(|| {
-                format!(
-                    "no stored predictions on {want} (stored: {})",
-                    runs.iter()
-                        .map(|r| r.device.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            });
-    }
-    let rec = results.find(model).and_then(|m| m.recommended.clone());
-    let reference = super::REFERENCE_DEVICES.map(|d| d.to_string());
-    rec.iter()
-        .chain(reference.iter())
-        .find_map(|d| runs.iter().find(|r| r.device == *d).copied())
-        .or_else(|| runs.first().copied())
-        .context("no stored predictions")
-}
-
 /// [`super::RunResult::preds_capped_images`] of the device run `run` was stored from (0 when the
 /// results no longer have it).
 fn capped_of(results: &BenchmarkResults, run: &StoredRun) -> usize {
@@ -1000,17 +1022,17 @@ pub fn search(
         elapsed_ms: 0.0,
     };
     for name in &names {
-        let runs = preds.runs_of(name);
-        if runs.is_empty() {
+        if preds.runs_of(name).is_empty() {
             out.errors.push(format!(
                 "{name}: no stored predictions; run a benchmark of this model first"
             ));
             continue;
         }
-        let run = match pick_run(results, &runs, name, req.device.as_deref()) {
+        let recommended = results.find(name).and_then(|m| m.recommended.as_deref());
+        let run = match preds.run_for(name, req.device.as_deref(), recommended) {
             Ok(r) => r,
             Err(e) => {
-                out.errors.push(format!("{name}: {e:#}"));
+                out.errors.push(format!("{name}: {e}"));
                 continue;
             }
         };
@@ -2364,5 +2386,50 @@ pub(crate) mod tests {
             "{:?}",
             o.tags
         );
+    }
+
+    /// One stored-run rule for Search and Tune (QA-124): an explicit device matches its other
+    /// spelling, the recommendation wins, then a CPU reference, then the first stored run.
+    #[test]
+    fn run_for_picks_like_search_and_tune() {
+        let run = |model: &str, device: &str| StoredRun {
+            model: model.into(),
+            device: device.into(),
+            timestamp: String::new(),
+            classes: Vec::new(),
+            configured: 0.5,
+            eval_confidence: 0.1,
+            images: Vec::new(),
+        };
+        let preds = StoredPreds {
+            version: String::new(),
+            runs: vec![
+                run("m", "ort:coreml"),
+                run("m", "openvino:gpu.0"),
+                run("m", "openvino:cpu"),
+                run("other", "ort:cpu"),
+            ],
+        };
+        let dev = |d: Option<&str>, rec: Option<&str>| {
+            preds.run_for("M", d, rec).map(|r| r.device.as_str())
+        };
+        assert_eq!(dev(Some("openvino:gpu"), None), Ok("openvino:gpu.0"));
+        assert_eq!(dev(Some("GPU.0"), Some("ort:coreml")), Ok("openvino:gpu.0"));
+        assert_eq!(dev(None, None), Ok("openvino:cpu"));
+        assert_eq!(dev(None, Some("ort:coreml")), Ok("ort:coreml"));
+        assert_eq!(dev(None, Some("ort:cuda")), Ok("openvino:cpu"));
+        let e = preds.run_for("m", Some("ort:cuda"), None).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "no stored predictions on ort:cuda (stored: ort:coreml, openvino:gpu.0, openvino:cpu)"
+        );
+        // Without a CPU reference: the first stored run.
+        let only = StoredPreds {
+            version: String::new(),
+            runs: vec![run("m", "ort:coreml"), run("m", "openvino:gpu.0")],
+        };
+        assert_eq!(only.run_for("m", None, None).unwrap().device, "ort:coreml");
+        assert_eq!(only.run_for("x", None, None).unwrap_err(), NoRun::Empty);
+        assert_eq!(NoRun::Empty.to_string(), "no stored predictions");
     }
 }

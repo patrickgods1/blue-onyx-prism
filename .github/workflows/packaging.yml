@@ -21,6 +21,7 @@ on:
       - "deploy/**"
       - "scripts/*systemd*"
       - "scripts/*launchd*"
+      - "scripts/install_common.sh"
       - "scripts/ci/retry.sh"
       - "scripts/ci/check_https.sh"
       - ".github/workflows/packaging.yml"
@@ -71,7 +72,7 @@ jobs:
       - name: Lint shell scripts
         if: runner.os == 'Linux'
         run: |
-          shellcheck -x -S warning scripts/*systemd*.sh scripts/*launchd*.sh packaging/*.sh \
+          shellcheck -x -S warning scripts/*systemd*.sh scripts/*launchd*.sh scripts/install_common.sh packaging/*.sh \
             packaging/linux/*.sh packaging/linux/debian/* packaging/linux/rpm/*.sh \
             packaging/macos/*.sh packaging/macos/scripts/* packaging/release/*.sh \
             scripts/ci/check_https.sh

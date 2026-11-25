@@ -1794,8 +1794,7 @@ mod tests {
         assert!(is_legacy_blob("4574847747418676496.blob"));
         assert!(!is_legacy_blob(".blob") && !is_legacy_blob("model.blob"));
         assert!(!is_legacy_blob("123.onnx") && !is_legacy_blob("123.blob.tmp"));
-        let root = std::env::temp_dir().join(format!("bop-ovcache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_dirs::TempDir::new("ovcache");
         std::fs::create_dir_all(root.join("openvino-cpu-f32")).unwrap();
         std::fs::create_dir_all(root.join("coreml")).unwrap();
         for f in [
@@ -1811,7 +1810,6 @@ mod tests {
         for f in ["openvino-cpu-f32/456.blob", "coreml/m.onnx", "notes.blob"] {
             assert!(root.join(f).exists(), "{f} removed");
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A real compile writes its blob into the model's own subfolder with `model.txt`; the next
@@ -1827,8 +1825,7 @@ mod tests {
         let ov = repo.join("openvino");
         let src = repo.join("models").join("IPcam-general.onnx");
         assert!(ov.is_dir() && src.is_file(), "fixtures missing");
-        let dir = std::env::temp_dir().join(format!("bop-ov-sub-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dirs::TempDir::new("ov-sub");
         let model = dir.join("cam.onnx");
         std::fs::copy(&src, &model).unwrap();
         let cache = dir.join("cache");
@@ -1921,6 +1918,5 @@ mod tests {
                 .any(|u| &u.path != sub && !u.superseded && u.bytes > 0)
         );
         drop(rt);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -16,7 +16,8 @@
 //! letter grades. [`sweep`] runs one model on every chosen device, checks each device's
 //! detections against a CPU reference device when one ran (image by image, B7; else every
 //! device is "not checked") and recommends a device ([`report::recommend`]).
-//! [`report`] holds the persisted results (`benchmark.json` next to the config file),
+//! [`report`] holds the persisted results (`benchmark.json` next to the config file; `save.rs`
+//! is the merge-and-write both the CLI and the service save through),
 //! [`history`] the run history beside it (`benchmark-history.json`: what changed between runs),
 //! [`service`] the background run behind `/v1/benchmark`, [`cli`] the command line, and
 //! [`export`] the standalone HTML / Markdown report. [`threshold`] sweeps the confidence
@@ -53,6 +54,7 @@ pub mod variant;
 mod run;
 #[cfg(test)]
 mod run_tests;
+mod save;
 mod scoring;
 mod sweep;
 
@@ -837,11 +839,7 @@ pub fn config_models(config: &Config) -> Result<Vec<&ModelConfig>> {
 
 /// The config entry named `name` (matched like `/v1/vision/custom/{model}`).
 pub fn find_model<'a>(config: &'a Config, name: &str) -> Option<&'a ModelConfig> {
-    let key = crate::registry::normalize_name(name);
-    config
-        .models
-        .iter()
-        .find(|m| crate::registry::normalize_name(&m.effective_name()) == key)
+    config.model(name)
 }
 
 /// A job for a model file given on the command line.

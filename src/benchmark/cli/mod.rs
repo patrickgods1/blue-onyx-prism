@@ -1340,21 +1340,22 @@ impl RunCtx<'_> {
         for w in warnings {
             report.warn(self.args.json, w);
         }
-        if let Some(w) = BenchmarkResults::merge_warning(prev.as_ref(), &results) {
+        let crate::benchmark::save::Committed {
+            merged,
+            seeds,
+            merge_warning,
+            ..
+        } = crate::benchmark::save::commit(
+            &path,
+            prev,
+            results,
+            BenchmarkResults::merge,
+            snapshot.as_ref(),
+            (self.metric, self.weights),
+        )?;
+        if let Some(w) = merge_warning {
             report.warn(self.args.json, w);
         }
-        // The results before this save seed the history of models that have none yet.
-        let seeds = prev
-            .as_ref()
-            .map(crate::benchmark::history::seed_entries)
-            .unwrap_or_default();
-        let mut merged = BenchmarkResults::merge(prev, results);
-        if let Some(id) = &snapshot {
-            crate::benchmark::cameras::snapshot::stamp(&mut merged, id);
-        }
-        // Models kept from earlier runs are graded like this run's.
-        merged.regrade(self.metric, self.weights);
-        merged.save(&path)?;
         for w in crate::benchmark::search::save_beside(&path, &merged, swept) {
             report.warn(self.args.json, w);
         }

@@ -1508,26 +1508,28 @@ impl ServiceRun<'_> {
         }
         let load_ms = super::run::ms(t.elapsed());
         for w in warnings {
-            self.h.with(|g| g.warnings.push(w));
-        }
-        if let Some(w) = BenchmarkResults::merge_warning(prev.as_ref(), &results) {
             self.h.warn(w);
         }
-        // The results before this save seed the history of models that have none yet.
-        let seeds = prev
-            .as_ref()
-            .map(super::history::seed_entries)
-            .unwrap_or_default();
         let name = results.models.first().map(|m| m.model.clone());
-        let mut merged = saver.merge(prev, results, last);
-        if let Some(id) = &saver.snapshot {
-            super::cameras::snapshot::stamp(&mut merged, id);
+        let snapshot = saver.snapshot.clone();
+        let super::save::Committed {
+            merged,
+            seeds,
+            merge_warning,
+            write,
+        } = super::save::commit(
+            &ctx.results_path,
+            prev,
+            results,
+            |prev, new| saver.merge(prev, new, last),
+            snapshot.as_ref(),
+            (req.accuracy_metric, req.weights),
+        )?;
+        if let Some(w) = merge_warning {
+            self.h.warn(w);
         }
-        // Models kept from earlier runs are graded like this run's.
-        merged.regrade(req.accuracy_metric, req.weights);
-        let merge_ms = super::run::ms(t.elapsed()) - load_ms;
-        merged.save(&ctx.results_path)?;
-        let save_ms = super::run::ms(t.elapsed()) - load_ms - merge_ms;
+        let save_ms = super::run::ms(write);
+        let merge_ms = super::run::ms(t.elapsed()) - load_ms - save_ms;
         // The goal in force, with what this run's form chose.
         let mut bench_cfg = ctx.config.benchmark.clone();
         bench_cfg.set_legacy(req.threshold_objective, req.accuracy_metric);
@@ -2382,5 +2384,81 @@ mod tests {
         );
         let ids: Vec<&str> = one.image_sets.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["s1", "s2", "s3"]);
+    }
+
+    /// The CLI's one save of a run and the service's save per model, both through
+    /// [`super::super::save::commit`] and the file, write the same `benchmark.json` (QA-123).
+    #[test]
+    fn cli_and_service_saves_write_the_same_file() {
+        let fixed = |mut r: BenchmarkResults| {
+            r.timestamp = "2026-11-24T00:00:00Z".into();
+            r
+        };
+        let grade = (AccuracyMetric::default(), Weights::default());
+        let run_sets = || vec![info("s1", "new"), info("s3", "new")];
+        let prevs = [
+            Some(results(
+                "hw",
+                vec![model("a", &["s1"]), model("b", &["s2"])],
+                vec![info("s1", "old"), info("s2", "old")],
+            )),
+            Some(results(
+                "other",
+                vec![model("b", &["s2"])],
+                vec![info("s2", "old")],
+            )),
+            None,
+        ];
+        for prev in prevs {
+            let dir = crate::test_dirs::TempDir::new("bench-save");
+            let (cli, svc) = (dir.join("cli.json"), dir.join("svc.json"));
+            if let Some(p) = &prev {
+                p.save(&cli).unwrap();
+                p.save(&svc).unwrap();
+            }
+            let models = || vec![model("a", &[]), model("c", &["s1", "s3"])];
+            // The CLI: one merge of the whole run.
+            let (loaded, _) = BenchmarkResults::load_for_merge(&cli).unwrap();
+            let new = fixed(results("hw", models(), run_sets()));
+            let c =
+                super::super::save::commit(&cli, loaded, new, BenchmarkResults::merge, None, grade)
+                    .unwrap();
+            assert_eq!(
+                c.merge_warning.is_some(),
+                prev.as_ref().is_some_and(|p| p.hardware.cpu == "other")
+            );
+            // The service: one save per finished model, each through the file.
+            let mut saver = Saver {
+                hardware: HardwareSummary {
+                    cpu: "hw".into(),
+                    ..Default::default()
+                },
+                versions: RuntimeVersions::default(),
+                retain_sets: None,
+                finalized: false,
+                bookkeeping_ms: 0.0,
+                snapshot_written: false,
+                snapshot: None,
+            };
+            let n = models().len();
+            for (i, m) in models().into_iter().enumerate() {
+                let (loaded, _) = BenchmarkResults::load_for_merge(&svc).unwrap();
+                let new = fixed(results("hw", vec![m], run_sets()));
+                super::super::save::commit(
+                    &svc,
+                    loaded,
+                    new,
+                    |p, n2| saver.merge(p, n2, i + 1 == n),
+                    None,
+                    grade,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                std::fs::read_to_string(&cli).unwrap(),
+                std::fs::read_to_string(&svc).unwrap(),
+                "{prev:?}"
+            );
+        }
     }
 }

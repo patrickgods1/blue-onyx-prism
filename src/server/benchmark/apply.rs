@@ -5,14 +5,14 @@
 //! config write goes through one `save_config` call; file I/O and search run in
 //! `server::blocking`.
 
-use super::{ApiError, form_field, form_models, json_error};
+use super::{ApiError, form_field, form_models, json_fail};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::Config;
 use crate::config_form::{
     DeviceChange, ProfileChange, ThresholdChange, apply_device_thresholds, apply_model_devices,
     apply_model_thresholds,
 };
-use crate::server::form::truthy;
+use crate::server::form::checked;
 use crate::server::{AppState, save_config, schedule_restart};
 use axum::Json;
 use axum::extract::rejection::FormRejection;
@@ -38,7 +38,7 @@ pub(in crate::server) async fn apply(
 ) -> Response {
     let form = match form {
         Ok(Form(f)) => f,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
     crate::server::blocking(move || apply_blocking(&state, &form)).await
 }
@@ -46,7 +46,7 @@ pub(in crate::server) async fn apply(
 /// [`apply`] off the runtime threads: it parses the results, writes the config and reloads
 /// the changed models (SV-06).
 fn apply_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Response {
-    let restart = form_field(form, "restart").is_some_and(truthy);
+    let restart = checked(form, "restart");
     let picks = match device_picks(state, form) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -58,7 +58,7 @@ fn apply_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Response 
     });
     if let Err(e) = saved {
         warn!("benchmark apply refused: {e:#}");
-        return json_error(StatusCode::BAD_REQUEST, format!("{e:#}"));
+        return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}"));
     }
     let (message, restarting, needs_restart) = device_apply_outcome(state, &changes, restart);
     info!("benchmark apply: {message}");
@@ -106,7 +106,7 @@ fn device_picks(
     form: &[(String, String)],
 ) -> Result<Vec<(String, Option<String>)>, ApiError> {
     let models = form_models(form);
-    if !form_field(form, "all").is_some_and(truthy) {
+    if !checked(form, "all") {
         return match (models.as_slice(), form_field(form, "device")) {
             ([model], Some(device)) => Ok(vec![(model.clone(), Some(device.to_string()))]),
             _ => Err(ApiError::new(
@@ -128,7 +128,7 @@ fn device_picks(
     let cfg = state.config_read().clone();
     Ok(recs
         .into_iter()
-        .filter(|(m, _)| crate::benchmark::find_model(&cfg, m).is_some())
+        .filter(|(m, _)| cfg.model(m).is_some())
         .map(|(m, d)| (m, Some(d)))
         .collect())
 }
@@ -231,7 +231,7 @@ fn current_thresholds(cfg: &Config) -> HashMap<String, f64> {
         .iter()
         .map(|m| {
             (
-                crate::registry::normalize_name(&m.effective_name()),
+                m.key(),
                 crate::config::round_threshold_f64(
                     m.confidence_threshold.unwrap_or(cfg.confidence_threshold),
                 ),
@@ -284,7 +284,7 @@ pub(in crate::server) async fn threshold_search(
 ) -> Response {
     let form = match form {
         Ok(Form(f)) => f,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
     crate::server::blocking(move || threshold_search_blocking(&state, &form)).await
 }
@@ -298,7 +298,7 @@ fn threshold_search_blocking(state: &AppState, form: &[(String, String)]) -> Res
         cfg.benchmark.threshold_objective,
     ) {
         Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
     let (results, preds) = match search_data(state) {
         Ok(d) => d,
@@ -317,7 +317,7 @@ fn threshold_search_blocking(state: &AppState, form: &[(String, String)]) -> Res
         })
     };
     match crate::benchmark::search::search(&results, &preds, &req, &lookup) {
-        Ok(out) if out.results.is_empty() => json_error(
+        Ok(out) if out.results.is_empty() => json_fail(
             StatusCode::BAD_REQUEST,
             format!("nothing to search: {}", out.errors.join("; ")),
         ),
@@ -334,7 +334,7 @@ fn threshold_search_blocking(state: &AppState, form: &[(String, String)]) -> Res
             }))
             .into_response()
         }
-        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
     }
 }
 
@@ -365,7 +365,7 @@ pub(in crate::server) async fn apply_threshold(
 ) -> Response {
     let form = match form {
         Ok(Form(f)) => f,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
     crate::server::blocking(move || apply_threshold_blocking(&state, &form)).await
 }
@@ -409,7 +409,7 @@ fn apply_threshold_blocking(state: &Arc<AppState>, form: &[(String, String)]) ->
         Ok(())
     }) {
         warn!("benchmark threshold apply refused: {e:#}");
-        return json_error(StatusCode::BAD_REQUEST, format!("{e:#}"));
+        return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}"));
     }
     let described: Vec<String> = changes
         .iter()
@@ -477,7 +477,8 @@ fn apply_threshold_blocking(state: &Arc<AppState>, form: &[(String, String)]) ->
 /// may have been spelled with an index, `openvino:gpu.0`) and its value (`0.30`), or `c`'s
 /// device and `none` when there was no profile. `before` is the config before the change.
 fn previous_profile(before: &Config, c: &ProfileChange) -> (String, String) {
-    crate::benchmark::find_model(before, &c.model)
+    before
+        .model(&c.model)
         .and_then(|m| crate::config::lookup_device_threshold_entry(&m.device_thresholds, &c.device))
         .map_or_else(
             || (c.device.clone(), "none".to_string()),
@@ -495,22 +496,14 @@ fn clear_model_thresholds(
     use crate::registry::normalize_name;
     let global = config.confidence_threshold;
     for n in names {
-        if !config
-            .models
-            .iter()
-            .any(|m| normalize_name(&m.effective_name()) == normalize_name(n))
-        {
+        if config.model(n).is_none() {
             anyhow::bail!("'{n}' is not one of the configured models");
         }
     }
     let mut changes = Vec::new();
     for n in names {
         let key = normalize_name(n);
-        for m in config
-            .models
-            .iter_mut()
-            .filter(|m| normalize_name(&m.effective_name()) == key)
-        {
+        for m in config.models.iter_mut().filter(|m| m.key() == key) {
             if let Some(old) = m.confidence_threshold.take() {
                 changes.push(ThresholdChange {
                     model: m.effective_name(),
@@ -581,7 +574,7 @@ fn suggested(
         cfg.benchmark.weights,
         only,
     ) {
-        if crate::benchmark::find_model(&cfg, &s.model).is_none() {
+        if cfg.model(&s.model).is_none() {
             continue;
         }
         let why = match (&s.refusal, s.threshold, &s.low_confidence) {
@@ -623,9 +616,9 @@ fn threshold_picks(
     form: &[(String, String)],
 ) -> Result<(Vec<ThresholdPick>, Vec<String>), ApiError> {
     let models = form_models(form);
-    if form_field(form, "all").is_some_and(truthy) {
+    if checked(form, "all") {
         let only = (!models.is_empty()).then_some(models.as_slice());
-        let confirm = form_field(form, "confirm").is_some_and(truthy);
+        let confirm = checked(form, "confirm");
         let (ok, skipped) = suggested(state, only, confirm)?;
         // Per model the suggestion of its recommended device, else of its first one.
         let mut picks: Vec<ThresholdPick> = Vec::new();
@@ -759,7 +752,7 @@ pub(in crate::server) async fn apply_profiles(
 ) -> Response {
     let form = match form {
         Ok(Form(f)) => f,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
     crate::server::blocking(move || apply_profiles_blocking(&state, &form)).await
 }
@@ -821,10 +814,10 @@ fn profile_form(state: &AppState, form: &[(String, String)]) -> Result<ProfileFo
             _ => {}
         }
     }
-    if form_field(form, "all").is_some_and(truthy) {
+    if checked(form, "all") {
         let models = form_models(form);
         let only = (!models.is_empty()).then_some(models.as_slice());
-        let confirm = form_field(form, "confirm").is_some_and(truthy);
+        let confirm = checked(form, "confirm");
         let (ok, skipped) = suggested(state, only, confirm)?;
         let all: Vec<(String, String, Option<f32>)> = ok
             .into_iter()
@@ -851,7 +844,7 @@ fn profile_form(state: &AppState, form: &[(String, String)]) -> Result<ProfileFo
 /// [`apply_profiles`] off the runtime threads: it parses the results, writes the config once
 /// and reloads the models whose device changed (SV-06).
 fn apply_profiles_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Response {
-    let restart = form_field(form, "restart").is_some_and(truthy);
+    let restart = checked(form, "restart");
     let asked = match profile_form(state, form) {
         Ok(p) => p,
         Err(e) => return e.into_response(),
@@ -881,7 +874,7 @@ fn apply_profiles_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> 
     });
     if let Err(e) = saved {
         warn!("benchmark apply-profiles refused: {e:#}");
-        return json_error(StatusCode::BAD_REQUEST, format!("{e:#}"));
+        return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}"));
     }
     let described: Vec<String> = devices
         .iter()

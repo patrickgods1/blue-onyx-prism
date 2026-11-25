@@ -65,11 +65,12 @@
 //! `dropped` count), and the client's text in it is cut: a `Host`, `Origin` or `Referer` to
 //! [`MAX_HOST_SHOWN`] characters (also in the 403 answer), a path to [`MAX_PATH_LOGGED`].
 
+use super::answer::json_error;
 use super::{MessageTemplate, network, render, wants_html};
 use crate::logthrottle::Throttle;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::{Json, middleware::Next};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use tracing::warn;
@@ -391,12 +392,7 @@ pub(super) async fn network_rule(
              served, add its network to allowed_networks in the config file"
         );
     }
-    let msg = network::refusal_message(why);
-    (
-        StatusCode::FORBIDDEN,
-        Json(serde_json::json!({ "success": false, "message": msg, "error": msg })),
-    )
-        .into_response()
+    json_error(StatusCode::FORBIDDEN, network::refusal_message(why))
 }
 
 /// 403 for a `host` the admin routes do not answer under: an HTML page for browsers, else
@@ -445,11 +441,7 @@ pub(super) fn refused(
         };
         (status, render(&page)).into_response()
     } else {
-        (
-            status,
-            Json(serde_json::json!({ "success": false, "message": msg, "error": msg })),
-        )
-            .into_response()
+        json_error(status, msg)
     }
 }
 

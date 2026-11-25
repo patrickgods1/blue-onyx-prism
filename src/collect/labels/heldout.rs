@@ -26,6 +26,7 @@
 use super::export::{
     DEFAULT_HOLDOUT_FRACTION, Group, Split, SplitConfig, assign_splits, group_hash,
 };
+use crate::sync::LockExt as _;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -359,7 +360,7 @@ fn update_with<T>(
     wait: Duration,
     f: impl FnOnce(&HeldoutFile) -> Result<(Vec<HeldoutDay>, T)>,
 ) -> Result<(HeldoutFile, T)> {
-    let _process = HELDOUT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _process = HELDOUT_LOCK.lock_recover();
     let lock = folder_lock(dir, wait);
     if matches!(lock, FolderLock::Busy) {
         bail!(

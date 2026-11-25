@@ -3,8 +3,9 @@
 //! default) and `POST /training/revert` (also on Home). The pure part is
 //! [`crate::training::switch`]; `POST /training/use` ([`super::training`]) does the switch.
 
+use super::form::field;
 use super::train_area::MODELS;
-use super::training::{field, records, view};
+use super::training::{records, view};
 use super::{AppState, blocking, devices_snapshot, render};
 use crate::benchmark::{BenchmarkResults, configured_device, find_model, results_path};
 use crate::config::{Config, ModelConfig};
@@ -25,7 +26,7 @@ fn key(name: &str) -> String {
 
 /// The device `m` runs on: the loaded one, else what the config resolves it to, else its spec.
 fn device_of(state: &AppState, cfg: &Config, m: &ModelConfig) -> String {
-    if let Some(d) = super::benchmark::loaded_devices(state).remove(&key(&m.effective_name())) {
+    if let Some(d) = super::benchmark::loaded_devices(state).remove(&m.key()) {
         return d;
     }
     let snap = devices_snapshot(state);
@@ -50,7 +51,7 @@ pub(super) fn suggestion_for(
     let r = results
         .models
         .iter()
-        .find(|r| key(&r.model) == key(&name))
+        .find(|r| key(&r.model) == m.key())
         .ok_or_else(|| format!("{name} has no benchmark yet"))?;
     let preds = crate::benchmark::search::StoredPreds::load_cached(
         &crate::benchmark::search::preds_path(&state.config_path),
@@ -149,7 +150,7 @@ pub(super) fn preview_of(
     };
     let bench = rec.benchmark.as_ref();
     Ok(Preview {
-        already_default: key(&cur.effective_name()) == key(&out.name),
+        already_default: cur.key() == key(&out.name),
         diff,
         suggestion,
         no_suggestion,
@@ -195,7 +196,7 @@ pub(super) async fn revert(
     body: axum::body::Bytes,
 ) -> Response {
     blocking(move || {
-        let f = super::dataset::parse_form(&body);
+        let f = super::form::parse(&body);
         let forget = field(&f, "forget").is_some();
         let mut message = String::new();
         let saved = super::save_config(&state, "default switch", |c| {

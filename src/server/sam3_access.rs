@@ -14,6 +14,7 @@
 //! A refusal is remembered per data root and token, without keeping the token (only its hash), so
 //! the panel can still show step 3 after a reload and a new login clears it.
 
+use super::answer::json_fail;
 use super::{AppState, Shared, blocking};
 use crate::config::Config;
 use crate::resources::catalog::{self, Gated, Resource};
@@ -267,16 +268,8 @@ fn failure(code: StatusCode, mut body: Sam3Status, message: String) -> Response 
     reply(code, body)
 }
 
-fn plain(code: StatusCode, message: &str) -> Response {
-    (
-        code,
-        Json(serde_json::json!({"success": false, "message": message})),
-    )
-        .into_response()
-}
-
 fn no_pin() -> Response {
-    plain(
+    json_fail(
         StatusCode::INTERNAL_SERVER_ERROR,
         "this build has no SAM 3 pin; update Blue Onyx Prism",
     )
@@ -341,7 +334,7 @@ fn space_problem(missing: u64, free: Option<u64>, dir: &Path) -> Option<String> 
 async fn download_with(state: Arc<AppState>, t: Arc<Target>) -> Response {
     let cfg = state.config_read().clone();
     let Some(ctx) = state.resources.as_ref() else {
-        return plain(
+        return json_fail(
             StatusCode::SERVICE_UNAVAILABLE,
             "this server has no download manager; run the service",
         );

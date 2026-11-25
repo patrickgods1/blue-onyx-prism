@@ -9,9 +9,9 @@
 //! auto-label form answers JSON (`{success, message, id}`) to a client that accepts
 //! `application/json`, else the Auto-label tab.
 
-use super::form::checked;
+use super::form::{all, checked, field, num};
 use super::train_area::{AUTOLABEL, IMPORT};
-use super::training::{all, field, num, service, view};
+use super::training::{service, view};
 use super::{Shared, blocking, render};
 use crate::config::Config;
 use crate::resources::catalog;
@@ -386,7 +386,7 @@ fn finish_from_form(
 pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes) -> Response {
     blocking(move || {
         let state = shared.current();
-        let f = super::dataset::parse_form(&body);
+        let f = super::form::parse(&body);
         let config = state.config_read().clone();
         let result = (|| -> anyhow::Result<String> {
             let mut req = import_from_form(&f)?;
@@ -574,7 +574,7 @@ pub(super) async fn autolabel(
     let json = wants_json(&headers);
     blocking(move || {
         let state = shared.current();
-        let f = super::dataset::parse_form(&body);
+        let f = super::form::parse(&body);
         let config = state.config_read().clone();
         let result = (|| -> anyhow::Result<(String, String)> {
             let req = autolabel_from_form(&f)?;
@@ -634,7 +634,7 @@ pub(super) async fn autolabel_preview(
 ) -> Response {
     blocking(move || {
         let state = shared.current();
-        let f = super::dataset::parse_form(&body);
+        let f = super::form::parse(&body);
         let config = state.config_read().clone();
         let preview = autolabel_from_form(&f)
             .and_then(|r| crate::training::autolabel::preview_autolabel(&config, r))

@@ -181,14 +181,7 @@
 
   var catalogPromise = null;
 
-  function api(url, opts) {
-    return fetch(url, opts).then(function (r) {
-      return r.json().catch(function () { return null; }).then(function (j) {
-        if (!r.ok || !j || j.success === false) throw new Error((j && j.message) || ('HTTP ' + r.status));
-        return j;
-      });
-    });
-  }
+  var api = PrismFetch.json;
 
   // GET /v1/review/class-catalog (cached for the page; `fresh` refetches).
   function fetchCatalog(fresh) {
@@ -221,12 +214,7 @@
 
   // ---- widget --------------------------------------------------------------------------------
 
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
-    return e;
-  }
+  var el = PrismDom.el;
 
   function badgeFor(entry) {
     var b;

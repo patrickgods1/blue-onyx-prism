@@ -91,7 +91,7 @@ fn models_of(c: &Config) -> Vec<(String, Map<String, Value>)> {
     n.normalize();
     n.models
         .iter()
-        .map(|m| (normalize_name(&m.effective_name()), model_object(m)))
+        .map(|m| (m.key(), model_object(m)))
         .collect()
 }
 
@@ -541,9 +541,7 @@ pub fn runtime_overlay(running: &Config, current: &Config) -> Config {
 
 /// The enabled entry of model `key` (normalized name).
 fn enabled_model<'a>(c: &'a Config, key: &str) -> Option<&'a ModelConfig> {
-    c.models
-        .iter()
-        .find(|m| m.enabled && normalize_name(&m.effective_name()) == key)
+    c.models.iter().find(|m| m.enabled && m.key() == key)
 }
 
 /// The models whose worker has to be replaced, started or stopped to go from `running` to
@@ -586,10 +584,8 @@ pub fn model_reloads(running: &Config, next: &Config) -> Vec<String> {
 /// remove it when `source` has none): a model whose reload did not happen keeps showing what
 /// runs.
 pub fn keep_model_from(target: &mut Config, source: &Config, name: &str) {
-    let key = normalize_name(name);
-    let is = |m: &ModelConfig| normalize_name(&m.effective_name()) == key;
-    let from = source.models.iter().find(|m| is(m)).cloned();
-    match (target.models.iter().position(is), from) {
+    let from = source.model(name).cloned();
+    match (target.model_index(name), from) {
         (Some(i), Some(m)) => {
             if let Some(slot) = target.models.get_mut(i) {
                 *slot = m;
@@ -633,14 +629,11 @@ pub fn pending(running: &Config, current: &Config) -> Pending {
     // The default model applies live (a default that is not loaded yet shows as that model's
     // "enabled; not loaded yet").
     let find = |c: &'_ Config, key: &str| -> Option<ModelConfig> {
-        c.models
-            .iter()
-            .find(|m| normalize_name(&m.effective_name()) == key)
-            .cloned()
+        c.models.iter().find(|m| m.key() == key).cloned()
     };
     let mut all: Vec<String> = Vec::new();
     for m in running.models.iter().chain(current.models.iter()) {
-        let k = normalize_name(&m.effective_name());
+        let k = m.key();
         if !all.contains(&k) {
             all.push(k);
         }

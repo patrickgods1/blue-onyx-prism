@@ -272,11 +272,11 @@ fn overloaded(command: &str, text: String) -> Box<Response> {
 }
 
 /// Admit a detection request under [`max_inflight`], or the 503 answer for an overloaded
-/// server (counted in `rejected_overloaded`, warned about at most once per 10 s).
+/// server (counted as `RejectReason::Overloaded`, warned about at most once per 10 s).
 ///
 /// An admitted upload also takes one of its peer's read slots (no peer address, which the
 /// server always adds, means no slot). A peer with [`peer_read_limit`] uploads still being read
-/// gets the same 503 (counted in `rejected_peer_body_reads`). Taken here, not in the parser,
+/// gets the same 503 (counted as `RejectReason::PeerBodyReads`). Taken here, not in the parser,
 /// because a body that is only discarded holds its in-flight slot just the same; the 503 leaves
 /// `upload` untouched for the caller.
 fn admit(

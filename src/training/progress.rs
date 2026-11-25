@@ -17,8 +17,9 @@ use super::recipe::SelectMetric;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
-/// Marker before every event.
-pub const MARKER: &str = "@train ";
+/// The tag of the training script's events (`@train {json}`, read by
+/// [`super::pyenv::parse_event`]).
+pub const TAG: &str = "train";
 
 /// One event of the training script.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -139,11 +140,10 @@ pub enum TrainEvent {
 }
 
 /// The event in `line`, if it carries one (anywhere in the line: a progress bar may precede it
-/// on the same line). Unknown events and bad JSON are None.
+/// on the same line; the one rule of [`super::pyenv::parse_event`]). Unknown events and bad JSON
+/// are None.
 pub fn parse_line(line: &str) -> Option<TrainEvent> {
-    let at = line.find(MARKER)?;
-    let json = line.get(at + MARKER.len()..)?.trim();
-    serde_json::from_str(json).ok()
+    super::pyenv::parse_event(line, TAG).and_then(|v| serde_json::from_value(v).ok())
 }
 
 /// Longest metric key kept.

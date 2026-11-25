@@ -399,6 +399,7 @@ dependencies = [
  "crossbeam-channel",
  "fast_image_resize",
  "flate2",
+ "form_urlencoded",
  "fs4",
  "futures-util",
  "half",

@@ -26,10 +26,11 @@
 //! ([`folder_problem`]: 200 from `/v1/review/next`, 503 where the folder is needed), not an empty
 //! dataset.
 //!
-//! This file holds what the routes share (answers, body and filter checks, the context of the
-//! current config), the page, the queue (`next`) and a frame's labels; the other routes are split by
-//! concern: [`bulk_routes`] (the bulk tools and the overlap check), [`spots`] (the reviewer's
-//! history and the spot memory) and [`files`] (export, import, the folder under review, classes);
+//! This file holds what the routes share (filter checks, the context of the current config; the
+//! JSON answers and body reader are [`super::answer`]'s), the page, the queue (`next`) and a
+//! frame's labels; the other routes are split by concern: [`bulk_routes`] (the bulk tools and the
+//! overlap check), [`spots`] (the reviewer's history and the spot memory) and [`files`] (export,
+//! import, the folder under review, classes);
 //! [`steer`] caches what steers the queue from outside its rows (measured recall, parked spots).
 
 mod bulk_routes;
@@ -48,6 +49,7 @@ pub(super) use spots::{
     accept_spot, history, reject_spot, spots, spots_moved, spots_parked, spots_retire,
 };
 
+use super::answer::{Answer, Problem, json_body, json_fail};
 use super::{AppState, blocking, encode_uri_component, render};
 use crate::collect::CollectSettings;
 #[cfg(test)]
@@ -60,7 +62,7 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use files::known_dirs;
 use serde::Deserialize;
@@ -75,39 +77,9 @@ pub(super) const LABELS_BODY_LIMIT: usize = 256 * 1024;
 /// Largest body of the other review POST routes.
 pub(super) const SMALL_BODY_LIMIT: usize = 16 * 1024;
 
-fn fail(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(serde_json::json!({ "success": false, "message": message.into() })),
-    )
-        .into_response()
-}
-
 fn not_found() -> Response {
-    fail(StatusCode::NOT_FOUND, "not a frame of the dataset")
+    json_fail(StatusCode::NOT_FOUND, "not a frame of the dataset")
 }
-
-/// An error answer not built yet (status, message): see [`fail`].
-type Problem = (StatusCode, String);
-
-/// A refused request, answered as [`fail`]: a route returning [`Answer`] checks with `?`.
-pub(super) struct Refused(Problem);
-
-impl From<Problem> for Refused {
-    fn from(p: Problem) -> Self {
-        Self(p)
-    }
-}
-
-impl IntoResponse for Refused {
-    fn into_response(self) -> Response {
-        let (status, message) = self.0;
-        fail(status, message)
-    }
-}
-
-/// What a route answers: its response, or the [`fail`] answer of a check that refused it.
-pub(super) type Answer = Result<Response, Refused>;
 
 /// `{"success": true}` with `fields` (an object), as JSON.
 fn success(fields: serde_json::Value) -> Response {
@@ -137,35 +109,6 @@ fn folder_unavailable(message: String) -> Response {
 /// [`not_found`], or [`folder_unavailable`] when that is why `dir` has no such frame.
 fn no_frame(state: &AppState, dir: &std::path::Path) -> Response {
     folder_problem(state, dir).map_or_else(not_found, folder_unavailable)
-}
-
-/// The JSON body of a POST: 413 over the route's cap, 415 without a JSON content type, 400 when
-/// it does not parse.
-fn json_body<T: for<'de> Deserialize<'de>>(
-    headers: &HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Result<T, Problem> {
-    let body = body.map_err(|e| {
-        let s = e.status();
-        if s == StatusCode::PAYLOAD_TOO_LARGE {
-            (s, "request body too large".to_string())
-        } else {
-            (s, format!("could not read the request body: {e}"))
-        }
-    })?;
-    let json = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
-    if !json {
-        return Err((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "send the body as JSON (Content-Type: application/json)".into(),
-        ));
-    }
-    serde_json::from_slice(&body)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")))
 }
 
 fn query_map(
@@ -405,11 +348,11 @@ fn labels_answer(
 ) -> Response {
     let rec = match frame.record() {
         Ok(r) => r,
-        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        Err(e) => return json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
     let (saved, revision) = match labels::read_with_revision(&frame.labels) {
         Ok(l) => l,
-        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        Err(e) => return json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
     let is_saved = saved.is_some();
     let file = saved.unwrap_or_else(|| labels::prefill(&rec, classes, hidden));
@@ -664,7 +607,7 @@ pub(super) async fn labels_post(
         };
         let rec = match frame.record() {
             Ok(r) => r,
-            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+            Err(e) => return json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         };
         let status = file.status;
         let saved = save(
@@ -693,10 +636,10 @@ pub(super) async fn labels_post(
                     .into_response();
             }
             Saved::Invalid(e) => {
-                return fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not saved: {e:#}"));
+                return json_fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not saved: {e:#}"));
             }
             Saved::Failed(e) => {
-                return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("Not saved: {e:#}"));
+                return json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("Not saved: {e:#}"));
             }
         };
         // The dataset check's open count may have changed (an answer, a box moved under a
@@ -728,6 +671,7 @@ mod tests {
     use crate::collect::record::{Det, Suppressed, empty_record};
     use axum::body::Body;
     use axum::http::Request;
+    use axum::http::header;
 
     struct Ds {
         state: Arc<AppState>,

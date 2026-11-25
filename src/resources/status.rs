@@ -82,12 +82,11 @@ pub struct ResourceRow {
     pub size_text: String,
     /// Over the large-download threshold (needs confirmation / `allow_large_downloads`).
     pub large: bool,
-    /// `installed`, `downloading`, `queued`, `verifying`, `extracting`, `failed`, `needed`,
-    /// `optional` (needed by a better device, gated by `allow_large_downloads`), `available`.
-    pub state: &'static str,
+    /// [`RowState`], serialized `installed`, `downloading`, `needs-export`, ...
+    pub state: RowState,
     /// Human-readable state, e.g. "downloading 42% (18/44 MB)".
     pub state_text: String,
-    /// Queued, downloading, verifying or extracting.
+    /// A download or an export in progress ([`RowState::is_busy`]).
     pub busy: bool,
     /// Download progress in percent while downloading.
     pub progress: Option<u8>,
@@ -129,6 +128,127 @@ pub struct ResourceRow {
     /// next start that loads it; Remove deletes it with the install (also alone, when the install
     /// it was meant for is gone).
     pub pending_bytes: Option<u64>,
+}
+
+/// A row's state as `/v1/resources` and the Resources card (`data-state`, the JS) spell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RowState {
+    Installed,
+    Downloading,
+    Queued,
+    Verifying,
+    Extracting,
+    Failed,
+    /// An enabled model waits for it.
+    Needed,
+    /// An exportable model the config uses, not exported yet.
+    NeedsExport,
+    /// Needed by a better device, gated by `allow_large_downloads`.
+    Optional,
+    Available,
+    /// An export on a platform where exports cannot run.
+    Unavailable,
+    Exporting,
+}
+
+impl RowState {
+    /// Every state, for tests over all of them.
+    #[cfg(test)]
+    const ALL: [Self; 12] = [
+        Self::Installed,
+        Self::Downloading,
+        Self::Queued,
+        Self::Verifying,
+        Self::Extracting,
+        Self::Failed,
+        Self::Needed,
+        Self::NeedsExport,
+        Self::Optional,
+        Self::Available,
+        Self::Unavailable,
+        Self::Exporting,
+    ];
+
+    /// The serialized spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::Downloading => "downloading",
+            Self::Queued => "queued",
+            Self::Verifying => "verifying",
+            Self::Extracting => "extracting",
+            Self::Failed => "failed",
+            Self::Needed => "needed",
+            Self::NeedsExport => "needs-export",
+            Self::Optional => "optional",
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+            Self::Exporting => "exporting",
+        }
+    }
+
+    /// A download (queued, downloading, verifying, extracting) or an export (queued, running)
+    /// in progress.
+    pub fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Self::Downloading | Self::Queued | Self::Verifying | Self::Extracting | Self::Exporting
+        )
+    }
+}
+
+impl std::fmt::Display for RowState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The config page's template compares the state with its spelling (`r.state == "installed"`).
+impl PartialEq<&str> for RowState {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl ResourceRow {
+    /// The row of `r` with what every builder shares: its catalog facts and install folder;
+    /// `available`, nothing in progress, nothing removable or to add, the Download action.
+    fn base(r: &Resource, config: &Config) -> Self {
+        Self {
+            id: r.id,
+            title: r.title,
+            description: r.description,
+            kind: kind_str(r.kind),
+            group: group_of(r),
+            version: r.version,
+            license: r.license,
+            size: r.size(),
+            size_text: catalog::format_size(r.size()),
+            large: false,
+            state: RowState::Available,
+            state_text: String::new(),
+            busy: false,
+            progress: None,
+            error: None,
+            retry_in: None,
+            provides: r.provides.labels(),
+            blocking: Vec::new(),
+            active: false,
+            loaded: false,
+            removable: false,
+            remove_blocked: None,
+            can_add_to_config: false,
+            target: target_dir(config, r).display().to_string(),
+            action: "download",
+            cancellable: false,
+            confirm: None,
+            size_note: None,
+            log: Vec::new(),
+            update_available: None,
+            pending_bytes: None,
+        }
+    }
 }
 
 fn kind_str(k: ResourceKind) -> &'static str {
@@ -210,7 +330,7 @@ fn wants_attention(r: &ResourceRow) -> bool {
     r.busy
         || r.update_available.is_some()
         || !r.blocking.is_empty()
-        || !matches!(r.state, "available" | "unavailable")
+        || !matches!(r.state, RowState::Available | RowState::Unavailable)
 }
 
 /// "7 resources · 1 needed · 2 installed · 1 failed".
@@ -223,13 +343,13 @@ fn group_summary(rows: &[ResourceRow]) -> String {
     }];
     for (count, what) in [
         (
-            n(&|r| !r.busy && matches!(r.state, "needed" | "needs-export")),
+            n(&|r| !r.busy && matches!(r.state, RowState::Needed | RowState::NeedsExport)),
             "needed",
         ),
         (n(&|r| r.busy), "in progress"),
-        (n(&|r| r.state == "installed"), "installed"),
+        (n(&|r| r.state == RowState::Installed), "installed"),
         (n(&|r| r.update_available.is_some()), "update"),
-        (n(&|r| r.state == "failed"), "failed"),
+        (n(&|r| r.state == RowState::Failed), "failed"),
     ] {
         if count > 0 {
             parts.push(format!("{count} {what}"));
@@ -676,6 +796,13 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
         .map(|m| config.data_path(&m.path))
         .collect();
 
+    let env = DownloadEnv {
+        statuses: &statuses,
+        installed: &installed,
+        resolution: &res,
+        active_flavor: active_flavor.as_deref(),
+        configured: &configured,
+    };
     platform_resources(ctx)
         .into_iter()
         // The DEIMv2 source and the Windows Visual C++ runtime are part of the export toolchain
@@ -685,135 +812,167 @@ pub fn rows(ctx: Option<&ResourcesCtx>, config: &Config) -> Vec<ResourceRow> {
             if matches!(r.kind, ResourceKind::ExportModel | ResourceKind::Tool) {
                 return export_row(ctx, config, r, &res, &statuses, &configured, &export_env);
             }
-            let status = status_of(&statuses, r.id);
-            let on_disk = is_installed(r, &installed, config);
-            let update = on_disk && installed.outdated(r);
-            // The catalog's version is downloaded and waits for the next start.
-            let staged = on_disk && installed.update_staged(r);
-            let pending = pending_update(r, config);
-            let need = res.needs.iter().find(|n| n.id() == r.id);
-            let optional = res.optional.iter().any(|n| n.id() == r.id);
-            let (state, progress, error, retry_in) = match status.map(|s| &s.state) {
-                Some(State::Downloading { bytes, total }) => (
-                    "downloading",
-                    Some(super::manager::percent(*bytes, *total)),
-                    None,
-                    None,
-                ),
-                Some(State::Queued) => ("queued", None, None, None),
-                Some(State::Verifying) => ("verifying", None, None, None),
-                Some(State::Extracting) => ("extracting", None, None, None),
-                // A failed update shows too: the installed version still works.
-                Some(State::Failed {
-                    error, retry_at, ..
-                }) if !on_disk || update => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .map_or(0, |d| d.as_secs());
-                    (
-                        "failed",
-                        None,
-                        Some(error.clone()),
-                        retry_at.map(|t| t.saturating_sub(now)),
-                    )
-                }
-                _ if on_disk => ("installed", None, None, None),
-                _ if need.is_some() => ("needed", None, None, None),
-                _ if optional => ("optional", None, None, None),
-                _ => ("available", None, None, None),
-            };
-            let flavor = r.flavor();
-            let loaded = match r.kind {
-                ResourceKind::OpenVinoRuntime => on_disk && ctx.is_some_and(|c| c.openvino_loaded),
-                ResourceKind::OnnxRuntime(f) => ctx.is_some_and(|c| c.ort_loaded == Some(f)),
-                ResourceKind::CudaLibs => crate::backend::libs::cuda_libs_preloaded().is_some(),
-                ResourceKind::Model
-                | ResourceKind::BenchImages
-                | ResourceKind::ExportModel
-                | ResourceKind::Tool => false,
-            };
-            let state_text = match (status, state) {
-                (Some(s), "downloading" | "queued" | "verifying" | "extracting" | "failed") => {
-                    s.state.describe()
-                }
-                (_, "needed") => format!(
-                    "needed: {}",
-                    need.map_or(String::new(), |n| n.reason.clone())
-                ),
-                (_, "optional") => "would enable a better device (large download)".into(),
-                (_, "installed") if update => format!(
-                    "installed {}; {} available (Update replaces it{})",
-                    installed.installed_version(r.id).unwrap_or("?"),
-                    r.version,
-                    update_note(r, need, loaded)
-                ),
-                (_, "installed") if staged => format!(
-                    "installed {}; {} is downloaded ({}) and replaces it at the next start that \
-                     loads it (restart the service to use it; Remove deletes both)",
-                    installed.installed_version(r.id).unwrap_or("?"),
-                    r.version,
-                    catalog::format_size(pending.as_ref().map_or(0, |(_, b)| *b))
-                ),
-                (_, s) => s.to_string(),
-            };
-            let state_text = with_pending(state_text, pending.as_ref(), on_disk, staged);
-            // A pending update alone can be removed too (RA resources-11).
-            let present = on_disk || pending.is_some();
-            let blocked = if present {
-                remove_blocked(ctx, r, config, status)
-            } else {
-                Some("not installed".into())
-            };
-            let can_add = r.kind == ResourceKind::Model
-                && on_disk
-                && !r
-                    .parts
-                    .iter()
-                    .any(|p| configured.contains(&target_dir(config, r).join(p.file_name)));
-            ResourceRow {
-                id: r.id,
-                title: r.title,
-                description: r.description,
-                kind: kind_str(r.kind),
-                group: group_of(r),
-                version: r.version,
-                license: r.license,
-                size: r.size(),
-                size_text: catalog::format_size(r.size()),
-                large: r.is_large(),
-                state,
-                state_text,
-                busy: matches!(state, "downloading" | "queued" | "verifying" | "extracting"),
-                progress,
-                error,
-                retry_in,
-                provides: r.provides.labels(),
-                blocking: need.map(|n| n.blocking_models.clone()).unwrap_or_default(),
-                active: flavor.is_some()
-                    && (flavor.map(|f| f.as_str()) == active_flavor.as_deref()
-                        || flavor == ctx.and_then(|c| c.ort_loaded)),
-                loaded,
-                removable: present && blocked.is_none(),
-                remove_blocked: if present { blocked } else { None },
-                can_add_to_config: can_add,
-                target: target_dir(config, r).display().to_string(),
-                action: "download",
-                cancellable: false,
-                confirm: r.is_large().then(|| {
-                    format!(
-                        "{} is {} ({}). Download it?",
-                        r.title,
-                        catalog::format_size(r.size()),
-                        r.license
-                    )
-                }),
-                size_note: None,
-                log: Vec::new(),
-                update_available: update.then_some(r.version),
-                pending_bytes: pending.as_ref().map(|(_, b)| *b),
-            }
+            download_row(ctx, config, r, &env)
         })
         .collect()
+}
+
+/// What every download row shares, computed once per [`rows`] call.
+struct DownloadEnv<'a> {
+    statuses: &'a [Status],
+    installed: &'a Installed,
+    resolution: &'a Resolution,
+    /// The ONNX Runtime flavor `active.txt` names.
+    active_flavor: Option<&'a str>,
+    /// The resolved paths of the config's model entries.
+    configured: &'a [PathBuf],
+}
+
+/// The state of a download row from the manager's state and what is on disk, with the
+/// progress, error and seconds to the next retry it shows. `update`: installed in another
+/// version than the catalog's (a failed update shows as failed: the installed one still works).
+fn download_state(
+    status: Option<&State>,
+    on_disk: bool,
+    update: bool,
+    needed: bool,
+    optional: bool,
+) -> (RowState, Option<u8>, Option<String>, Option<u64>) {
+    match status {
+        Some(State::Downloading { bytes, total }) => (
+            RowState::Downloading,
+            Some(super::manager::percent(*bytes, *total)),
+            None,
+            None,
+        ),
+        Some(State::Queued) => (RowState::Queued, None, None, None),
+        Some(State::Verifying) => (RowState::Verifying, None, None, None),
+        Some(State::Extracting) => (RowState::Extracting, None, None, None),
+        // A failed update shows too: the installed version still works.
+        Some(State::Failed {
+            error, retry_at, ..
+        }) if !on_disk || update => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            (
+                RowState::Failed,
+                None,
+                Some(error.clone()),
+                retry_at.map(|t| t.saturating_sub(now)),
+            )
+        }
+        _ if on_disk => (RowState::Installed, None, None, None),
+        _ if needed => (RowState::Needed, None, None, None),
+        _ if optional => (RowState::Optional, None, None, None),
+        _ => (RowState::Available, None, None, None),
+    }
+}
+
+/// The row of a catalog download (runtimes, GPU libraries, models, benchmark images).
+fn download_row(
+    ctx: Option<&ResourcesCtx>,
+    config: &Config,
+    r: &'static Resource,
+    env: &DownloadEnv<'_>,
+) -> ResourceRow {
+    let (statuses, installed, res) = (env.statuses, env.installed, env.resolution);
+    let status = status_of(statuses, r.id);
+    let on_disk = is_installed(r, installed, config);
+    let update = on_disk && installed.outdated(r);
+    // The catalog's version is downloaded and waits for the next start.
+    let staged = on_disk && installed.update_staged(r);
+    let pending = pending_update(r, config);
+    let need = res.needs.iter().find(|n| n.id() == r.id);
+    let optional = res.optional.iter().any(|n| n.id() == r.id);
+    let (state, progress, error, retry_in) = download_state(
+        status.map(|s| &s.state),
+        on_disk,
+        update,
+        need.is_some(),
+        optional,
+    );
+    let flavor = r.flavor();
+    let loaded = match r.kind {
+        ResourceKind::OpenVinoRuntime => on_disk && ctx.is_some_and(|c| c.openvino_loaded),
+        ResourceKind::OnnxRuntime(f) => ctx.is_some_and(|c| c.ort_loaded == Some(f)),
+        ResourceKind::CudaLibs => crate::backend::libs::cuda_libs_preloaded().is_some(),
+        ResourceKind::Model
+        | ResourceKind::BenchImages
+        | ResourceKind::ExportModel
+        | ResourceKind::Tool => false,
+    };
+    let state_text = match (status, state) {
+        (
+            Some(s),
+            RowState::Downloading
+            | RowState::Queued
+            | RowState::Verifying
+            | RowState::Extracting
+            | RowState::Failed,
+        ) => s.state.describe(),
+        (_, RowState::Needed) => format!(
+            "needed: {}",
+            need.map_or(String::new(), |n| n.reason.clone())
+        ),
+        (_, RowState::Optional) => "would enable a better device (large download)".into(),
+        (_, RowState::Installed) if update => format!(
+            "installed {}; {} available (Update replaces it{})",
+            installed.installed_version(r.id).unwrap_or("?"),
+            r.version,
+            update_note(r, need, loaded)
+        ),
+        (_, RowState::Installed) if staged => format!(
+            "installed {}; {} is downloaded ({}) and replaces it at the next start that \
+             loads it (restart the service to use it; Remove deletes both)",
+            installed.installed_version(r.id).unwrap_or("?"),
+            r.version,
+            catalog::format_size(pending.as_ref().map_or(0, |(_, b)| *b))
+        ),
+        (_, s) => s.as_str().to_string(),
+    };
+    let state_text = with_pending(state_text, pending.as_ref(), on_disk, staged);
+    // A pending update alone can be removed too (RA resources-11).
+    let present = on_disk || pending.is_some();
+    let blocked = if present {
+        remove_blocked(ctx, r, config, status)
+    } else {
+        Some("not installed".into())
+    };
+    let can_add = r.kind == ResourceKind::Model
+        && on_disk
+        && !r.parts.iter().any(|p| {
+            env.configured
+                .contains(&target_dir(config, r).join(p.file_name))
+        });
+    ResourceRow {
+        large: r.is_large(),
+        state,
+        state_text,
+        busy: state.is_busy(),
+        progress,
+        error,
+        retry_in,
+        blocking: need.map(|n| n.blocking_models.clone()).unwrap_or_default(),
+        active: flavor.is_some()
+            && (flavor.map(|f| f.as_str()) == env.active_flavor
+                || flavor == ctx.and_then(|c| c.ort_loaded)),
+        loaded,
+        removable: present && blocked.is_none(),
+        remove_blocked: if present { blocked } else { None },
+        can_add_to_config: can_add,
+        confirm: r.is_large().then(|| {
+            format!(
+                "{} is {} ({}). Download it?",
+                r.title,
+                catalog::format_size(r.size()),
+                r.license
+            )
+        }),
+        update_available: update.then_some(r.version),
+        pending_bytes: pending.as_ref().map(|(_, b)| *b),
+        ..ResourceRow::base(r, config)
+    }
 }
 
 /// `state_text` with the downloaded update waiting beside the install (`pending`: folder, bytes)
@@ -917,30 +1076,6 @@ fn export_row(
     let unsupported = env.unsupported.clone();
     let exporter = ctx.and_then(|c| c.provisioner.exporter());
     let mut row = ResourceRow {
-        id: r.id,
-        title: r.title,
-        description: r.description,
-        kind: kind_str(r.kind),
-        group: group_of(r),
-        version: r.version,
-        license: r.license,
-        size: r.size(),
-        size_text: catalog::format_size(r.size()),
-        large: false,
-        state: "available",
-        state_text: String::new(),
-        busy: false,
-        progress: None,
-        error: None,
-        retry_in: None,
-        provides: r.provides.labels(),
-        blocking: Vec::new(),
-        active: false,
-        loaded: false,
-        removable: false,
-        remove_blocked: None,
-        can_add_to_config: false,
-        target: target_dir(config, r).display().to_string(),
         action: if unsupported.is_some() {
             "none"
         } else if r.kind == ResourceKind::Tool {
@@ -948,12 +1083,7 @@ fn export_row(
         } else {
             "export"
         },
-        cancellable: false,
-        confirm: None,
-        size_note: None,
-        log: Vec::new(),
-        update_available: None,
-        pending_bytes: None,
+        ..ResourceRow::base(r, config)
     };
     if r.kind == ResourceKind::Tool {
         let dl = status_of(statuses, r.id).filter(|s| !s.state.is_final());
@@ -961,14 +1091,14 @@ fn export_row(
         row.target = paths.tools.display().to_string();
         row.size_note = toolchain_cost(platform).map(|c| format!("with Python env: {c}"));
         if let Some(s) = dl {
-            row.state = "downloading";
+            row.state = RowState::Downloading;
             row.busy = true;
             row.state_text = s.state.describe();
             if let State::Downloading { bytes, total } = s.state {
                 row.progress = Some(super::manager::percent(bytes, total));
             }
         } else if toolchain.present {
-            row.state = "installed";
+            row.state = RowState::Installed;
             row.state_text = match (toolchain.uv, toolchain.env_ready) {
                 (true, true) => format!(
                     "installed: uv {}, Python {} environment in {}",
@@ -1014,23 +1144,23 @@ fn export_row(
     row.confirm = Some(export_confirm(r, toolchain.ready(), platform));
     match st.as_ref().map(|s| &s.state) {
         Some(state @ ExportState::Running { percent, .. }) => {
-            row.state = "exporting";
+            row.state = RowState::Exporting;
             row.busy = true;
             row.progress = Some(*percent);
             row.state_text = state.describe();
         }
         Some(ExportState::Queued) => {
-            row.state = "queued";
+            row.state = RowState::Queued;
             row.busy = true;
             row.state_text = "export queued (one export at a time)".into();
         }
         Some(state @ ExportState::Failed { error, .. }) if !on_disk => {
-            row.state = "failed";
+            row.state = RowState::Failed;
             row.error = Some(error.clone());
             row.state_text = state.describe();
         }
         _ if on_disk => {
-            row.state = "installed";
+            row.state = RowState::Installed;
             row.state_text = if export::manifest(r, &target_dir(config, r)).is_some() {
                 "exported".into()
             } else {
@@ -1038,7 +1168,7 @@ fn export_row(
             };
         }
         _ if !needed_by.is_empty() => {
-            row.state = "needs-export";
+            row.state = RowState::NeedsExport;
             row.state_text = format!(
                 "needs export: used by {} in the config; click Export",
                 needed_by.join(", ")
@@ -1048,7 +1178,7 @@ fn export_row(
         _ => row.state_text = "not exported".into(),
     }
     if let Some(s) = &st
-        && (row.busy || row.state == "failed")
+        && (row.busy || row.state == RowState::Failed)
     {
         row.log = s.log.iter().rev().take(6).rev().cloned().collect();
     }
@@ -1076,7 +1206,7 @@ fn export_row(
     if let Some(why) = unsupported
         && !on_disk
     {
-        row.state = "unavailable";
+        row.state = RowState::Unavailable;
         row.state_text = why;
     }
     row
@@ -1087,6 +1217,7 @@ mod tests {
     use super::*;
 
     fn row(id: &'static str, group: &'static str, state: &'static str) -> ResourceRow {
+        let any = catalog::all().next().unwrap();
         ResourceRow {
             id,
             title: id,
@@ -1097,29 +1228,98 @@ mod tests {
             license: "MIT",
             size: 1,
             size_text: "1 B".into(),
-            large: false,
-            state,
+            state: RowState::ALL
+                .into_iter()
+                .find(|s| s.as_str() == state)
+                .unwrap(),
             state_text: state.into(),
-            busy: false,
-            progress: None,
-            error: None,
-            retry_in: None,
-            provides: Vec::new(),
-            blocking: Vec::new(),
-            active: false,
-            loaded: false,
-            removable: false,
-            remove_blocked: None,
-            can_add_to_config: false,
             target: String::new(),
-            action: "download",
-            cancellable: false,
-            confirm: None,
-            size_note: None,
-            log: Vec::new(),
-            update_available: None,
-            pending_bytes: None,
+            ..ResourceRow::base(any, &Config::default())
         }
+    }
+
+    /// The states serialize as the page and its JS spell them (QA-129), and the busy ones are
+    /// those of a download or an export in progress.
+    #[test]
+    fn row_states_serialize_as_before() {
+        let spelled = [
+            "installed",
+            "downloading",
+            "queued",
+            "verifying",
+            "extracting",
+            "failed",
+            "needed",
+            "needs-export",
+            "optional",
+            "available",
+            "unavailable",
+            "exporting",
+        ];
+        for (s, want) in RowState::ALL.into_iter().zip(spelled) {
+            assert_eq!(serde_json::to_value(s).unwrap(), want);
+            assert_eq!(s.as_str(), want);
+            assert_eq!(s.to_string(), want);
+            assert!(s == want);
+        }
+        let busy: Vec<&str> = RowState::ALL
+            .into_iter()
+            .filter(|s| s.is_busy())
+            .map(RowState::as_str)
+            .collect();
+        assert_eq!(
+            busy,
+            [
+                "downloading",
+                "queued",
+                "verifying",
+                "extracting",
+                "exporting"
+            ]
+        );
+    }
+
+    /// The download state from the manager's status and the disk: a failed update shows (the
+    /// installed one still works), a failed download of what is installed does not.
+    #[test]
+    fn download_state_orders_the_manager_then_the_disk() {
+        let busy = State::Downloading {
+            bytes: 50,
+            total: 100,
+        };
+        assert_eq!(
+            download_state(Some(&busy), true, false, true, true),
+            (RowState::Downloading, Some(50), None, None)
+        );
+        let failed = State::Failed {
+            error: "boom".into(),
+            retry_at: None,
+            attempts: 1,
+        };
+        assert_eq!(
+            download_state(Some(&failed), false, false, false, false),
+            (RowState::Failed, None, Some("boom".into()), None)
+        );
+        assert_eq!(
+            download_state(Some(&failed), true, true, false, false).0,
+            RowState::Failed
+        );
+        assert_eq!(
+            download_state(Some(&failed), true, false, false, false).0,
+            RowState::Installed
+        );
+        assert_eq!(
+            download_state(None, false, false, true, true).0,
+            RowState::Needed
+        );
+        assert_eq!(
+            download_state(None, false, false, false, true).0,
+            RowState::Optional
+        );
+        assert_eq!(
+            download_state(None, false, false, false, false).0,
+            RowState::Available
+        );
     }
 
     /// RA resources-11: a staged update is reported with its size: beside an install as an

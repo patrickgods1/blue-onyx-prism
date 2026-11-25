@@ -433,11 +433,8 @@ impl LiveSettings {
 /// without a model, or naming `m` itself (the global default never makes a model verify
 /// itself).
 pub fn verify_settings(config: &Config, m: &ModelConfig) -> Option<crate::verify::VerifyConfig> {
-    use crate::registry::normalize_name;
     let v = m.verify.as_ref().or(config.verify.as_ref())?;
-    let target = normalize_name(v.model.trim());
-    (v.enabled && !v.model.trim().is_empty() && target != normalize_name(&m.effective_name()))
-        .then(|| v.clone())
+    (v.enabled && !v.model.trim().is_empty() && !m.is_named(&v.model)).then(|| v.clone())
 }
 
 /// The night / IR rules of model `m`: its own values over the global ones; the label maps are

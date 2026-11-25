@@ -29,11 +29,7 @@ impl Forgotten {
 
 /// Normalized names of the models in `config`, the `keep` set of [`forget_model`].
 pub fn configured_names(config: &crate::config::Config) -> HashSet<String> {
-    config
-        .models
-        .iter()
-        .map(|m| normalize_name(&m.effective_name()))
-        .collect()
+    config.models.iter().map(|m| m.key()).collect()
 }
 
 /// Drop model `name` (normalized match) from the results file `results_file` and the

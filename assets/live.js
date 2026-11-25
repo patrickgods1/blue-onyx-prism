@@ -1,5 +1,5 @@
-// Blue Onyx Prism: live config for every page. Polls GET /v1/config (ETag / If-None-Match, every
-// 2 s while the tab is visible and on focus; no timer runs while it is hidden; after a failure
+// Blue Onyx Prism: live config for every page. Polls GET /v1/config (a PrismPoll loop; ETag /
+// If-None-Match, every 2 s while the tab is visible and on focus; no timer runs while it is hidden; after a failure
 // the header says so and the period backs off to 30 s), keeps the header's "pending changes - restart to
 // apply" indicator current, and hands each new payload to the page scripts
 // (PrismLive.onConfig). Also the form helpers the pages use to refresh fields the user has not
@@ -515,7 +515,7 @@
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", scrollCues);
   window.addEventListener("load", scrollCues);
   window.addEventListener("resize", scrollCues);
-  var listeners = [], etag = null, last = null, busy = null, failures = 0, timer = null;
+  var listeners = [], etag = null, last = null, busy = null, failedWith = null, loop = null;
   // The session as the polls last saw it: `lastGood` = when a signed-in answer came (0: none
   // yet), `signedOut` = the answer turned minimal (the sign-in dialog is asked for).
   var lastGood = 0, signedOut = false;
@@ -541,8 +541,10 @@
     if (!s) return;
     s.hidden = !text; s.textContent = text || "";
   }
-  // Fetch /v1/config; resolves to the payload (the last one on 304 or error).
-  function poll(force) {
+  // Fetch /v1/config; resolves to the payload (the last one on 304 or a signed-out answer) and
+  // rejects when the server does not answer usefully (`failedWith` keeps why, for the loop's
+  // header line). Callers while one is in flight share it; `force` skips the ETag.
+  function fetchConfig(force) {
     if (busy) return busy;
     var h = {"Accept": "application/json"};
     if (etag && !force) h["If-None-Match"] = etag;
@@ -553,29 +555,35 @@
         // The dialog opens (polls wait meanwhile); signed in, the next poll is the full answer.
         if (fullAnswer(last) && !fullAnswer(j)) {
           signedOut = true;
-          PrismPoll.signIn().then(function () { signedOut = false; poll(true).then(schedule); });
+          PrismPoll.signIn().then(function () { signedOut = false; poll(true).then(function () { loop.later(); }); });
           return last;
         }
         if (fullAnswer(j)) { lastGood = Date.now(); signedOut = false; }
         etag = r.headers.get("ETag"); var prev = last; last = j; emit(j, prev); return j;
       });
     }).then(function (j) {
-      failures = 0; liveStatus(null); return j;
+      busy = null; liveStatus(null); return j;
     }, function (e) {
-      failures++;
-      liveStatus("Live updates: server " + (e && e.reason ? "answered " + why(e) : "not answering") + "; retrying in " + Math.round(delay() / 1000) + " s");
-      return last;
-    }).then(function (j) { busy = null; return j; });
+      busy = null; failedWith = e; throw e;
+    });
     return busy;
   }
-  // 2 s; after failures 4, 8, 16, then 30 s.
-  function delay() { return failures ? Math.min(MAX_PERIOD, PERIOD * Math.pow(2, Math.min(failures, 5))) : PERIOD; }
-  // One timer at a time, none while the tab is hidden.
-  function schedule() {
-    clearTimeout(timer); timer = null;
-    if (document.hidden) return;
-    timer = setTimeout(function () { timer = null; poll().then(schedule); }, delay());
+  // PrismLive.poll: the payload, the last one when the server did not answer (never rejects).
+  function poll(force) {
+    return fetchConfig(force).catch(function () { return last; });
   }
+  // The config poll: every 2 s while the tab is visible; after failures 4, 8, 16, then 30 s, with
+  // the header saying so (PrismPoll: no timer while hidden, a run at once when shown, on pageshow
+  // from the back-forward cache and on `online`; never two requests at once).
+  loop = PrismPoll.create({
+    run: function () { return fetchConfig(false); },
+    period: PERIOD,
+    max: MAX_PERIOD,
+    onError: function (n) {
+      var e = failedWith;
+      liveStatus("Live updates: server " + (e && e.reason ? "answered " + why(e) : "not answering") + "; retrying in " + Math.round(PrismPoll.delay(PERIOD, n, MAX_PERIOD) / 1000) + " s");
+    }
+  });
 
   // Header: "N pending changes - restart to apply".
   function header(j) {
@@ -1046,7 +1054,7 @@
       PrismPoll.signIn().then(function () {
         signedOut = false; lastGood = Date.now();
         resubmit(form, by);
-        poll(true).then(schedule);
+        poll(true).then(function () { loop.later(); });
       });
     }, function () {
       // No answer: the browser posts as it would have (and shows what it gets).
@@ -1207,13 +1215,7 @@
     view: {capture: capture, restore: restore, busy: busyIn},
     ui: {edited: edited, current: current, baseline: baseline, same: same, set: set, flash: flash, note: note, refresh: refresh, markEdits: markEdits}
   };
-  poll().then(schedule);
-  window.addEventListener("focus", function () { if (!document.hidden) poll(); });
-  // Back from the back-forward cache, or the network is back: ask at once (poll() joins one in
-  // flight, so never two).
-  window.addEventListener("pageshow", function (e) { if (e && e.persisted && !document.hidden) poll().then(schedule); });
-  window.addEventListener("online", function () { if (!document.hidden) poll().then(schedule); });
-  document.addEventListener("visibilitychange", function () {
-    if (document.hidden) { clearTimeout(timer); timer = null; } else poll().then(schedule);
-  });
+  loop.start();
+  // Focus: ask now (not while hidden; a run in flight is answer enough, as for pageshow / online).
+  window.addEventListener("focus", function () { if (!loop.state().busy) loop.kick(); });
 })();

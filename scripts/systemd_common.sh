@@ -2,9 +2,21 @@
 # Shared helpers for the systemd install flows: scripts/install_systemd.sh (release archive) and
 # the .deb / .rpm maintainer scripts (packaging/linux/). Sourced, never executed. POSIX sh only
 # (Debian's /bin/sh is dash); the caller sets its own `set -eu` and must be root.
+#
+# It sources scripts/install_common.sh (bop_merge_keys, bop_migrate_config, bop_print_urls) from
+# BOP_SCRIPTS, the folder both files are in: POSIX sh cannot tell a sourced file where it is, so a
+# caller outside the installed program dir sets BOP_SCRIPTS first (the archive install, the
+# package build); the default is the packages' /opt/blue-onyx-prism/scripts.
 
 # Service user (member of render/video for /dev/dri access when those groups exist).
 BOP_USER=blueonyx
+
+# shellcheck source=scripts/install_common.sh
+. "${BOP_SCRIPTS:-/opt/blue-onyx-prism/scripts}/install_common.sh"
+# What bop_print_urls prints: the account of the `setup-code` line and the host placeholders.
+BOP_URL_USER="$BOP_USER"
+BOP_URL_WEB_HOST="<this machine>"
+BOP_URL_IRIS_HOST="<this machine's IP>"
 
 # bop_check_paths PATH...: the paths end up in a sed expression and in JSON.
 bop_check_paths() {
@@ -44,32 +56,9 @@ bop_own_data_root() {
     || echo "Could not change the owner of everything in $_own, so the service may fail to read it (is it a network share?). Fix it with: sudo chown -hR $BOP_USER:$BOP_USER $_own/." >&2
 }
 
-# bop_merge_keys KEYS FILE: FILE (pretty JSON as the service writes it) with the member lines KEYS
-# after the opening brace. The file's own top-level lines (2-space indent) of those keys are
-# dropped first, so no key repeats (Config::load refuses duplicates), and a comma left before the
-# closing brace is removed.
-bop_merge_keys() {
-  KEYS="$1" awk '
-    BEGIN {
-      n = split(ENVIRON["KEYS"], L, "\n")
-      for (i = 1; i <= n; i++) {
-        if (L[i] ~ /^  "[^"]*"[ \t]*:/) { k = L[i]; sub(/^  "/, "", k); sub(/".*/, "", k); drop[k] = 1 }
-      }
-      m = 0
-    }
-    NR == 1 { out[++m] = $0; out[++m] = ENVIRON["KEYS"]; next }
-    {
-      if ($0 ~ /^  "[^"]*"[ \t]*:/) { k = $0; sub(/^  "/, "", k); sub(/".*/, "", k); if (k in drop) next }
-      out[++m] = $0
-    }
-    END {
-      for (i = 2; i <= m; i++) if (out[i] ~ /^}/ && out[i - 1] ~ /,[ \t]*$/) sub(/,[ \t]*$/, "", out[i - 1])
-      for (i = 1; i <= m; i++) print out[i]
-    }' "$2"
-}
-
 # bop_seed_config INSTALL_DIR DATA_DIR CONFIG WITH_RUNTIMES: write CONFIG unless it exists (never
-# overwrites), then fix owner/mode. download_dir and cache_dir always point at the data root.
+# overwrites; from INSTALL_DIR's own config when it has one, bop_migrate_config), then fix
+# owner/mode. download_dir and cache_dir always point at the data root.
 # WITH_RUNTIMES=1 (archive flow) also names the bundled, root-owned openvino/ and onnxruntime/
 # dirs (a runtime named by openvino_dir / onnxruntime_dir is user-managed: never downloaded or
 # replaced); 0 (packages) leaves them out so the service downloads runtimes into download_dir.
@@ -96,24 +85,7 @@ bop_seed_config() {
   fi
 
   if [ ! -f "$_cfg" ]; then
-    src=""
-    if [ -f "$_inst/blue_onyx_prism_config.json" ]; then
-      src="$_inst/blue_onyx_prism_config.json"
-    fi
-    if [ -n "$src" ] && grep -Eq '"download_dir"[[:space:]]*:[[:space:]]*"' "$src"; then
-      cp "$src" "$_cfg"
-      echo "Copied $src to $_cfg; it already sets download_dir: check that it points at $_data."
-    elif [ -n "$src" ] && [ "$(head -n 1 "$src")" = "{" ]; then
-      # Pretty JSON as the service writes it: insert the keys after the opening brace.
-      bop_merge_keys "$keys" "$src" > "$_cfg"
-      echo "Moved the config to $_cfg (download_dir, cache_dir and runtime dirs added)."
-    elif [ -n "$src" ]; then
-      cp "$src" "$_cfg"
-      echo "Copied $src to $_cfg. Add these keys to it by hand:" >&2
-      echo "$keys" >&2
-    else
-      printf '{\n%s\n  "models_dir": "models"\n}\n' "$keys" > "$_cfg"
-    fi
+    bop_migrate_config "$_inst/blue_onyx_prism_config.json" "$_cfg" "$keys" "$_data"
   fi
   chown "$BOP_USER:$BOP_USER" "$_cfg"
   chmod 0640 "$_cfg"
@@ -130,17 +102,4 @@ bop_remove_legacy_unit() {
 # bop_install_unit UNIT_SRC UNIT_DEST INSTALL_DIR: the unit template names /opt/blue-onyx-prism.
 bop_install_unit() {
   sed "s#/opt/blue-onyx-prism#$3#g" "$1" > "$2"
-}
-
-# bop_print_urls CONFIG EXE: the addresses an install prints. The web UI is HTTPS (self-signed
-# certificate, a sign-in; the first visit creates the first account with the one-time code that
-# `setup-code` prints); Blue Iris uses the plain HTTP port with no account. The ports are the
-# config's when it names them (a pretty config, one key per line), else the defaults.
-bop_print_urls() {
-  _port=$(sed -n 's/^[[:space:]]*"port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | head -n 1 || true)
-  _https=$(sed -n 's/^[[:space:]]*"https_port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | head -n 1 || true)
-  echo "Web UI:    https://<this machine>:${_https:-32169}/ (self-signed certificate; on the first visit,"
-  echo "           create the first account with the code that this prints:"
-  echo "           sudo -u $BOP_USER $2 --config $1 setup-code)"
-  echo "Blue Iris: http://<this machine's IP>:${_port:-32168} (plain HTTP, no account)"
 }

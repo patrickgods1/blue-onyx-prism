@@ -104,6 +104,8 @@ struct ImportFake {
     /// `frames` runs now and at most at once.
     refetch_active: AtomicUsize,
     refetch_peak: AtomicUsize,
+    /// `fetch-url` reports its download's progress (half, then all of 3 MB) before `fetched`.
+    url_progress: bool,
 }
 
 /// `k` of a fake video `v<k>.mp4` (0 for any other name).
@@ -306,6 +308,13 @@ impl CommandRunner for ImportFake {
             std::fs::create_dir_all(&out).unwrap();
             let f = out.join("video.mp4");
             std::fs::write(&f, b"video").unwrap();
+            if self.url_progress {
+                for bytes in [1_500_000, 3_000_000] {
+                    on_line(&format!(
+                        "@import {{\"event\":\"progress\",\"bytes\":{bytes},\"total\":3000000}}"
+                    ));
+                }
+            }
             on_line(&format!(
                 "@import {}",
                 serde_json::json!({"event": "fetched", "file": f, "size": 5, "title": "A street",
@@ -385,6 +394,34 @@ fn run(job: &ImportJob, fake: &ImportFake) -> (Result<TaskOutcome>, Vec<String>)
         &cancel,
     );
     (r, stages)
+}
+
+/// [`run`], with every report as a line of text: `stage <step>/<steps> <percent>% (<step
+/// percent>%) <stage>: <detail>` or `line <text>`.
+fn run_reports(job: &ImportJob, fake: &ImportFake) -> (Result<TaskOutcome>, Vec<String>) {
+    let cancel = AtomicBool::new(false);
+    let mut reports = Vec::new();
+    let r = job.run(
+        TaskContext {
+            runner: fake,
+            fetcher: fake,
+        },
+        &mut |p| {
+            reports.push(match p {
+                TaskReport::Stage {
+                    stage,
+                    step,
+                    steps,
+                    percent,
+                    step_percent,
+                    detail,
+                } => format!("stage {step}/{steps} {percent}% ({step_percent}%) {stage}: {detail}"),
+                TaskReport::Line(l) => format!("line {l}"),
+            });
+        },
+        &cancel,
+    );
+    (r, reports)
 }
 
 /// The process-wide zone set to `zone` while held, under `clock::TEST_LOCK`; the old one is put
@@ -675,6 +712,109 @@ fn a_url_import_records_the_site_and_the_confirmed_licence() {
     let fetch = fake.script_cmds("fetch-url");
     assert_eq!(fetch.len(), 1);
     assert!(fetch[0].display().contains("--max-height 1080"));
+}
+
+/// Audit 2026-11 phase 9 (Q:training-jobs-9), pinned before the self-check, URL download and
+/// embedding blocks moved out of `stages`: what a URL import with the SigLIP 2 selection reports
+/// from the self-check to the end of the selection, byte for byte.
+#[test]
+fn a_url_import_reports_its_self_check_download_and_embeddings_as_before() {
+    let t = tmp("url-reports");
+    let root = &t.0;
+    let mut req = ImportRequest::new(ImportSource::Url("https://www.example.org/v/1".into()));
+    req.license = Some("CC BY 4.0".into());
+    req.license_confirmed = true;
+    req.selection = Selection::Siglip;
+    req.frames = 2;
+    let job = plan_import(&config(root), req, &host()).unwrap();
+    let fake = ImportFake {
+        url_progress: true,
+        ..ImportFake::new(4, 0)
+    };
+    let (r, reports) = run_reports(&job, &fake);
+    let out = r.unwrap();
+    assert_eq!(out.result["frames"], 2);
+    assert_eq!(fake.script_cmds("embed").len(), 1);
+    let from = reports
+        .iter()
+        .position(|l| l.ends_with("checking PyAV and yt-dlp"))
+        .unwrap();
+    let to = reports
+        .iter()
+        .position(|l| l.starts_with("stage 7/"))
+        .unwrap();
+    let shown: Vec<&str> = reports[from..to]
+        .iter()
+        .map(String::as_str)
+        .filter(|l| !l.starts_with("stage 4/") && !l.starts_with("stage 5/"))
+        .filter(|l| !l.starts_with("line v") && !l.starts_with("line video.mp4"))
+        .collect();
+    assert_eq!(job.request.hwaccel.as_str(), "auto");
+    let expected = [
+        "stage 2/7 27% (95%) setting up the training environment: checking PyAV and yt-dlp",
+        "line PyAV 18.1.0 (FFmpeg LGPL version 3 or later), yt-dlp 2026.08.19; hardware \
+         decoders: none; video decoding: auto",
+        "stage 3/7 28% (0%) downloading: SigLIP 2 base (patch 16, 224 px)",
+        "stage 3/7 35% (49%) downloading: SigLIP 2 base (patch 16, 224 px) 769 of 1539 MB",
+        "stage 3/7 35% (50%) downloading: downloading the video with yt-dlp",
+        "stage 3/7 39% (74%) downloading: downloading the video with yt-dlp: 1 of 3 MB",
+        "stage 3/7 42% (99%) downloading: downloading the video with yt-dlp: 3 of 3 MB",
+        "stage 3/7 42% (100%) downloading: done",
+        "stage 6/7 71% (0%) selecting frames: SigLIP 2 embeddings",
+        "stage 6/7 84% (90%) selecting frames: SigLIP 2 embeddings 4 of 4",
+        "stage 6/7 85% (100%) selecting frames: 2 of 4 frames (SigLIP 2 k-center)",
+    ];
+    assert_eq!(shown, expected, "{shown:#?}");
+}
+
+#[test]
+fn the_self_check_line_names_the_versions_and_the_hardware_decoders() {
+    let ev = serde_json::json!({"event": "self_check", "av": "18.1.0", "yt_dlp": "2026.08.19",
+        "ffmpeg_license": "LGPL version 3 or later", "hwdevices": ["videotoolbox", 7, "cuda"]});
+    assert_eq!(
+        self_check_line(&ev, "auto"),
+        "PyAV 18.1.0 (FFmpeg LGPL version 3 or later), yt-dlp 2026.08.19; hardware decoders: \
+         videotoolbox, cuda; video decoding: auto"
+    );
+    assert_eq!(
+        self_check_line(&serde_json::json!({"event": "self_check", "av": 18}), "off"),
+        "PyAV ? (FFmpeg ?), yt-dlp ?; hardware decoders: none; video decoding: off"
+    );
+}
+
+#[test]
+fn the_site_info_leaves_out_the_event_and_file_and_warns_on_another_licence() {
+    let ev = serde_json::json!({"event": "fetched", "file": "/w/download/v.mp4", "title": "A",
+        "license": "Creative Commons Attribution license (reuse allowed)"});
+    let (site, warning) = site_info(&ev, "CC BY 4.0");
+    assert_eq!(
+        site,
+        serde_json::json!({"title": "A",
+            "license": "Creative Commons Attribution license (reuse allowed)"})
+    );
+    assert_eq!(
+        warning.as_deref(),
+        Some(
+            "the site reports the licence \"Creative Commons Attribution license (reuse \
+             allowed)\"; you confirmed \"CC BY 4.0\" (both are in the provenance)"
+        )
+    );
+    // The same licence, either inside the other (case aside), none or an empty one: no warning.
+    for (reported, confirmed) in [
+        ("CC BY 4.0", "cc by 4.0"),
+        ("CC BY 4.0 International", "CC BY 4.0"),
+        ("cc by", "CC BY 4.0"),
+        ("", "CC BY 4.0"),
+    ] {
+        let ev = serde_json::json!({"event": "fetched", "license": reported});
+        assert_eq!(
+            site_info(&ev, confirmed).1,
+            None,
+            "{reported} / {confirmed}"
+        );
+    }
+    let (site, warning) = site_info(&serde_json::json!({"event": "fetched"}), "CC BY 4.0");
+    assert_eq!((site, warning), (serde_json::json!({}), None));
 }
 
 #[test]

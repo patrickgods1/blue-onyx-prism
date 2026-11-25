@@ -563,19 +563,18 @@ mod tests {
 
     #[test]
     fn save_writes_files() {
-        let dir = std::env::temp_dir().join(format!("bo_img_test_{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dirs::TempDir::unmade("img-test");
         let img = synthetic(32, 32);
         save_annotated(&dir, "../evil/cam1.jpg", &img, &[], true, None).unwrap();
         assert!(dir.join("cam1_od.jpg").exists());
         assert!(dir.join("cam1.jpg").exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The reference copy is the uploaded JPEG byte for byte; a PNG upload (or none) is
     /// encoded as a JPEG as before. The annotated file does not depend on the upload.
     #[test]
     fn reference_is_the_uploaded_jpeg() {
-        let dir = std::env::temp_dir().join(format!("bo_img_test_{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dirs::TempDir::unmade("img-test");
         let img = synthetic(32, 24);
         let jpeg = encode_jpeg(&img, 80).unwrap();
         let preds = [Prediction {
@@ -604,7 +603,6 @@ mod tests {
         save_annotated(&dir, "d.jpg", &img, &preds, false, Some(&jpeg)).unwrap();
         assert!(!dir.join("d.jpg").exists());
         assert_eq!(read("d_od.jpg"), annotated);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -643,7 +641,7 @@ mod tests {
 
     #[test]
     fn reserved_name_falls_back_to_uuid() {
-        let dir = std::env::temp_dir().join(format!("bo_img_test_{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dirs::TempDir::unmade("img-test");
         let img = synthetic(8, 8);
         save_annotated(&dir, "CON.jpg", &img, &[], true, None).unwrap();
         let names: Vec<String> = std::fs::read_dir(&dir)
@@ -652,14 +650,13 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
         assert!(names.iter().all(|n| n.starts_with("image_")), "{names:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Saves go through a temporary file and a rename: a write that fails keeps no partial or
     /// temporary file, and a successful one leaves only the final names.
     #[test]
     fn saves_are_atomic() {
-        let dir = std::env::temp_dir().join(format!("bo_img_atomic_{}", uuid::Uuid::new_v4()));
+        let dir = crate::test_dirs::TempDir::unmade("img-atomic");
         let img = synthetic(8, 8);
         let names = || -> Vec<String> {
             let mut n: Vec<String> = std::fs::read_dir(&dir)
@@ -676,7 +673,6 @@ mod tests {
         let e = save_annotated(&dir, "b.jpg", &img, &[], true, None).unwrap_err();
         assert!(format!("{e:#}").contains("b_od.jpg"), "{e:#}");
         assert_eq!(names(), ["a.jpg", "a_od.jpg", "b_od.jpg"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn png_bytes(w: u32, h: u32) -> Vec<u8> {

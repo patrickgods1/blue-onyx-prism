@@ -80,36 +80,7 @@
   var hideSet = {};   // class -> "don't want" ticked
   var $ = function (id) { return document.getElementById(id); };
 
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
-    return e;
-  }
-
-  function report(box, lines, warnings) {
-    box.textContent = '';
-    lines.forEach(function (l) { box.appendChild(el('div', null, l)); });
-    if (warnings && warnings.length) {
-      var ul = el('ul', 'warn-list');
-      warnings.slice(0, 50).forEach(function (w) { ul.appendChild(el('li', null, w)); });
-      if (warnings.length > 50) ul.appendChild(el('li', null, '... ' + (warnings.length - 50) + ' more'));
-      box.appendChild(ul);
-    }
-  }
-
-  function postJson(url, body) {
-    return fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(body)
-    }).then(function (r) {
-      return r.json().catch(function () { return null; }).then(function (j) {
-        if (!r.ok || !j || j.success === false) throw new Error((j && j.message) || ('HTTP ' + r.status));
-        return j;
-      });
-    });
-  }
+  var el = PrismDom.el, report = PrismDom.report, postJson = PrismFetch.postJson;
 
   // While a POST of `kind` ("Dataset export", "X-AnyLabeling import") waits: its newest line of
   // the Jobs list in `box`, after `lead`. Returns the stop, called before the answer is shown.

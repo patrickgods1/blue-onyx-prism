@@ -3,10 +3,9 @@
 use super::fake::{Fake, arg_after};
 use super::*;
 
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("bop-export-{tag}-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// A scratch folder `bop-export-<tag>-<uuid>`, removed on drop (also when the test fails).
+fn tmp(tag: &str) -> crate::test_dirs::TempDir {
+    crate::test_dirs::TempDir::new(&format!("export-{tag}"))
 }
 
 fn yolo26n() -> &'static Resource {
@@ -80,7 +79,6 @@ fn install_outputs_is_all_or_nothing() {
         .filter(|e| e.file_name().to_string_lossy().contains(".old-"))
         .count();
     assert_eq!(leftovers, 0);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// RS-11: the export lock wait is bounded and says why.
@@ -99,7 +97,6 @@ fn export_lock_wait_is_bounded() {
     drop(held);
     // Not at once: a child another test spawns right now holds the open file until it execs.
     ExportLock::acquire(&path, &never, Duration::from_secs(30), || {}).unwrap();
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 const MAC: Platform = Platform::MACOS_ARM64;
@@ -245,7 +242,6 @@ fn full_export_runs_every_stage_in_order() {
     remove_toolchain(&j.paths).unwrap();
     assert!(!toolchain_state(&j.paths, MAC).present);
     assert_only_locks_left(&root.join("tools"));
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Remove deletes everything of one export (IR of earlier versions, weights, work and staging
@@ -306,7 +302,6 @@ fn remove_export_leaves_nothing_behind() {
         assert!(f.exists(), "{} removed", f.display());
     }
     assert!(export_leftovers(yolo26n(), p, Some(&cache)).is_empty());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -392,7 +387,6 @@ fn failures_name_the_stage_and_leave_no_partial_install() {
     let e = run(&fake, &j).0.unwrap_err();
     assert_eq!(e.stage, Some(Stage::Weights));
     assert!(e.message.contains("hash mismatch"), "{}", e.message);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -473,7 +467,6 @@ fn exporter_queues_cancels_and_reports() {
     // Nothing to cancel any more.
     assert!(!ex.cancel("model:yolo26n"));
     ex.shutdown();
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Commands of `fake` that ran the export script for `name`.
@@ -540,7 +533,6 @@ fn a_cancelled_export_queued_again_runs_once() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(exports_of(&fake, "yolo26n"), 1, "{:?}", fake.cmds());
     ex.shutdown();
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// QA resources-7 (+extra): a cancel that lands after the worker received the request but before
@@ -581,7 +573,6 @@ fn a_cancel_during_the_pickup_is_not_lost() {
     assert_eq!(fake.runs.load(Ordering::SeqCst), 0, "{:?}", fake.cmds());
     assert!(fake.fetched.lock().unwrap().is_empty());
     ex.shutdown();
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A runner that panics on its first command, then behaves like `inner`.
@@ -653,7 +644,6 @@ fn a_panicking_export_fails_and_the_thread_keeps_serving() {
         ExportState::Installed
     );
     assert!(!ex.busy());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// RA restart-2: the run's stop cancels a running export (tree killed through the runner's
@@ -713,7 +703,6 @@ fn stop_for_exit_cancels_the_exports_within_the_deadline() {
             })
             .is_err()
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -768,7 +757,6 @@ fn exporter_failure_and_success_with_callback() {
     );
     ex.forget("model:yolo26n");
     assert!(ex.status("model:yolo26n").is_none());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -783,7 +771,7 @@ fn system_runner_streams_fails_times_out_and_cancels() {
         program: sh.into(),
         args: vec![flag.into(), script.into()],
         env: vec![("BOP_TEST".into(), "hello".into())],
-        cwd: dir.clone(),
+        cwd: dir.to_path_buf(),
         timeout,
         low_priority: false,
     };
@@ -958,7 +946,6 @@ fn system_runner_streams_fails_times_out_and_cancels() {
         }
         assert!(!alive(), "orphan {orphan} survived");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A `low_priority` command runs below normal priority (Windows priority class, Unix nice >= 10;
@@ -984,7 +971,7 @@ fn system_runner_starts_low_priority_children() {
             program: program.into(),
             args: args.iter().map(OsString::from).collect(),
             env: vec![],
-            cwd: dir.clone(),
+            cwd: dir.to_path_buf(),
             timeout: Duration::from_secs(60),
             low_priority,
         };
@@ -1014,7 +1001,6 @@ fn system_runner_starts_low_priority_children() {
         let normal: i32 = run(false).parse().unwrap();
         assert!(normal <= nice, "{normal} vs {nice}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Pause / resume of a real process tree: stopped while paused, output continues after it,
@@ -1034,7 +1020,7 @@ fn system_runner_pauses_resumes_and_cancels_while_paused() {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), script.into()],
         env: vec![],
-        cwd: dir.clone(),
+        cwd: dir.to_path_buf(),
         timeout,
         low_priority: false,
     };
@@ -1212,7 +1198,6 @@ fn system_runner_pauses_resumes_and_cancels_while_paused() {
         )
         .unwrap_err();
     assert!(e.downcast_ref::<Cancelled>().is_some(), "{e:#}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1410,7 +1395,6 @@ fn deimv2_export_fetches_the_source_and_passes_it() {
     // Remove toolchain: the source goes with it.
     remove_toolchain(&j.paths).unwrap();
     assert_only_locks_left(&root.join("tools"));
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1512,7 +1496,6 @@ fn megadetector_exports_pass_the_weights_file() {
         format!("{e:#}").contains("lists 80 classes; mdv6-yolov9-c has 3"),
         "{e:#}"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1570,7 +1553,6 @@ fn outdated_manifest_means_needs_export() {
     run(&fake, &j).0.unwrap();
     assert!(is_exported(rf, &models));
     assert!(pending_export(&onnx).is_none());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1597,7 +1579,6 @@ fn legacy_toolchain_is_replaced() {
         assert!(!root.join("tools").join(d).exists(), "{d}");
     }
     assert!(!root.join("tools/yolo26-requirements.lock.txt").exists());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A System32 stand-in holding every pinned runtime DLL at `v` (msvcp140 family; minus `skip`).
@@ -1699,7 +1680,6 @@ fn windows_old_runtime_gets_the_private_copy() {
     // Remove export toolchain removes the private runtime and the copies with tools/python.
     remove_toolchain(&j.paths).unwrap();
     assert_only_locks_left(&root.join("tools"));
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A current system runtime: the stage never touches the network.
@@ -1721,7 +1701,6 @@ fn windows_current_runtime_needs_no_download() {
     let base = root.join("tools/python").join(super::fake::FAKE_PYTHON);
     assert!(!base.join("msvcp140.dll").exists());
     assert!(!root.join("tools/vc-runtime").exists());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1747,7 +1726,6 @@ fn windows_runtime_download_failure_says_what_to_do() {
     assert!(!fake.cmds().iter().any(|c| c.contains("--self-check")));
     let base = root.join("tools/python").join(super::fake::FAKE_PYTHON);
     assert!(!base.join("msvcp140.dll").exists());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The incident's output through the stage machine: the self-check fails with the classified
@@ -1809,8 +1787,6 @@ fn self_check_failure_is_classified() {
         "{}",
         e.message
     );
-    let _ = std::fs::remove_dir_all(&root);
-    let _ = std::fs::remove_dir_all(&root2);
 }
 
 /// A toolchain on disk with every shared part (uv, Python, the uv cache, the export and training
@@ -1862,7 +1838,6 @@ fn remove_toolchain_refuses_a_held_tool_lock_and_keeps_the_lock_files() {
         "lock files kept"
     );
     assert_only_locks_left(&p.tools);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A look at the locks creates nothing; without a `tools` folder a removal is a no-op.
@@ -1873,7 +1848,6 @@ fn tools_in_use_and_remove_create_nothing_without_tools() {
     assert_eq!(tools_in_use(&p), None);
     remove_toolchain(&p).unwrap();
     assert!(!p.tools.exists());
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Audit 2026-11 extra 11: `tools/python` is the training environment's base interpreter. A
@@ -1928,5 +1902,4 @@ fn removing_the_toolchain_makes_the_training_env_not_ready() {
     remove_toolchain(&Paths::new(&root, root.join("models"))).unwrap();
     assert!(!tp.export.env.join(ENV_MARKER).exists());
     assert!(!train::train_env_ready(&tp, LINUX, lane));
-    let _ = std::fs::remove_dir_all(&root);
 }

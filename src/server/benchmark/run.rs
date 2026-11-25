@@ -5,8 +5,9 @@
 //! (`/v1/benchmark/image`, only files listed in the saved results, through a cached index keyed
 //! by the results file stamp). File I/O runs in `server::blocking`.
 
-use super::{file_stamp, json_error, loaded_devices};
+use super::{json_fail, loaded_devices};
 use crate::benchmark::images;
+use crate::benchmark::search::file_stamp;
 use crate::benchmark::service::{RunContext, RunRequest, SEVERAL_GPUS_WARNING, parse_devices};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::DatasetRef;
@@ -138,7 +139,7 @@ pub(in crate::server) async fn start(
 ) -> Response {
     let form = match form {
         Ok(Form(f)) => f,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
     crate::server::blocking(move || start_blocking(&state, &form)).await
 }
@@ -148,12 +149,12 @@ pub(in crate::server) async fn start(
 fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
     let req = match parse_request(state, form) {
         Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
     if state.benchmark.is_running() {
-        return json_error(
+        return json_fail(
             StatusCode::CONFLICT,
-            "a benchmark is already running; cancel it or wait for it to finish".into(),
+            "a benchmark is already running; cancel it or wait for it to finish",
         );
     }
     let job = running_job(
@@ -162,7 +163,7 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
         &crate::server::training::tasks(state),
     );
     if let Some(job) = job {
-        return json_error(
+        return json_fail(
             StatusCode::CONFLICT,
             format!(
                 "{job} is running, and a benchmark would compete with it for the same CPU and \
@@ -209,7 +210,7 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
     // Not while a Re-score holds the saved results (it checks for a run under the same lock).
     let _starting = match crate::benchmark::results_io::hold_for_start(&ctx.results_path) {
         Ok(h) => h,
-        Err(e) => return json_error(StatusCode::CONFLICT, e.to_string()),
+        Err(e) => return json_fail(StatusCode::CONFLICT, e.to_string()),
     };
     match state.benchmark.start(ctx, req) {
         Ok(()) => (
@@ -223,10 +224,10 @@ fn start_blocking(state: &AppState, form: &[(String, String)]) -> Response {
         // A run in progress is a conflict; a thread that could not start is the server's fault
         // (QA-047).
         Err(e @ crate::benchmark::service::StartError::Busy) => {
-            json_error(StatusCode::CONFLICT, e.to_string())
+            json_fail(StatusCode::CONFLICT, e.to_string())
         }
         Err(e @ crate::benchmark::service::StartError::Spawn(_)) => {
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            json_fail(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
     }
 }
@@ -242,7 +243,7 @@ pub(in crate::server) async fn settings(
 ) -> Response {
     let mut form = match form {
         Ok(Form(f)) => f,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
     crate::server::blocking(move || {
         if let Err(r) = add_folder(&state, &mut form) {
@@ -270,7 +271,7 @@ fn add_folder(state: &AppState, form: &mut Vec<(String, String)>) -> Result<(), 
     let cfg = state.config_read().clone();
     let path = crate::server::browse::allowed_path(&cfg, shown).map_err(|e| {
         let (status, message) = e.into_parts();
-        Box::new(json_error(
+        Box::new(json_fail(
             status,
             format!(
                 "The folder was not added: {message}. Choose it with Browse... (or type a folder \
@@ -279,7 +280,7 @@ fn add_folder(state: &AppState, form: &mut Vec<(String, String)>) -> Result<(), 
         ))
     })?;
     if !path.is_dir() {
-        return Err(Box::new(json_error(
+        return Err(Box::new(json_fail(
             StatusCode::BAD_REQUEST,
             format!(
                 "The folder was not added: {shown} is a file, not a folder. Use Browse... to \
@@ -299,7 +300,7 @@ fn add_folder(state: &AppState, form: &mut Vec<(String, String)>) -> Result<(), 
 fn settings_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Response {
     let req = match parse_request(state, form) {
         Ok(r) => r,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
     match save_config(state, "benchmark settings", |c| {
         req.to_config(&mut c.benchmark);
@@ -330,7 +331,7 @@ fn settings_blocking(state: &Arc<AppState>, form: &[(String, String)]) -> Respon
             }))
             .into_response()
         }
-        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
     }
 }
 
@@ -348,7 +349,7 @@ pub(in crate::server) async fn remove_dataset(
 ) -> Response {
     let form = match form {
         Ok(Form(f)) => f,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
     crate::server::blocking(move || remove_dataset_blocking(&state, &form)).await
 }
@@ -361,14 +362,14 @@ fn remove_dataset_blocking(state: &AppState, form: &[(String, String)]) -> Respo
         .map(|(_, v)| v.trim().to_string())
         .filter(|v| !v.is_empty())
     else {
-        return json_error(
+        return json_fail(
             StatusCode::BAD_REQUEST,
-            "give `dataset`, the folder dataset to remove".into(),
+            "give `dataset`, the folder dataset to remove",
         );
     };
     let is_it = |d: &DatasetRef| d.dir().is_some() && d.label() == value;
     if !state.config_read().benchmark.datasets.iter().any(is_it) {
-        return json_error(
+        return json_fail(
             StatusCode::NOT_FOUND,
             format!(
                 "'{value}' is not a saved folder dataset; it may have been removed already \
@@ -390,7 +391,7 @@ fn remove_dataset_blocking(state: &AppState, form: &[(String, String)]) -> Respo
             }
             Json(serde_json::json!({ "success": true, "message": message })).into_response()
         }
-        Err(e) => json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
     }
 }
 
@@ -480,7 +481,7 @@ pub(in crate::server) async fn cancel(State(state): State<Arc<AppState>>) -> Res
         Json(serde_json::json!({ "success": true, "message": "cancelling the benchmark" }))
             .into_response()
     } else {
-        json_error(StatusCode::CONFLICT, "no benchmark is running".into())
+        json_fail(StatusCode::CONFLICT, "no benchmark is running")
     }
 }
 
@@ -497,13 +498,13 @@ pub(in crate::server) async fn images_detail(
 /// [`images_detail`] off the runtime threads: it parses `benchmark.json` (SV-06).
 fn images_detail_blocking(state: &AppState, q: &HashMap<String, String>) -> Response {
     let (Some(model), Some(device)) = (q.get("model"), q.get("device")) else {
-        return json_error(StatusCode::BAD_REQUEST, "give `model` and `device`".into());
+        return json_fail(StatusCode::BAD_REQUEST, "give `model` and `device`");
     };
     let Some(results) = BenchmarkResults::load_or_warn(&results_path(&state.config_path)) else {
-        return json_error(StatusCode::NOT_FOUND, "no benchmark results yet".into());
+        return json_fail(StatusCode::NOT_FOUND, "no benchmark results yet");
     };
     let Some(m) = results.find(model) else {
-        return json_error(StatusCode::NOT_FOUND, format!("no results for '{model}'"));
+        return json_fail(StatusCode::NOT_FOUND, format!("no results for '{model}'"));
     };
     let Some(run) = m
         .devices
@@ -511,7 +512,7 @@ fn images_detail_blocking(state: &AppState, q: &HashMap<String, String>) -> Resp
         .find(|d| d.device == *device)
         .and_then(|d| d.run.as_ref())
     else {
-        return json_error(
+        return json_fail(
             StatusCode::NOT_FOUND,
             format!("'{model}' did not run on {device}"),
         );
@@ -567,7 +568,7 @@ pub(in crate::server) async fn image_file(
 ) -> Response {
     let q = query.map(|Query(q)| q).unwrap_or_default();
     let (Some(set), Some(file)) = (q.get("set"), q.get("file")) else {
-        return json_error(StatusCode::BAD_REQUEST, "give `set` and `file`".into());
+        return json_fail(StatusCode::BAD_REQUEST, "give `set` and `file`");
     };
     let ctype = |f: &str| {
         if f.to_ascii_lowercase().ends_with(".png") {
@@ -587,10 +588,7 @@ pub(in crate::server) async fn image_file(
     crate::server::blocking(move || {
         let paths = image_paths(&results_path(&state.config_path));
         let Some(path) = paths.get(&(set, file.clone())) else {
-            return json_error(
-                StatusCode::NOT_FOUND,
-                "not an image of the saved results".into(),
-            );
+            return json_fail(StatusCode::NOT_FOUND, "not an image of the saved results");
         };
         match std::fs::read(path) {
             Ok(bytes) => (
@@ -601,7 +599,7 @@ pub(in crate::server) async fn image_file(
                 bytes,
             )
                 .into_response(),
-            Err(e) => json_error(StatusCode::NOT_FOUND, format!("{}: {e}", path.display())),
+            Err(e) => json_fail(StatusCode::NOT_FOUND, format!("{}: {e}", path.display())),
         }
     })
     .await

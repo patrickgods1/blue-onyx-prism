@@ -432,7 +432,14 @@ fn a_model_whose_frames_cannot_be_known_is_refused_with_why() {
     let runs = crate::training::runs_file(&c);
     std::fs::write(
         &runs,
-        serde_json::json!([{"id": RUN, "run_dir": moved}]).to_string(),
+        serde_json::json!([{
+            "id": RUN, "name": "mine", "created": "2026-11-11T02:05:04Z", "state": "done",
+            "stage": null, "step": 8, "steps": 8, "percent": 100, "detail": "",
+            "request": {"recipe": TrainRecipe::new(TrainFamily::Rfdetr, "nano").unwrap(),
+                        "datasets": []},
+            "device": "cuda", "run_dir": moved
+        }])
+        .to_string(),
     )
     .unwrap();
     let before = std::fs::read(&runs).unwrap();
@@ -1279,4 +1286,87 @@ fn quick_preview_real_on_a_copy() {
         preview_text(&p)
     );
     println!("model: {:?}", p.model);
+}
+
+/// Characterises how a quick check ends (its whole summary, the report's warnings and every stage
+/// report, the machine's paths taken out) before its write/report tail was shared with the full
+/// check (QA-127).
+#[test]
+fn a_quick_check_ends_as_it_did() {
+    let f = fixture("ending", false);
+    let c = config(&f);
+    let mut job = plan_refine(
+        &c,
+        RefineRequest {
+            model: Some("mine".into()),
+            ..RefineRequest::default()
+        },
+        &host(),
+    )
+    .unwrap();
+    job.predictor = Some(Arc::new(ModelFake::default()));
+    let fake = crate::resources::export::fake::Fake::new();
+    let mut shown = Vec::new();
+    let out = job
+        .run(
+            TaskContext {
+                runner: &fake,
+                fetcher: &fake,
+            },
+            &mut |r| {
+                if let crate::training::task::TaskReport::Stage {
+                    stage,
+                    step,
+                    steps,
+                    percent,
+                    detail,
+                    ..
+                } = r
+                {
+                    shown.push(format!("{stage} {step}/{steps} {percent}% {detail}"));
+                }
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let (at, root) = (
+        f.dataset.display().to_string(),
+        f.root.display().to_string(),
+    );
+    let plain = |s: &str| {
+        s.replace(&at, "<dir>")
+            .replace(&root, "<root>")
+            .replace('\\', "/")
+    };
+    let warnings: Vec<String> = out.result["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| plain(w.as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        plain(&out.summary),
+        "4 frames mine never saw checked (2 it trained on and 1 it validated on left out); suggested: 4 missing boxes, 0 labels to verify, 0 other classes (4 of these suggestions new since the last check, on 4 frames written); 0 loose labels counted. No box was changed: confirm the suggestions on the Review tab; report: <dir>/refine/report-quick.json; 4 warnings"
+    );
+    assert_eq!(
+        warnings,
+        [
+            "1 of the 4 frames mine never saw are of camera days it trained or validated on: near copies of what it learned, so it finds their labels more easily than a model blind to the whole day would, and a quiet result there says less (the full check holds out whole camera days)",
+            "mine does not detect dog: those labels get no verify and no other-class suggestion and are left out of the recall",
+            "run 20261111-020504-cad6 does not record where its images came from (runs of earlier versions), so frames are matched by name only, the dataset's way of spelling them included (a name it cut short leaves out every frame it may be)",
+            "<root>/models/mine.provenance.json names no hash of the model file, so the check cannot tell that <root>/models/mine.onnx is the file training run 20261111-020504-cad6 produced",
+        ]
+    );
+    assert_eq!(
+        shown,
+        [
+            "selecting the reviewed frames 1/3 0% all reviewed frames",
+            "selecting the reviewed frames 1/3 33% 4 frames mine never saw on 3 camera days; 2 it trained on and 1 it validated on left out",
+            "checking with mine 2/3 33% running mine on 4 frames",
+            "checking with mine 2/3 50% writing suggestions: 0 of 4 frames",
+            "checking with mine 2/3 66% 4 frames checked, 4 changed",
+            "writing the report 3/3 66% ",
+            "writing the report 3/3 100% done",
+        ]
+    );
 }

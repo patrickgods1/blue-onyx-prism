@@ -63,7 +63,9 @@
 //!
 //! Progress ([`run_filtered_with`], [`ExportStep`]): the label files read, every image placed and
 //! per-frame label file written, then the publish, for a caller that shows a running export (the
-//! Jobs tab of the Train area). The plain entry points report to nobody.
+//! Jobs tab of the Train area). The plain entry points report to nobody. The export runs one
+//! writer per format ([`formats`]), each beside the count of the files it reports, so the count
+//! shown up front is what it then writes.
 //!
 //! Stopping ([`run_filtered_until`]): a caller's stop (the service stopping) is asked between two
 //! label files read and two files written; once it says yes the export ends with [`Stopped`]
@@ -82,9 +84,12 @@ use super::{
 };
 use crate::benchmark::images::{Manifest, ManifestImage, ManifestObject};
 use anyhow::{Context, Result, bail};
+use formats::Writer;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+mod formats;
 
 /// An export or import ended early because its caller asked it to stop ([`StopFn`]): the service
 /// is stopping. An export keeps nothing of itself; an import keeps the frames it had done.
@@ -790,6 +795,17 @@ pub fn reviewed_frames(
 pub struct Selection {
     pub frames: Vec<ExportFrame>,
     pub warnings: Vec<String>,
+    /// [`Self::warnings`] without the sentences of the frames counted in [`Self::pending`] and
+    /// [`Self::off_class_list`], in the same order: for a reader that counts those frames apart
+    /// (the dataset check). An unreadable frame's sentence stays: it names the error.
+    pub other_warnings: Vec<String>,
+    /// Reviewed frames left out because they still hold a pending box (each named in
+    /// [`Self::warnings`]).
+    pub pending: usize,
+    /// Reviewed frames left out because a training label is not in the class list (each named).
+    pub off_class_list: usize,
+    /// Reviewed frames left out because their label file or sidecar does not read (each named).
+    pub unreadable_frames: usize,
     /// Reviewed frames the filter left out.
     pub filtered_out: usize,
     /// [`ExportReport::lost_frames`].
@@ -919,10 +935,13 @@ fn select_with(
 ) -> Selection {
     let mut filtered_out = 0;
     let mut changed = 0;
+    let (mut pending, mut off_class_list, mut unreadable_frames) = (0, 0, 0);
     let mut unsure = BTreeSet::new();
     let flat_of = |rel: &str| layout::parse_rel(rel).map(|r| flat_name(&r));
     let mut revisions = BTreeMap::new();
+    // Every warning, and the same without the counted frames' ([`Selection::other_warnings`]).
     let mut warnings = Vec::new();
+    let mut other_warnings = Vec::new();
     let mut frames = Vec::new();
     progress(ExportStep::Listing);
     let scan = super::scan_labels(dir);
@@ -936,6 +955,7 @@ fn select_with(
             folder.display()
         ));
     }
+    other_warnings.clone_from(&warnings);
     let mut lost: Vec<String> = scan
         .orphans
         .iter()
@@ -968,7 +988,10 @@ fn select_with(
             }
             ReadFrame::Failed(e) => {
                 unsure.extend(flat_of(&rel));
-                warnings.push(format!("{rel}: {e}; left out"));
+                unreadable_frames += 1;
+                let w = format!("{rel}: {e}; left out");
+                other_warnings.push(w.clone());
+                warnings.push(w);
                 continue;
             }
             ReadFrame::Changed => {
@@ -984,6 +1007,7 @@ fn select_with(
             .map(|b| b.label.as_str())
             .collect();
         if !unknown.is_empty() {
+            off_class_list += 1;
             warnings.push(format!(
                 "{rel}: label(s) {} are not in the class list; left out (review it again or add \
                  the class)",
@@ -992,6 +1016,7 @@ fn select_with(
             continue;
         }
         if labels.boxes.iter().any(|b| b.state == BoxState::Pending) {
+            pending += 1;
             warnings.push(format!("{rel}: reviewed but has pending boxes; left out"));
             continue;
         }
@@ -1025,11 +1050,17 @@ fn select_with(
     }
     unsure.extend(lost.iter().filter_map(|rel| flat_of(rel)));
     if !lost.is_empty() {
-        warnings.push(lost_warning(&lost));
+        let w = lost_warning(&lost);
+        other_warnings.push(w.clone());
+        warnings.push(w);
     }
     Selection {
         frames,
         warnings,
+        other_warnings,
+        pending,
+        off_class_list,
+        unreadable_frames,
         filtered_out,
         lost_frames: lost.len(),
         unreadable_folders: scan.unreadable.len(),
@@ -1692,8 +1723,52 @@ fn build_export(
         heldout,
         ..ExportReport::default()
     };
+    count_frames(&mut r, &frames);
+    let writers = formats::plan(req, !frames.is_empty());
+    let mut written = Written {
+        done: 0,
+        of: written_files(&writers, &frames, unreviewed.len(), req.benchmark_split),
+        progress,
+        stop,
+    };
+    written.report();
+    let dirs = formats::Dirs { out, build };
+    for w in writers {
+        match w {
+            Writer::Images => formats::write_images(dirs, &frames, &mut written)?,
+            Writer::Yolo => {
+                formats::write_yolo(
+                    dirs,
+                    &frames,
+                    classes,
+                    &mut written,
+                    (&mut r, &mut warnings),
+                )?;
+            }
+            Writer::Coco => formats::write_coco(dirs, &frames, classes, &mut r)?,
+            Writer::XAnyLabeling => {
+                formats::write_xany(dirs, (&frames, unreviewed), classes, &mut written, &mut r)?;
+            }
+            Writer::Benchmark => formats::write_benchmark(
+                dirs,
+                (&frames, req.benchmark_split),
+                classes,
+                &mut written,
+                (&mut r, &mut warnings),
+            )?,
+        }
+    }
+    formats::write_extras(dirs, &frames, req, &mut r)?;
+    r.warnings = warnings;
+    write_file(&build.join("export.json"), &json_bytes(&r)?)?;
+    Ok(r)
+}
+
+/// The report's statistics of the exported `frames`: per split, confirmed empty, per class, under
+/// the floor (when `r` has one), and the split of every camera day.
+fn count_frames(r: &mut ExportReport, frames: &[ExportFrame]) {
     let mut groups: BTreeMap<Group, (Split, usize)> = BTreeMap::new();
-    for f in &frames {
+    for f in frames {
         match f.split {
             Split::Train => r.train += 1,
             Split::Val => r.val += 1,
@@ -1728,208 +1803,20 @@ fn build_export(
             frames,
         })
         .collect();
-    let by_split = |s: Split| frames.iter().filter(|f| f.split == s).collect::<Vec<_>>();
-    let wants = |f: Format| req.formats.contains(&f);
-    let in_bench = |f: &ExportFrame| match req.benchmark_split {
-        BenchSplit::All => true,
-        BenchSplit::Train => f.split == Split::Train,
-        BenchSplit::Val => f.split == Split::Val,
-    };
-    let mut written = Written {
-        done: 0,
-        of: written_files(&frames, unreviewed.len(), req, &in_bench),
-        progress,
-        stop,
-    };
-    written.report();
-    if (wants(Format::Yolo) || wants(Format::Coco)) && !frames.is_empty() {
-        for f in &frames {
-            let dst = build.join("images").join(f.split.as_str()).join(&f.name);
-            if let Some(p) = dst.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            link_or_copy(&f.image, &dst)?;
-            written.one()?;
-        }
-    }
-    if wants(Format::Yolo) && !frames.is_empty() {
-        for f in &frames {
-            let txt = yolo_txt(f, classes)?;
-            let stem = f.name.trim_end_matches(".jpg");
-            write_file(
-                &build
-                    .join("labels")
-                    .join(f.split.as_str())
-                    .join(format!("{stem}.txt")),
-                txt.as_bytes(),
-            )?;
-            written.one()?;
-        }
-        let mut names = classes.join("\n");
-        names.push('\n');
-        write_file(&build.join("classes.txt"), names.as_bytes())?;
-        let val = if r.val > 0 {
-            "images/val"
-        } else {
-            warnings.push(
-                "no frame was held out for validation; data.yaml validates on the training \
-                 images (name holdout cameras or days, or review more cameras/days)"
-                    .into(),
-            );
-            "images/train"
-        };
-        let mut yaml = format!(
-            "# Blue Onyx Prism review export (Ultralytics dataset)\npath: {}\ntrain: images/train\nval: {val}\nnames:\n",
-            serde_json::to_string(&out.to_string_lossy())?
-        );
-        for (i, c) in classes.iter().enumerate() {
-            yaml.push_str(&format!("  {i}: {}\n", serde_json::to_string(c)?));
-        }
-        write_file(&build.join("data.yaml"), yaml.as_bytes())?;
-        r.paths.insert("yolo".into(), out.join("data.yaml"));
-    }
-    if wants(Format::Coco) && !frames.is_empty() {
-        for s in [Split::Train, Split::Val] {
-            let list = by_split(s);
-            if list.is_empty() {
-                continue;
-            }
-            let v = coco_json(&list, classes)?;
-            write_file(
-                &build
-                    .join("annotations")
-                    .join(format!("instances_{}.json", s.as_str())),
-                &json_bytes(&v)?,
-            )?;
-        }
-        r.paths.insert("coco".into(), out.join("annotations"));
-    }
-    if wants(Format::XAnyLabeling) {
-        let xdir = build.join("xanylabeling");
-        std::fs::create_dir_all(&xdir)?;
-        for f in &frames {
-            link_or_copy(&f.image, &xdir.join(&f.name))?;
-            written.one()?;
-            // Every training box, the floor regardless: an import treats a box missing here as
-            // rejected, and `difficult` on it would stay in the label file for good.
-            let x = xany::to_xany(&f.name, f.width, f.height, f.training_boxes(), true);
-            let stem = f.name.trim_end_matches(".jpg");
-            write_file(&xdir.join(format!("{stem}.json")), &json_bytes(&x)?)?;
-            written.one()?;
-        }
-        for (frame, labels, w, h) in unreviewed {
-            let name = flat_name(&frame.rel);
-            link_or_copy(&frame.jpg, &xdir.join(&name))?;
-            written.one()?;
-            let preview = preview(labels).boxes;
-            let x = xany::to_xany(&name, *w, *h, &preview, false);
-            let stem = name.trim_end_matches(".jpg");
-            write_file(&xdir.join(format!("{stem}.json")), &json_bytes(&x)?)?;
-            written.one()?;
-        }
-        let mut names = classes.join("\n");
-        names.push('\n');
-        write_file(&xdir.join("classes.txt"), names.as_bytes())?;
-        r.paths
-            .insert("xanylabeling".into(), out.join("xanylabeling"));
-    }
-    if wants(Format::Benchmark) && !frames.is_empty() {
-        let bdir = build.join("benchmark");
-        let list: Vec<&ExportFrame> = frames.iter().filter(|f| in_bench(f)).collect();
-        if list.is_empty() {
-            warnings.push(
-                "the benchmark set was not written: no frame is in the chosen split (a share of \
-                 0 holds nothing out); hold out some cameras or days, or choose another set"
-                    .into(),
-            );
-        } else {
-            let img = bdir.join("images");
-            std::fs::create_dir_all(&img)?;
-            for f in &list {
-                link_or_copy(&f.image, &img.join(&f.name))?;
-                written.one()?;
-            }
-            let id = out
-                .file_name()
-                .map_or_else(|| "review".into(), |n| n.to_string_lossy().into_owned());
-            let m = benchmark_manifest(&list, classes, &format!("review-{id}"));
-            write_file(&bdir.join("manifest.json"), &json_bytes(&m)?)?;
-            let published = out.join("benchmark");
-            r.benchmark_dataset = Some(format!(
-                "{}{}",
-                crate::benchmark::images::DIR_PREFIX,
-                published.display()
-            ));
-            r.paths.insert("benchmark".into(), published);
-        }
-    }
-    let negatives: Vec<serde_json::Value> = frames
-        .iter()
-        .flat_map(|f| {
-            f.labels.hard_negatives().map(move |b| {
-                serde_json::json!({
-                    "frame": f.rel.jpg(),
-                    "file": f.name,
-                    "split": f.split,
-                    "label": b.label,
-                    "bbox": b.bbox,
-                    "score": b.score,
-                    "source": b.source,
-                    "origin": b.origin,
-                    "reason": b.reason,
-                    "reject_reason": b.reject_reason,
-                })
-            })
-        })
-        .collect();
-    r.hard_negative_boxes = negatives.len();
-    if !frames.is_empty() {
-        write_file(&build.join(HARD_NEGATIVES_FILE), &json_bytes(&negatives)?)?;
-        write_file(
-            &build.join(FRAMES_FILE),
-            &json_bytes(&frame_notes(&frames))?,
-        )?;
-        let mut ignore = ignore_file(&frames);
-        ignore.size_floor = req.size_floor;
-        r.ignore_boxes = ignore.images.values().map(Vec::len).sum();
-        write_file(&build.join(IGNORE_FILE), &json_bytes(&ignore)?)?;
-    }
-    r.warnings = warnings;
-    write_file(&build.join("export.json"), &json_bytes(&r)?)?;
-    Ok(r)
 }
 
-/// The files [`build_export`] counts in [`ExportStep::Writing`]: what its loops below write.
+/// The files [`build_export`] counts in [`ExportStep::Writing`]: what the `writers` it runs
+/// write ([`Writer::files`]).
 fn written_files(
+    writers: &[Writer],
     frames: &[ExportFrame],
     unreviewed: usize,
-    req: &ExportRequest,
-    in_bench: &dyn Fn(&ExportFrame) -> bool,
+    bench: BenchSplit,
 ) -> usize {
-    let wants = |f: Format| req.formats.contains(&f);
-    let n = frames.len();
-    if n == 0 {
-        // Only the X-AnyLabeling folder is written without a reviewed frame.
-        return if wants(Format::XAnyLabeling) {
-            2 * unreviewed
-        } else {
-            0
-        };
-    }
-    let mut of = 0;
-    if wants(Format::Yolo) || wants(Format::Coco) {
-        of += n;
-    }
-    if wants(Format::Yolo) {
-        of += n;
-    }
-    if wants(Format::XAnyLabeling) {
-        of += 2 * (n + unreviewed);
-    }
-    if wants(Format::Benchmark) {
-        of += frames.iter().filter(|f| in_bench(f)).count();
-    }
-    of
+    writers
+        .iter()
+        .map(|w| w.files(frames, unreviewed, bench))
+        .sum()
 }
 
 /// The count of [`ExportStep::Writing`], and where the caller's stop is asked.
@@ -3587,5 +3474,159 @@ mod tests {
         assert_eq!(names_in(&chosen), Vec::<String>::new());
         assert_eq!(names_in_or_none(&pending), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every file under `dir`, relative, `/`-separated, sorted.
+    fn tree(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p.strip_prefix(dir).unwrap().to_string_lossy();
+                    out.push(rel.replace('\\', "/"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Characterises what an export writes in every format and in each alone (QA-177, before
+    /// `build_export` was split into one writer per format): the file list, the last `Writing`
+    /// count against the files counted up front, the paths and the warnings.
+    #[test]
+    fn every_format_writes_the_files_it_counts() {
+        let root = crate::test_dirs::TempDir::new("export-formats");
+        let dir = root.join("dataset");
+        let mut negative = lb("dog", [30.0, 20.0, 40.0, 30.0], BoxState::Rejected);
+        negative.reject_reason = Some(super::super::RejectReason::FalsePositive);
+        let mut unsure = lb("person", [40.0, 30.0, 50.0, 40.0], BoxState::Accepted);
+        unsure.difficult = true;
+        put_reviewed(
+            &dir,
+            "drive",
+            "2026-10-21",
+            "a",
+            vec![
+                lb("person", [1.0, 1.0, 9.0, 9.0], BoxState::Accepted),
+                negative,
+                unsure,
+            ],
+            false,
+        );
+        put_reviewed(&dir, "drive", "2026-10-22", "b", vec![], true);
+        put_reviewed(
+            &dir,
+            "yard",
+            "2026-10-21",
+            "c",
+            vec![lb("dog", [5.0, 5.0, 25.0, 20.0], BoxState::Accepted)],
+            false,
+        );
+        // A queue frame with no label file: the X-AnyLabeling folder's unreviewed frame.
+        let day = dir.join("day").join("yard").join("2026-10-23");
+        std::fs::create_dir_all(&day).unwrap();
+        image::RgbImage::from_pixel(64, 48, image::Rgb([90, 90, 90]))
+            .save(day.join("d.jpg"))
+            .unwrap();
+        let mut rec = super::super::super::record::empty_record();
+        rec.id = "d".into();
+        rec.camera = "yard".into();
+        rec.width = 64;
+        rec.height = 48;
+        std::fs::write(day.join("d.json"), serde_json::to_vec(&rec).unwrap()).unwrap();
+        layout::append_review(&dir, &["day/yard/2026-10-23/d.jpg".to_string()]).unwrap();
+        let split = SplitConfig {
+            holdout_cameras: vec!["yard".into()],
+            ..SplitConfig::default()
+        };
+        let cases: Vec<(&str, Vec<Format>, BenchSplit, SplitConfig)> = vec![
+            ("all", Format::ALL.to_vec(), BenchSplit::All, split.clone()),
+            ("yolo", vec![Format::Yolo], BenchSplit::Val, split.clone()),
+            ("coco", vec![Format::Coco], BenchSplit::Val, split.clone()),
+            (
+                "xany",
+                vec![Format::XAnyLabeling],
+                BenchSplit::Val,
+                split.clone(),
+            ),
+            (
+                "bench",
+                vec![Format::Benchmark],
+                BenchSplit::Val,
+                split.clone(),
+            ),
+            (
+                "yolo-coco",
+                vec![Format::Yolo, Format::Coco],
+                BenchSplit::Val,
+                split.clone(),
+            ),
+            (
+                "no-val",
+                vec![Format::Yolo, Format::Benchmark],
+                BenchSplit::Val,
+                SplitConfig {
+                    holdout_fraction: 0.0,
+                    ..SplitConfig::default()
+                },
+            ),
+        ];
+        let mut seen = Vec::new();
+        for (name, formats, benchmark_split, split) in cases {
+            let out = root.join("out").join(name);
+            let req = ExportRequest {
+                formats,
+                out_dir: out.clone(),
+                split,
+                benchmark_split,
+                include_unreviewed: true,
+                hidden_classes: Vec::new(),
+                size_floor: None,
+                heldout: None,
+            };
+            let last = std::sync::Mutex::new(None);
+            let progress = |s: ExportStep| {
+                if let ExportStep::Writing { done, of } = s {
+                    *last.lock().unwrap() = Some((done, of));
+                }
+            };
+            let r = run_filtered_until(
+                &dir,
+                &classes(),
+                &req,
+                &ClassFilter::default(),
+                &progress,
+                &|| false,
+            )
+            .unwrap();
+            let at = out.display().to_string();
+            let (done, of) = last.lock().unwrap().unwrap();
+            assert_eq!(done, of, "{name}: every counted file written");
+            seen.push(format!(
+                "{name}: {done}/{of} files={:?} paths={:?} warnings={:?}",
+                tree(&out),
+                r.paths.keys().collect::<Vec<_>>(),
+                r.warnings
+                    .iter()
+                    .map(|w| w.replace(&at, "<out>"))
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        // As the export wrote before its split into one writer per format.
+        let want = [
+            "all: 17/17 files=[\"annotations/instances_train.json\", \"annotations/instances_val.json\", \"benchmark/images/day.drive.2026-10-21.a.jpg\", \"benchmark/images/day.drive.2026-10-22.b.jpg\", \"benchmark/images/day.yard.2026-10-21.c.jpg\", \"benchmark/manifest.json\", \"classes.txt\", \"data.yaml\", \"export.json\", \"frames.json\", \"hard_negatives.json\", \"ignore.json\", \"images/train/day.drive.2026-10-21.a.jpg\", \"images/train/day.drive.2026-10-22.b.jpg\", \"images/val/day.yard.2026-10-21.c.jpg\", \"labels/train/day.drive.2026-10-21.a.txt\", \"labels/train/day.drive.2026-10-22.b.txt\", \"labels/val/day.yard.2026-10-21.c.txt\", \"xanylabeling/classes.txt\", \"xanylabeling/day.drive.2026-10-21.a.jpg\", \"xanylabeling/day.drive.2026-10-21.a.json\", \"xanylabeling/day.drive.2026-10-22.b.jpg\", \"xanylabeling/day.drive.2026-10-22.b.json\", \"xanylabeling/day.yard.2026-10-21.c.jpg\", \"xanylabeling/day.yard.2026-10-21.c.json\", \"xanylabeling/day.yard.2026-10-23.d.jpg\", \"xanylabeling/day.yard.2026-10-23.d.json\"] paths=[\"benchmark\", \"coco\", \"xanylabeling\", \"yolo\"] warnings=[]",
+            "yolo: 6/6 files=[\"classes.txt\", \"data.yaml\", \"export.json\", \"frames.json\", \"hard_negatives.json\", \"ignore.json\", \"images/train/day.drive.2026-10-21.a.jpg\", \"images/train/day.drive.2026-10-22.b.jpg\", \"images/val/day.yard.2026-10-21.c.jpg\", \"labels/train/day.drive.2026-10-21.a.txt\", \"labels/train/day.drive.2026-10-22.b.txt\", \"labels/val/day.yard.2026-10-21.c.txt\"] paths=[\"yolo\"] warnings=[]",
+            "coco: 3/3 files=[\"annotations/instances_train.json\", \"annotations/instances_val.json\", \"export.json\", \"frames.json\", \"hard_negatives.json\", \"ignore.json\", \"images/train/day.drive.2026-10-21.a.jpg\", \"images/train/day.drive.2026-10-22.b.jpg\", \"images/val/day.yard.2026-10-21.c.jpg\"] paths=[\"coco\"] warnings=[]",
+            "xany: 8/8 files=[\"export.json\", \"frames.json\", \"hard_negatives.json\", \"ignore.json\", \"xanylabeling/classes.txt\", \"xanylabeling/day.drive.2026-10-21.a.jpg\", \"xanylabeling/day.drive.2026-10-21.a.json\", \"xanylabeling/day.drive.2026-10-22.b.jpg\", \"xanylabeling/day.drive.2026-10-22.b.json\", \"xanylabeling/day.yard.2026-10-21.c.jpg\", \"xanylabeling/day.yard.2026-10-21.c.json\", \"xanylabeling/day.yard.2026-10-23.d.jpg\", \"xanylabeling/day.yard.2026-10-23.d.json\"] paths=[\"xanylabeling\"] warnings=[]",
+            "bench: 1/1 files=[\"benchmark/images/day.yard.2026-10-21.c.jpg\", \"benchmark/manifest.json\", \"export.json\", \"frames.json\", \"hard_negatives.json\", \"ignore.json\"] paths=[\"benchmark\"] warnings=[]",
+            "yolo-coco: 6/6 files=[\"annotations/instances_train.json\", \"annotations/instances_val.json\", \"classes.txt\", \"data.yaml\", \"export.json\", \"frames.json\", \"hard_negatives.json\", \"ignore.json\", \"images/train/day.drive.2026-10-21.a.jpg\", \"images/train/day.drive.2026-10-22.b.jpg\", \"images/val/day.yard.2026-10-21.c.jpg\", \"labels/train/day.drive.2026-10-21.a.txt\", \"labels/train/day.drive.2026-10-22.b.txt\", \"labels/val/day.yard.2026-10-21.c.txt\"] paths=[\"coco\", \"yolo\"] warnings=[]",
+            "no-val: 6/6 files=[\"classes.txt\", \"data.yaml\", \"export.json\", \"frames.json\", \"hard_negatives.json\", \"ignore.json\", \"images/train/day.drive.2026-10-21.a.jpg\", \"images/train/day.drive.2026-10-22.b.jpg\", \"images/train/day.yard.2026-10-21.c.jpg\", \"labels/train/day.drive.2026-10-21.a.txt\", \"labels/train/day.drive.2026-10-22.b.txt\", \"labels/train/day.yard.2026-10-21.c.txt\"] paths=[\"yolo\"] warnings=[\"no frame was held out for validation; data.yaml validates on the training images (name holdout cameras or days, or review more cameras/days)\", \"the benchmark set was not written: no frame is in the chosen split (a share of 0 holds nothing out); hold out some cameras or days, or choose another set\"]",
+        ];
+        assert_eq!(seen, want);
     }
 }

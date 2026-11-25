@@ -826,6 +826,9 @@ mod tests {
     const MERGE_DRIVER: &str = r#"
 const fs = require('fs'), vm = require('vm');
 const ctx = vm.createContext({ window: {}, console });
+// dom.js (PrismDom, PrismFetch) sits next to the asset and is loaded first, as base.html does.
+const domJs = require('path').join(require('path').dirname(process.env.BOP_TRAIN_METRICS), 'dom.js');
+vm.runInContext(fs.readFileSync(domJs, 'utf8'), ctx);
 vm.runInContext(fs.readFileSync(process.env.BOP_TRAIN_METRICS, 'utf8'), ctx);
 const P = ctx.window.TrainMetrics.poll;
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
@@ -973,6 +976,9 @@ process.stdout.write(JSON.stringify({ store: input.store, have: P.have(input.sto
         const DRIVER: &str = r#"
 const fs = require('fs'), vm = require('vm'), assert = require('assert');
 const ctx = vm.createContext({ window: {}, console });
+// dom.js (PrismDom, PrismFetch) sits next to the asset and is loaded first, as base.html does.
+const domJs = require('path').join(require('path').dirname(process.env.BOP_TRAIN_METRICS), 'dom.js');
+vm.runInContext(fs.readFileSync(domJs, 'utf8'), ctx);
 vm.runInContext(fs.readFileSync(process.env.BOP_TRAIN_METRICS, 'utf8'), ctx);
 const C = ctx.window.TrainMetrics.constantOf, F = ctx.window.TrainMetrics.format;
 const h = (lrs) => lrs.map((lr, i) => ({ epoch: i + 1, metrics: lr === null ? { map: 0.1 } : { lr, map: 0.1 } }));

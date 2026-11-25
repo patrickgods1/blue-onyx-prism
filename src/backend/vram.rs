@@ -21,6 +21,7 @@
 
 use super::detect::{self, AdapterIds, GpuAdapter, GpuVendor, HardwareInfo, PciAddress};
 use super::spec::{Device, Runtime, Target};
+use crate::sync::LockExt;
 use serde::Serialize;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -219,9 +220,7 @@ pub fn readings() -> Vec<VramReading> {
         return cards.into_iter().map(|c| c.reading).collect();
     }
     static CACHE: Mutex<Option<(Instant, Vec<VramReading>)>> = Mutex::new(None);
-    let mut c = CACHE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut c = CACHE.lock_recover();
     if let Some((at, v)) = c.as_ref()
         && at.elapsed() < MAX_AGE
     {
@@ -539,9 +538,7 @@ pub struct Hold(u64);
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        let mut h = HOLDERS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut h = HOLDERS.lock_recover();
         h.retain(|(id, _)| *id != self.0);
     }
 }
@@ -549,10 +546,7 @@ impl Drop for Hold {
 /// Register `h` until the returned [`Hold`] drops.
 pub fn hold(h: Holder) -> Hold {
     let id = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
-    HOLDERS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((id, h));
+    HOLDERS.lock_recover().push((id, h));
     Hold(id)
 }
 
@@ -567,8 +561,7 @@ pub fn holders_on(adapter: u32) -> Vec<Holder> {
 /// Every registered holder, in load order.
 pub fn holders() -> Vec<Holder> {
     HOLDERS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .lock_recover()
         .iter()
         .map(|(_, h)| h.clone())
         .collect()
@@ -923,19 +916,13 @@ mod tests {
         assert_eq!(from_sysfs("x", "1"), None);
         // Used above total (racing reads) is 0 free, not a wrap.
         assert_eq!(from_sysfs("1048576", "2097152"), Some((1, 0)));
-        struct Tmp(std::path::PathBuf);
-        impl Drop for Tmp {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let dir = Tmp(std::env::temp_dir().join(format!("bop-vram-{}", uuid::Uuid::new_v4())));
-        let dev = dir.0.join("card1").join("device");
+        let dir = crate::test_dirs::TempDir::unmade("vram");
+        let dev = dir.join("card1").join("device");
         std::fs::create_dir_all(&dev).unwrap();
         std::fs::write(dev.join("mem_info_vram_total"), "8589934592\n").unwrap();
         std::fs::write(dev.join("mem_info_vram_used"), "536870912\n").unwrap();
-        assert_eq!(sysfs_in(&dir.0, 1), Some((8192, 7680)));
-        assert_eq!(sysfs_in(&dir.0, 0), None);
+        assert_eq!(sysfs_in(&dir, 1), Some((8192, 7680)));
+        assert_eq!(sysfs_in(&dir, 0), None);
     }
 
     #[test]

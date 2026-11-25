@@ -1,37 +1,11 @@
-//! Test helpers for the extraction tests: a self-removing temp dir and builders for crafted
+//! Test helpers for the extraction tests: the crate's self-removing temp dir
+//! ([`crate::test_dirs::TempDir`]) and builders for crafted
 //! zip / tar.gz archives (including names the archive writers refuse, patched in afterwards).
 
 use super::*;
 
-/// A fresh directory under the OS temp dir, removed on drop (also when a test panics).
-pub(super) struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    pub(super) fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("bop-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl std::ops::Deref for TempDir {
-    type Target = Path;
-    fn deref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl AsRef<Path> for TempDir {
-    fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+/// The crate's self-removing scratch folder, as these tests have always named it.
+pub(super) use crate::test_dirs::TempDir;
 
 pub(super) fn set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|s| s.to_string()).collect()

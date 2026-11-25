@@ -68,19 +68,13 @@ pub fn download_with_root(
 }
 
 /// Build config entries for the downloaded `.onnx` files (name = catalog name, family from the
-/// catalog, classes = the sibling `.yaml` when it was downloaded). Paths under `base`, the data
-/// root of the config that gets the entries (what [`Config::data_path`] resolves them against),
-/// are stored relative to it, others absolute. Files not in the catalog are ignored.
-pub fn model_configs(files: &[PathBuf], base: &Path) -> Vec<ModelConfig> {
-    let base_canon = base.canonicalize().ok();
-    let rel = |p: &Path| -> PathBuf {
-        for b in [Some(base), base_canon.as_deref()].into_iter().flatten() {
-            if let Ok(r) = p.strip_prefix(b) {
-                return r.to_path_buf();
-            }
-        }
-        p.to_path_buf()
-    };
+/// catalog, classes = the sibling `.yaml` when it was downloaded) for `config`, the config the
+/// entries are added to. Paths under its data root (what [`Config::data_path`] resolves them
+/// against, never the exe dir, QA-036: with `download_dir: "data"` an exe-relative
+/// `data/models/x.onnx` resolved to `<exe>/data/data/models/x.onnx`) are stored relative to it,
+/// others absolute ([`Config::relative_to_data_root`]). Files not in the catalog are ignored.
+pub fn model_configs(files: &[PathBuf], config: &Config) -> Vec<ModelConfig> {
+    let rel = |p: &Path| config.relative_to_data_root(p);
     let mut out = Vec::new();
     for f in files {
         if f.extension().and_then(|e| e.to_str()) != Some("onnx") {
@@ -102,13 +96,6 @@ pub fn model_configs(files: &[PathBuf], base: &Path) -> Vec<ModelConfig> {
         });
     }
     out
-}
-
-/// [`model_configs`] for `config`, the config the entries are added to: relative to its data
-/// root, never the exe dir (QA-036: with `download_dir: "data"` an exe-relative
-/// `data/models/x.onnx` resolved to `<exe>/data/data/models/x.onnx`).
-pub fn model_configs_for(files: &[PathBuf], config: &Config) -> Vec<ModelConfig> {
-    model_configs(files, &config.data_root())
 }
 
 /// What [`add_to_config`] did with one downloaded model.
@@ -245,23 +232,29 @@ mod tests {
 
     #[test]
     fn model_configs_from_files() {
-        let exe = Path::new("/exe");
+        let exe = crate::exe_dir();
+        // Outside the data root (the exe dir here).
+        let elsewhere = exe.parent().unwrap_or(&exe).join("elsewhere");
         let files = vec![
-            PathBuf::from("/exe/models/IPcam-general.onnx"),
-            PathBuf::from("/exe/models/IPcam-general.yaml"),
-            PathBuf::from("/elsewhere/rt-detrv2-s.onnx"),
-            PathBuf::from("/elsewhere/unknown.onnx"),
+            exe.join("models").join("IPcam-general.onnx"),
+            exe.join("models").join("IPcam-general.yaml"),
+            elsewhere.join("rt-detrv2-s.onnx"),
+            elsewhere.join("unknown.onnx"),
         ];
-        let c = model_configs(&files, exe);
+        let config = Config {
+            download_dir: Some(exe.clone()),
+            ..Default::default()
+        };
+        let c = model_configs(&files, &config);
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].name.as_deref(), Some("IPcam-general"));
-        assert_eq!(c[0].path, Path::new("models/IPcam-general.onnx"));
+        assert_eq!(c[0].path, Path::new("models").join("IPcam-general.onnx"));
         assert_eq!(c[0].family, ModelFamilyKind::Yolo5);
         assert_eq!(
             c[0].classes.as_deref(),
-            Some(Path::new("models/IPcam-general.yaml"))
+            Some(Path::new("models").join("IPcam-general.yaml").as_path())
         );
-        assert_eq!(c[1].path, Path::new("/elsewhere/rt-detrv2-s.onnx"));
+        assert_eq!(c[1].path, elsewhere.join("rt-detrv2-s.onnx"));
         assert_eq!(c[1].family, ModelFamilyKind::RtDetr);
         assert_eq!(c[1].classes, None);
     }
@@ -272,14 +265,13 @@ mod tests {
         let exe = crate::exe_dir();
         let data = exe.join("data");
         let file = data.join("models").join("IPcam-general.onnx");
-        let c = model_configs(std::slice::from_ref(&file), &data);
-        assert_eq!(c[0].path, Path::new("models").join("IPcam-general.onnx"));
-
         let config = Config {
             download_dir: Some(data.clone()),
             ..Default::default()
         };
-        let c = model_configs_for(std::slice::from_ref(&file), &config);
+        let c = model_configs(std::slice::from_ref(&file), &config);
+        assert_eq!(c[0].path, Path::new("models").join("IPcam-general.onnx"));
+        let c = model_configs(std::slice::from_ref(&file), &config);
         assert_eq!(c[0].path, Path::new("models").join("IPcam-general.onnx"));
         assert_eq!(
             config.data_path(&c[0].path),

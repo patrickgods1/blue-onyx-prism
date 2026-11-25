@@ -142,12 +142,11 @@ impl InFlight {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn in_flight(seq: u64) -> InFlight {
+impl InFlight {
+    /// A 1x1 request with default live settings, submitted now as `seq` (unit tests).
+    pub(super) fn for_test(seq: u64) -> Self {
         let (reply, _rx) = tokio::sync::oneshot::channel();
-        InFlight {
+        Self {
             meta: Meta {
                 reply: Reply::Client(reply),
                 enqueued: Instant::now(),
@@ -181,6 +180,15 @@ mod tests {
             done: None,
             overdue: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn in_flight(seq: u64) -> InFlight {
+        InFlight::for_test(seq)
     }
 
     #[test]

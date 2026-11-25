@@ -92,6 +92,7 @@ setup() {
   : > "$WORK/owners"
   rewrite "$HERE/pkg-scriptlet.sh" "$OPT/scripts/pkg_scriptlet.sh"
   rewrite "$REPO/scripts/systemd_common.sh" "$OPT/scripts/systemd_common.sh"
+  rewrite "$REPO/scripts/install_common.sh" "$OPT/scripts/install_common.sh"
 }
 
 # run SCRIPT ARGS...: a maintainer script as sh runs it, its output in $OUT.
@@ -159,6 +160,7 @@ run "$HERE/debian/postrm" remove
 mkdir -p "$OPT/scripts"
 rewrite "$HERE/pkg-scriptlet.sh" "$OPT/scripts/pkg_scriptlet.sh"
 rewrite "$REPO/scripts/systemd_common.sh" "$OPT/scripts/systemd_common.sh"
+rewrite "$REPO/scripts/install_common.sh" "$OPT/scripts/install_common.sh"
 run "$HERE/debian/preinst" install 0.2.0 0.3.0
 run "$HERE/debian/postinst" configure 0.2.0
 expect_call 'systemctl enable blue-onyx-prism'
@@ -245,6 +247,114 @@ bash -c '
   bop_merge_keys "$keys" "$3"
 ' _ "$DATA" "$REPO" "$WORK/launchd-src.json" > "$WORK/launchd-out.json" 2> "$OUT" || fail "launchd merge failed: $(cat "$OUT")"
 no_dup_keys "$WORK/launchd-out.json" "$DATA"
+
+# QA-128: scripts/install_common.sh, shared by the systemd and launchd flows, is strict POSIX sh:
+# it parses and runs under dash (Debian's /bin/sh) where dash is installed, else under sh.
+SH="$(command -v dash || command -v sh)"
+expect_text() { # expect_text FILE TEXT: FILE holds exactly TEXT (plus its last newline)
+  [ "$(cat "$1")" = "$2" ] || fail "$1 differs; got:
+$(cat "$1")
+want:
+$2"
+}
+
+setup "install_common.sh and systemd_common.sh parse as POSIX sh"
+for f in "$REPO/scripts/install_common.sh" "$REPO/scripts/systemd_common.sh"; do
+  "$SH" -n "$f" || fail "$f does not parse under $SH"
+done
+
+# migrate SRC KEYS: bop_migrate_config SRC -> $WORK/migrated.json under $SH, its output in $OUT.
+migrate() {
+  rm -f "$WORK/migrated.json"
+  PATH="$BIN:$PATH" "$SH" -c '. "$1"; bop_migrate_config "$2" "$3" "$4" "$5"' _ \
+    "$REPO/scripts/install_common.sh" "$1" "$WORK/migrated.json" "$2" "$DATA" > "$OUT" 2>&1 \
+    || fail "bop_migrate_config exited with $?: $(cat "$OUT")"
+}
+KEYS_LINUX="  \"download_dir\": \"$DATA\",
+  \"cache_dir\": \"$DATA/cache\","
+KEYS_MAC="$KEYS_LINUX
+  \"log_path\": \"$DATA/log\","
+
+setup "bop_migrate_config without a source writes a fresh config"
+migrate "" "$KEYS_LINUX"
+expect_text "$WORK/migrated.json" "{
+$KEYS_LINUX
+  \"models_dir\": \"models\"
+}"
+migrate "$WORK/no-such.json" "$KEYS_LINUX"
+expect_text "$WORK/migrated.json" "{
+$KEYS_LINUX
+  \"models_dir\": \"models\"
+}"
+
+setup "bop_migrate_config merges a program-written config and names what it added"
+migrate "$REPO/tests/data/0.2.0/config.json" "$KEYS_LINUX"
+no_dup_keys "$WORK/migrated.json" "$DATA"
+expect_out "Moved the config to $WORK/migrated.json (download_dir, cache_dir and runtime dirs added)."
+migrate "$REPO/tests/data/0.2.0/config.json" "$KEYS_MAC"
+no_dup_keys "$WORK/migrated.json" "$DATA"
+expect_out "(download_dir, cache_dir, log_path and runtime dirs added)."
+
+setup "bop_migrate_config copies a config that sets download_dir and one it cannot merge"
+printf '{\n  "download_dir": "/somewhere"\n}\n' > "$WORK/src.json"
+migrate "$WORK/src.json" "$KEYS_LINUX"
+cmp -s "$WORK/src.json" "$WORK/migrated.json" || fail "a path-valued download_dir config was changed"
+expect_out "Copied $WORK/src.json to $WORK/migrated.json; it already sets download_dir: check that it points at $DATA."
+printf '{"port": 1}\n' > "$WORK/src.json"
+migrate "$WORK/src.json" "$KEYS_LINUX"
+cmp -s "$WORK/src.json" "$WORK/migrated.json" || fail "a one-line config was changed"
+expect_out "Add these keys to it by hand:"
+expect_out "\"cache_dir\": \"$DATA/cache\","
+
+setup "bop_print_urls names the config's ports (systemd wording) under POSIX sh"
+printf '{\n  "port": 1234,\n  "https_port": 4321\n}\n' > "$WORK/ports.json"
+PATH="$BIN:$PATH" "$SH" -c '. "$1"; bop_print_urls "$2" /x/blue-onyx-prism' _ \
+  "$OPT/scripts/systemd_common.sh" "$WORK/ports.json" > "$WORK/urls" 2>&1 || fail "bop_print_urls failed: $(cat "$WORK/urls")"
+expect_text "$WORK/urls" "Web UI:    https://<this machine>:4321/ (self-signed certificate; on the first visit,
+           create the first account with the code that this prints:
+           sudo -u blueonyx /x/blue-onyx-prism --config $WORK/ports.json setup-code)
+Blue Iris: http://<this machine's IP>:1234 (plain HTTP, no account)"
+printf '{}\n' > "$WORK/ports.json"
+PATH="$BIN:$PATH" "$SH" -c '. "$1"; bop_print_urls "$2" /x/blue-onyx-prism' _ \
+  "$OPT/scripts/systemd_common.sh" "$WORK/ports.json" > "$WORK/urls" 2>&1 || fail "bop_print_urls failed: $(cat "$WORK/urls")"
+grep -q 'https://<this machine>:32169/' "$WORK/urls" || fail "default HTTPS port missing: $(cat "$WORK/urls")"
+grep -q "http://<this machine's IP>:32168 " "$WORK/urls" || fail "default HTTP port missing: $(cat "$WORK/urls")"
+
+setup "bop_print_urls in launchd wording"
+printf '{\n  "port": 1234,\n  "https_port": 4321\n}\n' > "$WORK/ports.json"
+bash -c 'set -euo pipefail; . "$1/scripts/launchd_common.sh"; bop_print_urls "$2" /x/blue-onyx-prism' _ \
+  "$REPO" "$WORK/ports.json" > "$WORK/urls" 2>&1 || fail "launchd bop_print_urls failed: $(cat "$WORK/urls")"
+expect_text "$WORK/urls" "Web UI:    https://localhost:4321/ (self-signed certificate; on the first visit,
+           create the first account with the code that this prints:
+           sudo -u _blueonyx /x/blue-onyx-prism --config $WORK/ports.json setup-code)
+Blue Iris: http://<this Mac's IP>:1234 (plain HTTP, no account)"
+
+# The zip flow (install_launchd.sh) carries an install-dir config over through bop_seed_config;
+# the .pkg (no source) writes a fresh one.
+setup "launchd bop_seed_config carries over the install-dir config with the runtime dirs"
+cp "$REPO/tests/data/0.2.0/config.json" "$WORK/launchd-src.json"
+PATH="$BIN:$PATH" bash -c '
+  set -euo pipefail
+  DATA_DIR="$1"; LOG_DIR="$1/log"; CONFIG="$1/launchd.json"
+  . "$2/scripts/launchd_common.sh"
+  bop_seed_config "  \"openvino_dir\": \"/p/openvino\"," "$3"
+' _ "$DATA" "$REPO" "$WORK/launchd-src.json" > "$OUT" 2>&1 || fail "launchd seed failed: $(cat "$OUT")"
+no_dup_keys "$DATA/launchd.json" "$DATA"
+grep -q "\"log_path\": \"$DATA/log\"," "$DATA/launchd.json" || fail "log_path was not added"
+grep -q '"openvino_dir": "/p/openvino",' "$DATA/launchd.json" || fail "openvino_dir was not added"
+expect_out "(download_dir, cache_dir, log_path and runtime dirs added)."
+expect_call "chown _blueonyx:_blueonyx $DATA/launchd.json"
+rm -f "$DATA/launchd.json"
+PATH="$BIN:$PATH" bash -c '
+  set -euo pipefail
+  DATA_DIR="$1"; LOG_DIR="$1/log"; CONFIG="$1/launchd.json"
+  . "$2/scripts/launchd_common.sh"
+  bop_seed_config
+' _ "$DATA" "$REPO" > "$OUT" 2>&1 || fail "launchd fresh seed failed: $(cat "$OUT")"
+expect_text "$DATA/launchd.json" "{
+$KEYS_MAC
+  \"models_dir\": \"models\"
+}"
 
 [ "$failed" -eq 0 ] || exit 1
 echo "scriptlet checks passed"
