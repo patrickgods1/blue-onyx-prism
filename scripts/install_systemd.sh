@@ -14,6 +14,7 @@ DATA_DIR=/var/lib/blue-onyx-prism
 CONFIG="$DATA_DIR/blue_onyx_prism_config.json"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_SRC="$HERE/deploy/blue-onyx-prism.service"
+# shellcheck disable=SC2034 # read by the sourced systemd_common.sh
 BOP_SCRIPTS="$HERE/scripts"
 # shellcheck source=systemd_common.sh
 . "$HERE/scripts/systemd_common.sh"
