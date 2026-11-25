@@ -5260,5 +5260,10 @@ powershell -ExecutionPolicy Bypass -File scripts\research\measure_resources.ps1 
 powershell -ExecutionPolicy Bypass -File scripts\research\measure_resources.ps1 -Idle 20 -LoadSecs 20 -PostIdle 10 -RestartIdle 15 -FinalRun 10   # smoke, about 2 min
 ```
 
+On the PR, Windows CI failed `cli_and_service_saves_write_the_same_file` (phase 9's QA-123 test): its helper fixed
+the results' timestamp but not the models', which `ModelResult::failed` stamps with the current second, and the slow
+runner crossed a second between the CLI's and the service's halves. With a 1.1 s sleep between the halves the old
+helper fails and the fixed one (every stamp fixed) passes.
+
 Tests: the new parent-watch test (shown failing without the watch), the extended stop-budget test, the updated
 pickers node test; gates as in every phase.
