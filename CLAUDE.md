@@ -197,6 +197,22 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     steps that only look at a token; documented intervals stay. Long in-process job work uses
     `parallel::Spawned::Background`.
 
+- **Child processes and stopping** (`children.rs`, `backend/process.rs`, `command.rs`, `runner.rs` "Stopping").
+  - Every child (export, training, auto-label, import, uv, video decode, the native file dialog) starts through
+    `backend::process::prepare` (own process group; Linux `PR_SET_PDEATHSIG`; Windows: suspended, joined to a
+    kill-on-close Job, resumed) and is recorded in `<data root>/.children.json` (pid, start time, exe, owner). Python
+    scripts get a stdin pipe + `BOP_PARENT_PIPE=1`; `watch_parent()` kills their group on EOF
+    (`scripts/ci/test_parent_watch.py`). A `Tree` dropped unreaped kills its group.
+  - A start (and `fetch` / the job-running `train` commands, before taking a lock) sweeps orphans: only entries whose
+    owner is dead and whose pid, start time and exe all match are killed (`children::decide`).
+  - Short helper programs (port holder, service control, system info) run through `command` (output drained and
+    capped, group stopped at the deadline).
+  - Stop: one timeline from t0 (`runner::stop`), every bound measured from t0; hard bound `SHUTDOWN_DEADLINE` (60 s),
+    then recorded child trees killed and the log flushed. Service managers wait `SERVICE_MANAGER_STOP` (75 s: systemd,
+    launchd, compose, the Windows preshutdown timeout set by `install_service.ps1` and the MSI); a test reads the files.
+  - Writes: `fsx::write_atomic` (unique `.<name>.<hex>.tmp`, fsync, keeps the mode; the sweep removes crash temps after
+    1 h), `fsx::lock_wait`, `fsx::is_windows_reserved` for on-disk names built from user input.
+
 - **Backend** (`src/backend/`, the only place `unsafe` is allowed): runtimes behind a `Backend` enum
   (`OpenVino | Ort`). OpenVINO wrapper (properties CACHE_DIR, f16 on GPU and the GPU hint: the hardware profile's choice
   or `performance_hint`, LATENCY by default on an integrated GPU, THROUGHPUT on Arc; cache dir

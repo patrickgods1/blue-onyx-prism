@@ -162,6 +162,12 @@ function Assert-Hardening([string]$Log) {
         Fail "the service's failure actions do not apply to non-crash failures (sc failureflag)" @($Log)
     }
     Write-Host "Failure actions apply to non-crash failures."
+    # --set-preshutdown-timeout (MSI custom action): an OS shutdown waits for the service's bounded
+    # stop (runner::SERVICE_MANAGER_STOP, 75 s) instead of Windows' default 10 s.
+    if (-not $svcKey.PSObject.Properties["PreshutdownTimeout"] -or $svcKey.PreshutdownTimeout -ne 75000) {
+        Fail "the service's preshutdown timeout is not 75000 ms (blue-onyx-prism-service.exe --set-preshutdown-timeout)" @($Log)
+    }
+    Write-Host "Preshutdown timeout: $($svcKey.PreshutdownTimeout) ms."
 
     # The HTTP port (Blue Iris) and the HTTPS port (web UI): the same scope and profiles.
     foreach ($name in $FirewallRules) {

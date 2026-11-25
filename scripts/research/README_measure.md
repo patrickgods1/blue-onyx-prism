@@ -54,4 +54,8 @@ dir), `--model/-Model` (default `IPcam-general`, an `.onnx` already in `<bin dir
   use `blue-onyx-prism service stop` (admin) and compare the data root by hand. The Windows script has not been
   run (no Windows host available when written); it is PowerShell 5.1 syntax only.
 - The restart exercised is a generation restart in the same process (the process id does not change).
-- macOS smoke run (20 s phases): idle CPU 0.05 %, RSS about 280 MB, no children, 5 files in a fresh data root.
+- macOS (M1, end of the 2026-11 audit, full run): idle CPU 0.04 % in every phase, RSS about 265 MB, 426 MB right
+  after a generation restart falling to 346 MB within 5 min, threads stable, nothing left after kill -9 or SIGTERM.
+  RSS on macOS counts lazily freed allocator pages; see docs/PRODUCTION_REVIEW.md, "phase 11 notes".
+- The harness starts no job child; `scripts/ci/test_parent_watch.py` checks that the Python children end when their
+  parent is killed.

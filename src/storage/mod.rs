@@ -64,8 +64,8 @@ pub(crate) fn remove_counted(p: &Path, why: &str, out: &mut Vec<Removed>) -> boo
         }
         Err(e) => {
             tracing::warn!(
-                "storage: could not remove {} ({why}): {e:#}; it is tried again at the next \
-                 sweep, or delete it by hand",
+                "storage: could not remove {} ({why}): {e:#}; try again later (the daily sweep \
+                 retries what it removes by itself) or delete it by hand",
                 p.display()
             );
             false

@@ -89,6 +89,15 @@
                   Directory="INSTALLFOLDER"
                   ExeCommand="&quot;[System64Folder]sc.exe&quot; privs BlueOnyxPrismService SeChangeNotifyPrivilege"
                   Execute="deferred" Impersonate="no" Return="check" />
+    <!-- Stop budget at an OS shutdown: the service accepts PRESHUTDOWN, and the SCM then waits up to
+         the service's preshutdown timeout (Windows' default is 10 s, less than the service's own
+         bounded stop). The service exe sets it to runner::SERVICE_MANAGER_STOP, as
+         install_service.ps1 does. Return="ignore": a failure leaves the 10 s default and never
+         blocks the install; the smoke test checks the registry value. -->
+    <CustomAction Id="SetServicePreshutdownTimeout"
+                  FileRef="ServiceExe"
+                  ExeCommand="--set-preshutdown-timeout"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
     <!-- The data folder's DACL: protected (nothing inherited from ProgramData, whose ACL lets Users
          create files in every folder below it), same result as install_service.ps1 for its install
          folder. Administrators and SYSTEM full control, LocalService modify, Users read (the tray,
@@ -160,6 +169,7 @@
       <Custom Action="SetServiceFailureActions" After="InstallServices" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="SetServiceFailureFlag" After="SetServiceFailureActions" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="SetServicePrivileges" After="SetServiceFailureFlag" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="SetServicePreshutdownTimeout" After="SetServicePrivileges" Condition="NOT REMOVE~=&quot;ALL&quot;" />
       <Custom Action="RemoveProgramFolder" After="RemoveFiles"
               Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE AND INSTALLFOLDER ~= BOP_DEFAULT_INSTALLFOLDER" />
       <Custom Action="RemoveDataFolder" After="RemoveProgramFolder"

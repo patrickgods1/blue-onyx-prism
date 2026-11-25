@@ -44,6 +44,7 @@ process.stdout.write(JSON.stringify({
     '\u{1F600}'.repeat(65)].map((s) => [CU.validName(s), CU.nameProblem(s)]),
   start: CU.defaultSelection(cat),
   visible: CU.visibleClasses(['person', 'car', 'Dog'], ['dog', 'car']),
+  hiddenCase: [CU.isHidden('Dog', ['dog']), CU.isHidden('car', ['CAR']), CU.isHidden('cat', ['dog'])],
   quick: CU.quickSetsFor(cat),
   missing: {on, off,
     kept: MU.missingDefaults(true, '0.4', '500', ''),
@@ -129,8 +130,8 @@ fn class_names_follow_the_server_rules() {
 
 /// The auto-label form starts with what the enabled models detect, in list order, without the
 /// hidden ones; the quick sets offer the visible list, person + vehicles, animals and each enabled
-/// model's visible classes. Hidden classes are compared exactly here (Review ignores case: QA-112
-/// left this open), so a hidden `dog` keeps `Dog`.
+/// model's visible classes. Hidden classes are compared ignoring case, as in Review and on the server
+/// (QA-112), so a hidden `dog` hides `Dog`.
 #[test]
 fn starting_classes_and_quick_sets() {
     if !have_node() {
@@ -142,7 +143,8 @@ fn starting_classes_and_quick_sets() {
         json!(["person", "dog", "cat"]),
         "relevant in list order, then the rest of relevant, minus hidden"
     );
-    assert_eq!(v["visible"], json!(["person", "Dog"]));
+    assert_eq!(v["visible"], json!(["person"]));
+    assert_eq!(v["hiddenCase"], json!([true, true, false]));
     assert_eq!(
         v["quick"],
         json!([

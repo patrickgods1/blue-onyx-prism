@@ -216,7 +216,7 @@ pub(crate) const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 /// Longest wait for a state change (`launchctl bootstrap|bootout|kickstart|enable`,
 /// `systemctl start|stop|restart`, which waits for the job): above systemd's default 90 s start
-/// timeout and the unit's 30 s stop timeout.
+/// timeout and the unit's stop timeout (`runner::SERVICE_MANAGER_STOP`, 75 s).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) const CHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 

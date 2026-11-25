@@ -4205,7 +4205,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 |---|---|---|---|---|---|---|
 | RA-001 | `platform-storage/platform-6` | processes | medium | 0 | fixed (phase 0): see QA-003; the 30 s repeat: RA-033, fixed (phase 6) | On Windows, port_holder never reads netstat's piped stdout until it exits, so `netstat -ano` blocks on a full pipe, is killed after 5 s, and this repeats every 30 s while the HTTPS port is taken |
 | RA-002 | `backend/backend-9` | crash-recovery | low | 0 | fixed (phase 0): both JPEGs written atomically | save_annotated writes saved images in place: a crash or full disk leaves truncated <stem>_od.jpg / <stem>.jpg |
-| RA-003 | `gap-how-memory-returns/memgap-1` | memory | low | 0 | partial (phase 0): `backend::memory::trim` for Linux glibc, macOS and Windows (process heap only); call sites in phase 5 | No trim helper on Windows or macOS: the seven proposed `backend::memory::trim()` fixes are glibc-only. Below is one spec that covers every OS (Windows-first corrections included). |
+| RA-003 | `gap-how-memory-returns/memgap-1` | memory | low | 0 | fixed (phase 0 + 5): `backend::memory::trim` on every OS, called through `trim_soon` after loads, retires, reaps, jobs, benchmarks, exports and sign-in bursts | No trim helper on Windows or macOS: the seven proposed `backend::memory::trim()` fixes are glibc-only. Below is one spec that covers every OS (Windows-first corrections included). |
 | RA-004 | `platform-storage/platform-5` | crash-recovery | low | 0 | fixed (phase 0): see QA-009 | CO-02 fix incomplete: `Config::save` uses one fixed `<config>.tmp` name, so a CLI save and a service save at the same moment can rename a mixed, corrupt file over the config |
 | RA-005 | `resources/resources-9` | processes | low | 0 | fixed (phase 1): seams.rs signals through `backend::process::signal_group` | Unix group kill, pause and resume run an external `kill` program and ignore failure: where it is missing, tree kill silently degrades to killing only the direct child |
 | RA-006 | `gap-inprocess-restart-windows/restart-1` | memory | medium | 1 | fixed (phase 1): the slot empties at the stop; hooks and the fetcher hold a detachable per-run target, so run 1's AppState is freed (Weak test) | The static training queue keeps the first run's last AppState alive for the life of the process: its registry's Runtimes (OpenVINO Core and GPU plugin), its preprocess pool threads with their buffers, its Provisioner (download thread, exporter thread), its BenchmarkService, ConfigStore and Auth |
@@ -4213,8 +4213,8 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | RA-008 | `gap-inprocess-restart-windows/restart-3` | gpu | medium | 1 | fixed (phase 1): hooks fail with a clear message once their run stopped | After an in-process restart, training hooks and export completions act on the dead run: apply_config spawns compile-only workers on the shut-down registry with the old OpenVINO Core, and end-of-run benchmarks run on the old Runtimes and BenchmarkService, which the serving run cannot cancel; baselines are always skipped |
 | RA-009 | `gap-one-stop-timeline/gap-1` | shutdown | medium | 1 | fixed (phase 1): one timeline from t0 (`runner::stop`): jobs, provisioner and collector signalled together, then HTTP, benchmark, joins, retire; constants and const asserts in runner.rs | Nothing runs the stop as one bounded sequence: only some parts hear the stop at t0, a 30 s benchmark wait runs first, and the bounded waits alone add up to about 44 s, more than any 30 s stop budget |
 | RA-010 | `gap-one-stop-timeline/gap-2` | threads | medium | 1 | fixed (phase 1): export and X-AnyLabeling import stop on `AppState.shutdown` (503, nothing left); Staging has a Drop | Dataset (review) export and X-AnyLabeling import run on the blocking pool with no stop signal at all, and while they run they keep the stop's Provisioner, Exporter and log-guard drops from happening |
-| RA-011 | `gap-startup-recovery-as/recovery-1` | processes | medium | 1 | partial (phase 2): `fetch` and the job-running `train` commands now run the orphan sweep before taking a lock, and a leaderless group's members are swept (RA-012); uv on macOS still has no pipe watch of its own (the sweep covers it) | On Unix, job locks and busy markers are released the moment the spawning process dies, while export_model.py and every uv stage keep running with no parent watch, so a second live process starts on top of the orphan |
-| RA-012 | `resources/resources-1` | processes | medium | 1 | partial (phase 1 + 2): process group + Linux PDEATHSIG, a stdin parent pipe (`BOP_PARENT_PIPE`) watched by every Python script, `.children.json` + startup sweep, Tree Drop kills the group; phase 2: when a leader is gone, the members of its group that started after it, run from `tools/` and were recorded in this boot are killed by PID (Linux, macOS). Left: uv itself has no pipe watch on macOS (only the sweep) | On Unix, export and training child trees outlive the service after a crash, kill -9, the forced-exit paths or a double Ctrl-C. Nothing kills them when the parent dies and nothing sweeps them at startup. |
+| RA-011 | `gap-startup-recovery-as/recovery-1` | processes | medium | 1 | fixed (phase 1 + 2): `fetch` and the job-running `train` commands sweep orphans before taking a lock, so no second process starts on top of one; Python children end on the parent pipe (end-to-end test in phase 11). Limit kept: uv (a third-party binary) has no pipe watch on macOS; it ends with its install or at the next sweep | On Unix, job locks and busy markers are released the moment the spawning process dies, while export_model.py and every uv stage keep running with no parent watch, so a second live process starts on top of the orphan |
+| RA-012 | `resources/resources-1` | processes | medium | 1 | fixed (phase 1 + 2 + 11): process group + Linux PDEATHSIG, the `BOP_PARENT_PIPE` stdin pipe watched by every Python script, `.children.json` + startup sweep (leaderless groups too), Tree Drop kills the group; phase 11 added a real-process test of the pipe watch (kill -9 of the parent, running and paused child). Limit kept: uv has no pipe watch on macOS (the sweep covers it) | On Unix, export and training child trees outlive the service after a crash, kill -9, the forced-exit paths or a double Ctrl-C. Nothing kills them when the parent dies and nothing sweeps them at startup. |
 | RA-013 | `resources/resources-4` | processes | medium | 1 | fixed (phase 1): `Manager::cancel`; the fetcher gives a cancelled download up unless someone else wants it | Cancelling an export, or an export that fails at the weights stage, does not stop its download: the shared manager keeps downloading and retrying in the background |
 | RA-014 | `training-core/training-core-2` | shutdown | medium | 1 | fixed (phase 1): `TrainingService::stop_for_exit`: the run is interrupted and retryable, work and checkpoint kept; tasks are recorded as interrupted (their own cleanup follows the cancel rules) | A graceful service stop never stops the training queue, and TrainingService has no stop that keeps the run (shutdown() works like a user Cancel and deletes the checkpoints) |
 | RA-015 | `workers-registry/workers-registry-1` | threads | medium | 1 | fixed (phase 1): the load checks the cancel token between candidates, at the runtimes lock, after the compile and during warm-up | Model load ignores the worker's cancel token: a cancelled or retired worker keeps compiling and warming up every remaining candidate |
@@ -4229,7 +4229,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | RA-024 | `gap-one-stop-timeline/gap-4` | shutdown | low | 1 | fixed (phase 1): `cli::flush_logs` before every exit | The file log's tail is lost on the forced-exit paths and whenever an abandoned task still holds an AppState: the non-blocking writer's WorkerGuard lives only in shared LogReloadHandle clones |
 | RA-025 | `platform-storage/platform-10` | processes | low | 1 | fixed (phase 1): tini as the image entrypoint (`-s`) | The Docker image runs the server as PID 1 with no init, so orphaned grandchildren of killed export/training trees are never reaped |
 | RA-026 | `platform-storage/platform-11` | shutdown | low | 1 | fixed (phase 1): systemd TimeoutStopSec, launchd ExitTimeOut, compose stop_grace_period = 75 s (`SERVICE_MANAGER_STOP`), KillMode=control-group explicit; a test checks the files against the constants | The systemd, launchd and Docker stop timeouts (30 s) are shorter than the app's own shutdown bound (60 s + 5 s), and the unit keeps KillMode=control-group |
-| RA-027 | `platform-storage/platform-12` | shutdown | low | 1 | partial (phase 1): the service accepts PRESHUTDOWN, `install_service.ps1` sets a 75 s preshutdown timeout, and the console binary handles Ctrl-Break/close/logoff/shutdown. The MSI does not set the timeout yet (Windows default 10 s) | Windows: the service does not accept PRESHUTDOWN, so an OS reboot gives it the ~5 s SHUTDOWN budget; the console server handles only Ctrl-C (not Ctrl-Break, window close, logoff or shutdown) |
+| RA-027 | `platform-storage/platform-12` | shutdown | low | 1 | fixed (phase 1 + 11): the service accepts PRESHUTDOWN and handles the console events; `install_service.ps1` and (phase 11) the MSI set the 75 s preshutdown timeout, checked by the MSI smoke test | Windows: the service does not accept PRESHUTDOWN, so an OS reboot gives it the ~5 s SHUTDOWN budget; the console server handles only Ctrl-C (not Ctrl-Break, window close, logoff or shutdown) |
 | RA-028 | `platform-storage/platform-13` | shutdown | low | 1 | fixed (phase 1): stop waits 85 s and start 75 s; a restart whose stop is still pending goes on to start | `service restart` on Windows gives up after the same 60 s the service may legitimately need to stop, and then never starts it |
 | RA-029 | `platform-storage/platform-4` | processes | low | 1 | fixed (phase 1): forced exits kill this process's recorded child trees (`runner::before_forced_exit`) and flush the log | The CLI server's `process::exit` paths (second Ctrl-C, 60 s deadline) skip every child kill. On Unix the training/export children sit in their own process group, survive, and the next start's sweep deletes their work folder under them |
 | RA-030 | `platform-storage/platform-7` | shutdown | low | 1 | fixed (phase 1): the sweep stops between items; the sweeper join is bounded (2 s) | The storage sweep cannot be cancelled, and shutdown joins its thread, so a stop during a large deletion or auto-label recovery waits until it finishes |
@@ -4282,9 +4282,9 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | RA-077 | `backend/backend-2` | memory | medium | 5 | fixed (phase 5): `memory::trim_soon` (coalescing `bop-trim` thread) at model Ready, worker retire, reaper drop, generation retire, job/benchmark/export ends, sign-in burst end, CoreML compile | No allocator trim anywhere: freed compile/load and job transients stay in the glibc heap after a spike |
 | RA-078 | `benchmark/benchmark-3` | memory | medium | 5 | fixed (phase 5): the CLI applies the 2000-image cap (`--no-image-cap`), `model_report` drops eval_preds | CLI benchmark has no image cap and keeps 4-5 full copies of every model x device x image result until it ends (the BM-11 fix covers the service only) |
 | RA-079 | `server-core/server-core-1` | memory | medium | 5 | fixed (phase 5): cut messages stored at their cut size, capacity counted; refusal logs cut the path to 200 chars | Log ring keeps the full allocation of every truncated message, so the 8 MiB budget can be exceeded about 16x through request paths that unauthenticated LAN clients control (the SV-08 fix is incomplete) |
-| RA-080 | `training-core/training-core-3` | memory | medium | 5 | partial (phase 5): the 3 s poll, task projection and run-state readers share `Arc` histories; LRU cache by entries and weight; `runs()` / `get()` / `wait()` still copy (TrainProgress.history is a Vec) | Every runs() / get() / wait() deep-clones every run's whole epoch history, and a process-wide cache keeps up to 256 histories for the life of the process |
+| RA-080 | `training-core/training-core-3` | memory | medium | 5 | deferred: phase 5 shares `Arc` histories on the 3 s poll, the task projection and the run-state readers and bounds the cache; `runs()` / `get()` / `wait()` still copy (page render, full `GET /v1/training`, CLI wait loops), because `TrainProgress.history` is a `Vec` in a serialized type. Cost: one copy of each run's epoch list per such read | Every runs() / get() / wait() deep-clones every run's whole epoch history, and a process-wide cache keeps up to 256 histories for the life of the process |
 | RA-081 | `training-jobs/training-jobs-6` | memory | medium | 5 | fixed (phase 5): SigLIP text tower dropped after prompts (autolabel.py and import_footage.py), SAM 3 text encoder stubbed after encoding | Python labelers keep unused text towers resident in host RAM for the whole run |
-| RA-082 | `workers-registry/workers-registry-3` | memory | medium | 5 | partial (phase 5): a device a reaper waits on (30 s) or with every reaper busy is skipped, upgrades held until it ends; worker threads stuck in an inference are not tracked by device | A hung GPU is retried forever (better-device upgrades, and automatic reloads after a stuck inference); once MAX_REAPERS reapers are blocked, every new try leaks a whole backend with mem::forget |
+| RA-082 | `workers-registry/workers-registry-3` | memory | medium | 5 | deferred: phase 5 fixed the retry loop (a device a reaper waits on, or with every reaper busy, is skipped and its upgrades held; no backend leaked past the reaper cap); a worker thread stuck inside an inference is still not counted against its device, and `openvino:gpu` / `.0` are separate keys. Needs a hung GPU to test (not available) | A hung GPU is retried forever (better-device upgrades, and automatic reloads after a stuck inference); once MAX_REAPERS reapers are blocked, every new try leaks a whole backend with mem::forget |
 | RA-083 | `backend/backend-3` | memory | low | 5 | fixed (phase 5): idle lengths dropped after 10 min, 64 MiB cap on free tensors, the last `LengthHold` of a length frees it at once, idle preprocessors dropped | PL-04 fix incomplete: TensorPool keeps up to 32 buffers per tensor length for the whole generation, and each prep thread keeps a Preprocessor per geometry ever seen |
 | RA-084 | `backend/backend-4` | memory | low | 5 | fixed (phase 5): `PooledBuf` holds the pool weakly; a detached ORT session thread keeps the `vram::Hold` | A hung ONNX Runtime session thread (or a reaper-leaked backend) keeps the whole TensorPool of its generation alive, not just its one tensor |
 | RA-085 | `backend/backend-5` | memory | low | 5 | fixed (phase 5): `device::core_property` / `compiled_property` free the string with `ov_free` (measured: 0 vs ~16 B per read) | Every OpenVINO property read leaks the C string OpenVINO allocates (openvino 0.11 never calls ov_free) |
@@ -4307,7 +4307,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | RA-102 | `workers-registry/workers-registry-5` | memory | low | 5 | fixed (phase 5): see RA-077 | Freed backends are never trimmed: after a reload, retire, reaper drop or generation swap, the old model's host memory stays in the allocator's arenas |
 | RA-103 | `workers-registry/workers-registry-8` | memory | low | 5 | fixed (phase 5): sweep every 64 calls, deque never past its cap | Static-box memory keeps an idle camera's expired tracks until 256 other keys evict it, and the per-track VecDeque doubles to 128 slots to hold 64 |
 | RA-104 | `collect/collect-1` | cpu | medium | 6 | fixed (phase 6) | Retention prune looks up each doomed file by linear search: O(doomed x entries), minutes to hours of one core |
-| RA-105 | `collect/collect-2` | cpu | medium | 6 | partial (phase 6): margin, triggers and day cache; `adopt` still rescans every index after a deleting prune | Every dataset prune is a full walk that reads every label file. At the size cap it repeats every 30 s, and it runs every 10 min while idle |
+| RA-105 | `collect/collect-2` | cpu | medium | 6 | deferred: phase 6 added the margin, the prune triggers and the day cache; `adopt` still rescans every `index.jsonl` after a prune that deleted frames (needs a remove on `layout::Summary`). Cost: one index read per deleting prune | Every dataset prune is a full walk that reads every label file. At the size cap it repeats every 30 s, and it runs every 10 min while idle |
 | RA-106 | `gap-log-lines-with/logs-1` | storage | medium | 6 | fixed (phase 6) | The cross-site refusal warning has no throttle and logs the client's Origin header in full, so one unauthenticated LAN client can wipe the Windows Application log and fill today's log file in seconds |
 | RA-107 | `gap-log-lines-with/logs-2` | storage | medium | 6 | fixed (phase 6) | Refused sign-ins log one unthrottled WARN per request before any password hashing, so a locked-out guessing client writes thousands of Event Log records a second |
 | RA-108 | `gap-log-lines-with/logs-4` | storage | medium | 6 | fixed (phase 6) | The unknown-model warning has no throttle: a camera still calling a removed or renamed model writes one WARN (and one Event Log record) per image |
@@ -4336,7 +4336,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-003 | `platform-config/platform-2` | bug | medium | 0 | fixed (phase 0): output drained while waiting; netstat/tasklist started from System32 | port_holder::run waits for exit before reading a piped stdout: `netstat -ano` fills the pipe and the Windows lookup always times out |
 | QA-004 | `backend/backend-9` | refactor | low | 0 | fixed (phase 0): `fsx::write_atomic` | Atomic writes are reimplemented in backend; `write_active_flavor` uses a fixed temp name and no fsync |
 | QA-005 | `collect/collect-8` | refactor | low | 0 | fixed (phase 0): `fsx::lock_wait` / `lock_wait_with` | Three hand-written fs4 lock-wait loops in this area, more elsewhere |
-| QA-006 | `gap-helpers-duplicated-across/gap-10` | refactor | low | 0 | partial (phase 0): `fsx::is_windows_reserved` moved from image.rs unchanged; camera_dir / valid_model_name in phase 7 | The Windows reserved-name rule is private to image.rs; make it one public fs-name helper and use it for every on-disk name built from user input |
+| QA-006 | `gap-helpers-duplicated-across/gap-10` | refactor | low | 0 | fixed (phase 0 + 7): `fsx::is_windows_reserved` is used by `camera_dir` and `valid_model_name`; prepared dataset names always start `s<N>-`, so they cannot be a device name | The Windows reserved-name rule is private to image.rs; make it one public fs-name helper and use it for every on-disk name built from user input |
 | QA-007 | `gap-helpers-duplicated-across/gap-2` | bug | low | 0 | fixed (phase 0): `service_ctl::run` bounded (10 s queries, 120 s state changes) | The macOS tray's 3-second poll can freeze for good on a hung launchctl, because service_ctl::run has no timeout |
 | QA-008 | `gap-helpers-duplicated-across/gap-3` | refactor | low | 0 | fixed (phase 0): one cached `command::euid` | Two copies of `/usr/bin/id -u` with different failure rules |
 | QA-009 | `platform-config/platform-3` | bug | low | 0 | fixed (phase 0): unique temp, mode kept, rename retried on a sharing violation | Config::save uses one fixed temp name `<config>.tmp`, so two processes saving at once can rename a mixed or truncated file into place |
@@ -4442,7 +4442,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-109 | `training-jobs/training-jobs-7` | bug | low | 6 | fixed (phase 6) | k-center greedy checks `chosen.contains(&i)` inside its inner loop: O(n*k^2) for a large import |
 | QA-110 | `training-jobs/training-jobs-8` | bug | low | 8 | fixed (phase 8): merge capped at `MAX_BOXES` (`ApplyReport.full`) | The labelers' merge path has no MAX_BOXES cap, while the Review save refuses a file over 500 boxes |
 | QA-111 | `web-assets/web-1` | bug | low | 8 | fixed (phase 8): server `data-tz-abbr` map (`Zone::abbreviation_map`), parity test | PrismTime.when labels drift from Zone::display for most non-US zones; the parity test slices the label away |
-| QA-112 | `web-assets/web-2` | bug | low | 8 | partial (phase 8): stored in the list's spelling; Review compares ignoring case (class picker / training.js still exact) | Hidden classes compared exactly in pickers/shortcuts but case-insensitively when drawing: a hidden class stays on a shortcut key while its boxes vanish |
+| QA-112 | `web-assets/web-2` | bug | low | 8 | fixed (phase 8 + 11): stored in the list's spelling; Review, the class picker, the Dataset tab and the auto-label form compare hidden classes ignoring case (`ClassPicker.util.isHidden`) | Hidden classes compared exactly in pickers/shortcuts but case-insensitively when drawing: a hidden class stays on a shortcut key while its boxes vanish |
 | QA-113 | `web-assets/web-3` | bug | low | 8 | fixed (phase 8): `waitNext` on generation or epoch (`data-epoch`) | Restart page waits on generation only (no epoch): a process restart during the reload never 'comes back' |
 | QA-114 | `web-assets/web-4` | bug | low | 8 | fixed (phase 8): `PrismTestPage` + parity unit test | Test page 'no objects' twins differ: Rust names a night threshold that did not apply; no parity test |
 | QA-115 | `web-assets/web-6` | bug | low | 8 | fixed (phase 8): Jobs and Refine polls reject on errors (back off) | Train area jobs poll swallows errors, so PrismPoll never backs off and the Jobs tab shows a stale list silently |
@@ -4502,7 +4502,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-169 | `benchmark/bench-19` | refactor | low | 5 | fixed (phase 5): see RA-088 | ModelResult::finish deep-clones the reference device's whole RunResult on every call, including every sweep progress step |
 | QA-170 | `benchmark/bench-20` | refactor | low | 10 | fixed (phase 10) | Saver::merge redoes the set merge that BenchmarkResults::merge just computed and discards |
 | QA-171 | `benchmark/bench-21` | refactor | low | 10 | fixed (phase 10): `seen::by_source` shared; image_sources frames were already counted since QA-104 | 'Which frames did a model train on' has two rules: trained_on (train list only) vs cameras::seen (train + valid + image_sources renames) |
-| QA-172 | `benchmark/bench-22` | refactor | low | 10 | partial (phase 10): the unreachable `--repeat 0` check is gone; `apply_value_on` now has a caller (`server/live.rs`) | Dead code: ThresholdAdvice::apply_value_on (tests only) and an unreachable --repeat 0 check |
+| QA-172 | `benchmark/bench-22` | refactor | low | 10 | fixed (phase 10): the unreachable `--repeat 0` check is gone; `apply_value_on` is no longer dead code (`server/live.rs` calls it since phase 9) | Dead code: ThresholdAdvice::apply_value_on (tests only) and an unreachable --repeat 0 check |
 | QA-173 | `benchmark/bench-23` | refactor | low | 10 | fixed (phase 10) | points_at and search_run repeat the same input grouping (chosen/real split, per-dataset index lists, matched SweepImages) |
 | QA-174 | `benchmark/bench-24` | refactor | low | 10 | fixed (phase 10) | Lenient per-entry loading implemented twice (parse_lenient and the streaming RunsVisitor) |
 | QA-175 | `benchmark/bench-26` | test-gap | low | 10 | fixed (phase 10) | results_io tests cannot detect a start that does not wait for a writer |
@@ -4521,7 +4521,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-188 | `gap-most-of-the/benchgap-11` | refactor | low | 10 | fixed (phase 10) | Two Mann-Whitney AUC implementations; the weighted one never ends on a NaN score (roc::auc guards against it) |
 | QA-189 | `gap-most-of-the/benchgap-12` | refactor | low | 10 | fixed (phase 10) | is_image duplicated between benchmark::images and training::dataset; small misplaced docs and test-only pub items in this area |
 | QA-190 | `gap-most-of-the/benchgap-14` | test-gap | low | 10 | fixed (phase 10) | cameras::live staleness and eviction rules have no unit test |
-| QA-191 | `gap-most-of-the/benchgap-2` | refactor | low | 10 | partial (phase 7): `variant::owner` / `owned_by`; forget.rs keeps its wider rule; current.rs keeps `base_name` | No single 'which model owns this result name' helper; seven callers each pick base_name, is_reference or an exact match |
+| QA-191 | `gap-most-of-the/benchgap-2` | refactor | low | 10 | fixed (phase 7): `variant::owner` / `owned_by`. Not an issue: `forget_model` keeps its wider rule on purpose (removing a model also drops `+` remainders that no longer parse) and `current.rs` its `base_name` (a `+served` or variant result is rebased on its base model's current settings) | No single 'which model owns this result name' helper; seven callers each pick base_name, is_reference or an exact match |
 | QA-192 | `gap-the-review-index/labels-3` | refactor | low | 10 | fixed (phase 10) | FNV-1a 64 is hand-written four times |
 | QA-193 | `gap-the-review-index/labels-4` | refactor | low | 10 | fixed (phase 10) | Small box and union-find helpers copied between refine.rs, statics.rs, overlaps.rs, need.rs and stacks.rs |
 | QA-194 | `gap-the-review-index/labels-5` | refactor | low | 10 | fixed (phase 10) | bulk::accept_one is a test-only pub fn that silently ignores hidden classes |
@@ -4557,7 +4557,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-224 | `server-core/srvcore-17` | refactor | low | 9 | fixed (phase 9) | Ad-hoc poison handling bypasses crate::sync helpers (worker.device read().ok(), manual into_inner) |
 | QA-225 | `server-core/srvcore-18` | refactor | low | 10 | fixed (phase 10): `Process::build_generation`; the ignored restart / live-config tests 7/7 before and after | run_server_inner is ~260 lines mixing bind/notify/watchdog, process setup and the generation loop |
 | QA-226 | `server-core/srvcore-19` | refactor | low | 10 | fixed (phase 10) | tls own-files error hard-codes the HTTPS retry period |
-| QA-227 | `server-core/srvcore-8` | refactor | low | 10 | partial (phase 10): `lockout_base`, `verify_logged`, `account_now` shared; the failure log lines stay apart (their texts differ; DELAY_AFTER logged since phase 8) | Password re-check machinery copy-pasted between /login and the Accounts card's reauth, and already drifting |
+| QA-227 | `server-core/srvcore-8` | refactor | low | 10 | fixed (phase 8 + 10): `lockout_base`, `verify_logged`, `account_now` shared, DELAY_AFTER logged by both. Not an issue: the two failure log lines stay apart because their texts differ on purpose (sign-in vs re-check) | Password re-check machinery copy-pasted between /login and the Accounts card's reauth, and already drifting |
 | QA-228 | `server-core/srvcore-9` | refactor | low | 10 | fixed (phase 10) | AppState is assembled in two struct literals (test-only AppState::new and runner's state_for) that must be kept in sync |
 | QA-229 | `server-core/srvcore-test-2` | test-gap | low | 10 | fixed (phase 10) | is_open_path (the plain-port allow list) has no direct edge-case test |
 | QA-230 | `server-core/srvcore-test-3` | test-gap | low | 10 | fixed (phase 10) | reauth's per-account lockout and trusted-device paths are untested |
@@ -4565,7 +4565,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-232 | `server-core/srvcore-test-5` | test-gap | low | 10 | fixed (phases 8, 10): edge stamps without overflow and a bridged record without a message added; the rest was pinned in phase 8 | Lockout and log-ring edge inputs unpinned: future last_failure, after=u64::MAX, bridged log fields |
 | QA-233 | `server-handlers/handlers-13` | refactor | low | 9 | fixed (phase 9) | Three file-stamp helpers and two identical single-slot stamp caches |
 | QA-234 | `server-handlers/handlers-14` | refactor | low | 10 | fixed (phase 10) | benchmark RunContext built three times from the same AppState fields |
-| QA-235 | `server-handlers/handlers-15` | refactor | low | 10 | partial (phase 10): one `BulkBody`; the per-route tail stays (each route has its own words and keys) | Bulk route bodies: two identical structs and seven copies of the same filter/limit/message boilerplate |
+| QA-235 | `server-handlers/handlers-15` | refactor | low | 10 | fixed (phase 10): one `BulkBody`. Not an issue: each route keeps its own tail because its messages and keys differ | Bulk route bodies: two identical structs and seven copies of the same filter/limit/message boilerplate |
 | QA-236 | `server-handlers/handlers-17` | refactor | low | 10 | fixed (phase 10) | Flash-page answer boilerplate repeated in about 13 training handlers |
 | QA-237 | `server-handlers/handlers-18` | refactor | low | 10 | fixed (phase 10) | TaskKind display words written out in four places, and one has drifted |
 | QA-238 | `server-handlers/handlers-19` | refactor | low | 10 | fixed (phase 10) | Per-request config read many times; classes, hidden and size_floor can come from different revisions |
@@ -5167,3 +5167,98 @@ Shown failing with their fix reverted by the lead (one private copy, one mutatio
 decode message `a_frame_the_writer_cannot_decode_is_told_as_undecodable`, QA-263
 `a_failed_embedding_falls_back_to_dhash_and_a_cancel_still_cancels`. The agents showed QA-215, QA-261 and the JS
 drivers' mutants failing themselves (scratch copies of the assets or the old script).
+
+### Audit 2026-11, phase 11 notes (closing)
+
+Closing measurement, the last partial items and the docs. Every ID in the table above is now `fixed` (403) or
+`deferred` (3: RA-080, RA-082, RA-105), each with its reason; where part of an item stays on purpose the status says
+"not an issue" for that part (QA-191, QA-227, QA-235).
+
+**Closing measurement** (development Mac, Apple M1, 16 GB; release build of this branch; IPcam-general on
+`openvino:cpu`; `scripts/research/measure_resources.sh`). "Before" is phase 0's smoke baseline, taken on the code
+before any audit fix:
+
+| measurement | phase 0 smoke | phase 11 smoke (same phases) | phase 11 full run (10 / 5 / 5 / 5 min) |
+|---|---|---|---|
+| idle CPU (CPU-time delta) | 0.05 % | 0.05 % | 0.04 % |
+| idle CPU after load / after a generation restart | not recorded | 0.10 % / 0.07 % | 0.04 % / 0.04 % |
+| RSS before load / after load + idle | 288 / 274 MB | 290 / 271 MB | 262 / 269 MB (peak under load 269 MB) |
+| RSS after a generation restart + idle | 388 MB (10 s) | 428 MB (15 s) | 426 MB at once, 346 MB after 5 min |
+| threads | stable | stable (20-21) | stable (20-21) |
+| open fds, idle start to end | not recorded | +2 | +2 |
+| load test 10 req/s, answer p50 / p99 | not recorded | 52 / 68 ms | 51 / 65 ms |
+| after kill -9 | no children, no survivors, no new files | same | same |
+| SIGTERM stop | 1 s, nothing left | 1 s, nothing left | 1 s, nothing left |
+
+The only files a run leaves are the data root's own (`.children.json` / `.lock`, `.downloads.lock`, `auth/`); the
+"1 changed file" the summary counts after kill -9 or the stop is `.downloads.lock`, which holds its holder's pid.
+
+The rise after a generation restart is the new generation's OpenVINO Core and compile beside the old one, which
+retires 30 ms after the swap. It is not kept: in the full run RSS fell from 426 to 346 MB over the 5 idle minutes
+(426, 398, 384, then 346 MB). Six restarts in a row (20 s apart, five detections each) gave 393, 470, 478, 325,
+452 and 460 MB with 20 threads throughout: a band, not a climb. macOS counts allocator pages freed lazily (MADV_FREE)
+in RSS until memory pressure takes them, so RSS overstates what a restart keeps; `/stats.json`'s
+`memoryFootprintBytes` is the closer number there. Linux glibc trims run in CI's ubuntu job only.
+
+**Kill -9 with a live child.** The harness has no job child to kill. `scripts/ci/test_parent_watch.py` (new, in
+`scripts/ci/python_self_tests.sh`, so CI runs it on Linux and macOS) covers the Python side with real processes: per
+script (export, training, auto-label, import) a stand-in parent starts the script's `watch_parent()` as a group leader
+with the `BOP_PARENT_PIPE` stdin pipe, the child starts a helper in its group, and the parent is killed with SIGKILL.
+The child and its helper are gone within 10 s (in practice under 1 s), also when the child's group was stopped
+(SIGSTOP, a paused run) first. With `watch_parent` reduced to `return`, all four running cases fail (shown in a
+private copy); the paused case passes either way, because the kernel sends SIGHUP + SIGCONT to a stopped group that
+becomes orphaned, so it shows the portable path, not the watch. The Rust side (recorded children, the startup sweep,
+PDEATHSIG, Tree Drop) has had real-process tests since phases 0-2 (`children::tests::sweep_kills_a_real_orphan_and_keeps_our_own`, ...).
+
+**Fixed in this phase:**
+- RA-027: the MSI runs `blue-onyx-prism-service.exe --set-preshutdown-timeout` after installing the service
+  (`SetServicePreshutdownTimeout`, `Return="ignore"`: a failure leaves Windows' 10 s and never blocks the install). The
+  MSI smoke test checks `PreshutdownTimeout` = 75000 in the service's registry key, and
+  `service_manager_stop_budgets_cover_the_app_s_hard_bound` ties both files to `SERVICE_MANAGER_STOP`.
+- QA-112: `ClassPicker.util.isHidden` (case-insensitive, like Review and the server) in the class picker, the
+  Dataset tab's class form, the auto-label picker entries and "Hide the classes left unticked"; `js_pickers.rs` now
+  expects a hidden `dog` to hide `Dog`.
+- Wording: `service_ctl` CHANGE_TIMEOUT's comment named a 30 s unit stop timeout (it is 75 s); `remove_counted`'s
+  warning promised a retry "at the next sweep" also to Storage card Clears.
+
+**Docs.** CLAUDE.md gains "Child processes and stopping" (process preparation, `.children.json`, the parent pipe,
+the orphan sweep, `command`, the stop timeline, `fsx`). README gains "Disk use: the Storage card" (both groups, what
+the daily sweep removes, what a start after a crash ends) and the MSI's preshutdown timeout; its service stop section
+already had the service-manager timeouts (phase 1).
+
+**Left open after the audit** (checked against the code at the end of phase 11; none is a data-loss or security
+problem; each is small and listed with what it costs):
+- Memory and devices: RA-080 (history copies on non-poll reads); RA-082's rest (a worker stuck inside an inference
+  is not counted against its device; `openvino:gpu` and `openvino:gpu.0` are different keys for the hung check); one
+  process-wide trim counter (no per-reason count); `/stats.json` has no `privateMemoryBytes` (Prometheus has it).
+- Disk and retention: RA-105 (`adopt` rereads every `index.jsonl` after a deleting prune); a full prune walk still
+  reads every label file for `is_protected`; a failed run's `work` keeps `rfdetr-base-mapped.pth` / the Ultralytics
+  `base-<weights>` copy (tens to hundreds of MB per failed run, shown in the checkpoints row, removed with the run);
+  the retention tick does not warn about a capped log file (status and the Logs page show it).
+- Processes and CPU: uv has no pipe watch on macOS (it ends with its install, or at the next start's sweep); import
+  analysis uses physical cores - 1 at below-normal priority with no further cap; runs started by an older binary
+  without a busy marker are not guarded by a TrainLock check.
+- Accounts: a device cookie of an account removed and created again within the same second skips the lockout wait
+  (the password is still needed; sessions do not depend on it).
+- Benchmark: `tune::suggestions` offers `<model>+<variant>` results that match no configured model;
+  `combos::blocked_for` says "no longer in the config" for `+served` / variant results; `is_reference` is config-free.
+- Code and tests: the CUDA library search setup exists twice (`libs.rs`, `ort_plan.rs`); the test-only fake backend
+  skips `check_input_size`; `server/test_util.rs` and two `leftovers.rs` test modules keep their own temp folders;
+  QA-097 has no test (the race is not reproducible); `normalize_name` is not idempotent (lookups take raw names);
+  about 240 pre-existing private-link `cargo doc` warnings (CI does not build docs).
+
+**Not verified** (no such hardware here; type-checked, linted and, where CI has the OS, tested there): every Windows
+path on a real install (`measure_resources.ps1` has never run; the MSI preshutdown action runs only in the packaging
+smoke test), the i5-8500 / UHD 630 numbers (idle CPU, private bytes, `HeapCompact`, OpenVINO GPU cache folders, the
+`BOP_ORT_CPU_ARENA` comparison), NVIDIA / TensorRT, a hung GPU (RA-082), the Linux glibc trim outside CI. For the
+Windows box (elevated PowerShell in a checkout with a release build and IPcam-general downloaded):
+
+```powershell
+cargo build --release
+target\release\blue-onyx-prism.exe download-models --name IPcam-general
+powershell -ExecutionPolicy Bypass -File scripts\research\measure_resources.ps1                 # about 30 min
+powershell -ExecutionPolicy Bypass -File scripts\research\measure_resources.ps1 -Idle 20 -LoadSecs 20 -PostIdle 10 -RestartIdle 15 -FinalRun 10   # smoke, about 2 min
+```
+
+Tests: the new parent-watch test (shown failing without the watch), the extended stop-budget test, the updated
+pickers node test; gates as in every phase.
