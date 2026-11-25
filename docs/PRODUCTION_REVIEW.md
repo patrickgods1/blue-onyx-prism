@@ -5097,7 +5097,7 @@ Left open: QA-139 (review.js split) and QA-225's per-generation build (phase 10)
 that does not decode as "could not save a frame..." (a one-arm change in `Store::write` now that the error is typed);
 workers-7 / QA-277 (the delivery tail of `finish`); bench-*.js, training.js, stats/logs/welcome keep their own fetch
 wrappers and `el` copies (different contracts); `normalize_name` is not idempotent (`a.onnx.xml`), so the lookup
-helpers take raw names and key-holding sites compare `m.key()`; `dataset/valid.rs` keeps its own `frame_key`.
+helpers take raw names and key-holding sites compare `m.key()`; `dataset/valid.rs` keeps its own `frame_key`. On Windows the refine full-check test's look stage probes the host's real `msvcp140.dll` (existing `resources/export` behaviour; the test masks only its version and folder).
 
 Tests: 3803 lib + 216 integration green with `BOP_REQUIRE_NODE=1 BOP_REQUIRE_PYTHON=1`. The two lock-poison fixes are
 shown failing on the old code by the lead (one private copy, old non-test code + new tests): QA-270

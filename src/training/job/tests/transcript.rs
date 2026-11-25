@@ -8,10 +8,18 @@ use super::*;
 
 /// `s` with the test's folder and run id replaced, `/` separators, and what depends on the
 /// clock left out: the time left (`, about 3 s left`) and the time of a self-check that passed.
+///
+/// A path inside JSON (the trainer's `done` event in the log) is escaped: on Windows its root is
+/// `C:\\Users\\...` and each separator `\\`, so the escaped root is replaced first and an
+/// escaped separator becomes one `/` (the fixtures' lines hold no `\\` of their own).
 fn norm(s: &str, root: &Path, id: &str) -> String {
+    let shown = root.display().to_string();
+    let json = serde_json::to_string(&shown).unwrap_or_default();
     let mut s = s
-        .replace(&root.display().to_string(), "<T>")
+        .replace(json.trim_matches('"'), "<T>")
+        .replace(&shown, "<T>")
         .replace(id, "<ID>")
+        .replace("\\\\", "/")
         .replace('\\', "/");
     for (start, end, with) in [
         (", about ", " left", ""),

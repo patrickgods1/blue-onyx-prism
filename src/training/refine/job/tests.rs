@@ -1561,14 +1561,20 @@ fn the_selection_counts_what_it_left_out_from_the_exports_counts() {
         }
     );
     // The damaged frame's sentence stays a warning; the pending and off-list ones are counted.
-    let at = dir.display().to_string();
+    // The error names the label file by the folder's canonical path (`/private/var/...` on macOS,
+    // `\\?\C:\Users\<long name>\...` on Windows), so both spellings of the folder are taken out.
+    let slashes = |p: &Path| p.display().to_string().replace('\\', "/");
+    let (canonical, at) = (
+        slashes(&std::fs::canonicalize(&dir).unwrap()),
+        slashes(&dir),
+    );
     let warnings: Vec<String> = s
         .warnings
         .iter()
         .map(|w| {
-            w.replace(&format!("/private{at}"), "<dir>")
+            w.replace('\\', "/")
+                .replace(&canonical, "<dir>")
                 .replace(&at, "<dir>")
-                .replace('\\', "/")
         })
         .collect();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -2113,7 +2119,8 @@ fn a_failed_look_keeps_the_folds_suggestions_and_says_so() {
 
 /// A check's end as the task shows it, the machine's paths taken out: the summary, the report's
 /// warnings and the stage reports of the check itself (a fold's training run's own lines, which
-/// carry times, left out).
+/// carry times, left out). The host's own `msvcp140.dll`, which the environment's Visual C++
+/// runtime step names on Windows, reads `<version> (<where>)` ([`runtime_lines`]).
 fn ending(dir: &Path, out: &TaskOutcome, shown: &[Shown]) -> (String, Vec<String>, Vec<String>) {
     let at = dir.display().to_string();
     let plain = |s: &str| s.replace(&at, "<dir>").replace('\\', "/");
@@ -2124,15 +2131,44 @@ fn ending(dir: &Path, out: &TaskOutcome, shown: &[Shown]) -> (String, Vec<String
                 .any(|p| detail.starts_with(p))
             || detail.ends_with("changed")
     };
+    let found = "checking the Visual C++ runtime: msvcp140.dll ";
+    let version = |d: &str| match d.strip_prefix(found).and_then(|v| v.split_once(") ")) {
+        Some((_, rest)) => format!("{found}<version> (<where>) {rest}"),
+        None => d.to_string(),
+    };
     (
         plain(&out.summary),
         warnings_of(&out.result).iter().map(|w| plain(w)).collect(),
         shown
             .iter()
             .filter(|(s, _, _, _, d)| own(s, d))
-            .map(|(s, i, n, p, d)| format!("{s} {i}/{n} {p}% {}", plain(d)))
+            .map(|(s, i, n, p, d)| format!("{s} {i}/{n} {p}% {}", plain(&version(d))))
             .collect(),
     )
+}
+
+/// What the environment's Visual C++ runtime step of stage `stage` reports on this host, as
+/// [`crate::resources::export`] words it for the platform the check runs on
+/// ([`crate::resources::catalog::Platform::current`]): Windows probes the installed runtime and
+/// names the `msvcp140.dll` it found (its version and folder read `<version> (<where>)` by
+/// [`ending`]), other systems need none.
+fn runtime_lines(stage: &str, (probe, found): (u8, u8)) -> Vec<String> {
+    let os = crate::resources::catalog::Platform::current().os;
+    if os == "windows" {
+        vec![
+            format!(
+                "{stage} {probe}% checking the Visual C++ runtime: probing the installed runtime"
+            ),
+            format!(
+                "{stage} {found}% checking the Visual C++ runtime: msvcp140.dll <version> \
+                 (<where>) is new enough"
+            ),
+        ]
+    } else {
+        vec![format!(
+            "{stage} {found}% checking the Visual C++ runtime: not needed on {os}"
+        )]
+    }
 }
 
 /// Characterises how a full check with the closer look ends (summary, warnings, stage reports)
@@ -2151,33 +2187,39 @@ fn a_full_check_with_the_look_ends_as_it_did() {
         "12 frames checked by 4 fold models; suggested: 12 missing boxes, 0 labels to verify, 0 other classes, 12 better-fitting boxes for loose labels (24 of these suggestions new since the last check, on 12 frames written); 12 loose labels counted, 12 of 12 sent to a closer look answered. No box was changed: confirm the suggestions on the Review tab; report: <dir>/refine/report.json"
     );
     assert_eq!(warnings, Vec::<String>::new());
-    assert_eq!(
-        shown,
+    let mut want: Vec<String> = [
+        "selecting the reviewed frames 1/7 0% all reviewed frames",
+        "selecting the reviewed frames 1/7 14% 12 frames on 4 camera days, 4 folds",
+        "checking fold 1 of 4 2/7 14% exporting: 3 frames held out, 9 to train on",
+        "checking fold 1 of 4 2/7 26% running the fold model on its 3 frames",
+        "checking fold 1 of 4 2/7 27% writing suggestions: 0 of 3 frames",
+        "checking fold 1 of 4 2/7 28% 3 frames checked, 3 changed",
+        "checking fold 2 of 4 3/7 28% exporting: 3 frames held out, 9 to train on",
+        "checking fold 2 of 4 3/7 40% running the fold model on its 3 frames",
+        "checking fold 2 of 4 3/7 42% writing suggestions: 0 of 3 frames",
+        "checking fold 2 of 4 3/7 42% 3 frames checked, 3 changed",
+        "checking fold 3 of 4 4/7 42% exporting: 3 frames held out, 9 to train on",
+        "checking fold 3 of 4 4/7 55% running the fold model on its 3 frames",
+        "checking fold 3 of 4 4/7 56% writing suggestions: 0 of 3 frames",
+        "checking fold 3 of 4 4/7 57% 3 frames checked, 3 changed",
+        "checking fold 4 of 4 5/7 57% exporting: 3 frames held out, 9 to train on",
+        "checking fold 4 of 4 5/7 69% running the fold model on its 3 frames",
+        "checking fold 4 of 4 5/7 70% writing suggestions: 0 of 3 frames",
+        "checking fold 4 of 4 5/7 71% 3 frames checked, 3 changed",
+        "looking closer at 12 loose labels 6/7 71% setting up the environment",
+        "looking closer at 12 loose labels 6/7 71% downloading uv: checking the toolchain",
+        "looking closer at 12 loose labels 6/7 71% downloading uv: uv is installed",
+        "looking closer at 12 loose labels 6/7 71% installing Python 3.11: reusing the Python environment",
+        "looking closer at 12 loose labels 6/7 73% installing the pinned Python packages: packages already installed",
+    ]
+    .map(String::from)
+    .to_vec();
+    want.extend(runtime_lines(
+        "looking closer at 12 loose labels 6/7",
+        (73, 74),
+    ));
+    want.extend(
         [
-            "selecting the reviewed frames 1/7 0% all reviewed frames",
-            "selecting the reviewed frames 1/7 14% 12 frames on 4 camera days, 4 folds",
-            "checking fold 1 of 4 2/7 14% exporting: 3 frames held out, 9 to train on",
-            "checking fold 1 of 4 2/7 26% running the fold model on its 3 frames",
-            "checking fold 1 of 4 2/7 27% writing suggestions: 0 of 3 frames",
-            "checking fold 1 of 4 2/7 28% 3 frames checked, 3 changed",
-            "checking fold 2 of 4 3/7 28% exporting: 3 frames held out, 9 to train on",
-            "checking fold 2 of 4 3/7 40% running the fold model on its 3 frames",
-            "checking fold 2 of 4 3/7 42% writing suggestions: 0 of 3 frames",
-            "checking fold 2 of 4 3/7 42% 3 frames checked, 3 changed",
-            "checking fold 3 of 4 4/7 42% exporting: 3 frames held out, 9 to train on",
-            "checking fold 3 of 4 4/7 55% running the fold model on its 3 frames",
-            "checking fold 3 of 4 4/7 56% writing suggestions: 0 of 3 frames",
-            "checking fold 3 of 4 4/7 57% 3 frames checked, 3 changed",
-            "checking fold 4 of 4 5/7 57% exporting: 3 frames held out, 9 to train on",
-            "checking fold 4 of 4 5/7 69% running the fold model on its 3 frames",
-            "checking fold 4 of 4 5/7 70% writing suggestions: 0 of 3 frames",
-            "checking fold 4 of 4 5/7 71% 3 frames checked, 3 changed",
-            "looking closer at 12 loose labels 6/7 71% setting up the environment",
-            "looking closer at 12 loose labels 6/7 71% downloading uv: checking the toolchain",
-            "looking closer at 12 loose labels 6/7 71% downloading uv: uv is installed",
-            "looking closer at 12 loose labels 6/7 71% installing Python 3.11: reusing the Python environment",
-            "looking closer at 12 loose labels 6/7 73% installing the pinned Python packages: packages already installed",
-            "looking closer at 12 loose labels 6/7 74% checking the Visual C++ runtime: not needed on macos",
             "looking closer at 12 loose labels 6/7 74% checking the auto-labeler",
             "looking closer at 12 loose labels 6/7 74% RF-DETR large COCO checkpoint",
             "looking closer at 12 loose labels 6/7 74% RF-DETR large COCO checkpoint 67 of 135 MB",
@@ -2199,7 +2241,9 @@ fn a_full_check_with_the_look_ends_as_it_did() {
             "writing the report 7/7 85% ",
             "writing the report 7/7 100% done",
         ]
+        .map(String::from),
     );
+    assert_eq!(shown, want);
 }
 
 #[test]

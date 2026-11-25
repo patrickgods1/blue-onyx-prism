@@ -173,10 +173,22 @@ fn hinted(n: usize) -> Source {
 
 /// The plan of every case as (name, sha256 of its JSON, its JSON).
 fn cases() -> Vec<(&'static str, Result<String, String>)> {
+    // The plan's text names a source by its folder (`pins/review` in a warning), which Windows
+    // displays with `\`: that one string is written the same on every OS, nothing else is
+    // touched (the plan itself is the same everywhere).
     let plan_of = |sources: &[Source], opts: &Options| -> Result<String, String> {
+        let same_everywhere = |mut text: String| {
+            for s in sources {
+                let shown = s.dir.display().to_string();
+                let json = serde_json::to_string(&shown).unwrap();
+                let json = json.trim_matches('"');
+                text = text.replace(json, &shown.replace('\\', "/"));
+            }
+            text
+        };
         plan(sources, opts)
-            .map(|p| serde_json::to_string(&p).unwrap())
-            .map_err(|e| format!("{e:#}"))
+            .map(|p| same_everywhere(serde_json::to_string(&p).unwrap()))
+            .map_err(|e| same_everywhere(format!("{e:#}")))
     };
     let base = Options::default();
     let mut out = Vec::new();
