@@ -5158,3 +5158,12 @@ phase-9 "Left open" items QA-139, QA-225 and the decode message are done; `bulkA
 `assets/review-bulk.js`. Corrections found while testing: a disabled account never reaches reauth (the session layer
 answers 401 first, pinned); `Manager::start(ManagerOptions::new(..))` is the real constructor the QA-151 tests use.
 `cargo doc` warnings: 240 (pre-existing private-link and HTML-tag kinds; the one new broken link was fixed).
+
+Tests: 3910 lib + 233 integration green with `BOP_REQUIRE_NODE=1 BOP_REQUIRE_PYTHON=1`; Python self-tests green.
+Shown failing with their fix reverted by the lead (one private copy, one mutation at a time): QA-251
+`a_reopened_log_counts_its_size_toward_the_cap`, QA-161 `abort_shares_one_deadline_across_hung_slots`, QA-275
+`join_within_reports_ended_stuck_or_running`, QA-150 `a_failed_lazy_load_is_not_tried_again_by_another_load`, QA-219
+`review_posts_refuse_bodies_over_the_small_limit`, QA-242 `every_bulk_route_that_writes_drops_the_refine_caches`, the
+decode message `a_frame_the_writer_cannot_decode_is_told_as_undecodable`, QA-263
+`a_failed_embedding_falls_back_to_dhash_and_a_cancel_still_cancels`. The agents showed QA-215, QA-261 and the JS
+drivers' mutants failing themselves (scratch copies of the assets or the old script).
