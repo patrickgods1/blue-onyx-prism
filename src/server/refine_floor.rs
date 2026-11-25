@@ -29,14 +29,17 @@
 //!   pending. A dry run counts what an apply on the unchanged folder does; at most `limit` frames
 //!   (500) are written per call.
 
-use super::refine::{fail, json_body, label_files_changed, recall_report};
+use super::answer::{json_body, json_fail};
+use super::refine::{label_files_changed, recall_report};
 use super::review::{push_failed, push_past_limit};
+use super::walk_cache::{WalkCache, wanted_key};
 use super::{AppState, blocking, save_config, training};
 use crate::collect::labels::SizeFloor;
 use crate::collect::labels::bulk;
 use crate::collect::labels::export::{self, FloorCounts};
 use crate::collect::labels::queue::{Filters, QueueSource};
 use crate::collect::labels::{MAX_FLOOR_INPUT, MAX_FLOOR_PX, MIN_FLOOR_INPUT, MIN_FLOOR_PX};
+#[cfg(test)]
 use crate::sync::LockExt;
 use crate::training::dataset::IgnoreMode;
 use crate::training::service::RunState;
@@ -49,8 +52,8 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Largest request body of the three POST routes.
 pub(super) const BODY_LIMIT: usize = 4 * 1024;
@@ -137,20 +140,18 @@ fn key_of(f: Option<SizeFloor>) -> String {
     f.map_or_else(|| "-".into(), |f| format!("{}@{}", f.px.to_bits(), f.input))
 }
 
-struct Kept {
-    at: Instant,
-    value: Arc<Computed>,
-}
-
 /// The walks' answers per folder, class list and floor (one per process, [`CACHE`]; a test makes
-/// its own, so other tests clearing the process's cannot touch it).
-struct Cache {
-    kept: Mutex<BTreeMap<String, Kept>>,
-    /// One walk at a time: a second caller waits and finds the first one's answer.
-    walking: Mutex<()>,
-    /// Bumped by [`Self::forget`] under `kept`'s lock: a walk that began before a drop answers
-    /// its caller and keeps nothing (it may have read the files before the change).
-    generation: std::sync::atomic::AtomicU64,
+/// its own, so other tests clearing the process's cannot touch it). No stamp: nothing outside the
+/// files and the key changes a floor's answer. Derefs to its [`WalkCache`] (`forget`, and what the
+/// tests look at).
+struct Cache(WalkCache<Arc<Computed>>);
+
+impl std::ops::Deref for Cache {
+    type Target = WalkCache<Arc<Computed>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 static CACHE: Cache = Cache::new();
@@ -168,18 +169,7 @@ pub(super) fn forgotten() -> u64 {
 
 impl Cache {
     const fn new() -> Self {
-        Self {
-            kept: Mutex::new(BTreeMap::new()),
-            walking: Mutex::new(()),
-            generation: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    fn forget(&self) {
-        let mut kept = self.kept.lock_recover();
-        self.generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        kept.clear();
+        Self(WalkCache::new(KEEP, KEEP_FOR, KEEP_FOR))
     }
 
     fn computed(
@@ -191,43 +181,14 @@ impl Cache {
         saved: Option<SizeFloor>,
     ) -> Arc<Computed> {
         let key = format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
-            dir.display(),
-            classes.join("\u{1e}"),
-            hidden.join("\u{1e}"),
+            "{}\u{1f}{}\u{1f}{}",
+            wanted_key(dir, classes, hidden),
             key_of(shown),
             key_of(saved)
         );
-        let fresh = |k: &Kept| k.at.elapsed() < KEEP_FOR;
-        if let Some(k) = self.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
-            return k.value.clone();
-        }
-        let _walking = self.walking.lock_recover();
-        if let Some(k) = self.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
-            return k.value.clone();
-        }
-        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
-        let value = Arc::new(compute(dir, classes, hidden, shown, saved));
-        let mut map = self.kept.lock_recover();
-        // A drop since the walk began: what it found may be the files before a change.
-        if self.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-            return value;
-        }
-        map.retain(|k, v| *k != key && v.at.elapsed() < KEEP_FOR);
-        while map.len() >= KEEP {
-            let Some(oldest) = map.iter().min_by_key(|(_, v)| v.at).map(|(k, _)| k.clone()) else {
-                break;
-            };
-            map.remove(&oldest);
-        }
-        map.insert(
-            key,
-            Kept {
-                at: Instant::now(),
-                value: value.clone(),
-            },
-        );
-        value
+        self.get_or_walk(key, "", || {
+            Arc::new(compute(dir, classes, hidden, shown, saved))
+        })
     }
 }
 
@@ -364,7 +325,7 @@ pub(super) async fn floor(
 ) -> Response {
     let asked = match floor_from_query(&q) {
         Ok(f) => f,
-        Err(m) => return fail(StatusCode::BAD_REQUEST, format!("Not previewed: {m}")),
+        Err(m) => return json_fail(StatusCode::BAD_REQUEST, format!("Not previewed: {m}")),
     };
     blocking(move || Json(floor_of(&state, asked)).into_response()).await
 }
@@ -394,19 +355,19 @@ pub(super) async fn size_floor(
 ) -> Response {
     let b: FloorBody = match json_body(&headers, body) {
         Ok(b) => b,
-        Err((status, message)) => return fail(status, message),
+        Err((status, message)) => return json_fail(status, message),
     };
     let new = match (b.off, b.px, b.input) {
         (true, None, None) => None,
         (false, Some(px), Some(input)) => {
             let f = SizeFloor { px, input };
             if let Err(e) = f.validate("collect.size_floor") {
-                return fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}"));
+                return json_fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}"));
             }
             Some(f)
         }
         _ => {
-            return fail(
+            return json_fail(
                 StatusCode::BAD_REQUEST,
                 "Not saved: send {\"px\": .., \"input\": ..} to set a floor or {\"off\": true} to \
                  turn it off, not both and not neither.",
@@ -428,7 +389,7 @@ pub(super) async fn size_floor(
                 }))
                 .into_response()
             }
-            Err(e) => fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
+            Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
         }
     })
     .await
@@ -450,7 +411,7 @@ pub(super) async fn ignore_mode(
 ) -> Response {
     let b: ModeBody = match json_body(&headers, body) {
         Ok(b) => b,
-        Err((status, message)) => return fail(status, message),
+        Err((status, message)) => return json_fail(status, message),
     };
     let mode = b.mode;
     blocking(move || {
@@ -465,7 +426,7 @@ pub(super) async fn ignore_mode(
                 "mode": mode.as_str(),
             }))
             .into_response(),
-            Err(e) => fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
+            Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
         }
     })
     .await
@@ -498,11 +459,11 @@ pub(super) async fn resolve_small(
 ) -> Response {
     let b: ResolveBody = match json_body(&headers, body) {
         Ok(b) => b,
-        Err((status, message)) => return fail(status, message),
+        Err((status, message)) => return json_fail(status, message),
     };
     let limit = b.limit.unwrap_or(RESOLVE_LIMIT);
     if !(1..=RESOLVE_LIMIT).contains(&limit) {
-        return fail(
+        return json_fail(
             StatusCode::BAD_REQUEST,
             format!("limit: must be between 1 and {RESOLVE_LIMIT}, got {limit}"),
         );
@@ -512,7 +473,7 @@ pub(super) async fn resolve_small(
         let config = state.config_read().clone();
         let saved = config.collect.size_floor;
         if saved.is_none() && !restore {
-            return fail(
+            return json_fail(
                 StatusCode::BAD_REQUEST,
                 "Not run: no size floor is saved. Set one in the Too small card and save it first.",
             );

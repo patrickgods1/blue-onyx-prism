@@ -44,13 +44,11 @@ fi
 bop_install_newsyslog
 
 # Settings that point the daemon at the data root, the log dir and the root-owned runtimes (a
-# runtime named by openvino_dir / onnxruntime_dir is user-managed: never downloaded or replaced).
-keys="  \"download_dir\": \"$DATA_DIR\",
-  \"cache_dir\": \"$DATA_DIR/cache\",
-  \"log_path\": \"$LOG_DIR\","
+# runtime named by openvino_dir / onnxruntime_dir is user-managed: never downloaded or replaced);
+# an install-dir config is carried over (bop_seed_config, bop_migrate_config).
+runtimes=""
 if [ -d "$INSTALL_DIR/openvino" ]; then
-  keys="$keys
-  \"openvino_dir\": \"$INSTALL_DIR/openvino\","
+  runtimes="  \"openvino_dir\": \"$INSTALL_DIR/openvino\","
 fi
 ort=""
 if [ -f "$INSTALL_DIR/onnxruntime/active.txt" ]; then
@@ -60,31 +58,10 @@ elif ls "$INSTALL_DIR"/onnxruntime/libonnxruntime*.dylib >/dev/null 2>&1; then
   ort="$INSTALL_DIR/onnxruntime"
 fi
 if [ -n "$ort" ]; then
-  keys="$keys
-  \"onnxruntime_dir\": \"$ort\","
+  runtimes="${runtimes:+$runtimes
+}  \"onnxruntime_dir\": \"$ort\","
 fi
-
-
-if [ ! -f "$CONFIG" ]; then
-  src=""
-  [ -f "$INSTALL_DIR/blue_onyx_prism_config.json" ] && src="$INSTALL_DIR/blue_onyx_prism_config.json"
-  if [ -n "$src" ] && grep -Eq '"download_dir"[[:space:]]*:[[:space:]]*"' "$src"; then
-    cp "$src" "$CONFIG"
-    echo "Copied $src to $CONFIG; it already sets download_dir: check that it points at $DATA_DIR."
-  elif [ -n "$src" ] && [ "$(head -n 1 "$src")" = "{" ]; then
-    # Pretty JSON as the service writes it: insert the keys after the opening brace.
-    bop_merge_keys "$keys" "$src" > "$CONFIG"
-    echo "Moved the config to $CONFIG (download_dir, cache_dir, log_path and runtime dirs added)."
-  elif [ -n "$src" ]; then
-    cp "$src" "$CONFIG"
-    echo "Copied $src to $CONFIG. Add these keys to it by hand:" >&2
-    echo "$keys" >&2
-  else
-    printf '{\n%s\n  "models_dir": "models"\n}\n' "$keys" > "$CONFIG"
-  fi
-fi
-chown "$SVC:$SVC" "$CONFIG"
-chmod 0640 "$CONFIG"
+bop_seed_config "$runtimes" "$INSTALL_DIR/blue_onyx_prism_config.json"
 
 # Pre-rename daemon (Blue Onyx OpenVINO): unload and remove it so the two don't fight over the port.
 OLD_PLIST="/Library/LaunchDaemons/com.blueonyx.openvino.plist"

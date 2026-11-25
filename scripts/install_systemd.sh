@@ -5,7 +5,8 @@
 # Layout: the program dir (binary, openvino/, onnxruntime/, scripts) stays owned by root and
 # read-only to the service; the service user `blueonyx` owns only the data root
 # /var/lib/blue-onyx-prism (config, models, cache, downloads, benchmark.json, tools/).
-# Shared steps live in scripts/systemd_common.sh (also used by the .deb / .rpm packages).
+# Shared steps live in scripts/systemd_common.sh (also used by the .deb / .rpm packages), which
+# sources scripts/install_common.sh from BOP_SCRIPTS.
 set -euo pipefail
 
 INSTALL_DIR="${1:-/opt/blue-onyx-prism}"
@@ -13,6 +14,8 @@ DATA_DIR=/var/lib/blue-onyx-prism
 CONFIG="$DATA_DIR/blue_onyx_prism_config.json"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_SRC="$HERE/deploy/blue-onyx-prism.service"
+# shellcheck disable=SC2034 # read by the sourced systemd_common.sh
+BOP_SCRIPTS="$HERE/scripts"
 # shellcheck source=systemd_common.sh
 . "$HERE/scripts/systemd_common.sh"
 

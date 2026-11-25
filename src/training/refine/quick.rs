@@ -56,6 +56,7 @@ use crate::resources::export::train::{self as env, TrainPaths};
 use crate::training::capability::{Accelerator, Capability};
 use crate::training::dataset::names;
 use crate::training::recipe::TrainRecipe;
+use crate::training::service::RunRecord;
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -194,13 +195,9 @@ pub fn odd_names_warning(n: usize, of: usize, l: &Located) -> String {
     )
 }
 
-/// `name` of the config's models, as the model names are compared ([`crate::registry::normalize_name`]).
+/// `name` of the config's models, as the model names are compared ([`Config::model`]).
 pub fn find_entry<'a>(config: &'a Config, name: &str) -> Option<&'a ModelConfig> {
-    let key = crate::registry::normalize_name(name);
-    config
-        .models
-        .iter()
-        .find(|m| crate::registry::normalize_name(&m.effective_name()) == key)
+    config.model(name)
 }
 
 /// The training record beside `m`'s model file.
@@ -238,21 +235,16 @@ fn plain(id: &str) -> bool {
 pub struct RunDirs(BTreeMap<String, PathBuf>);
 
 impl RunDirs {
-    /// `runs.json` of `config`'s training folder.
+    /// `runs.json` of `config`'s training folder ([`super::read_runs`]).
     pub fn read(config: &Config) -> Self {
-        let list = std::fs::read(super::super::runs_file(config))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Vec<serde_json::Value>>(&b).ok())
-            .unwrap_or_default();
+        Self::of(&super::read_runs(config))
+    }
+
+    /// The folders of the runs `runs` (the first record of an id counts).
+    pub fn of(runs: &[RunRecord]) -> Self {
         let mut out = BTreeMap::new();
-        for r in list {
-            if let (Some(id), Some(dir)) = (
-                r.get("id").and_then(serde_json::Value::as_str),
-                r.get("run_dir").and_then(serde_json::Value::as_str),
-            ) {
-                out.entry(id.to_string())
-                    .or_insert_with(|| PathBuf::from(dir));
-            }
+        for r in runs {
+            out.entry(r.id.clone()).or_insert_with(|| r.run_dir.clone());
         }
         Self(out)
     }

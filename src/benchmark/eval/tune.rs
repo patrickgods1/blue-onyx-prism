@@ -143,43 +143,23 @@ pub struct TuneView {
     pub elapsed_ms: f64,
 }
 
-/// The run of `model` to tune: on `device`, else the recommended device, else the first.
+/// The run of `model` to tune ([`StoredPreds::run_for`], the rule Search uses) and its result.
 fn pick_run<'a>(
     results: &'a BenchmarkResults,
     preds: &'a StoredPreds,
     model: &str,
     device: Option<&str>,
 ) -> Result<(&'a StoredRun, Option<&'a RunResult>)> {
-    let runs = preds.runs_of(model);
-    if runs.is_empty() {
+    if preds.runs_of(model).is_empty() {
         bail!("{model}: no stored predictions; run a benchmark of this model first");
     }
     let m = results.find(model);
-    let want = device.map(|d| {
-        crate::backend::spec::parse(d)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| d.to_string())
-    });
-    let run = match &want {
-        Some(d) => runs
-            .iter()
-            .find(|r| r.device == *d || crate::config::same_device(&r.device, d))
-            .copied()
-            .with_context(|| {
-                format!(
-                    "{model}: no stored predictions on {d} (stored: {})",
-                    runs.iter()
-                        .map(|r| r.device.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?,
-        None => m
-            .and_then(|m| m.recommended.as_deref())
-            .and_then(|d| runs.iter().find(|r| r.device == d).copied())
-            .or_else(|| runs.first().copied())
-            .context("no stored predictions")?,
-    };
+    let run = preds
+        .run_for(model, device, m.and_then(|m| m.recommended.as_deref()))
+        .map_err(|e| match e {
+            crate::benchmark::search::NoRun::Empty => anyhow::anyhow!("{e}"),
+            crate::benchmark::search::NoRun::NotOn { .. } => anyhow::anyhow!("{model}: {e}"),
+        })?;
     let rr = m
         .and_then(|m| m.devices.iter().find(|d| d.device == run.device))
         .and_then(|d| d.run.as_ref());

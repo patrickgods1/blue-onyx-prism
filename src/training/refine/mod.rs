@@ -59,6 +59,7 @@ use super::dataset::SceneFilter;
 use super::job::{TrainRequest, Workers};
 use super::progress::EpochPoint;
 use super::recipe::TrainRecipe;
+use super::service::{RunRecord, RunState};
 use crate::collect::labels::bulk::Wanted;
 use crate::collect::labels::export::{self, ClassFilter, ExportFrame, Selection, SplitConfig};
 use crate::collect::labels::statics;
@@ -285,26 +286,24 @@ impl RefineRequest {
     }
 }
 
-/// The recipe of the newest finished (Done) training run in the `runs.json` text `text`, by its
-/// `created` time; None when there is none or the file does not parse. Read only: `runs.json` is
-/// never written, moved or repaired here.
-pub fn newest_done_recipe(text: &str) -> Option<TrainRecipe> {
-    newest_done_run(text).map(|(r, _)| r)
+/// The training runs of `config`'s `runs.json`, read once per plan or preview: the records that
+/// parse ([`super::task::read_records`]: read only, `runs.json` is never written, moved or
+/// repaired here; a missing or damaged file is no runs).
+pub fn read_runs(config: &Config) -> Vec<RunRecord> {
+    super::task::read_records::<RunRecord>(&super::runs_file(config))
 }
 
-/// [`newest_done_recipe`] with the run's whole record (an entry of `runs.json`, as JSON).
-fn newest_done_run(text: &str) -> Option<(TrainRecipe, serde_json::Value)> {
-    let list: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
-    list.into_iter()
-        .filter(|r| r.get("state").and_then(serde_json::Value::as_str) == Some("done"))
-        .filter_map(|r| {
-            let created = r.get("created")?.as_str()?.to_string();
-            let recipe: TrainRecipe =
-                serde_json::from_value(r.get("request")?.get("recipe")?.clone()).ok()?;
-            Some((created, recipe, r))
-        })
-        .max_by(|a, b| a.0.cmp(&b.0))
-        .map(|(_, recipe, r)| (recipe, r))
+/// The recipe of the newest finished (Done) training run of `runs`, by its `created` time; None
+/// when there is none.
+pub fn newest_done_recipe(runs: &[RunRecord]) -> Option<TrainRecipe> {
+    newest_done_run(runs).map(|r| r.request.recipe.clone())
+}
+
+/// The record of [`newest_done_recipe`]'s run (the last of the newest on a tie).
+fn newest_done_run(runs: &[RunRecord]) -> Option<&RunRecord> {
+    runs.iter()
+        .filter(|r| r.state == RunState::Done)
+        .max_by(|a, b| a.created.cmp(&b.created))
 }
 
 /// The fold models' recipe ([`choose_recipe`]) and, when it is the newest finished run's, that
@@ -312,7 +311,7 @@ fn newest_done_run(text: &str) -> Option<(TrainRecipe, serde_json::Value)> {
 struct Chosen {
     recipe: TrainRecipe,
     from: String,
-    run: Option<serde_json::Value>,
+    run: Option<RunRecord>,
 }
 
 /// The fold models' recipe and where it came from: the newest finished training run's model, input
@@ -324,27 +323,27 @@ pub fn choose_recipe(
     epochs: u32,
     cap: &Capability,
 ) -> Result<(TrainRecipe, String)> {
-    let c = choose(config, epochs, cap)?;
+    let c = choose(&read_runs(config), epochs, cap)?;
     Ok((c.recipe, c.from))
 }
 
-/// [`choose_recipe`], keeping the run record the recipe came from.
-fn choose(config: &Config, epochs: u32, cap: &Capability) -> Result<Chosen> {
+/// [`choose_recipe`] from the runs `runs` ([`read_runs`]), keeping the run record the recipe came
+/// from.
+fn choose(runs: &[RunRecord], epochs: u32, cap: &Capability) -> Result<Chosen> {
     let usable =
         |r: &TrainRecipe| cap.family(r.family).is_none_or(|f| f.available) && r.validate().is_ok();
-    let previous = std::fs::read_to_string(super::runs_file(config))
-        .ok()
-        .and_then(|t| newest_done_run(&t))
-        .filter(|(p, _)| usable(p))
-        .and_then(|(p, run)| {
+    let previous = newest_done_run(runs)
+        .filter(|run| usable(&run.request.recipe))
+        .and_then(|run| {
+            let p = &run.request.recipe;
             let mut r = TrainRecipe::new(p.family, &p.size).ok()?;
             r.imgsz = p.imgsz;
             r.batch = p.batch;
             r.multi_scale = p.multi_scale;
-            r.base_weights = p.base_weights;
+            r.base_weights = p.base_weights.clone();
             Some((r, run))
         });
-    let run = previous.as_ref().map(|(_, run)| run.clone());
+    let run = previous.as_ref().map(|(_, run)| (*run).clone());
     let (mut r, from) = match previous.map(|(r, _)| r) {
         Some(r) => {
             let from = format!("the newest finished training run ({})", r.label());
@@ -392,12 +391,14 @@ impl Pace {
 
 /// The GPU the run record `run` trained on: `progress.settings.gpu`, else the name that starts its
 /// `device` (`NVIDIA GeForce GTX 1070 Ti (compute capability 6.1, ...)`).
-fn run_gpu(run: &serde_json::Value) -> Option<String> {
+fn run_gpu(run: &RunRecord) -> Option<String> {
     let settings = run
-        .pointer("/progress/settings/gpu")
-        .and_then(serde_json::Value::as_str);
+        .progress
+        .as_ref()
+        .and_then(|p| p.settings.as_ref())
+        .and_then(|s| s.gpu.as_deref());
     let device = || {
-        let d = run.get("device")?.as_str()?;
+        let d = run.device.as_str();
         Some(d.split_once(" (").map_or(d, |(name, _)| name))
     };
     settings
@@ -446,33 +447,24 @@ fn epoch_s_of(history: &[EpochPoint]) -> Option<f64> {
 /// `history` ([`epoch_s_of`]), else from the record (`progress.elapsed_s` over `progress.epoch`);
 /// the images of an epoch are `dataset.train_images` (repeats from balancing included) plus
 /// `dataset.valid_images`. None when anything is missing or not positive.
-pub fn pace_of(run: &serde_json::Value, history: &[EpochPoint], gpu: &str) -> Option<Pace> {
+pub fn pace_of(run: &RunRecord, history: &[EpochPoint], gpu: &str) -> Option<Pace> {
     if run_gpu(run).as_deref() != Some(gpu.trim()) {
         return None;
     }
     let epoch_s = epoch_s_of(history).or_else(|| {
-        let elapsed = run.pointer("/progress/elapsed_s")?.as_f64()?;
-        let epoch = run.pointer("/progress/epoch")?.as_u64()?;
-        (epoch > 0).then(|| elapsed / epoch as f64)
+        let p = run.progress.as_ref()?;
+        (p.epoch > 0).then(|| p.elapsed_s / f64::from(p.epoch))
     })?;
-    let images = run.pointer("/dataset/train_images")?.as_u64()?
-        + run
-            .pointer("/dataset/valid_images")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
+    let d = run.dataset.as_ref()?;
+    let images = d.train_images + d.valid_images;
     let s_per_image = epoch_s / images as f64;
     (images > 0 && s_per_image.is_finite() && s_per_image > 0.0).then_some(Pace { s_per_image })
 }
 
 /// [`pace_of`] of the run record `run`, its history read from `<run_dir>/history.jsonl` (read only).
-fn measured_pace(run: &serde_json::Value, gpu: &str) -> Option<Pace> {
-    let history = run
-        .get("run_dir")
-        .and_then(serde_json::Value::as_str)
-        .map(|d| {
-            super::service::history::read(&super::service::history::history_path(Path::new(d)))
-        })
-        .unwrap_or_default();
+fn measured_pace(run: &RunRecord, gpu: &str) -> Option<Pace> {
+    let history =
+        super::service::history::read(&super::service::history::history_path(&run.run_dir));
     pace_of(run, &history, gpu)
 }
 
@@ -688,27 +680,20 @@ pub fn weak_epochs_warning(family: TrainFamily, epochs: u32, open: usize) -> Str
 /// Most selection warnings kept in a report.
 const MAX_WARNINGS: usize = 20;
 
-/// Sort the export selection's warnings into `left_out` (the per-frame ones, by the wording of
-/// [`export::reviewed_frames_filtered`]) and the rest.
+/// The export selection's counts of what it left out into `left_out`, and the first
+/// [`MAX_WARNINGS`] of its warnings but those of the frames counted as pending or off the class
+/// list ([`Selection::other_warnings`]).
 fn sort_warnings(sel: &Selection, left_out: &mut LeftOut) -> Vec<String> {
-    let mut rest = Vec::new();
-    for w in &sel.warnings {
-        if w.ends_with("reviewed but has pending boxes; left out") {
-            left_out.pending += 1;
-        } else if w.contains("are not in the class list; left out") {
-            left_out.off_class_list += 1;
-        } else if w.ends_with("; left out") {
-            left_out.unreadable += 1;
-            if rest.len() < MAX_WARNINGS {
-                rest.push(w.clone());
-            }
-        } else if rest.len() < MAX_WARNINGS {
-            rest.push(w.clone());
-        }
-    }
+    left_out.pending = sel.pending;
+    left_out.off_class_list = sel.off_class_list;
+    left_out.unreadable = sel.unreadable_frames;
     left_out.lost = sel.lost_frames;
     left_out.unreadable_folders = sel.unreadable_folders;
-    rest
+    sel.other_warnings
+        .iter()
+        .take(MAX_WARNINGS)
+        .cloned()
+        .collect()
 }
 
 /// Training boxes per wanted class (the list's spelling) of `frames`, ignore regions left out: with
@@ -971,7 +956,7 @@ pub fn preview(
         recipe,
         from,
         run: recipe_run,
-    } = choose(config, request.epochs, cap)?;
+    } = choose(&read_runs(config), request.epochs, cap)?;
     let tighten = tighten_on(config, request);
     let (open_suggestions, open_tightens, open_frames) = s.open.for_check(tighten);
     // What a start asks about comes first.
@@ -1367,7 +1352,9 @@ pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) ->
             crate::resources::catalog::format_size(dl)
         );
     }
-    let (recipe, from) = choose_recipe(config, request.epochs, cap)?;
+    // `runs.json` once: the recipe's run and the past runs' worker counts.
+    let runs = read_runs(config);
+    let Chosen { recipe, from, .. } = choose(&runs, request.epochs, cap)?;
     let base = recipe.base()?;
     super::pyenv::check_large(&[(base, paths.weights_dir(base))], allow_large)?;
     // The closer look: on by default only when its weights are here; asked for, they come with
@@ -1406,10 +1393,7 @@ pub fn plan_refine(config: &Config, request: RefineRequest, cap: &Capability) ->
     train.run_dir = first;
     train.id = format!("{id}-fold1");
     // The folds are not recorded in `runs.json`, but learn their worker count from the runs that are.
-    train.past_runs = super::service::load_bare_records(&super::runs_file(config))
-        .into_iter()
-        .filter(|r| r.resources.is_some())
-        .collect();
+    train.past_runs = runs.into_iter().filter(|r| r.resources.is_some()).collect();
     Ok(RefineJob {
         dataset_dir: config.collect.resolved_review_dir(&config.data_root()),
         classes: config.collect.classes.clone(),
@@ -1486,22 +1470,32 @@ mod tests {
             r
         };
         let runs = serde_json::json!([
-            {"id": "a", "created": "2026-10-01T00:00:00Z", "state": "done",
-             "request": {"recipe": rec(TrainFamily::Yolo26, "n", 640, 8)}},
-            {"id": "b", "created": "2026-10-05T00:00:00Z", "state": "done",
-             "request": {"recipe": rec(TrainFamily::Rfdetr, "small", 448, 2)}},
-            {"id": "c", "created": "2026-10-09T00:00:00Z", "state": "failed",
-             "request": {"recipe": rec(TrainFamily::Yolo11, "s", 640, 8)}},
-            {"id": "d", "created": "2026-10-08T00:00:00Z", "state": "done",
-             "request": {"recipe": "broken"}}
+            record(
+                "a",
+                "2026-10-01T00:00:00Z",
+                "done",
+                rec(TrainFamily::Yolo26, "n", 640, 8)
+            ),
+            record(
+                "b",
+                "2026-10-05T00:00:00Z",
+                "done",
+                rec(TrainFamily::Rfdetr, "small", 448, 2)
+            ),
+            record(
+                "c",
+                "2026-10-09T00:00:00Z",
+                "failed",
+                rec(TrainFamily::Yolo11, "s", 640, 8)
+            ),
+            record("d", "2026-10-08T00:00:00Z", "done", "broken")
         ]);
-        let r = newest_done_recipe(&runs.to_string()).unwrap();
+        let r = newest_done_recipe(&records(&runs)).unwrap();
         assert_eq!(
             (r.family, r.size.as_str(), r.imgsz, r.batch),
             (TrainFamily::Rfdetr, "small", 448, 2)
         );
-        assert!(newest_done_recipe("not json").is_none());
-        assert!(newest_done_recipe("[]").is_none());
+        assert!(newest_done_recipe(&[]).is_none());
         // On a config: no runs.json -> RF-DETR nano; with one -> its model, input and batch, the
         // check's epochs and no early stopping.
         let root = std::env::temp_dir().join(format!("bop-refine-recipe-{}", uuid::Uuid::new_v4()));
@@ -1530,7 +1524,43 @@ mod tests {
         assert_eq!((r.imgsz, r.batch, r.epochs, r.patience), (448, 2, 3, 0));
         assert!(from.contains("rfdetr-small"), "{from}");
         assert_eq!(std::fs::read(&runs_file).unwrap(), before, "read only");
+        // A runs.json that does not parse is no runs, and stays as it is.
+        std::fs::write(&runs_file, "not json").unwrap();
+        assert!(read_runs(&c).is_empty());
+        let (r, _) = choose_recipe(&c, 3, &cap).unwrap();
+        assert_eq!(r.label(), "rfdetr-nano");
+        assert_eq!(std::fs::read(&runs_file).unwrap(), b"not json");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `runs.json` entry of run `id` with `recipe` (a value that does not parse as one makes the
+    /// whole record unreadable).
+    fn record(
+        id: &str,
+        created: &str,
+        state: &str,
+        recipe: impl serde::Serialize,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": id, "created": created, "state": state,
+            "request": {"recipe": recipe, "datasets": []},
+            "device": "cuda", "stage": null, "step": 0, "steps": 0, "percent": 0, "detail": "",
+            "run_dir": ""
+        })
+    }
+
+    /// The records of the `runs.json` list `runs` that parse, as [`read_runs`] reads them.
+    fn records(runs: &serde_json::Value) -> Vec<RunRecord> {
+        runs.as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| serde_json::from_value(r.clone()).ok())
+            .collect()
+    }
+
+    /// One `runs.json` entry as [`read_runs`] reads it.
+    fn typed(run: &serde_json::Value) -> RunRecord {
+        serde_json::from_value(run.clone()).unwrap()
     }
 
     const GTX: &str = "NVIDIA GeForce GTX 1070 Ti";
@@ -1549,20 +1579,21 @@ mod tests {
             "id": "20261111-020504-2fff",
             "name": "rfdetr-nano-s2",
             "created": "2026-11-11T02:05:06Z",
-            "request": {"recipe": recipe},
+            "request": {"recipe": recipe, "datasets": []},
             "device": format!("{GTX} (compute capability 6.1, 7 GB, PyTorch cu126)"),
-            "state": "done",
+            "state": "done", "stage": null, "step": 8, "steps": 8, "percent": 100, "detail": "",
             "progress": {
                 "device": "cuda:0", "epoch": 51, "epochs": 100, "batch": 168, "batches": 168,
                 "elapsed_s": 7707.1700769, "eta_s": null, "phase": "export", "history": [],
                 "best": {"metric": "f2", "epoch": 34, "value": 0.67},
                 "batch_size": 8, "imgsz": 384,
-                "settings": {"lr_schedule": "cosine", "select_metric": "f2", "epochs": 100,
-                             "patience": 10, "batch": 8, "workers": 0, "seed": 1,
+                "settings": {"lr_schedule": "cosine", "lr_min_factor": 0.01,
+                             "select_metric": "f2", "epochs": 100, "patience": 10,
+                             "patience_doubled": false, "batch": 8, "workers": 0, "seed": 1,
                              "scene": "all", "gpu": GTX}
             },
             "dataset": {"classes": ["person", "car"], "train_images": 1331, "train_frames": 564,
-                        "valid_images": 83, "heldout_images": 169},
+                        "valid_images": 83, "heldout_images": 169, "warnings": []},
             "finished": "2026-11-11T06:20:49Z",
             "run_dir": run_dir
         })
@@ -1585,10 +1616,10 @@ mod tests {
         let run = real_run("");
         let images = 1331.0 + 83.0;
         // From the history: the median epoch, untouched by an hour's pause or the first epoch.
-        let p = pace_of(&run, &rows(51, 150.45, 3600.0), GTX).unwrap();
+        let p = pace_of(&typed(&run), &rows(51, 150.45, 3600.0), GTX).unwrap();
         assert!((p.s_per_image - 150.45 / images).abs() < 1e-9, "{p:?}");
         // Without a history: the record's elapsed time over its epochs (pause and all).
-        let p = pace_of(&run, &[], GTX).unwrap();
+        let p = pace_of(&typed(&run), &[], GTX).unwrap();
         assert!(
             (p.s_per_image - 7_707.170_076_9 / 51.0 / images).abs() < 1e-9,
             "{p:?}"
@@ -1599,29 +1630,29 @@ mod tests {
             elapsed_s: 600.0,
             metrics: BTreeMap::new(),
         }];
-        let p = pace_of(&run, &one, GTX).unwrap();
+        let p = pace_of(&typed(&run), &one, GTX).unwrap();
         assert!((p.s_per_image - 150.0 / images).abs() < 1e-9);
         // Another GPU, or none named: nothing measured here.
-        assert!(pace_of(&run, &[], "NVIDIA GeForce RTX 3060").is_none());
+        assert!(pace_of(&typed(&run), &[], "NVIDIA GeForce RTX 3060").is_none());
         let mut nameless = run.clone();
         nameless["progress"]["settings"]["gpu"] = serde_json::Value::Null;
-        nameless["device"] = serde_json::Value::Null;
-        assert!(pace_of(&nameless, &[], GTX).is_none());
+        nameless["device"] = "".into();
+        assert!(pace_of(&typed(&nameless), &[], GTX).is_none());
         // The device names the GPU when the settings do not (records before RunSettings).
         let mut old = run.clone();
         old["progress"].as_object_mut().unwrap().remove("settings");
-        assert!(pace_of(&old, &[], GTX).is_some());
+        assert!(pace_of(&typed(&old), &[], GTX).is_some());
         // No epoch, no images: none.
         let mut fresh = run.clone();
         fresh["progress"]["epoch"] = 0.into();
-        assert!(pace_of(&fresh, &[], GTX).is_none());
+        assert!(pace_of(&typed(&fresh), &[], GTX).is_none());
         let mut empty = run.clone();
         empty["dataset"]["train_images"] = 0.into();
         empty["dataset"]["valid_images"] = 0.into();
-        assert!(pace_of(&empty, &rows(51, 150.45, 0.0), GTX).is_none());
+        assert!(pace_of(&typed(&empty), &rows(51, 150.45, 0.0), GTX).is_none());
         let mut no_dataset = run;
         no_dataset.as_object_mut().unwrap().remove("dataset");
-        assert!(pace_of(&no_dataset, &[], GTX).is_none());
+        assert!(pace_of(&typed(&no_dataset), &[], GTX).is_none());
     }
 
     #[test]
@@ -1631,7 +1662,7 @@ mod tests {
         let held = [213_usize, 213, 213, 212];
         let train: Vec<usize> = held.iter().map(|h| 851 - h).collect();
         assert_eq!(train.iter().sum::<usize>(), 3 * 851);
-        let pace = pace_of(&real_run(""), &rows(51, 150.45, 0.0), GTX).unwrap();
+        let pace = pace_of(&typed(&real_run("")), &rows(51, 150.45, 0.0), GTX).unwrap();
         let none = |_: usize| -> Option<f64> { panic!("the guess is not used with a pace") };
         let s = check_seconds(&train, 8, Some(pace), none);
         let want = 150.45 / 1414.0 * 2553.0 * 8.0 + 4.0 * FOLD_OVERHEAD_S;
@@ -1677,7 +1708,7 @@ mod tests {
         let runs_file = super::super::runs_file(&c);
         std::fs::create_dir_all(runs_file.parent().unwrap()).unwrap();
         std::fs::write(&runs_file, serde_json::json!([run]).to_string()).unwrap();
-        let chosen = choose(&c, 8, &cap).unwrap();
+        let chosen = choose(&read_runs(&c), 8, &cap).unwrap();
         assert_eq!(chosen.recipe.label(), "rfdetr-nano");
         let pace = measured_pace(chosen.run.as_ref().unwrap(), gpu.name()).unwrap();
         assert!(

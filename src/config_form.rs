@@ -474,15 +474,9 @@ pub fn apply_models_selection(
     enabled: &[String],
     default: Option<&str>,
 ) -> Result<()> {
-    use crate::registry::normalize_name;
     use anyhow::bail;
     let mut c = config.clone();
-    let index_of = |name: &str| {
-        let key = normalize_name(name);
-        c.models
-            .iter()
-            .position(|m| normalize_name(&m.effective_name()) == key)
-    };
+    let index_of = |name: &str| c.model_index(name);
     let mut on = vec![false; c.models.len()];
     for name in enabled {
         match index_of(name).and_then(|i| on.get_mut(i)) {
@@ -540,16 +534,10 @@ pub fn apply_model_devices(
     config: &mut Config,
     devices: &[(String, Option<String>)],
 ) -> Result<Vec<DeviceChange>> {
-    use crate::registry::normalize_name;
     let mut c = config.clone();
     let mut changes = Vec::new();
     for (name, device) in devices {
-        let key = normalize_name(name);
-        let Some(m) = c
-            .models
-            .iter_mut()
-            .find(|m| normalize_name(&m.effective_name()) == key)
-        else {
+        let Some(m) = c.model_mut(name) else {
             anyhow::bail!("'{name}' is not one of the configured models");
         };
         let device = device
@@ -610,7 +598,6 @@ pub fn apply_model_thresholds(
     config: &mut Config,
     thresholds: &[(String, f32)],
 ) -> Result<Vec<ThresholdChange>> {
-    use crate::registry::normalize_name;
     let mut c = config.clone();
     let global = c.confidence_threshold;
     let mut changes = Vec::new();
@@ -622,12 +609,7 @@ pub fn apply_model_thresholds(
         if *t <= 0.0 {
             anyhow::bail!("model '{name}': confidence threshold rounds to 0");
         }
-        let key = normalize_name(name);
-        let Some(m) = c
-            .models
-            .iter_mut()
-            .find(|m| normalize_name(&m.effective_name()) == key)
-        else {
+        let Some(m) = c.model_mut(name) else {
             anyhow::bail!("'{name}' is not one of the configured models");
         };
         let effective = m.confidence_threshold.unwrap_or(global);
@@ -688,7 +670,6 @@ pub fn apply_device_thresholds(
     entries: &[(String, String, Option<f32>)],
 ) -> Result<Vec<ProfileChange>> {
     use crate::config::{device_threshold_key, lookup_device_threshold, same_device};
-    use crate::registry::normalize_name;
     let mut c = config.clone();
     // (model index, canonical device) in first-touched order.
     let mut touched: Vec<(usize, String)> = Vec::new();
@@ -706,12 +687,9 @@ pub fn apply_device_thresholds(
             }
             None => None,
         };
-        let wanted = normalize_name(name);
         let Some((i, m)) = c
-            .models
-            .iter_mut()
-            .enumerate()
-            .find(|(_, m)| normalize_name(&m.effective_name()) == wanted)
+            .model_index(name)
+            .and_then(|i| Some((i, c.models.get_mut(i)?)))
         else {
             anyhow::bail!("'{name}' is not one of the configured models");
         };

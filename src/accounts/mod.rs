@@ -48,6 +48,7 @@ pub mod setup;
 
 pub use process::Auth;
 
+use crate::sync::LockExt as _;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -591,7 +592,7 @@ impl Cached {
                 )));
             }
         };
-        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = self.slot.lock_recover();
         if let Some((s, snap)) = slot.as_ref()
             && *s == stamp
         {
@@ -608,7 +609,7 @@ impl Cached {
 
     /// Forget what was read, so the next [`Self::get`] reads the file.
     pub fn invalidate(&self) {
-        *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.slot.lock_recover() = None;
     }
 }
 

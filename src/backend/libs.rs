@@ -83,7 +83,7 @@ static LOADED_OPENVINO_C: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// The `openvino_c` library this process loaded: the explicit path from
 /// [`prepare_environment`], else what the finder's environment search sees.
 pub fn loaded_openvino_c() -> Option<PathBuf> {
-    let loaded = LOADED_OPENVINO_C.lock().ok().and_then(|g| g.clone());
+    let loaded = LOADED_OPENVINO_C.lock_recover().clone();
     loaded.or_else(|| find_openvino_c(&mut Vec::new()))
 }
 
@@ -92,9 +92,7 @@ static NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn note(s: String) {
     tracing::debug!("{s}");
-    if let Ok(mut n) = NOTES.lock() {
-        n.push(s);
-    }
+    NOTES.lock_recover().push(s);
 }
 
 /// Set when `OPENVINO_INSTALL_DIR` overrides the configured `openvino_dir` or the bundled
@@ -143,9 +141,7 @@ fn install_dir_override_warning(
 /// `OPENVINO_INSTALL_DIR` is left untouched.
 pub fn prepare_environment(explicit: Option<&Path>) {
     harden_dll_search();
-    if let Ok(mut n) = NOTES.lock() {
-        n.clear();
-    }
+    NOTES.lock_recover().clear();
     *OVERRIDE_WARNING.lock_recover() = None;
     // Before OpenVINO loads: cap oneDNN's ISA on Windows CPUs whose AMX path faults (decided once).
     if let Some(n) = super::cpu_isa::apply() {
@@ -229,9 +225,8 @@ pub fn prepare_environment(explicit: Option<&Path>) {
                 match openvino_sys::library::load_from(&lib) {
                     Ok(()) => {
                         note(format!("loaded {}", lib.display()));
-                        if let Ok(mut g) = LOADED_OPENVINO_C.lock()
-                            && g.is_none()
-                        {
+                        let mut g = LOADED_OPENVINO_C.lock_recover();
+                        if g.is_none() {
                             *g = Some(lib.clone());
                         }
                     }
@@ -337,9 +332,7 @@ static PRELOADED: Mutex<Vec<libloading::os::unix::Library>> = Mutex::new(Vec::ne
 #[cfg(unix)]
 fn preload_dependencies(install_dir: &Path) {
     use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
-    let Ok(mut loaded) = PRELOADED.lock() else {
-        return;
-    };
+    let mut loaded = PRELOADED.lock_recover();
     if !loaded.is_empty() {
         return;
     }
@@ -603,7 +596,7 @@ fn find_openvino_c(checked: &mut Vec<String>) -> Option<PathBuf> {
 pub(crate) fn diagnostics() -> String {
     let mut checked = Vec::new();
     let found = find_openvino_c(&mut checked);
-    let notes = NOTES.lock().map(|n| n.clone()).unwrap_or_default();
+    let notes = NOTES.lock_recover().clone();
     let mut s = format!(
         "OpenVINO runtime lookup for {}: checked {}.",
         openvino_c_file_name(),
@@ -1337,7 +1330,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn preload_plan_orders_tbb_then_openvino() {
-        let root = std::env::temp_dir().join(format!("bo_libs_{}", std::process::id()));
+        let root = crate::test_dirs::TempDir::new("libs");
         let lib = root.join(if cfg!(target_os = "macos") {
             "runtime/lib/arm64/Release"
         } else {
@@ -1362,7 +1355,6 @@ mod tests {
         // Without openvino_c the dir is not an install dir.
         std::fs::remove_file(lib.join(ovc)).unwrap();
         assert!(preload_plan(&root).is_empty());
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1419,7 +1411,7 @@ mod tests {
 
     #[test]
     fn onnxruntime_lookup_order() {
-        let root = std::env::temp_dir().join(format!("bop_ortlib_{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dirs::TempDir::unmade("ortlib");
         let (a, b, c) = (root.join("a"), root.join("b"), root.join("c"));
         for d in [&a, &b, &c] {
             std::fs::create_dir_all(d).unwrap();
@@ -1461,14 +1453,13 @@ mod tests {
         assert_eq!(read_ort_flavor(&c).as_deref(), Some("coreml"));
         assert_eq!(read_ort_flavor(&a), None);
         assert!(default_onnxruntime_dir().ends_with(ORT_DIR_NAME));
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// S2: the config's `onnxruntime_dir` must be a folder; only `ORT_DYLIB_PATH`, which the
     /// web UI cannot touch, may name a file.
     #[test]
     fn onnxruntime_dir_in_the_config_refuses_a_file() {
-        let root = std::env::temp_dir().join(format!("bop_ortfile_{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dirs::TempDir::unmade("ortfile");
         let (a, b) = (root.join("a"), root.join("b"));
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
@@ -1495,7 +1486,6 @@ mod tests {
         );
         let r = find_onnxruntime_from(None, Some(&file), &root.join("empty"));
         assert_eq!(r.library, Some(file.clone()));
-        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1627,16 +1617,14 @@ mod tests {
 
     #[test]
     fn cuda_preload_of_an_empty_dir_reports_nothing() {
-        let dir = std::env::temp_dir().join(format!("bop_cudalibs_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dirs::TempDir::new("cudalibs");
         let r = preload_cuda_libs(&dir);
         assert!(r.loaded.is_empty() && r.failed.is_empty(), "{r:?}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn per_flavor_dirs_and_active_file() {
-        let root = std::env::temp_dir().join(format!("bop_ortflv_{}", uuid::Uuid::new_v4()));
+        let root = crate::test_dirs::TempDir::unmade("ortflv");
         let lib = ort_library_file_name();
         for f in ["cpu", "cuda"] {
             std::fs::create_dir_all(root.join(f)).unwrap();
@@ -1678,6 +1666,5 @@ mod tests {
         );
         std::fs::write(root.join(ORT_ACTIVE_FILE), "nonsense").unwrap();
         assert_eq!(read_active_flavor(&root), None);
-        std::fs::remove_dir_all(&root).ok();
     }
 }

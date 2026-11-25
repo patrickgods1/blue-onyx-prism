@@ -10,6 +10,7 @@
 //! makes a missing `node` a failure: a skip must not read as a pass there.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+use crate::js_harness::{asset, have_node, run_node_json};
 use blue_onyx_prism::collect::labels::bulk::Wanted;
 use blue_onyx_prism::collect::labels::overlaps::{self, Suggestion, Verdict};
 use blue_onyx_prism::collect::labels::{
@@ -19,8 +20,6 @@ use blue_onyx_prism::collect::labels::{
 use blue_onyx_prism::model::coco;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::Command;
 
 /// The frame's rules run in Node; prints one JSON answer per request. `process.argv`: this script,
 /// the rules file, the request file.
@@ -95,26 +94,6 @@ console.log(JSON.stringify({
 }));
 "#;
 
-/// Whether `node` runs here. Missing: a skip, or with `BOP_REQUIRE_NODE=1` a failure.
-fn have_node() -> bool {
-    let ok = Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
-            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
-        );
-        println!("skipped: no node");
-    }
-    ok
-}
-
-fn rules_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/review-rules.js")
-}
-
 /// Run [`DRIVER`] on `request`, in a folder of its own, and read its answer.
 fn node(request: &Value) -> Value {
     node_with(DRIVER, request)
@@ -122,25 +101,11 @@ fn node(request: &Value) -> Value {
 
 /// Run `driver` on `request`, in a folder of its own, and read its answer.
 fn node_with(driver_js: &str, request: &Value) -> Value {
-    let dir = std::env::temp_dir().join(format!("bop-js-rules-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (driver, cases) = (dir.join("driver.js"), dir.join("request.json"));
-    std::fs::write(&driver, driver_js).unwrap();
-    std::fs::write(&cases, serde_json::to_vec(request).unwrap()).unwrap();
-    let out = Command::new("node")
-        .arg(&driver)
-        .arg(rules_path())
-        .arg(&cases)
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "node failed ({}): {}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).unwrap()
+    run_node_json(
+        driver_js,
+        &[asset("review-rules.js").as_os_str()],
+        &[("request.json", &serde_json::to_vec(request).unwrap())],
+    )
 }
 
 /// xorshift64*: the generator's frames are the same on every run and OS.
@@ -1694,7 +1659,7 @@ fn the_page_loads_the_rules_first_and_they_touch_no_page() {
         page.find("/static/review.js?v=").unwrap(),
     );
     assert!(rules < own, "review.js reads ReviewRules when it starts");
-    let js = std::fs::read_to_string(rules_path()).unwrap();
+    let js = std::fs::read_to_string(asset("review-rules.js")).unwrap();
     for word in [
         "document",
         "window",
@@ -1938,7 +1903,7 @@ process.stdout.write(JSON.stringify({
   measured_old: F.measuredWith({ recipe: { imgsz: 384 } }),
 }));
 "#;
-    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let refine = asset("train-refine.js");
     let got = node_with(driver, &json!({"refine": refine}));
     assert_eq!(
         got["all"],
@@ -2045,7 +2010,7 @@ process.stdout.write(JSON.stringify({
   other_none: F.otherLine(null, 'W'),
 }));
 "#;
-    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let refine = asset("train-refine.js");
     let got = node_with(driver, &json!({"refine": refine}));
     assert_eq!(
         got["quick_line"],
@@ -2129,7 +2094,7 @@ process.stdout.write(JSON.stringify({
   earlier: F.looseLine({ loose: 12, found: { add: 2, verify: 1, relabel: 0 } }),
 }));
 "#;
-    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let refine = asset("train-refine.js");
     let got = node_with(driver, &json!({"refine": refine}));
     assert_eq!(
         got["looked"],
@@ -2168,7 +2133,7 @@ process.stdout.write(JSON.stringify({
   none: F.missesLine(null),
 }));
 "#;
-    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let refine = asset("train-refine.js");
     let got = node_with(driver, &json!({"refine": refine}));
     let line = "The check finds some errors, not all: small, dark or partly hidden objects most \
                 often slip past it.";
@@ -2221,7 +2186,7 @@ process.stdout.write(JSON.stringify({
   quick: F.thinRecallNote(quick),
 }));
 "#;
-    let refine = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-refine.js");
+    let refine = asset("train-refine.js");
     let got = node_with(driver, &json!({"refine": refine}));
     assert_eq!(got["consts"], json!([20, 20, 0.7, 0.9]));
     for k in ["fine", "edge20"] {
@@ -2325,7 +2290,7 @@ process.stdout.write(JSON.stringify({
   nothing: L(null),
 }));
 "#;
-    let dataset = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-dataset.js");
+    let dataset = asset("train-dataset.js");
     let got = node_with(driver, &json!({"dataset": dataset}));
     assert_eq!(
         got["many"],
@@ -2373,7 +2338,7 @@ process.stdout.write(JSON.stringify({
   absent: L(undefined),
 }));
 "#;
-    let dataset = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-dataset.js");
+    let dataset = asset("train-dataset.js");
     let got = node_with(driver, &json!({"dataset": dataset}));
     assert_eq!(
         got["added"],

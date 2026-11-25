@@ -38,6 +38,7 @@ pub mod xany;
 
 use super::layout::{self, Rel};
 use super::record::Record;
+use crate::sync::LockExt as _;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -1535,7 +1536,7 @@ fn lock_path(path: &Path) -> PathBuf {
 
 /// Remember that `lock` failed; true the first time since a lock last worked there.
 fn folder_lock_failed(lock: &Path) -> bool {
-    let mut failed = NO_FOLDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut failed = NO_FOLDER_LOCK.lock_recover();
     failed.insert(lock.to_path_buf(), Instant::now()).is_none()
 }
 
@@ -1574,7 +1575,7 @@ fn open_lock(lock: &Path) -> std::io::Result<std::fs::File> {
 fn folder_lock(path: &Path, wait: Duration) -> Option<std::fs::File> {
     let lock = lock_path(path);
     {
-        let failed = NO_FOLDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let failed = NO_FOLDER_LOCK.lock_recover();
         if failed.get(&lock).is_some_and(|t| t.elapsed() < LOCK_RETRY) {
             return None;
         }
@@ -1588,7 +1589,7 @@ fn folder_lock(path: &Path, wait: Duration) -> Option<std::fs::File> {
             return None;
         }
     };
-    let long_held = || LONG_HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let long_held = || LONG_HELD.lock_recover();
     let wait = if long_held().contains(&lock) {
         wait.min(HELD_WAIT)
     } else {
@@ -1619,17 +1620,14 @@ fn folder_lock(path: &Path, wait: Duration) -> Option<std::fs::File> {
         }
     }
     long_held().remove(&lock);
-    NO_FOLDER_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&lock);
+    NO_FOLDER_LOCK.lock_recover().remove(&lock);
     Some(file)
 }
 
 /// The label write lock for the file at `path`: [`WRITE_LOCK`], then the lock of its dataset
 /// folder. Held around one read-modify-rename only, never across a job.
 fn write_lock(path: &Path) -> WriteGuard {
-    let process = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let process = WRITE_LOCK.lock_recover();
     WriteGuard {
         folder: folder_lock(path, LOCK_WAIT),
         _process: process,
@@ -3319,12 +3317,7 @@ mod tests {
         let held = std::fs::File::create(dir.join(".labels.lock")).unwrap();
         fs4::FileExt::try_lock(&held).unwrap();
         assert!(folder_lock(&path, Duration::from_millis(20)).is_none());
-        let listed = |p: &Path| {
-            NO_FOLDER_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains_key(&lock_path(p))
-        };
+        let listed = |p: &Path| NO_FOLDER_LOCK.lock_recover().contains_key(&lock_path(p));
         assert!(!listed(&path), "a busy lock was given up on");
         fs4::FileExt::unlock(&held).unwrap();
         assert!(folder_lock(&path, Duration::from_secs(5)).is_some());
@@ -3426,7 +3419,7 @@ mod tests {
             for _ in 0..5000 {
                 let guard = WriteGuard {
                     folder: folder_lock(&path, Duration::ZERO),
-                    _process: WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+                    _process: WRITE_LOCK.lock_recover(),
                 };
                 if guard.folder.is_none() {
                     held += 1;

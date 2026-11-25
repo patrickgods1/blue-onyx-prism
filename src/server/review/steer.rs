@@ -43,6 +43,7 @@ use crate::collect::labels::need::Steer;
 use crate::collect::labels::recall::Measured;
 use crate::collect::labels::statics;
 use crate::server::AppState;
+use crate::server::walk_cache::wanted_key;
 use crate::sync::LockExt;
 use crate::training::service::RunRecord;
 use std::collections::{BTreeSet, HashMap};
@@ -157,6 +158,7 @@ impl Slots {
     /// Forget the tables of the folder `dir` ([`forget_spots`]).
     fn forget(&mut self, dir: &Path) {
         self.epoch = self.epoch.wrapping_add(1);
+        // Every key of the folder starts so ([`wanted_key`]).
         let prefix = format!("{}\u{1f}", dir.display());
         for (key, slot) in &mut self.slots {
             if key.starts_with(&prefix) {
@@ -374,12 +376,7 @@ fn job_of(dir: &Path, classes: &[String], hidden: &[String]) -> Job {
     let wanted = (classes.to_vec(), hidden.to_vec());
     let stamp = crate::collect::labels::index::rows_version(dir, Some(&wanted));
     Job {
-        key: format!(
-            "{}\u{1f}{}\u{1f}{}",
-            dir.display(),
-            classes.join("\u{1e}"),
-            hidden.join("\u{1e}")
-        ),
+        key: wanted_key(dir, classes, hidden),
         stamp,
         dir: dir.to_path_buf(),
         classes: wanted.0,
@@ -465,7 +462,9 @@ pub fn recall(state: &AppState) -> Option<Arc<Measured>> {
     })
 }
 
-/// The key of `path` now; None when it cannot be read (missing).
+/// The key of `path` now; None when it cannot be read (missing). Unlike
+/// [`crate::benchmark::search::file_stamp`] it needs a regular file, and an unreadable one is
+/// missing: no `runs.json` to read is no recall, whichever the reason.
 fn key_of(path: &Path) -> Option<Key> {
     let m = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
     Some(Key {

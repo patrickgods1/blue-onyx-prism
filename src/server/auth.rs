@@ -31,6 +31,7 @@
 //! No password, hash, token, session or device id or setup code is in a log line, an answer or an
 //! error; an unknown name that was typed is never logged or repeated.
 
+use super::answer::json_error;
 use super::guard;
 use super::{AppState, blocking, encode_uri_component, render, wants_html};
 use crate::accounts::lockout::Decision;
@@ -549,13 +550,7 @@ fn login_url(method: &Method, uri: &Uri, headers: &HeaderMap) -> String {
 
 /// `status` with the JSON shape of the other refusals.
 pub(super) fn json_refusal(status: StatusCode, message: &str) -> Response {
-    no_store(
-        (
-            status,
-            Json(serde_json::json!({ "success": false, "message": message, "error": message })),
-        )
-            .into_response(),
-    )
+    no_store(json_error(status, message))
 }
 
 pub(super) fn with_retry_after(mut resp: Response, secs: u64) -> Response {

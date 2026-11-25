@@ -231,10 +231,9 @@ pub fn drop_config_entries(config: &mut Config, names: &[String]) -> Vec<String>
         .collect();
     let mut dropped = Vec::new();
     config.models.retain(|m| {
-        let name = m.effective_name();
-        let go = !m.enabled && wanted.contains(&crate::registry::normalize_name(&name));
+        let go = !m.enabled && wanted.contains(&m.key());
         if go {
-            dropped.push(name);
+            dropped.push(m.effective_name());
         }
         !go
     });
@@ -371,12 +370,7 @@ fn entry_files(
 /// Remove the config entry `name` (the Models card's Remove): only a disabled entry. Its files
 /// are deleted by [`EntryRemoved::delete_files`] once the config is saved.
 pub fn remove_config_entry(config: &mut Config, name: &str) -> Result<EntryRemoved, ActionError> {
-    let norm = crate::registry::normalize_name(name.trim());
-    let Some(m) = config
-        .models
-        .iter()
-        .find(|m| crate::registry::normalize_name(&m.effective_name()) == norm)
-    else {
+    let Some(m) = config.model(name.trim()) else {
         return Err(ActionError::NotFound(format!(
             "no model named '{}' in the config; reload the page",
             name.trim()
@@ -548,7 +542,7 @@ pub fn add_to_config(
         )));
     }
     let files: Vec<PathBuf> = res.parts.iter().map(|p| dir.join(p.file_name)).collect();
-    let mut models = crate::download::model_configs_for(&files, config);
+    let mut models = crate::download::model_configs(&files, config);
     if models.is_empty()
         && let catalog::Provides::Model { name, family } = res.provides
     {
@@ -556,11 +550,7 @@ pub fn add_to_config(
         let Some(first) = files.first() else {
             return Err(ActionError::Conflict(format!("{} has no files", res.title)));
         };
-        let rel = |p: &Path| {
-            p.strip_prefix(config.data_root())
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|_| p.to_path_buf())
-        };
+        let rel = |p: &Path| config.relative_to_data_root(p);
         models.push(crate::config::ModelConfig {
             name: Some(name.to_string()),
             path: rel(first),
@@ -586,11 +576,7 @@ fn add_export_to_config(config: &mut Config, res: &Resource) -> Result<String, A
     let Some(first) = files.first() else {
         return Err(ActionError::Conflict(format!("{} has no files", res.title)));
     };
-    let rel = |p: &Path| {
-        p.strip_prefix(config.data_root())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|_| p.to_path_buf())
-    };
+    let rel = |p: &Path| config.relative_to_data_root(p);
     let catalog::Provides::Model { name, family } = res.provides else {
         return Err(ActionError::Conflict(format!(
             "{} is not a model",
@@ -632,10 +618,7 @@ fn add_local_to_config(config: &mut Config, file: &str) -> Result<String, Action
         )));
     }
     // Relative to the data root like downloads (`models/x.onnx`), absolute otherwise.
-    let path = full
-        .strip_prefix(config.data_root())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| full.clone());
+    let path = config.relative_to_data_root(&full);
     let name = Path::new(file)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -861,9 +844,8 @@ pub fn add_custom_model(config: &mut Config, req: &CustomModel) -> Result<String
     };
 
     // Duplicates are errors here (add_to_config would skip them silently).
-    let norm = crate::registry::normalize_name(&name);
     for m in &config.models {
-        if crate::registry::normalize_name(&m.effective_name()) == norm {
+        if m.is_named(&name) {
             return Err(ActionError::Conflict(format!(
                 "a model named '{name}' is already in the config"
             )));
@@ -877,19 +859,7 @@ pub fn add_custom_model(config: &mut Config, req: &CustomModel) -> Result<String
         }
     }
 
-    let root = config.data_root();
-    let root_canon = root.canonicalize().ok();
-    let rel = |p: &Path| -> PathBuf {
-        for base in [Some(root.as_path()), root_canon.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            if let Ok(r) = p.strip_prefix(base) {
-                return r.to_path_buf();
-            }
-        }
-        p.to_path_buf()
-    };
+    let rel = |p: &Path| config.relative_to_data_root(p);
     let out = crate::download::add_to_config(
         config,
         vec![crate::config::ModelConfig {
@@ -953,20 +923,14 @@ mod custom_model_tests {
     use super::*;
     use crate::config::ModelConfig;
 
+    /// A folder outside the data root; both are in one scratch folder removed on drop.
     struct Dirs {
-        root: PathBuf,
+        base: crate::test_dirs::TempDir,
         outside: PathBuf,
     }
 
-    impl Drop for Dirs {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-            let _ = std::fs::remove_dir_all(&self.outside);
-        }
-    }
-
     fn setup() -> (Dirs, Config) {
-        let base = std::env::temp_dir().join(format!("bop-custom-{}", uuid::Uuid::new_v4()));
+        let base = crate::test_dirs::TempDir::new("custom");
         let root = base.join("root");
         let outside = base.join("outside");
         std::fs::create_dir_all(&root).unwrap();
@@ -975,13 +939,7 @@ mod custom_model_tests {
             download_dir: Some(root.clone()),
             ..Default::default()
         };
-        (
-            Dirs {
-                root: base,
-                outside,
-            },
-            config,
-        )
+        (Dirs { base, outside }, config)
     }
 
     fn touch(p: &Path) {
@@ -1343,9 +1301,9 @@ mod custom_model_tests {
     #[test]
     fn paths_relative_to_data_root() {
         let (d, mut c) = setup();
-        touch(&d.root.join("root/models/in.onnx"));
+        touch(&d.base.join("root/models/in.onnx"));
         touch(&d.outside.join("out.onnx"));
-        std::fs::write(d.root.join("root/models/in.yaml"), YAML).unwrap();
+        std::fs::write(d.base.join("root/models/in.yaml"), YAML).unwrap();
         let r = CustomModel {
             classes: Some("models/in.yaml".into()),
             ..req(Path::new("models/in.onnx"))

@@ -4,6 +4,7 @@
 //! marks the details of a download wait, so the pages label only those "Waiting for download"
 //! and every other detail (a compile, a generation hand-over) "Loading" (QA-121).
 
+use crate::sync::RwLockExt;
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,22 +43,15 @@ impl StateHandle {
     }
 
     pub fn get(&self) -> ModelState {
-        self.0.read().map(|s| s.state.clone()).unwrap_or_else(|_| {
-            ModelState::Failed(
-                "the model state is unreadable after a crash in another thread; this is a \
-                     bug; restart the service and report the log"
-                    .into(),
-            )
-        })
+        self.0.read_recover().state.clone()
     }
 
     /// Set the state; clears the detail.
     pub fn set(&self, s: ModelState) {
-        if let Ok(mut g) = self.0.write() {
-            g.state = s;
-            g.detail = None;
-            g.download = false;
-        }
+        let mut g = self.0.write_recover();
+        g.state = s;
+        g.detail = None;
+        g.download = false;
     }
 
     /// `Initializing` with a detail message (a compile, a hand-over, ...).
@@ -72,29 +66,28 @@ impl StateHandle {
     }
 
     fn set_detail(&self, detail: String, download: bool) {
-        if let Ok(mut g) = self.0.write() {
-            g.state = ModelState::Initializing;
-            g.detail = Some(detail);
-            g.download = download;
-        }
+        let mut g = self.0.write_recover();
+        g.state = ModelState::Initializing;
+        g.detail = Some(detail);
+        g.download = download;
     }
 
     /// The detail of an `Initializing` model and whether it is a download wait, read together.
     pub fn detail_kind(&self) -> Option<(String, bool)> {
-        self.0
-            .read()
-            .ok()
-            .filter(|g| g.state == ModelState::Initializing)
-            .and_then(|g| g.detail.clone().map(|d| (d, g.download)))
+        let g = self.0.read_recover();
+        if g.state != ModelState::Initializing {
+            return None;
+        }
+        g.detail.clone().map(|d| (d, g.download))
     }
 
     /// The detail of an `Initializing` model, if any.
     pub fn detail(&self) -> Option<String> {
-        self.0
-            .read()
-            .ok()
-            .filter(|g| g.state == ModelState::Initializing)
-            .and_then(|g| g.detail.clone())
+        let g = self.0.read_recover();
+        if g.state != ModelState::Initializing {
+            return None;
+        }
+        g.detail.clone()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -150,5 +143,29 @@ mod tests {
         assert_eq!(s.detail_kind(), None, "a new state clears the tag too");
         s.set_initializing("compiling on openvino:gpu");
         assert_eq!(s.detail_kind().map(|(_, d)| d), Some(false));
+    }
+
+    // QA-270: a lock poisoned by a panic elsewhere is recovered like every other lock of the
+    // crate (`crate::sync`), so the model still changes state and reads back what was set.
+    #[test]
+    fn a_poisoned_state_lock_still_reads_and_changes() {
+        let s = StateHandle::new();
+        s.set_initializing("compiling");
+        let inner = s.0.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = inner.write().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(s.0.is_poisoned());
+        assert_eq!(s.get(), ModelState::Initializing);
+        assert_eq!(s.detail_kind(), Some(("compiling".into(), false)));
+        s.set(ModelState::Ready);
+        assert!(s.is_ready());
+        assert_eq!(s.detail(), None);
+        s.set_waiting_for_download("downloading");
+        assert_eq!(s.describe(), "Initializing (downloading)");
+        s.set(ModelState::Failed("gone".into()));
+        assert_eq!(s.describe(), "Failed: gone");
     }
 }

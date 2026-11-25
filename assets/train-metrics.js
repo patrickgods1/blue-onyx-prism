@@ -17,12 +17,7 @@
   "use strict";
   var PB = window.PrismBench || {};
   var has = function (v) { return v !== null && v !== undefined && typeof v === "number" && !isNaN(v); };
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text !== undefined && text !== null) e.textContent = text;
-    return e;
-  }
+  var el = PrismDom.el;
 
   // UI state that survives re-renders (the block is rebuilt when the history grows).
   var state = { all: {}, cols: {}, tbl: {}, more: {} };

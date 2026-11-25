@@ -11,54 +11,26 @@
 //! request sent once more, its caller getting that answer; polls held while it is open), and falls
 //! back to the login page with the way back (`#hash` included) on Cancel, a second 401, a body that
 //! cannot be sent twice, or no `<dialog>`. Native POST forms check a stale session first, and a
-//! `data-confirm` on submit still asks once. `PrismDraft` keeps working without storage.
+//! `data-confirm` on submit still asks once. `PrismDraft` keeps working without storage. The
+//! config poll of every page (a `PrismPoll` loop: 2 s, backing off to 30 s with the header line,
+//! hidden / focus / pageshow / online, `PrismLive.poll(true)`, a signed-out answer opening the
+//! dialog); `PrismLive.ui` (a polled value refreshes an unedited field, an edited one keeps the
+//! user's value with a "Changed elsewhere" note) and `PrismLive.keep` / `patch` (skip, defer while
+//! the user is in the section, rebuild only changed children).
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI).
-#![allow(clippy::unwrap_used)]
 
-use std::path::PathBuf;
-use std::process::Command;
+use crate::js_harness::{asset, have_node, run_node_ok};
 
-fn have_node() -> bool {
-    let ok = Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
-            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
-        );
-        println!("skipped: no node");
-    }
-    ok
-}
-
-fn asset(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join(name)
-}
-
-/// Run `driver_js` with the asset paths as arguments; it asserts and exits non-zero on a failure.
+/// Run `driver_js` with the paths of `live.js` and `train-area.js` as its arguments; it asserts,
+/// exits non-zero on a failure and prints `ok` at the end.
 fn run(driver_js: &str) {
-    let dir = std::env::temp_dir().join(format!("bop-js-poll-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let driver = dir.join("driver.js");
-    std::fs::write(&driver, driver_js).unwrap();
-    let out = Command::new("node")
-        .arg(&driver)
-        .arg(asset("live.js"))
-        .arg(asset("train-area.js"))
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "node failed ({}): {}{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    run_node_ok(
+        driver_js,
+        &[
+            asset("live.js").as_os_str(),
+            asset("train-area.js").as_os_str(),
+        ],
     );
 }
 
@@ -465,11 +437,13 @@ const advance = async (ms) => {
   }
   K.now = end;
 };
-function reply(status, body) {
-  return {status, ok: status >= 200 && status < 300, headers: {get: () => null},
+function reply(status, body, headers) {
+  return {status, ok: status >= 200 && status < 300,
+    headers: {get: (k) => headers && Object.prototype.hasOwnProperty.call(headers, k) ? headers[k] : null},
     json: () => body === undefined ? Promise.reject(new Error('no JSON')) : Promise.resolve(body)};
 }
-// queues[url]: [[status, body] | ['hang'] | ['fail']]; then defaults[url]; else in flight for good.
+// queues[url]: [[status, body, headers?] | ['hang'] | ['fail']]; then defaults[url]; else in flight
+// for good (`answer(s, ...)` settles one later).
 function fakeFetch(url, init) {
   return new Promise((resolve, reject) => {
     const s = {url, init, resolve, reject};
@@ -479,9 +453,10 @@ function fakeFetch(url, init) {
     const spec = q && q.length ? q.shift() : K.defaults[url];
     if (!spec || spec[0] === 'hang') return;
     if (spec[0] === 'fail') { reject(new TypeError('Failed to fetch')); return; }
-    resolve(reply(spec[0], spec[1]));
+    resolve(reply(spec[0], spec[1], spec[2]));
   });
 }
+const answer = (s, status, body, headers) => s.resolve(reply(status, body, headers));
 const sentTo = (u) => K.sent.filter(s => s.url === u);
 const pollMark = (s) => { const h = s.init && s.init.headers; return h && (typeof h.get === 'function' ? h.get('X-Prism-Poll') : h['X-Prism-Poll']); };
 function el(tag) {
@@ -1088,5 +1063,483 @@ console.log('ok');
 fn the_start_anyway_box_shows_only_beside_a_memory_refusal() {
     if have_node() {
         run(MEMORY);
+    }
+}
+
+/// `PrismLive.ui` (how a polled server value reaches a form control: an unedited one takes it, an
+/// edited one keeps the user's value and says when the server changed it too) and `PrismLive.keep`
+/// / `patch` (when a polled re-render is skipped, deferred while the user is in the section, or
+/// applied per keyed child), on fake controls and nodes. Pins what the Config page relies on.
+const UI: &str = r#"
+const location = {pathname: '/config', search: '', hash: '', origin: 'https://h',
+  assign(u) { K.assigned.push(u); }, reload() {}, replace() {}};
+const sandbox = sandboxOf(location);
+const document = makeDocument();
+function Option(text, value, defaultSelected, selected) {
+  this.text = text; this.value = value; this.defaultSelected = defaultSelected; this.selected = selected;
+}
+Object.assign(sandbox, {document, Option, history: {}, scrollX: 0, scrollY: 0, scrollTo() {}, addEventListener() {}});
+sandbox.window = sandbox;
+const ctx = vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const L = vm.runInContext('PrismLive', ctx), U = L.ui;
+
+function classes() {
+  const s = new Set(), adds = [];
+  return {s, adds, add(c) { s.add(c); adds.push(c); }, remove(c) { s.delete(c); }, contains(c) { return s.has(c); },
+    toggle(c, on) { if (on === undefined) on = !s.has(c); if (on) s.add(c); else s.delete(c); return on; }};
+}
+// The <label> (or <td>) a control sits in: where its "Changed elsewhere" note goes.
+function holder() {
+  return {children: [],
+    querySelector(sel) { return sel === '.live-note' ? this.children.find(c => c.className === 'live-note') || null : null; },
+    appendChild(c) { c.parentNode = this; c.remove = () => { this.children = this.children.filter(x => x !== c); }; this.children.push(c); return c; }};
+}
+function control(props, inLabel) {
+  const h = holder();
+  return Object.assign({tagName: 'INPUT', classList: classes(), parentNode: h, offsetWidth: 0,
+    closest: (sel) => (inLabel === false ? null : (sel === 'label, td' ? h : null))}, props);
+}
+const field = (type, v, inLabel) => control({type, value: String(v), defaultValue: String(v)}, inLabel);
+const checkbox = (on) => control({type: 'checkbox', checked: on, defaultChecked: on});
+function select(values, chosen) {
+  const s = control({type: 'select-one', tagName: 'SELECT',
+    options: values.map(v => ({value: v, selected: v === chosen, defaultSelected: v === chosen})),
+    add(o) { this.options.push(o); }});
+  // (a getter Object.assign would have read once)
+  Object.defineProperty(s, 'value', {get() { const o = this.options.find(x => x.selected); return o ? o.value : ''; }});
+  return s;
+}
+const noteOf = (e) => { const n = e.parentNode.querySelector('.live-note'); return n ? n.textContent : null; };
+const notes = (e) => e.parentNode.children.length;
+const flashes = (e) => e.classList.adds.filter(c => c === 'flash').length;
+const has = (e, c) => e.classList.contains(c);
+const ELSEWHERE = (v) => 'Changed elsewhere to ' + v + '; saving replaces it with your value.';
+
+// edited(): a control differs from what the server last showed (its default state).
+{
+  const t = field('text', 'a');
+  assert.strictEqual(U.edited(t), false);
+  t.value = 'b'; assert.strictEqual(U.edited(t), true);
+  const n = field('number', '0.50');
+  n.value = '0.5'; assert.strictEqual(U.edited(n), false, 'the same number, spelt otherwise');
+  n.value = ' 0.5 '; assert.strictEqual(U.edited(n), false, 'spaces around it');
+  n.value = '0.6'; assert.strictEqual(U.edited(n), true);
+  n.value = ''; assert.strictEqual(U.edited(n), true, 'emptied');
+  const n0 = field('number', '');
+  assert.strictEqual(U.edited(n0), false);
+  n0.value = '0'; assert.strictEqual(U.edited(n0), true, 'filled in');
+  const c = checkbox(false);
+  assert.strictEqual(U.edited(c), false);
+  c.checked = true; assert.strictEqual(U.edited(c), true);
+  const s = select(['a', 'b'], 'a');
+  assert.strictEqual(U.edited(s), false);
+  s.options[0].selected = false; s.options[1].selected = true;
+  assert.strictEqual(U.edited(s), true);
+}
+// current / baseline / same.
+{
+  const c = checkbox(true);
+  assert.strictEqual(U.current(c), true);
+  c.checked = false;
+  assert.strictEqual(U.current(c), false);
+  assert.strictEqual(U.baseline(c), true);
+  const t = field('text', 'a'); t.value = 'b';
+  assert.strictEqual(U.current(t), 'b');
+  assert.strictEqual(U.baseline(t), 'a');
+  assert.strictEqual(U.baseline(select(['a', 'b'], 'b')), 'b');
+  assert.strictEqual(U.baseline(select(['a', 'b'], null)), 'a', 'no default: the first option');
+  assert.strictEqual(U.baseline(select([], null)), '', 'no options');
+  const n = field('number', '1');
+  assert.strictEqual(U.same(n, '0.50', 0.5), true, 'numbers by value');
+  assert.strictEqual(U.same(n, '', 0), false, 'empty is not 0');
+  assert.strictEqual(U.same(n, '', null), true, 'empty is null');
+  assert.strictEqual(U.same(t, '0.50', 0.5), false, 'text by its letters');
+  assert.strictEqual(U.same(t, null, ''), true);
+  assert.strictEqual(U.same(t, undefined, ''), true);
+  assert.strictEqual(U.same(t, 3, '3'), true);
+  assert.strictEqual(U.same(c, 1, true), true, 'a checkbox by truth');
+  assert.strictEqual(U.same(c, '', true), false);
+  assert.strictEqual(U.same(c, 0, false), true);
+}
+// set(): value and default together; a select takes an unknown value as one extra option.
+{
+  const t = field('text', 'a');
+  U.set(t, 'b'); assert.deepStrictEqual([t.value, t.defaultValue], ['b', 'b']);
+  U.set(t, null); assert.deepStrictEqual([t.value, t.defaultValue], ['', '']);
+  U.set(t, 3); assert.deepStrictEqual([t.value, t.defaultValue], ['3', '3']);
+  const c = checkbox(false);
+  U.set(c, 1); assert.deepStrictEqual([c.checked, c.defaultChecked], [true, true]);
+  U.set(c, ''); assert.deepStrictEqual([c.checked, c.defaultChecked], [false, false]);
+  const s = select(['a', 'b'], 'a');
+  const state = () => s.options.map(o => [o.value, o.selected, o.defaultSelected]);
+  U.set(s, 'b');
+  assert.deepStrictEqual(state(), [['a', false, false], ['b', true, true]]);
+  U.set(s, 'zzz');
+  assert.deepStrictEqual(state(), [['a', false, false], ['b', false, false], ['zzz', true, true]]);
+  assert.strictEqual(s.options[2].text, 'zzz — not a known option');
+  U.set(s, 'zzz');
+  assert.strictEqual(s.options.length, 3, 'the same unknown value again: no second option');
+  U.set(s, 'yyy');
+  assert.deepStrictEqual(state(), [['a', false, false], ['b', false, false], ['zzz', false, false], ['yyy', true, true]],
+    'another unknown value: one more option, the first one stays');
+  U.set(s, 'a');
+  assert.strictEqual(s.options.length, 4);
+  assert.strictEqual(U.edited(s), false);
+}
+// refresh(): an unedited control takes the server value (a flash only when it changed).
+{
+  const t = field('text', 'a');
+  assert.strictEqual(U.refresh(t, 'a'), true);
+  assert.strictEqual(flashes(t), 0, 'unchanged: no flash');
+  assert.strictEqual(U.refresh(t, 'b'), true);
+  assert.deepStrictEqual([t.value, t.defaultValue, flashes(t)], ['b', 'b', 1]);
+  assert.strictEqual(notes(t), 0);
+  const n = field('number', '0.50');
+  assert.strictEqual(U.refresh(n, 0.5), true);
+  assert.strictEqual(flashes(n), 0, '0.50 and 0.5 are the same');
+  assert.strictEqual(n.value, '0.5', 'the server spelling is shown');
+  const c = checkbox(false);
+  assert.strictEqual(U.refresh(c, true), true);
+  assert.deepStrictEqual([c.checked, c.defaultChecked, flashes(c)], [true, true, 1]);
+  const s = select(['a', 'b'], 'a');
+  assert.strictEqual(U.refresh(s, 'q'), true);
+  assert.deepStrictEqual([s.options.length, s.value, flashes(s)], [3, 'q', 1]);
+  assert.strictEqual(U.refresh(s, 'q'), true);
+  assert.deepStrictEqual([s.options.length, flashes(s)], [3, 1], 'a repeat adds nothing and does not flash');
+}
+// refresh(): an edited control keeps the user's value; the server changing it too is noted.
+{
+  const t = field('text', 'a');
+  t.value = 'mine'; t.classList.add('edited');
+  assert.strictEqual(U.refresh(t, 'theirs'), false);
+  assert.deepStrictEqual([t.value, t.defaultValue], ['mine', 'a'], 'the user\'s value and the old default stay');
+  assert.strictEqual(noteOf(t), ELSEWHERE('theirs'));
+  assert.ok(has(t, 'edited-conflict') && has(t, 'edited'));
+  assert.strictEqual(U.refresh(t, 'x', v => '«' + v + '»'), false);
+  assert.strictEqual(noteOf(t), ELSEWHERE('«x»'), 'the page describes the value');
+  assert.strictEqual(notes(t), 1, 'one note, rewritten');
+  // The server is back at what the page showed: the note goes, the edit stays.
+  assert.strictEqual(U.refresh(t, 'a'), false);
+  assert.strictEqual(noteOf(t), null);
+  assert.strictEqual(notes(t), 0);
+  assert.ok(!has(t, 'edited-conflict') && has(t, 'edited'));
+  assert.strictEqual(t.value, 'mine');
+  // The server changes to the user's value: no longer an edit.
+  U.refresh(t, 'zzz');
+  assert.strictEqual(noteOf(t), ELSEWHERE('zzz'));
+  assert.strictEqual(U.refresh(t, 'mine'), true);
+  assert.deepStrictEqual([t.value, t.defaultValue], ['mine', 'mine']);
+  assert.strictEqual(noteOf(t), null);
+  assert.ok(!has(t, 'edited-conflict') && !has(t, 'edited'));
+  assert.strictEqual(flashes(t), 0, 'no flash for the user\'s own value');
+  // An edited control the server did not change: no note.
+  const u = field('text', 'a'); u.value = 'b';
+  assert.strictEqual(U.refresh(u, 'a'), false);
+  assert.strictEqual(notes(u), 0);
+  // An edited number: the server's 0.5 is its 0.50, the user's 0.7 stays without a note.
+  const n = field('number', '0.50'); n.value = '0.7';
+  assert.strictEqual(U.refresh(n, 0.5), false);
+  assert.strictEqual(notes(n), 0);
+  assert.strictEqual(n.value, '0.7');
+  // Outside a <label> / <td> the note goes in the parent.
+  const p = field('text', 'a', false); p.value = 'b';
+  U.refresh(p, 'c');
+  assert.strictEqual(noteOf(p), ELSEWHERE('c'));
+  // An edited checkbox the server sets to the user's state.
+  const c = checkbox(false); c.checked = true;
+  assert.strictEqual(U.refresh(c, true), true);
+  assert.strictEqual(c.defaultChecked, true);
+}
+// markEdits(): input and change mark a named control `edited` while it differs.
+{
+  const form = el('form');
+  U.markEdits(form);
+  const t = field('text', 'a'); t.name = 'x';
+  t.value = 'b'; form.listeners.input.forEach(h => h({target: t}));
+  assert.ok(has(t, 'edited'));
+  t.value = 'a'; form.listeners.change.forEach(h => h({target: t}));
+  assert.ok(!has(t, 'edited'));
+  const anon = field('text', 'a'); anon.value = 'b';
+  form.listeners.input.forEach(h => h({target: anon}));
+  assert.ok(!has(anon, 'edited'), 'unnamed controls are left alone');
+}
+
+// keep() / patch(): nodes with children, siblings and `contains`; `marked` = a chart under the mouse.
+class N {
+  constructor(key) { this.tagName = 'DIV'; this.children = []; this.parentNode = null; this.dataset = {}; this.marked = false;
+    if (key !== undefined) this.dataset.patchKey = key; }
+  get firstChild() { return this.children[0] || null; }
+  get nextSibling() { const p = this.parentNode; return p ? p.children[p.children.indexOf(this) + 1] || null : null; }
+  detach() { const p = this.parentNode; if (p) { p.children.splice(p.children.indexOf(this), 1); this.parentNode = null; } }
+  insertBefore(n, ref) {
+    n.detach();
+    const i = ref ? this.children.indexOf(ref) : -1;
+    if (i < 0) this.children.push(n); else this.children.splice(i, 0, n);
+    n.parentNode = this; return n;
+  }
+  appendChild(n) { return this.insertBefore(n, null); }
+  replaceWith(n) { const p = this.parentNode; n.detach(); p.children[p.children.indexOf(this)] = n; n.parentNode = p; this.parentNode = null; }
+  remove() { this.detach(); }
+  contains(x) { for (let e = x; e; e = e.parentNode) if (e === this) return true; return false; }
+  querySelectorAll() { return []; }
+  querySelector(sel) { return this.marked && sel.indexOf('[data-pointer-in]') >= 0 ? new N() : null; }
+}
+const press = (t) => document.listeners.pointerdown.forEach(f => f({target: t}));
+const lift = () => document.listeners.pointerup.forEach(f => f({}));
+{
+  let renders = 0;
+  const render = () => { renders++; };
+  assert.strictEqual(L.keep(null, 's', render), false, 'no section');
+  const root = new N(), inner = root.appendChild(new N());
+  assert.strictEqual(L.keep(root, 's1', render), true);
+  assert.deepStrictEqual([renders, root._keepSig], [1, 's1']);
+  assert.strictEqual(L.keep(root, 's1', render), false, 'the same data: skipped');
+  assert.strictEqual(renders, 1);
+  // The mouse is pressed inside: deferred, the new signature not taken.
+  press(inner);
+  assert.strictEqual(L.keep(root, 's2', render), false);
+  assert.deepStrictEqual([renders, root._keepSig], [1, 's1']);
+  lift();
+  assert.strictEqual(L.keep(root, 's2', render), true, 'released: the deferred render runs');
+  assert.deepStrictEqual([renders, root._keepSig], [2, 's2']);
+  // Pressed elsewhere: not busy here.
+  press(new N());
+  assert.strictEqual(L.keep(root, 's3', render), true);
+  lift();
+  // A chart under the mouse (data-pointer-in) defers too.
+  root.marked = true;
+  assert.strictEqual(L.keep(root, 's4', render), false);
+  root.marked = false;
+  assert.strictEqual(L.keep(root, 's4', render), true);
+  // No signature: always rendered.
+  assert.strictEqual(L.keep(root, undefined, render), true);
+  assert.strictEqual(L.keep(root, undefined, render), true);
+  assert.strictEqual(renders, 6);
+  // The first render of a section is never deferred (nothing is shown yet).
+  const fresh = new N(); fresh.marked = true;
+  assert.strictEqual(L.keep(fresh, 'a', render), true);
+}
+{
+  const box = new N();
+  let builds = [];
+  const item = (key, sig) => ({key, sig, build: () => { builds.push(key); return new N(); }});
+  const keys = () => box.children.map(c => c.dataset.patchKey);
+  L.patch(box, [item('a', 1), item('b', 1), item('c', 1)]);
+  assert.deepStrictEqual(keys(), ['a', 'b', 'c']);
+  assert.deepStrictEqual(builds, ['a', 'b', 'c']);
+  assert.deepStrictEqual(box.children.map(c => c._keepSig), [1, 1, 1]);
+  const [a, b, c] = box.children;
+  // Reordered, unchanged: moved, never rebuilt.
+  builds = [];
+  L.patch(box, [item('c', 1), item('a', 1), item('b', 1)]);
+  assert.deepStrictEqual(keys(), ['c', 'a', 'b']);
+  assert.deepStrictEqual(builds, []);
+  assert.ok(box.children[0] === c && box.children[1] === a && box.children[2] === b, 'the same nodes');
+  // A changed signature: that child is rebuilt in its place.
+  L.patch(box, [item('c', 1), item('a', 2), item('b', 1)]);
+  assert.deepStrictEqual(builds, ['a']);
+  assert.deepStrictEqual(keys(), ['c', 'a', 'b']);
+  assert.ok(box.children[1] !== a && a.parentNode === null, 'the old one is out');
+  assert.strictEqual(box.children[1]._keepSig, 2);
+  assert.ok(box.children[0] === c && box.children[2] === b);
+  // A key gone is removed; a new one is built where it belongs.
+  builds = [];
+  L.patch(box, [item('d', 1), item('c', 1), item('b', 1)]);
+  assert.deepStrictEqual(keys(), ['d', 'c', 'b']);
+  assert.deepStrictEqual(builds, ['d']);
+  // The mouse pressed in a child: its change waits (signature not taken), the rest goes on.
+  press(b.appendChild(new N()));
+  builds = [];
+  L.patch(box, [item('d', 2), item('c', 1), item('b', 2)]);
+  assert.deepStrictEqual(builds, ['d']);
+  assert.ok(box.children[2] === b && b._keepSig === 1);
+  lift();
+  L.patch(box, [item('d', 2), item('c', 1), item('b', 2)]);
+  assert.deepStrictEqual(builds, ['d', 'b'], 'released: rebuilt on the next patch');
+  assert.deepStrictEqual(keys(), ['d', 'c', 'b']);
+  // Nothing left.
+  L.patch(box, []);
+  assert.deepStrictEqual(keys(), []);
+}
+console.log('ok');
+"#;
+
+#[test]
+fn polled_values_refresh_unedited_fields_and_keep_and_patch_skip_or_defer_re_renders() {
+    if have_node() {
+        run(&format!("{KIT}{UI}"));
+    }
+}
+
+/// The config poll of `live.js` (GET /v1/config behind every page): the first poll at load, then
+/// one every 2 s with `If-None-Match`; failures back off 4, 8, 16, 30 s and say so in the header,
+/// a success clears that; nothing while the tab is hidden, a poll at once when it shows, on
+/// focus, on `pageshow` from the back-forward cache and on `online`; `PrismLive.poll(true)`
+/// skips the ETag, shares a request in flight and resolves to the last payload when it fails; a
+/// signed-out (minimal) answer keeps the last payload and opens the sign-in dialog, and once
+/// signed in a fresh full answer is fetched and the 2 s period goes on.
+const CONFIG_POLL: &str = r#"
+const location = {pathname: '/config', search: '', hash: '', origin: 'https://h',
+  assign(u) { K.assigned.push(u); }, reload() {}, replace() {}};
+const sandbox = sandboxOf(location);
+const document = makeDocument();
+const status = el('span'); status.hidden = true;
+document.getElementById = (id) => id === 'live-status' ? status : null;
+const winL = {};
+Object.assign(sandbox, {document, HTMLDialogElement: function () {}, history: {}, scrollX: 0, scrollY: 0,
+  scrollTo() {}, confirm: () => true,
+  addEventListener(t, f) { (winL[t] = winL[t] || []).push(f); }});
+sandbox.window = sandbox;
+const fireWin = async (t, ev) => { (winL[t] || []).forEach(f => f(ev || {})); await flush(); };
+const FULL = (rev) => [200, {config: {rev}, revision: rev, epoch: 'e', pendingCount: 0}, {ETag: '"r' + rev + '"'}];
+const MINIMAL = [200, {success: true, revision: 1, epoch: 'e', pendingCount: 0}];
+const URL = '/v1/config';
+K.queues[URL] = [FULL(1)];
+const ctx = vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const L = vm.runInContext('PrismLive', ctx);
+const seen = [];
+L.onConfig((j) => seen.push(j.revision));
+const polls = () => sentTo(URL).length;
+const lastSent = () => sentTo(URL).slice(-1)[0];
+const etagOf = (s) => s.init.headers['If-None-Match'];
+// Timers still to run, in ms from now (a request in flight has its 15 s abort timer).
+const pending = () => K.timers.map(t => t.at - K.now).sort((a, b) => a - b);
+const line = () => status.hidden ? null : status.textContent;
+
+(async () => {
+  await flush();
+  assert.strictEqual(polls(), 1, 'the first poll at load');
+  assert.strictEqual(pollMark(lastSent()), '1', 'a poll');
+  assert.strictEqual(etagOf(lastSent()), undefined, 'no ETag yet');
+  assert.strictEqual(lastSent().init.cache, 'no-store');
+  assert.deepStrictEqual(seen, [1]);
+  assert.deepStrictEqual(pending(), [2000], 'the next one 2 s on');
+  // 304: nothing new for the pages.
+  K.defaults[URL] = [304];
+  await advance(2000);
+  assert.strictEqual(polls(), 2);
+  assert.strictEqual(etagOf(lastSent()), '"r1"');
+  assert.deepStrictEqual(seen, [1]);
+  assert.deepStrictEqual(pending(), [2000]);
+
+  // No answer: the period backs off and the header says when it tries again.
+  K.defaults[URL] = ['fail'];
+  const backoff = [];
+  for (const wait of [2000, 4000, 8000, 16000, 30000]) {
+    const n = polls();
+    await advance(wait);
+    assert.strictEqual(polls(), n + 1, 'one poll after ' + wait + ' ms');
+    backoff.push([pending()[0], line()]);
+  }
+  assert.deepStrictEqual(backoff, [
+    [4000, 'Live updates: server not answering; retrying in 4 s'],
+    [8000, 'Live updates: server not answering; retrying in 8 s'],
+    [16000, 'Live updates: server not answering; retrying in 16 s'],
+    [30000, 'Live updates: server not answering; retrying in 30 s'],
+    [30000, 'Live updates: server not answering; retrying in 30 s']]);
+  K.queues[URL].push([500, {}]);
+  await advance(30000);
+  assert.strictEqual(line(), 'Live updates: server answered HTTP 500; retrying in 30 s');
+  assert.strictEqual(L.last().revision, 1, 'the last payload stays');
+  // Answering again: the line goes, the period is 2 s again.
+  K.defaults[URL] = FULL(2);
+  await advance(30000);
+  assert.strictEqual(line(), null);
+  assert.strictEqual(status.textContent, '');
+  assert.deepStrictEqual(seen, [1, 2]);
+  assert.deepStrictEqual(pending(), [2000]);
+
+  // Hidden: no timer and no request, however long; shown again: a poll at once.
+  K.defaults[URL] = [304];
+  document.hidden = true; document.fire('visibilitychange'); await flush();
+  assert.deepStrictEqual(pending(), [], 'no timer while hidden');
+  let n = polls();
+  await advance(120000);
+  await fireWin('focus');
+  await fireWin('pageshow', {persisted: true});
+  await fireWin('online');
+  assert.strictEqual(polls(), n, 'nothing while hidden');
+  document.hidden = false; document.fire('visibilitychange'); await flush();
+  assert.strictEqual(polls(), n + 1, 'a poll when shown');
+  assert.deepStrictEqual(pending(), [2000]);
+  // Focus, back from the back-forward cache, the network back: a poll at once each.
+  n = polls();
+  await fireWin('focus');
+  assert.strictEqual(polls(), n + 1, 'focus');
+  await fireWin('pageshow', {persisted: false});
+  assert.strictEqual(polls(), n + 1, 'a normal pageshow: nothing');
+  await fireWin('pageshow', {persisted: true});
+  assert.strictEqual(polls(), n + 2, 'pageshow from the cache');
+  await fireWin('online');
+  assert.strictEqual(polls(), n + 3, 'online');
+
+  // PrismLive.poll(true): no ETag; two callers and the timer share one request in flight.
+  await advance(2000);
+  K.queues[URL].push(['hang']);
+  n = polls();
+  let a = null, b = null;
+  L.poll(true).then(j => { a = j; });
+  L.poll(false).then(j => { b = j; });
+  await flush();
+  assert.strictEqual(polls(), n + 1, 'one request for both');
+  assert.strictEqual(etagOf(lastSent()), undefined, 'forced: no ETag');
+  await advance(2000);
+  assert.strictEqual(polls(), n + 1, 'the timer joins it');
+  answer(lastSent(), ...FULL(3));
+  await flush();
+  assert.ok(a && a.revision === 3 && b && b.revision === 3, 'both get the payload');
+  assert.deepStrictEqual(seen, [1, 2, 3]);
+  assert.deepStrictEqual(pending(), [2000], 'one timer after it');
+  // A forced poll that fails resolves to the last payload (config.js reads it).
+  K.queues[URL].push(['fail']);
+  const got = await L.poll(true);
+  assert.strictEqual(got.revision, 3);
+  await advance(2000);
+  assert.strictEqual(line(), null, 'the next poll answered');
+
+  // Signed out (the answer turns minimal): the dialog opens and the last payload stays.
+  K.queues[URL].push(MINIMAL);
+  const shown0 = K.shown;
+  await advance(2000);
+  assert.strictEqual(K.shown, shown0 + 1, 'the sign-in dialog');
+  const ui = dialogOf(document);
+  assert.ok(ui && ui.dlg.open);
+  assert.strictEqual(L.last().revision, 3);
+  assert.deepStrictEqual(seen, [1, 2, 3], 'nothing emitted');
+  assert.strictEqual(line(), null);
+  // Signed in before the next poll: one fresh full answer (no ETag), then every 2 s again.
+  n = polls();
+  K.queues['/login'] = [[200, {success: true, next: '/'}]];
+  K.queues[URL].push(FULL(4));
+  ui.pass.value = 'right'; submitDialog(ui); await flush();
+  assert.ok(!ui.dlg.open);
+  assert.strictEqual(polls(), n + 1, 'one poll after signing in');
+  assert.strictEqual(etagOf(lastSent()), undefined, 'a fresh answer');
+  assert.deepStrictEqual(seen, [1, 2, 3, 4]);
+  assert.deepStrictEqual(pending(), [2000], 'the loop goes on');
+  // Signed out again, the next poll held behind the dialog: signing in sends it, and only it.
+  K.queues[URL].push(MINIMAL);
+  await advance(2000);
+  assert.ok(ui.dlg.open);
+  n = polls();
+  await advance(10000);
+  assert.strictEqual(polls(), n, 'held while the dialog is open');
+  K.queues['/login'] = [[200, {success: true, next: '/'}]];
+  K.queues[URL].push(FULL(5));
+  ui.pass.value = 'right'; submitDialog(ui); await flush();
+  assert.strictEqual(polls(), n + 1, 'the held poll, once');
+  assert.deepStrictEqual(seen, [1, 2, 3, 4, 5]);
+  assert.deepStrictEqual(pending(), [2000]);
+  assert.deepStrictEqual(K.assigned, [], 'never the login page');
+  console.log('ok');
+})().catch(e => { console.error(e); process.exit(1); });
+"#;
+
+#[test]
+fn the_config_poll_backs_off_sleeps_while_hidden_wakes_and_signs_in_again() {
+    if have_node() {
+        run(&format!("{KIT}{CONFIG_POLL}"));
     }
 }

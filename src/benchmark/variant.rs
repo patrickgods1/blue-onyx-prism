@@ -330,7 +330,6 @@ fn night_route(
     night: &str,
     profile: Option<crate::profile::Profile>,
 ) -> NightRoute {
-    use crate::registry::normalize_name;
     let fallback = |reason: String| NightRoute::Fallback {
         model: night.to_string(),
         reason,
@@ -338,7 +337,7 @@ fn night_route(
     let Some(entry) = super::find_model(config, night) else {
         return fallback("not a configured model".into());
     };
-    if normalize_name(&entry.effective_name()) == normalize_name(&m.effective_name()) {
+    if entry.key() == m.key() {
         return fallback("it is the model itself".into());
     }
     if !entry.enabled {

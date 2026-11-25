@@ -98,7 +98,7 @@ document.addEventListener("click", function (e) {
   U.markEdits(serverForm); U.markEdits(card); U.markEdits(jsonForm);
   function show(v) { return v === "" || v === null || v === undefined ? "global" : v === true ? "on" : v === false ? "off" : String(v); }
   function fmtThr(t) { return t === null || t === undefined ? "" : String(t); }
-  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  var el = PrismDom.el;
 
   // Server form and the models JSON form: inputs/selects/checkboxes keyed by name. `reset` is
   // the form just saved (its fields take the server values) or null.
@@ -794,7 +794,6 @@ document.addEventListener("click", function (e) {
     if (b >= 1e3) return Math.round(b / 1e3) + " kB";
     return b + " B";
   }
-  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
   function table(title, items, total) {
     var wrap = el("div");
     var h = el("h3", null, title + " ");

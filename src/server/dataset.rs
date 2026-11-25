@@ -7,6 +7,7 @@
 //! same summary as JSON. Plain HTML forms: the page needs no script (`browse.js` only adds the
 //! folder field's Browse... button).
 
+use super::form::{field, parse, value};
 use super::{AppState, blocking, encode_uri_component, render, save_config};
 use crate::collect::health::{Counts, DropCount, Health};
 use crate::collect::layout::{self, REVIEW_QUEUE_FILE, SCENES};
@@ -22,66 +23,22 @@ use std::sync::Arc;
 
 const MB: f64 = 1024.0 * 1024.0;
 
-/// Decode an `application/x-www-form-urlencoded` body into its fields in order (repeated keys
-/// kept, which the page's frame checkboxes need).
-pub(super) fn parse_form(body: &[u8]) -> Vec<(String, String)> {
-    fn decode(s: &str) -> String {
-        let b = s.as_bytes();
-        let mut out = Vec::with_capacity(b.len());
-        let mut i = 0;
-        while let Some(&c) = b.get(i) {
-            match c {
-                b'+' => out.push(b' '),
-                b'%' => {
-                    // Two hex digits only: `from_str_radix` alone takes `%+5` as 0x05.
-                    let hex = b
-                        .get(i + 1..i + 3)
-                        .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
-                        .and_then(|h| std::str::from_utf8(h).ok())
-                        .and_then(|h| u8::from_str_radix(h, 16).ok());
-                    match hex {
-                        Some(v) => {
-                            out.push(v);
-                            i += 2;
-                        }
-                        None => out.push(b'%'),
-                    }
-                }
-                c => out.push(c),
-            }
-            i += 1;
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-    String::from_utf8_lossy(body)
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| match p.split_once('=') {
-            Some((k, v)) => (decode(k), decode(v)),
-            None => (decode(p), String::new()),
-        })
-        .collect()
-}
-
-fn field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.trim())
-}
-
 /// Apply the page's settings form to `c`: checkboxes are on when present; a number field that
-/// is missing or empty keeps its value. Errors name the field.
+/// is missing or empty keeps its value ([`field`]); the night interval and the folder read
+/// present-and-empty as unset ([`value`]). Errors name the field.
 pub(super) fn apply_form(c: &mut CollectConfig, fields: &[(String, String)]) -> anyhow::Result<()> {
     use anyhow::Context;
-    c.enabled = field(fields, "enabled").is_some();
+    c.enabled = value(fields, "enabled").is_some();
     for b in Bucket::ALL {
         let key = b.as_str();
         let bc = c.buckets.get_mut(b);
-        bc.enabled = field(fields, &format!("{key}.enabled")).is_some();
-        if let Some(v) = field(fields, &format!("{key}.rate")).filter(|v| !v.is_empty()) {
+        bc.enabled = value(fields, &format!("{key}.enabled")).is_some();
+        if let Some(v) = field(fields, &format!("{key}.rate")) {
             bc.rate = v
                 .parse()
                 .with_context(|| format!("{key} rate: '{v}' is not a number between 0 and 1"))?;
         }
-        if let Some(v) = field(fields, &format!("{key}.interval")).filter(|v| !v.is_empty()) {
+        if let Some(v) = field(fields, &format!("{key}.interval")) {
             bc.per_camera_min_interval_s = v.parse().with_context(|| {
                 format!("{key} interval: '{v}' is not a whole number of seconds")
             })?;
@@ -89,7 +46,7 @@ pub(super) fn apply_form(c: &mut CollectConfig, fields: &[(String, String)]) -> 
         // Present and empty = unset (the default, never stricter than the day interval); a
         // number sets it; a missing field keeps the value.
         if b == Bucket::Empty
-            && let Some(v) = field(fields, &format!("{key}.night_interval"))
+            && let Some(v) = value(fields, &format!("{key}.night_interval"))
         {
             bc.night_interval_s = if v.is_empty() {
                 None
@@ -100,32 +57,32 @@ pub(super) fn apply_form(c: &mut CollectConfig, fields: &[(String, String)]) -> 
             };
         }
     }
-    if let Some(v) = field(fields, "near_threshold.margin").filter(|v| !v.is_empty()) {
+    if let Some(v) = field(fields, "near_threshold.margin") {
         c.buckets.near_threshold.margin = Some(
             v.parse()
                 .with_context(|| format!("near-threshold margin: '{v}' is not a number"))?,
         );
     }
-    if let Some(v) = field(fields, "max_gb").filter(|v| !v.is_empty()) {
+    if let Some(v) = field(fields, "max_gb") {
         c.max_gb = v
             .parse()
             .with_context(|| format!("max size: '{v}' is not a number of GB"))?;
     }
-    if let Some(v) = field(fields, "max_age_days").filter(|v| !v.is_empty()) {
+    if let Some(v) = field(fields, "max_age_days") {
         c.max_age_days = v
             .parse()
             .with_context(|| format!("max age: '{v}' is not a whole number of days"))?;
     }
-    if let Some(v) = field(fields, "dedup_hamming").filter(|v| !v.is_empty()) {
+    if let Some(v) = field(fields, "dedup_hamming") {
         c.dedup_hamming = v
             .parse()
             .with_context(|| format!("dedup distance: '{v}' is not a whole number"))?;
     }
-    if let Some(v) = field(fields, "dedup_mode").filter(|v| !v.is_empty()) {
+    if let Some(v) = field(fields, "dedup_mode") {
         c.dedup_mode = crate::collect::config::DedupMode::parse(v)
             .with_context(|| format!("dedup rule: '{v}' is not one of both, dhash"))?;
     }
-    if let Some(v) = field(fields, "dir") {
+    if let Some(v) = value(fields, "dir") {
         c.dir = (!v.is_empty()).then(|| v.into());
     }
     Ok(())
@@ -409,7 +366,7 @@ pub(super) async fn settings(
     body: axum::body::Bytes,
 ) -> Response {
     blocking(move || {
-        let fields = parse_form(&body);
+        let fields = parse(&body);
         let result = save_config(&state, "dataset page", |c| {
             apply_form(&mut c.collect, &fields)?;
             c.collect.validate(&c.data_root())
@@ -428,7 +385,7 @@ pub(super) async fn review(
     body: axum::body::Bytes,
 ) -> Response {
     blocking(move || {
-        let rels: Vec<String> = parse_form(&body)
+        let rels: Vec<String> = parse(&body)
             .into_iter()
             .filter(|(k, _)| k == "frame")
             .map(|(_, v)| v)
@@ -589,24 +546,6 @@ mod tests {
     use axum::http::Request;
 
     #[test]
-    fn form_parsing_keeps_repeated_keys_and_decodes() {
-        let f = parse_form(b"frame=ir%2Fa%2F2026-10-22%2Fx.jpg&frame=b+c&enabled=on&bad=%zz&k");
-        assert_eq!(f[0], ("frame".into(), "ir/a/2026-10-22/x.jpg".into()));
-        assert_eq!(f[1].1, "b c");
-        assert_eq!(f[3].1, "%zz");
-        assert_eq!(f[4], ("k".into(), String::new()));
-    }
-
-    /// q-extras [17]: `%` takes two hex digits only; `from_str_radix` alone read `%+5` as 0x05.
-    #[test]
-    fn a_percent_without_two_hex_digits_is_kept_literally() {
-        let f = parse_form(b"a=%+5&b=%-1x&c=%41%4");
-        assert_eq!(f[0].1, "% 5");
-        assert_eq!(f[1].1, "%-1x");
-        assert_eq!(f[2].1, "A%4");
-    }
-
-    #[test]
     fn the_disk_line_says_how_much_is_protected() {
         let mut s = Status::default();
         s.summary.bytes = 3 * 1024 * 1024;
@@ -653,17 +592,17 @@ mod tests {
     fn the_settings_form_sets_the_dedup_rule() {
         use crate::collect::config::DedupMode;
         let mut c = CollectConfig::default();
-        apply_form(&mut c, &parse_form(b"dedup_mode=dhash")).unwrap();
+        apply_form(&mut c, &parse(b"dedup_mode=dhash")).unwrap();
         assert_eq!(c.dedup_mode, DedupMode::Dhash);
-        apply_form(&mut c, &parse_form(b"dedup_mode=")).unwrap();
+        apply_form(&mut c, &parse(b"dedup_mode=")).unwrap();
         assert_eq!(
             c.dedup_mode,
             DedupMode::Dhash,
             "an empty field keeps the value"
         );
-        apply_form(&mut c, &parse_form(b"dedup_mode=both")).unwrap();
+        apply_form(&mut c, &parse(b"dedup_mode=both")).unwrap();
         assert_eq!(c.dedup_mode, DedupMode::Both);
-        let e = apply_form(&mut c, &parse_form(b"dedup_mode=blocks")).unwrap_err();
+        let e = apply_form(&mut c, &parse(b"dedup_mode=blocks")).unwrap_err();
         assert!(e.to_string().contains("dedup rule"), "{e}");
         assert_eq!(c.dedup_mode, DedupMode::Both);
     }
@@ -717,7 +656,7 @@ mod tests {
     #[test]
     fn settings_form_toggles_and_numbers() {
         let mut c = CollectConfig::default();
-        let f = parse_form(
+        let f = parse(
             b"enabled=on&positive.enabled=on&positive.rate=0.5&positive.interval=60&empty.rate=&max_gb=2&near_threshold.enabled=on&near_threshold.margin=0.05&dir=",
         );
         apply_form(&mut c, &f).unwrap();
@@ -731,18 +670,18 @@ mod tests {
             c.buckets.empty.night_interval_s, None,
             "a missing field keeps it"
         );
-        apply_form(&mut c, &parse_form(b"empty.night_interval=30")).unwrap();
+        apply_form(&mut c, &parse(b"empty.night_interval=30")).unwrap();
         assert_eq!(c.buckets.empty.night_interval_s, Some(30));
-        apply_form(&mut c, &parse_form(b"empty.night_interval=")).unwrap();
+        apply_form(&mut c, &parse(b"empty.night_interval=")).unwrap();
         assert_eq!(c.buckets.empty.night_interval_s, None, "empty = unset");
-        apply_form(&mut c, &parse_form(b"empty.night_interval=0")).unwrap();
+        apply_form(&mut c, &parse(b"empty.night_interval=0")).unwrap();
         assert_eq!(c.buckets.empty.night_interval_s, Some(0));
-        assert!(apply_form(&mut c, &parse_form(b"empty.night_interval=soon")).is_err());
+        assert!(apply_form(&mut c, &parse(b"empty.night_interval=soon")).is_err());
         assert_eq!(c.buckets.positive.night_interval_s, None);
         assert_eq!(c.max_gb, 2.0);
         assert_eq!(c.buckets.near_margin(), 0.05);
         assert_eq!(c.dir, None);
-        let e = apply_form(&mut c, &parse_form(b"positive.rate=lots")).unwrap_err();
+        let e = apply_form(&mut c, &parse(b"positive.rate=lots")).unwrap_err();
         assert!(e.to_string().contains("positive rate"), "{e}");
     }
 

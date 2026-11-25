@@ -32,7 +32,8 @@ Files:
   `useradd` as fallback.
 - `pkg-scriptlet.sh` -> `/opt/blue-onyx-prism/scripts/pkg_scriptlet.sh`: the one implementation of
   post-install / post-upgrade / pre-remove, built on `scripts/systemd_common.sh` (also used by
-  `install_systemd.sh`). `debian/{preinst,postinst,prerm,postrm}` and `rpm/*.sh` are thin wrappers.
+  `install_systemd.sh`), which sources `scripts/install_common.sh` (the config migration and the
+  printed addresses, shared with the macOS flows; both are installed beside it). `debian/{preinst,postinst,prerm,postrm}` and `rpm/*.sh` are thin wrappers.
 - No `systemd-units` in cargo-deb: the scriptlet does enable/start itself, so nothing is handled
   twice (`#DEBHELPER#` stays in the scripts but expands to nothing).
 

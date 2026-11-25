@@ -30,7 +30,9 @@
 //! `POST /v1/refine/static-cap`) are in [`super::refine_spots`], the one place of this tab that
 //! writes boxes (through [`suggestions::accept`]) or the config.
 
+use super::answer::{json_body, json_fail};
 use super::train_area::{REFINE, tab_title};
+use super::walk_cache::{WalkCache, wanted_key};
 use super::{AppState, Shared, blocking, render, training};
 use crate::collect::labels::LabelFile;
 use crate::collect::labels::bulk::Wanted;
@@ -50,12 +52,12 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -73,14 +75,6 @@ const STRIP_WALK_EVERY: Duration = Duration::from_secs(60);
 const OPEN_KEEP: usize = 8;
 /// Largest `report.json` read (a report with this many recall rows is not one this build wrote).
 const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
-
-pub(super) fn fail(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(serde_json::json!({ "success": false, "message": message.into() })),
-    )
-        .into_response()
-}
 
 // ---------------------------------------------------------------------------------------------
 // The page
@@ -196,47 +190,37 @@ pub(super) fn count_open(dir: &Path, classes: &[String], hidden: &[String]) -> O
     open
 }
 
-struct Kept {
-    at: Instant,
-    stamp: String,
-    open: Open,
-}
-
 /// The walks' answers per folder and class list, and what keeps their walks in check. One per
-/// process ([`OPEN`]); tests make their own.
+/// process ([`OPEN`]); tests make their own. Derefs to its [`WalkCache`] of answers (by
+/// [`wanted_key`]; fresh for [`OPEN_TTL`], kept up to [`STRIP_OPEN_TTL`] for [`open_cached`], at
+/// most [`OPEN_KEEP`]), whose `forget` drops every kept answer.
 pub(super) struct OpenStore {
-    /// The kept answers, by [`open_key`].
-    kept: Mutex<BTreeMap<String, Kept>>,
-    /// One walk at a time: a second caller waits and finds the first one's answer.
-    walking: Mutex<()>,
+    /// The kept answers.
+    counts: WalkCache<Open>,
     /// Keys whose walk [`open_cached`] started and that has not ended: one background walk per key.
     refreshing: Mutex<BTreeSet<String>>,
     /// When [`open_cached`] last started a walk, per key: at most one per [`STRIP_WALK_EVERY`].
     started: Mutex<BTreeMap<String, Instant>>,
-    /// Bumped by [`forget_counts`]: a walk that began before a drop keeps its answer to itself.
-    generation: AtomicU64,
     /// Walks run (tests).
     walks: AtomicUsize,
+}
+
+impl std::ops::Deref for OpenStore {
+    type Target = WalkCache<Open>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.counts
+    }
 }
 
 impl OpenStore {
     const fn new() -> Self {
         Self {
-            kept: Mutex::new(BTreeMap::new()),
-            walking: Mutex::new(()),
+            counts: WalkCache::new(OPEN_KEEP, OPEN_TTL, STRIP_OPEN_TTL),
             refreshing: Mutex::new(BTreeSet::new()),
             started: Mutex::new(BTreeMap::new()),
-            generation: AtomicU64::new(0),
             walks: AtomicUsize::new(0),
         }
-    }
-
-    /// Drop every kept answer.
-    fn forget(&self) {
-        // Under the map's lock: a walk storing its answer checks the generation under it too.
-        let mut kept = self.kept.lock_recover();
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        kept.clear();
     }
 }
 
@@ -270,42 +254,10 @@ fn open_counts_with(
     stamp: &str,
     count: impl FnOnce() -> Open,
 ) -> Open {
-    let key = open_key(dir, classes, hidden);
-    let fresh = |k: &Kept| k.at.elapsed() < OPEN_TTL && k.stamp == stamp;
-    if let Some(k) = store.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
-        return k.open.clone();
-    }
-    let _walking = store.walking.lock_recover();
-    if let Some(k) = store.kept.lock_recover().get(&key).filter(|k| fresh(k)) {
-        return k.open.clone();
-    }
-    let generation = store.generation.load(Ordering::SeqCst);
-    store.walks.fetch_add(1, Ordering::SeqCst);
-    let open = count();
-    let mut kept = store.kept.lock_recover();
-    // A drop since the walk began: what it counted may be the file before a save.
-    if store.generation.load(Ordering::SeqCst) == generation {
-        remember(
-            &mut kept,
-            key,
-            Kept {
-                at: Instant::now(),
-                stamp: stamp.to_string(),
-                open: open.clone(),
-            },
-        );
-    }
-    open
-}
-
-/// The key of a walk's answer in [`OPEN`]: the folder and both class lists.
-fn open_key(dir: &Path, classes: &[String], hidden: &[String]) -> String {
-    format!(
-        "{}\u{1f}{}\u{1f}{}",
-        dir.display(),
-        classes.join("\u{1e}"),
-        hidden.join("\u{1e}")
-    )
+    store.get_or_walk(wanted_key(dir, classes, hidden), stamp, || {
+        store.walks.fetch_add(1, Ordering::SeqCst);
+        count()
+    })
 }
 
 /// Takes its key out of [`OpenStore::refreshing`] when dropped, panic included, so a failed walk
@@ -341,14 +293,11 @@ fn open_cached_in(
     hidden: &[String],
     stamp: &str,
 ) -> Option<Open> {
-    let key = open_key(dir, classes, hidden);
+    let key = wanted_key(dir, classes, hidden);
     // Another queue: the answer is of the checks before, and no number is better than its.
     let kept = store
-        .kept
-        .lock_recover()
-        .get(&key)
-        .filter(|k| k.stamp == stamp)
-        .map(|k| (k.open.clone(), k.at.elapsed() < STRIP_OPEN_TTL));
+        .peek(&key, stamp)
+        .map(|(open, age)| (open, age < STRIP_OPEN_TTL));
     if kept.as_ref().is_some_and(|(_, young)| *young) {
         return kept.map(|(open, _)| open);
     }
@@ -422,8 +371,8 @@ pub(super) fn keep_open_now(dir: &Path, classes: &[String], hidden: &[String]) -
 /// The kept open count of `dir`, whatever the queue. Tests of other modules.
 #[cfg(test)]
 pub(super) fn kept_open(dir: &Path, classes: &[String], hidden: &[String]) -> Option<Open> {
-    let key = open_key(dir, classes, hidden);
-    OPEN.kept.lock_recover().get(&key).map(|k| k.open.clone())
+    let key = wanted_key(dir, classes, hidden);
+    OPEN.kept.lock_recover().get(&key).map(|k| k.value.clone())
 }
 
 /// Whether a review save of `before` (the stored file, None when there was none) as `after` can
@@ -432,20 +381,6 @@ pub(super) fn kept_open(dir: &Path, classes: &[String], hidden: &[String]) -> Op
 pub(super) fn save_changes_open(before: Option<&LabelFile>, after: &LabelFile) -> bool {
     let unanswered = |f: &LabelFile| f.refine.iter().any(|s| !s.answered());
     before.is_some_and(unanswered) || unanswered(after)
-}
-
-/// Put `kept` in `map` under `key`: answers past [`STRIP_OPEN_TTL`] go first, then the oldest, so
-/// at most [`OPEN_KEEP`] stay (each folder under review and class list ever asked about would
-/// otherwise stay for the life of the process).
-fn remember(map: &mut BTreeMap<String, Kept>, key: String, kept: Kept) {
-    map.retain(|k, v| *k != key && v.at.elapsed() < STRIP_OPEN_TTL);
-    while map.len() >= OPEN_KEEP {
-        let Some(oldest) = map.iter().min_by_key(|(_, v)| v.at).map(|(k, _)| k.clone()) else {
-            break;
-        };
-        map.remove(&oldest);
-    }
-    map.insert(key, kept);
 }
 
 /// The full check's report in `dir` and what is wrong with it: `(None, None)` when there is none
@@ -482,7 +417,9 @@ enum FileStamp {
     File(u64, SystemTime),
 }
 
-/// The stamp of `path`; None when it cannot be told (then nothing is kept).
+/// The stamp of `path`; None when it cannot be told (then nothing is kept). Stricter than
+/// [`crate::benchmark::search::file_stamp`], where an unreadable file is a missing one: a report
+/// that cannot be stamped is read again at every ask, never answered from an old read.
 fn file_stamp(path: &Path) -> Option<FileStamp> {
     match std::fs::metadata(path) {
         Ok(m) => Some(FileStamp::File(m.len(), m.modified().ok()?)),
@@ -951,7 +888,7 @@ pub(super) async fn preview(
     blocking(move || {
         let request = match q.request() {
             Ok(r) => r,
-            Err(m) => return fail(StatusCode::BAD_REQUEST, m),
+            Err(m) => return json_fail(StatusCode::BAD_REQUEST, m),
         };
         let config = state.config_read().clone();
         let cap = crate::training::capability_now();
@@ -964,7 +901,7 @@ pub(super) async fn preview(
                 }
                 Json(v).into_response()
             }
-            Err(e) => fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
         }
     })
     .await
@@ -1001,39 +938,6 @@ struct CheckBody {
     /// Start even when the memory commit check would refuse (the preview's "Start anyway").
     #[serde(default)]
     ignore_memory_check: bool,
-}
-
-/// The JSON body of a POST: 413 over the cap, 415 without a JSON content type, 400 when it does
-/// not parse (as the Review routes' own reader).
-pub(super) fn json_body<T: for<'de> Deserialize<'de>>(
-    headers: &HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Result<T, (StatusCode, String)> {
-    let body = body.map_err(|e| {
-        let s = e.status();
-        if s == StatusCode::PAYLOAD_TOO_LARGE {
-            (s, "request body too large".to_string())
-        } else {
-            (s, format!("could not read the request body: {e}"))
-        }
-    })?;
-    let json = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
-    if !json {
-        return Err((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "send the body as JSON (Content-Type: application/json)".into(),
-        ));
-    }
-    serde_json::from_slice(&body).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("the request is not valid: {e}"),
-        )
-    })
 }
 
 /// Why a check was not queued.
@@ -1200,7 +1104,7 @@ pub(super) async fn start(
 ) -> Response {
     let b: CheckBody = match json_body(&headers, body) {
         Ok(b) => b,
-        Err((status, message)) => return fail(status, message),
+        Err((status, message)) => return json_fail(status, message),
     };
     blocking(move || {
         let request = match build_request(Fields {
@@ -1217,7 +1121,7 @@ pub(super) async fn start(
                 ignore_memory_check: b.ignore_memory_check,
                 ..r
             },
-            Err(m) => return fail(StatusCode::BAD_REQUEST, m),
+            Err(m) => return json_fail(StatusCode::BAD_REQUEST, m),
         };
         let state = shared.current();
         let config = state.config_read().clone();
@@ -1264,6 +1168,7 @@ mod tests {
     use crate::training::refine::report::Mode;
     use axum::body::Body;
     use axum::http::Request;
+    use axum::http::header;
     use std::path::PathBuf;
 
     /// QA-091: one call drops all four Refine caches (other tests may drop them too meanwhile,
@@ -1523,6 +1428,32 @@ mod tests {
                 .set_len(p.size)
                 .unwrap();
         }
+    }
+
+    /// QA-131: the start's body is read by the shared reader ([`super::super::answer::json_body`]):
+    /// its 415 and 400 answers, `{success: false, message}`.
+    #[tokio::test]
+    async fn the_check_answers_a_wrong_body_as_every_json_route_does() {
+        let dir = scratch();
+        let state = state_in(&dir);
+        let (s, v) = json(&state, post_json("/v1/refine/check", "{")).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["success"], false);
+        let message = v["message"].as_str().unwrap();
+        assert!(message.starts_with("invalid JSON body: "), "{message}");
+        let plain = Request::post("/v1/refine/check")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (s, v) = json(&state, plain).await;
+        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{v}");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "success": false,
+                "message": "send the body as JSON (Content-Type: application/json)"
+            })
+        );
     }
 
     #[tokio::test]
@@ -2131,39 +2062,6 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(covered(), None);
         assert_eq!(reads.get(), 10, "the file went");
-    }
-
-    #[test]
-    fn at_most_a_handful_of_answers_are_kept_and_the_oldest_go_first() {
-        let mut map = BTreeMap::new();
-        let base = Instant::now();
-        let kept = |secs: u64| Kept {
-            at: base - STRIP_OPEN_TTL + Duration::from_secs(secs),
-            stamp: String::new(),
-            open: Open::default(),
-        };
-        // One expired answer goes at the next insert whatever the room.
-        map.insert(
-            "expired".to_string(),
-            Kept {
-                at: base - STRIP_OPEN_TTL - Duration::from_secs(1),
-                ..kept(0)
-            },
-        );
-        for i in 0..(OPEN_KEEP as u64 + 5) {
-            remember(&mut map, format!("k{i:02}"), kept(30 + i));
-            assert!(map.len() <= OPEN_KEEP, "{}", map.len());
-        }
-        assert!(!map.contains_key("expired"));
-        let left: Vec<&String> = map.keys().collect();
-        let want: Vec<String> = (5..(OPEN_KEEP as u64 + 5))
-            .map(|i| format!("k{i:02}"))
-            .collect();
-        assert_eq!(left, want.iter().collect::<Vec<_>>(), "the newest stay");
-        // The same key again replaces its answer, it does not push another out.
-        remember(&mut map, "k12".into(), kept(59));
-        assert_eq!(map.len(), OPEN_KEEP);
-        assert!(map.contains_key("k05"));
     }
 
     #[tokio::test]

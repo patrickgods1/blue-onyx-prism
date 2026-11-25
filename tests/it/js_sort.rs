@@ -7,25 +7,8 @@
 //! order, re-renders, migration, sections).
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI).
-#![allow(clippy::unwrap_used)]
 
-use std::path::PathBuf;
-use std::process::Command;
-
-fn have_node() -> bool {
-    let ok = Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
-            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
-        );
-        println!("skipped: no node");
-    }
-    ok
-}
+use crate::js_harness::{asset, have_node, run_node_ok};
 
 /// Run `body` after loading `assets/sort.js` (no `document`: the pure part only) as `S`; it
 /// asserts and exits non-zero on a failure.
@@ -45,27 +28,9 @@ console.log('ok');
     ));
 }
 
-/// Run `driver_js` with the path of `assets/sort.js` as its argument.
+/// Run `driver_js` with the path of `assets/sort.js` as its argument; it prints `ok` at the end.
 fn node(driver_js: &str) {
-    let dir = std::env::temp_dir().join(format!("bop-js-sort-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let driver = dir.join("driver.js");
-    std::fs::write(&driver, driver_js).unwrap();
-    let asset = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/sort.js");
-    let out = Command::new("node")
-        .arg(&driver)
-        .arg(asset)
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "node failed ({}): {}{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("ok"));
+    run_node_ok(driver_js, &[asset("sort.js").as_os_str()]);
 }
 
 #[test]
@@ -553,7 +518,7 @@ Promise.resolve().then(() => {
   assert.strictEqual(g1.querySelector('button.th-sort').getAttribute('aria-label'), 'Sort by Recall');
   assert.strictEqual(glueOf(g2).firstChild.nodeValue, 'p95');
   assert.strictEqual(g2.childNodes.length, 1, 'a one-word header: only the span');
-  console.log('dom ok');
+  console.log('ok');
 }).catch((e) => { console.error(e); process.exit(1); });
 "#;
 

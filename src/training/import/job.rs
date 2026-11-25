@@ -7,7 +7,11 @@
 //! then the dedup; in Rust) -> select (SigLIP embeddings from `import_footage.py embed`, k-center
 //! per scene) -> write (the kept video frames again at
 //! full resolution with `import_footage.py frames`, then the dataset layout, the review queue,
-//! `imports.jsonl`).
+//! `imports.jsonl`). `ImportJob::stages` runs them in that order, one linear driver; the helper
+//! runs with self-contained inputs and outputs are methods of their own: the self-check
+//! (`ImportJob::self_check`, its line `self_check_line`), the URL download
+//! (`ImportJob::fetch_url`, the site's metadata `site_info`) and the SigLIP 2 embeddings
+//! (`ImportJob::embed`).
 //!
 //! The candidates are stored downscaled ([`disk::CANDIDATE_MAX_SIDE`]); a kept video frame is
 //! written from its full-resolution extraction only, never from the candidate (a frame that cannot
@@ -299,6 +303,63 @@ fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// What [`ImportJob::fetch_url`] downloaded.
+struct FetchedUrl {
+    video: Video,
+    /// The site's metadata, for the provenance ([`site_info`]).
+    site: serde_json::Value,
+    /// The site reports another licence than the confirmed one.
+    warning: Option<String>,
+}
+
+/// The line the self-check event `ev` of `import_footage.py --self-check` is reported as: PyAV,
+/// FFmpeg's licence, yt-dlp (`?` when missing), the hardware decoders and the request's
+/// `hwaccel`.
+fn self_check_line(ev: &serde_json::Value, hwaccel: &str) -> String {
+    let text = |k: &str| ev.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+    let hw: Vec<&str> = ev
+        .get("hwdevices")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    format!(
+        "PyAV {} (FFmpeg {}), yt-dlp {}; hardware decoders: {}; video decoding: {hwaccel}",
+        text("av"),
+        text("ffmpeg_license"),
+        text("yt_dlp"),
+        if hw.is_empty() {
+            "none".to_string()
+        } else {
+            hw.join(", ")
+        },
+    )
+}
+
+/// The provenance's site metadata of yt-dlp's `fetched` event `ev` (the event without its
+/// `event` and `file`), and a warning when the licence it reports is neither the confirmed
+/// `license` nor contains it (or is contained in it), case aside.
+fn site_info(ev: &serde_json::Value, license: &str) -> (serde_json::Value, Option<String>) {
+    let mut site = ev.clone();
+    if let Some(o) = site.as_object_mut() {
+        o.remove("event");
+        o.remove("file");
+    }
+    let warning = site
+        .get("license")
+        .and_then(serde_json::Value::as_str)
+        .filter(|l| {
+            let (a, b) = (l.to_ascii_lowercase(), license.to_ascii_lowercase());
+            !l.is_empty() && !a.contains(&b) && !b.contains(&a)
+        })
+        .map(|l| {
+            format!(
+                "the site reports the licence \"{l}\"; you confirmed \"{license}\" (both are in \
+                 the provenance)"
+            )
+        });
+    (site, warning)
 }
 
 impl ImportJob {
@@ -711,6 +772,213 @@ impl ImportJob {
         Ok(out)
     }
 
+    /// Run `import_footage.py --self-check` (step 2, after the environment is set up) and report
+    /// its versions and hardware decoders as one line ([`self_check_line`]).
+    fn self_check(
+        &self,
+        runner: &dyn CommandRunner,
+        import: &Path,
+        report: &mut dyn FnMut(TaskReport<'_>),
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        let mut seen = None;
+        pyenv::run_script(
+            runner,
+            &self.paths,
+            self.platform,
+            &self.paths.scripts,
+            Duration::from_secs(10 * 60),
+            vec![import.as_os_str().to_os_string(), "--self-check".into()],
+            "import",
+            &mut |ev, _| {
+                if ev.get("event").and_then(serde_json::Value::as_str) == Some("self_check") {
+                    seen = Some(ev.clone());
+                }
+            },
+            report,
+            cancel,
+        )
+        .context("the import helpers' self-check failed")?;
+        let Some(ev) = seen else {
+            bail!("the import helpers' self-check printed no report; the script is damaged");
+        };
+        report(TaskReport::Line(&self_check_line(
+            &ev,
+            self.request.hwaccel.as_str(),
+        )));
+        Ok(())
+    }
+
+    /// Download the video at `u` with yt-dlp (`import_footage.py fetch-url`, the second half of
+    /// step 3) into the work folder's `download`: the video (its camera the site's name unless the
+    /// request names one), the site's metadata for the provenance and a warning when the site's
+    /// licence differs from the confirmed `license` ([`site_info`]).
+    fn fetch_url(
+        &self,
+        u: &str,
+        script: &dyn Fn() -> Result<OsString>,
+        license: &str,
+        runner: &dyn CommandRunner,
+        report: &mut dyn FnMut(TaskReport<'_>),
+        guard: &Guard,
+    ) -> Result<FetchedUrl> {
+        self.step(report, 3, 50, "downloading the video with yt-dlp");
+        let dl = self.work.join("download");
+        let mut fetched: Option<serde_json::Value> = None;
+        pyenv::run_script(
+            runner,
+            &self.paths,
+            self.platform,
+            &self.work,
+            self.timeout,
+            vec![
+                script()?,
+                "fetch-url".into(),
+                "--url".into(),
+                u.into(),
+                "--out".into(),
+                dl.clone().into_os_string(),
+                "--max-bytes".into(),
+                MAX_URL_BYTES.to_string().into(),
+                "--max-height".into(),
+                "1080".into(),
+            ],
+            "import",
+            &mut |ev, report| match ev.get("event").and_then(serde_json::Value::as_str) {
+                Some("fetched") => fetched = Some(ev.clone()),
+                Some("progress") => {
+                    let n = |k: &str| ev.get(k).and_then(serde_json::Value::as_u64);
+                    let (bytes, total) = (n("bytes").unwrap_or(0), n("total").unwrap_or(0));
+                    guard.check_work_for(total.saturating_sub(bytes));
+                    // The second half of the step (the first is the pinned downloads).
+                    if let Some(share) = (49 * bytes.min(total)).checked_div(total) {
+                        let pct = 50 + share;
+                        stage(
+                            report,
+                            STAGES[2],
+                            3,
+                            STAGES.len(),
+                            u8::try_from(pct).unwrap_or(99),
+                            &format!(
+                                "downloading the video with yt-dlp: {} of {} MB",
+                                bytes / 1_000_000,
+                                total / 1_000_000
+                            ),
+                        );
+                    }
+                }
+                _ => {}
+            },
+            report,
+            &guard.stop,
+        )
+        .context("downloading the video")?;
+        let ev = fetched.ok_or_else(|| anyhow!("yt-dlp reported no downloaded file"))?;
+        let file = PathBuf::from(
+            ev.get("file")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        );
+        if !file.starts_with(&dl) || !file.is_file() {
+            bail!("yt-dlp wrote no video into {}", dl.display());
+        }
+        let host = source::site_of(u);
+        let camera = source::camera_of(&file, self.request.camera.as_deref().or(Some(&host)));
+        let (site, warning) = site_info(&ev, license);
+        Ok(FetchedUrl {
+            video: Video {
+                path: file,
+                camera,
+                base: SystemTime::now(),
+                kind: "video",
+            },
+            site,
+            warning,
+        })
+    }
+
+    /// The SigLIP 2 embeddings of the `unique` candidates (`import_footage.py embed`, step 6),
+    /// flat with their dimension ([`read_embeddings`]).
+    fn embed(
+        &self,
+        cands: &[Candidate],
+        unique: &[usize],
+        script: &dyn Fn() -> Result<OsString>,
+        runner: &dyn CommandRunner,
+        report: &mut dyn FnMut(TaskReport<'_>),
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<f32>, usize)> {
+        self.step(report, 6, 0, "SigLIP 2 embeddings");
+        if let Some(Accelerator::Cuda {
+            ordinal,
+            compute_capability,
+            ..
+        }) = &self.accelerator
+            && let Some(w) = crate::backend::vram::check_cuda_job(
+                *ordinal,
+                &crate::training::autolabel::memory::embed_need(Some(compute_capability.major)),
+            )
+        {
+            tracing::warn!("import: SigLIP 2 embeddings: {w}");
+        }
+        let list = self.work.join("candidates.txt");
+        let text: String = unique
+            .iter()
+            .filter_map(|i| cands.get(*i))
+            .map(|c| format!("{}\n", c.file.display()))
+            .collect();
+        std::fs::create_dir_all(&self.work)?;
+        std::fs::write(&list, text)?;
+        let emb = self.work.join("embeddings.f32");
+        let s = self.siglip()?;
+        let mut dim = None;
+        let total = unique.len();
+        pyenv::run_script(
+            runner,
+            &self.paths,
+            self.platform,
+            &self.work,
+            self.timeout,
+            vec![
+                script()?,
+                "embed".into(),
+                "--list".into(),
+                list.into_os_string(),
+                "--model".into(),
+                pyenv::weights_dir(&self.paths, s).into_os_string(),
+                "--out".into(),
+                emb.clone().into_os_string(),
+                "--device".into(),
+                self.device().into(),
+            ],
+            "import",
+            &mut |ev, report| match ev.get("event").and_then(serde_json::Value::as_str) {
+                Some("progress") => {
+                    let done = ev
+                        .get("done")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let pct = u8::try_from(done * 90 / u64::try_from(total.max(1)).unwrap_or(1))
+                        .unwrap_or(90);
+                    stage(
+                        report,
+                        STAGES[5],
+                        6,
+                        STAGES.len(),
+                        pct,
+                        &format!("SigLIP 2 embeddings {done} of {total}"),
+                    );
+                }
+                Some("done") => dim = ev.get("dim").and_then(serde_json::Value::as_u64),
+                _ => {}
+            },
+            report,
+            cancel,
+        )
+        .context("computing the SigLIP 2 embeddings")?;
+        read_embeddings(&emb, total, dim)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "one linear stage machine reads best in one place"
@@ -784,50 +1052,7 @@ impl ImportJob {
             )?;
             let (import, _) = crate::resources::export::train::write_task_scripts(&self.paths)?;
             self.step(report, 2, 95, "checking PyAV and yt-dlp");
-            let mut seen = None;
-            pyenv::run_script(
-                ctx.runner,
-                &self.paths,
-                self.platform,
-                &self.paths.scripts,
-                Duration::from_secs(10 * 60),
-                vec![import.clone().into_os_string(), "--self-check".into()],
-                "import",
-                &mut |ev, _| {
-                    if ev.get("event").and_then(serde_json::Value::as_str) == Some("self_check") {
-                        seen = Some(ev.clone());
-                    }
-                },
-                report,
-                cancel,
-            )
-            .context("the import helpers' self-check failed")?;
-            let Some(ev) = seen else {
-                bail!("the import helpers' self-check printed no report; the script is damaged");
-            };
-            let hw: Vec<&str> = ev
-                .get("hwdevices")
-                .and_then(serde_json::Value::as_array)
-                .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
-                .unwrap_or_default();
-            report(TaskReport::Line(&format!(
-                "PyAV {} (FFmpeg {}), yt-dlp {}; hardware decoders: {}; video decoding: {}",
-                ev.get("av")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?"),
-                ev.get("ffmpeg_license")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?"),
-                ev.get("yt_dlp")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?"),
-                if hw.is_empty() {
-                    "none".to_string()
-                } else {
-                    hw.join(", ")
-                },
-                r.hwaccel.as_str()
-            )));
+            self.self_check(ctx.runner, &import, report, cancel)?;
             Some(import)
         } else {
             self.step(report, 2, 100, "not needed");
@@ -876,93 +1101,10 @@ impl ImportJob {
         }
         let mut url_info: Option<(String, serde_json::Value)> = None;
         if let ImportSource::Url(u) = &r.source {
-            self.step(report, 3, 50, "downloading the video with yt-dlp");
-            let dl = self.work.join("download");
-            let mut fetched: Option<serde_json::Value> = None;
-            pyenv::run_script(
-                ctx.runner,
-                &self.paths,
-                self.platform,
-                &self.work,
-                self.timeout,
-                vec![
-                    script()?,
-                    "fetch-url".into(),
-                    "--url".into(),
-                    u.into(),
-                    "--out".into(),
-                    dl.clone().into_os_string(),
-                    "--max-bytes".into(),
-                    MAX_URL_BYTES.to_string().into(),
-                    "--max-height".into(),
-                    "1080".into(),
-                ],
-                "import",
-                &mut |ev, report| match ev.get("event").and_then(serde_json::Value::as_str) {
-                    Some("fetched") => fetched = Some(ev.clone()),
-                    Some("progress") => {
-                        let n = |k: &str| ev.get(k).and_then(serde_json::Value::as_u64);
-                        let (bytes, total) = (n("bytes").unwrap_or(0), n("total").unwrap_or(0));
-                        guard.check_work_for(total.saturating_sub(bytes));
-                        // The second half of the step (the first is the pinned downloads).
-                        if let Some(share) = (49 * bytes.min(total)).checked_div(total) {
-                            let pct = 50 + share;
-                            stage(
-                                report,
-                                STAGES[2],
-                                3,
-                                STAGES.len(),
-                                u8::try_from(pct).unwrap_or(99),
-                                &format!(
-                                    "downloading the video with yt-dlp: {} of {} MB",
-                                    bytes / 1_000_000,
-                                    total / 1_000_000
-                                ),
-                            );
-                        }
-                    }
-                    _ => {}
-                },
-                report,
-                cancel,
-            )
-            .context("downloading the video")?;
-            let ev = fetched.ok_or_else(|| anyhow!("yt-dlp reported no downloaded file"))?;
-            let file = PathBuf::from(
-                ev.get("file")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            );
-            if !file.starts_with(&dl) || !file.is_file() {
-                bail!("yt-dlp wrote no video into {}", dl.display());
-            }
-            let host = source::site_of(u);
-            let camera = source::camera_of(&file, r.camera.as_deref().or(Some(&host)));
-            let mut site = ev.clone();
-            if let Some(o) = site.as_object_mut() {
-                o.remove("event");
-                o.remove("file");
-            }
-            if let Some(l) = site
-                .get("license")
-                .and_then(serde_json::Value::as_str)
-                .filter(|l| {
-                    let (a, b) = (l.to_ascii_lowercase(), license.to_ascii_lowercase());
-                    !l.is_empty() && !a.contains(&b) && !b.contains(&a)
-                })
-            {
-                warnings.push(format!(
-                    "the site reports the licence \"{l}\"; you confirmed \"{license}\" (both are \
-                     in the provenance)"
-                ));
-            }
-            url_info = Some((u.clone(), site));
-            videos.push(Video {
-                path: file,
-                camera,
-                base: SystemTime::now(),
-                kind: "video",
-            });
+            let fetched = self.fetch_url(u, &script, &license, ctx.runner, report, guard)?;
+            warnings.extend(fetched.warning);
+            url_info = Some((u.clone(), fetched.site));
+            videos.push(fetched.video);
         }
         self.step(report, 3, 100, "done");
         check(cancel)?;
@@ -1285,76 +1427,7 @@ impl ImportJob {
             .filter_map(|i| info.get(*i)?.as_ref().map(|x| x.0))
             .collect();
         let embeddings = if r.selection == Selection::Siglip && unique.len() > r.frames {
-            self.step(report, 6, 0, "SigLIP 2 embeddings");
-            if let Some(Accelerator::Cuda {
-                ordinal,
-                compute_capability,
-                ..
-            }) = &self.accelerator
-                && let Some(w) = crate::backend::vram::check_cuda_job(
-                    *ordinal,
-                    &crate::training::autolabel::memory::embed_need(Some(compute_capability.major)),
-                )
-            {
-                tracing::warn!("import: SigLIP 2 embeddings: {w}");
-            }
-            let list = self.work.join("candidates.txt");
-            let text: String = unique
-                .iter()
-                .filter_map(|i| cands.get(*i))
-                .map(|c| format!("{}\n", c.file.display()))
-                .collect();
-            std::fs::create_dir_all(&self.work)?;
-            std::fs::write(&list, text)?;
-            let emb = self.work.join("embeddings.f32");
-            let s = self.siglip()?;
-            let mut dim = None;
-            let total = unique.len();
-            pyenv::run_script(
-                ctx.runner,
-                &self.paths,
-                self.platform,
-                &self.work,
-                self.timeout,
-                vec![
-                    script()?,
-                    "embed".into(),
-                    "--list".into(),
-                    list.into_os_string(),
-                    "--model".into(),
-                    pyenv::weights_dir(&self.paths, s).into_os_string(),
-                    "--out".into(),
-                    emb.clone().into_os_string(),
-                    "--device".into(),
-                    self.device().into(),
-                ],
-                "import",
-                &mut |ev, report| match ev.get("event").and_then(serde_json::Value::as_str) {
-                    Some("progress") => {
-                        let done = ev
-                            .get("done")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0);
-                        let pct =
-                            u8::try_from(done * 90 / u64::try_from(total.max(1)).unwrap_or(1))
-                                .unwrap_or(90);
-                        stage(
-                            report,
-                            STAGES[5],
-                            6,
-                            STAGES.len(),
-                            pct,
-                            &format!("SigLIP 2 embeddings {done} of {total}"),
-                        );
-                    }
-                    Some("done") => dim = ev.get("dim").and_then(serde_json::Value::as_u64),
-                    _ => {}
-                },
-                report,
-                cancel,
-            )
-            .context("computing the SigLIP 2 embeddings")?;
-            Some(read_embeddings(&emb, total, dim)?)
+            Some(self.embed(&cands, &unique, &script, ctx.runner, report, cancel)?)
         } else {
             None
         };

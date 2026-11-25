@@ -13,6 +13,14 @@ NEWSYSLOG_CONF="${NEWSYSLOG_CONF:-/etc/newsyslog.d/blue-onyx-prism.conf}"
 TRAY_LABEL="${TRAY_LABEL:-com.blueonyx.prism.tray}"
 TRAY_PLIST="${TRAY_PLIST:-/Library/LaunchAgents/$TRAY_LABEL.plist}"
 
+# bop_merge_keys, bop_migrate_config and bop_print_urls: shared with the Linux flows.
+# shellcheck source=scripts/install_common.sh
+. "$(dirname "${BASH_SOURCE[0]}")/install_common.sh"
+# What bop_print_urls prints: the account of the `setup-code` line and the host placeholders.
+BOP_URL_USER="$SVC"
+BOP_URL_WEB_HOST="localhost"
+BOP_URL_IRIS_HOST="<this Mac's IP>"
+
 # Role account _blueonyx (hidden, no shell, no password) with a group of the same name; one free
 # id below 500 serves as both UID and GID.
 # (awk reads its whole input: `grep -q` would exit early and fail the pipe under pipefail.)
@@ -98,30 +106,6 @@ CONF
   chmod 644 "$NEWSYSLOG_CONF"
 }
 
-# bop_merge_keys KEYS FILE: FILE (pretty JSON as the service writes it) with the member lines KEYS
-# after the opening brace. The file's own top-level lines (2-space indent) of those keys are
-# dropped first, so no key repeats (Config::load refuses duplicates), and a comma left before the
-# closing brace is removed.
-bop_merge_keys() {
-  KEYS="$1" awk '
-    BEGIN {
-      n = split(ENVIRON["KEYS"], L, "\n")
-      for (i = 1; i <= n; i++) {
-        if (L[i] ~ /^  "[^"]*"[ \t]*:/) { k = L[i]; sub(/^  "/, "", k); sub(/".*/, "", k); drop[k] = 1 }
-      }
-      m = 0
-    }
-    NR == 1 { out[++m] = $0; out[++m] = ENVIRON["KEYS"]; next }
-    {
-      if ($0 ~ /^  "[^"]*"[ \t]*:/) { k = $0; sub(/^  "/, "", k); sub(/".*/, "", k); if (k in drop) next }
-      out[++m] = $0
-    }
-    END {
-      for (i = 2; i <= m; i++) if (out[i] ~ /^}/ && out[i - 1] ~ /,[ \t]*$/) sub(/,[ \t]*$/, "", out[i - 1])
-      for (i = 1; i <= m; i++) print out[i]
-    }' "$2"
-}
-
 # Settings that point the daemon at the data root and the log dir. Prints the JSON members (each
 # line ending in a comma). An optional extra block (already formatted, comma-terminated) can be
 # passed as $1, e.g. the runtime dirs of the zip flow.
@@ -131,10 +115,13 @@ bop_config_keys() {
   printf '\n'
 }
 
-# Write a fresh config with the keys above; never touches an existing file.
+# bop_seed_config [EXTRA_KEYS [SRC]]: write $CONFIG with the keys above (EXTRA_KEYS as for
+# bop_config_keys) unless it exists (never touches an existing file), then fix owner/mode. SRC is
+# a config to carry over (the zip flow names the install dir's own config; bop_migrate_config);
+# without one (the .pkg) the config is a fresh one.
 bop_seed_config() {
   if [ ! -f "$CONFIG" ]; then
-    printf '{\n%s\n  "models_dir": "models"\n}\n' "$(bop_config_keys "${1:-}")" > "$CONFIG"
+    bop_migrate_config "${2:-}" "$CONFIG" "$(bop_config_keys "${1:-}")" "$DATA_DIR"
   fi
   chown "$SVC:$SVC" "$CONFIG"
   chmod 0640 "$CONFIG"
@@ -195,18 +182,4 @@ bop_tray_start() {
   launchctl bootout "gui/$uid/$TRAY_LABEL" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$uid" "$TRAY_PLIST" >/dev/null 2>&1 || true
   return 0
-}
-
-# bop_print_urls CONFIG EXE: the addresses an install prints. The web UI is HTTPS (self-signed
-# certificate, a sign-in; the first visit creates the first account with the one-time code that
-# `setup-code` prints); Blue Iris uses the plain HTTP port with no account. The ports are the
-# config's when it names them (a pretty config, one key per line), else the defaults.
-bop_print_urls() {
-  local port https
-  port="$(sed -n 's/^[[:space:]]*"port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | head -n 1 || true)"
-  https="$(sed -n 's/^[[:space:]]*"https_port":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | head -n 1 || true)"
-  echo "Web UI:    https://localhost:${https:-32169}/ (self-signed certificate; on the first visit,"
-  echo "           create the first account with the code that this prints:"
-  echo "           sudo -u $SVC $2 --config $1 setup-code)"
-  echo "Blue Iris: http://<this Mac's IP>:${port:-32168} (plain HTTP, no account)"
 }

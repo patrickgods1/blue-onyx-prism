@@ -116,6 +116,9 @@ time = { version = "=0.3.55", default-features = false, features = ["std"] }
 argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "getrandom", "password-hash"] }
 # NFC normalization of passwords before counting and hashing; already in the tree through url/idna.
 icu_normalizer = { version = "=2.4.0", default-features = false, features = ["compiled_data"] }
+# Urlencoded form bodies read in order with repeated names (`server::form::parse`); already in the
+# tree through axum, url and serde_urlencoded (axum's `Form`), same version.
+form_urlencoded = "=1.2.3"
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 raw-cpuid = "11"
@@ -175,6 +178,7 @@ assets = [
     ["THIRD_PARTY_LICENSES.md", "opt/blue-onyx-prism/", "644"],
     ["README.md", "opt/blue-onyx-prism/", "644"],
     ["scripts/systemd_common.sh", "opt/blue-onyx-prism/scripts/", "644"],
+    ["scripts/install_common.sh", "opt/blue-onyx-prism/scripts/", "644"],
     ["scripts/train_model.py", "opt/blue-onyx-prism/scripts/", "644"],
     ["scripts/export_model.py", "opt/blue-onyx-prism/scripts/", "644"],
     ["scripts/autolabel.py", "opt/blue-onyx-prism/scripts/", "644"],
@@ -193,6 +197,7 @@ assets = [
     { source = "THIRD_PARTY_LICENSES.md", dest = "/opt/blue-onyx-prism/THIRD_PARTY_LICENSES.md", mode = "644" },
     { source = "README.md", dest = "/opt/blue-onyx-prism/README.md", mode = "644" },
     { source = "scripts/systemd_common.sh", dest = "/opt/blue-onyx-prism/scripts/systemd_common.sh", mode = "644" },
+    { source = "scripts/install_common.sh", dest = "/opt/blue-onyx-prism/scripts/install_common.sh", mode = "644" },
     { source = "scripts/train_model.py", dest = "/opt/blue-onyx-prism/scripts/train_model.py", mode = "644" },
     { source = "scripts/export_model.py", dest = "/opt/blue-onyx-prism/scripts/export_model.py", mode = "644" },
     { source = "scripts/autolabel.py", dest = "/opt/blue-onyx-prism/scripts/autolabel.py", mode = "644" },

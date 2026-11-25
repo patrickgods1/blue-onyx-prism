@@ -4,8 +4,8 @@
 //! `.../retire`, `.../moved`).
 
 use super::{
-    ACCEPT_AUTO_DEFAULT_LIMIT, Answer, AppState, Problem, blocking, bulk_limit, context, fail,
-    filters, hidden, json_body, not_found, now, push_failed, push_past_limit, query_map, success,
+    ACCEPT_AUTO_DEFAULT_LIMIT, Answer, AppState, Problem, blocking, bulk_limit, context, filters,
+    hidden, json_body, json_fail, not_found, now, push_failed, push_past_limit, query_map, success,
 };
 use crate::collect::labels::{self, Frame, bulk};
 use crate::collect::layout;
@@ -99,13 +99,13 @@ async fn spot_route(
     let b: SpotBody = json_body(&headers, body)?;
     let camera = b.camera.trim().to_string();
     if !layout::camera_ok(&camera) {
-        return Ok(fail(
+        return Ok(json_fail(
             StatusCode::BAD_REQUEST,
             "camera: not a camera name of the dataset",
         ));
     }
     if crate::collect::config::validate_classes(std::slice::from_ref(&b.label)).is_err() {
-        return Ok(fail(
+        return Ok(json_fail(
             StatusCode::BAD_REQUEST,
             "label: not a valid class name",
         ));
@@ -117,7 +117,7 @@ async fn spot_route(
         || b.width == 0
         || b.height == 0
     {
-        return Ok(fail(
+        return Ok(json_fail(
             StatusCode::BAD_REQUEST,
             "bbox: give [x0, y0, x1, y1] in pixels of the width x height frame, x1 > x0, y1 > y0",
         ));
@@ -129,19 +129,19 @@ async fn spot_route(
     };
     let min_iou = b.min_iou.unwrap_or(default);
     if !(lo..=1.0).contains(&min_iou) {
-        return Ok(fail(
+        return Ok(json_fail(
             StatusCode::BAD_REQUEST,
             format!("min_iou: must be between {lo} and 1, got {min_iou}"),
         ));
     }
     if accept && b.reject_reason.is_some() {
-        return Ok(fail(
+        return Ok(json_fail(
             StatusCode::BAD_REQUEST,
             "reject_reason: only for reject-spot",
         ));
     }
     if let Some(labels::RejectReason::Other(r)) = &b.reject_reason {
-        return Ok(fail(
+        return Ok(json_fail(
             StatusCode::BAD_REQUEST,
             format!(
                 "reject_reason: '{}' is not a reason this build knows",
@@ -270,7 +270,7 @@ pub(in crate::server) async fn spots(
         let (dir, _, _) = context(&state);
         let store = match labels::spots::read(&dir, &camera) {
             Ok(s) => s,
-            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+            Err(e) => return json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         };
         // Today in the configured zone (new day folders are named in it).
         let today = crate::clock::day(chrono::Utc::now());
@@ -313,11 +313,11 @@ pub(in crate::server) async fn spots_parked(
         };
         let rec = match frame.record() {
             Ok(r) => r,
-            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+            Err(e) => return json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         };
         let bbox = match spot_box(&b.label, b.bbox, rec.width, rec.height) {
             Ok(c) => c,
-            Err((s, m)) => return fail(s, m),
+            Err((s, m)) => return json_fail(s, m),
         };
         let at = labels::spots::Place {
             camera: &frame.rel.camera,
@@ -336,7 +336,7 @@ pub(in crate::server) async fn spots_parked(
                 );
                 success(serde_json::json!({ "spot": spot, "new": new }))
             }
-            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+            Err(e) => json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         }
     })
     .await)
@@ -374,8 +374,8 @@ pub(in crate::server) async fn spots_retire(
         let today = crate::clock::display_date(chrono::Utc::now());
         match labels::spots::retire(&dir, &at, &today) {
             Ok(true) => success(serde_json::json!({})),
-            Ok(false) => fail(StatusCode::NOT_FOUND, "no parked spot there"),
-            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+            Ok(false) => json_fail(StatusCode::NOT_FOUND, "no parked spot there"),
+            Err(e) => json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         }
     })
     .await)
@@ -405,7 +405,7 @@ pub(in crate::server) async fn spots_moved(
                 tracing::info!(camera, retired, "review: camera moved, spots forgotten");
                 success(serde_json::json!({ "retired": retired, "moved_at": at }))
             }
-            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+            Err(e) => json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         }
     })
     .await)

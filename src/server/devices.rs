@@ -86,7 +86,7 @@ pub(super) fn model_selection(
         crate::backend::select::onnx_path_for(&path).is_some(),
     );
     let bench = live::bench_summary(&crate::benchmark::results_path(&state.config_path));
-    let key = crate::registry::normalize_name(&m.effective_name());
+    let key = m.key();
     if let Some(order) = (*bench)
         .as_ref()
         .and_then(|b| b.models.get(&key))

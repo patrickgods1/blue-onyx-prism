@@ -5,7 +5,7 @@
 
 use super::{
     ACCEPT_AUTO_DEFAULT_LIMIT, ACCEPT_AUTO_MAX_LIMIT, Answer, AppState, blocking, bulk_filters,
-    bulk_limit, context, fail, hidden, json_body, now, push_failed, push_past_limit, success,
+    bulk_limit, context, hidden, json_body, json_fail, now, push_failed, push_past_limit, success,
 };
 use crate::collect::labels::bulk;
 use crate::server::Shared;
@@ -127,7 +127,7 @@ pub(in crate::server) async fn reject_low(
 ) -> Answer {
     let b: RejectLowBody = json_body(&headers, body)?;
     if !(0.01..=1.0).contains(&b.min_score) {
-        return Ok(fail(
+        return Ok(json_fail(
             StatusCode::BAD_REQUEST,
             format!("min_score: must be between 0.01 and 1, got {}", b.min_score),
         ));
@@ -422,7 +422,7 @@ pub(in crate::server) async fn suggest_overlaps(
         let state = shared.current();
         let mut req = match OverlapsRequest::parse(if b.again { "again=1" } else { "" }) {
             Ok(r) => r,
-            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+            Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
         };
         for (k, v) in [
             ("bucket", b.bucket),
@@ -438,7 +438,7 @@ pub(in crate::server) async fn suggest_overlaps(
         req.allow_large = b.allow_large;
         req.ignore_memory_check = b.ignore_memory_check;
         if let Err(e) = req.frames.filters() {
-            return fail(StatusCode::BAD_REQUEST, format!("{e:#}"));
+            return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}"));
         }
         if b.dry_run {
             let (dir, classes, _) = context(&state);
@@ -449,7 +449,7 @@ pub(in crate::server) async fn suggest_overlaps(
             };
             let s = match select::select(&dir, &req.frames, &wanted) {
                 Ok(s) => s,
-                Err(e) => return fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
+                Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
             };
             let message = (s.pairs == 0).then(|| {
                 let again = if s.answered > 0 {
@@ -496,7 +496,7 @@ pub(in crate::server) async fn suggest_overlaps(
         let cap = crate::training::capability_now();
         let job = match plan_overlaps(&config, req, &cap) {
             Ok(j) => j,
-            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("Not queued: {e:#}")),
+            Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("Not queued: {e:#}")),
         };
         let title = crate::training::task::Task::title(&job);
         match crate::server::training::service(&shared).enqueue_task(Box::new(job)) {
@@ -507,7 +507,7 @@ pub(in crate::server) async fn suggest_overlaps(
                      confirm one here."
                 ),
             })),
-            Err(e) => fail(StatusCode::BAD_REQUEST, format!("Not queued: {e}")),
+            Err(e) => json_fail(StatusCode::BAD_REQUEST, format!("Not queued: {e}")),
         }
     })
     .await)

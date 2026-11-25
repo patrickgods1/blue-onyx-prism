@@ -113,7 +113,11 @@ loaded library's version (the resolver's hypothetical probe carries the version 
 
 - **HTTP** (`src/server.rs` + `src/server/`): axum on a 2-thread tokio runtime (`runner.rs`); fs-heavy handlers run in
   `server::blocking`. The listener is bound once per process (`bind` + `serve_on`) and serves `Shared`, the swappable
-  current `AppState`, so it survives generation restarts.
+  current `AppState`, so it survives generation restarts. Shared route helpers: `server/answer.rs` (`json_fail`
+  `{success,message}` for page routes, `json_error` `{success,message,error}` for core refusals, `Refused`/`Answer`,
+  `json_body`), `server/form.rs` (`parse`, `value`, `field`, `all`, `num`, `truthy`, `checked`), `server/walk_cache.rs`
+  (the refine walks' `WalkCache`); config entries by name through `Config::model*` / `ModelConfig::key` (pass raw names:
+  `normalize_name` is not idempotent).
   - Blue Iris calls `POST /v1/vision/detection` (default model), `POST /v1/vision/custom/{model}`,
     `POST /v1/vision/custom/list`. Responses use `api.rs` structs (camelCase; `Prediction` snake_case), byte-compatible
     with CodeProject.AI (see Conventions).
@@ -273,7 +277,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   upload + a v1 sidecar to one collector thread (buckets, per-camera rate limits (shorter `empty.night_interval` for
   night/IR), dedup that most buckets skip: dHash + `blockdiff` thumbnail both must agree, `collect.dedup_mode`,
   disk guard that re-arms; atomic writes under `<data root>/dataset/<scene>/<camera>/<date>/`;
-  `retention::prune_dataset`). `collect/health.rs` feeds `GET /v1/dataset`. Collect tab `/train/collect`.
+  `retention::prune_dataset`). One frame writer, `layout::write_frame` (image, sidecar, index line, all or nothing),
+  shared with the footage import. `collect/health.rs` feeds `GET /v1/dataset`. Collect tab `/train/collect`.
 
 - **Data safety** (applies to every writer of user data).
   - Damaged JSON stores (runs/tasks, benchmark results/history/preds) go through `json_aside`: a file that cannot be
@@ -402,8 +407,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     remove-env, the training-folder move and SAM 3 Remove with no job queued under them.
   - Protection: a failed run keeps `work`'s checkpoints (scratch in `job::FAILED_RUN_SCRATCH` goes once the trainer
     is reaped; a shutdown keeps all) (`training/retry.rs`, `train retry-export`; training itself does not resume);
-    an OOM restarts only before 3 finished epochs; an early GPU OOM retries at half the batch, a host OOM halves the
-    loader workers, never the batch (`training::workers_for`); `check_disk` refuses up front.
+    an OOM never restarts a run whose checkpoint is kept (3 finished epochs or training ended); an early GPU OOM
+    retries at half the batch, a host OOM halves the loader workers, never the batch (`training::workers_for`; the
+    rule is pure `job/attempt.rs::next_attempt`, stages in `job/stages.rs`); `check_disk` refuses up front.
   - Worker count: `training::workers::learned` (pure) adjusts the automatic count from past runs' `RunRecord.resources`.
   - Model switch (`training/switch.rs`): Revert swaps `previous_default` (one level); a verifier is replaced only when
     named (`replace_verifier`); `Hooks::baseline` benchmarks into the run folder, never `benchmark.json`.
@@ -441,7 +447,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   the environment sets them; the systemd unit and Docker image set them too.
 
 - **Benchmark** (`src/benchmark/`, `server/benchmark/`): grades models x devices into `benchmark.json` next to the config
-  (preds in `benchmark-preds.json`).
+  (preds in `benchmark-preds.json`). The CLI and the service save through one `benchmark/save.rs::commit` (merge,
+  seeds, stamp, regrade, write); stored runs are picked by `StoredPreds::run_for`.
   - `history/`: `benchmark-history.json` (recent runs per model + one pinned baseline; failed runs never recorded); pure
     `comparable` / `compare` / `trust` with the noise rules as named constants in `history/compare.rs`.
   - `combos/`: which model x device combos hold each image set and on which fair frames (left-out frames, missing
@@ -466,6 +473,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     `PrismDraft` (sessionStorage drafts restored only at the same revision), `PrismViewport`, `PrismPointer`,
     `PrismTip` (information only in a `title` needs a tap-to-pin `button.term`, touch has no hover). Incremental polls: `server/training/poll.rs`
     (`TrainMetrics.poll`, node parity test), `server/benchmark/poll.rs`.
+  - `assets/dom.js` (loaded right after live.js): `PrismDom` (`el`, `clear`, `report`) and `PrismFetch` (`json`,
+    `postJson`, rejecting with `status` / `body` / `conflict`), the one copy pages use (`tests/it/js_dom.rs`); node
+    tests run through `tests/it/js_harness.rs` (`run_node_ok` wants a final `ok` line).
   - `PrismSort` (`assets/sort.js`, node-tested in `tests/it/js_sort.rs`) is the one table sorter (`data-sort="<key>"`
     or `PrismSort.attach`; re-renders call `PrismSort.apply`); ranked defaults come from Rust `data-best`, never
     a JS ranking twin.
@@ -494,6 +504,7 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     `--config C:\ProgramData\BlueOnyxPrism\blue_onyx_prism_config_service.json`; a service config outside the exe dir
     seeds `download_dir` / `cache_dir` / `log_path` beside it. `port_holder` names what holds a port.
   - deb/rpm and pkg share `scripts/systemd_common.sh` / `scripts/launchd_common.sh` with the archive install scripts;
+    both source the POSIX `scripts/install_common.sh` (`bop_migrate_config`, `bop_print_urls`), shipped beside them;
     the Docker image starts through `deploy/docker-entrypoint.sh` (checks the volumes are writable). Uninstall keeps
     data unless asked (README "Uninstalling keeps your data").
   - `src/service_ctl/` (SCM / `launchctl` / `systemctl`, pure parsers tested everywhere) backs `service ...`;

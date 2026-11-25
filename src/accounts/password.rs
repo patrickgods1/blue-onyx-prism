@@ -28,6 +28,7 @@
 //! coalesced and off the calling thread): glibc otherwise keeps the freed 19 MiB buffers in its
 //! arenas (RA-096). Never per hash: a burst of sign-ins ends in one trim.
 
+use crate::sync::LockExt as _;
 use anyhow::{Context, Result, anyhow, bail};
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -257,7 +258,7 @@ pub struct Permit<'a> {
 impl Drop for Permit<'_> {
     fn drop(&mut self) {
         let idle = {
-            let mut free = self.sem.free.lock().unwrap_or_else(|e| e.into_inner());
+            let mut free = self.sem.free.lock_recover();
             *free = free.saturating_add(1).min(self.sem.total);
             self.sem.freed.notify_one();
             *free == self.sem.total
@@ -294,7 +295,7 @@ impl Semaphore {
     /// A permit, waiting at most `timeout` (blocking); `None` when none came free in time.
     pub fn acquire(&self, timeout: Duration) -> Option<Permit<'_>> {
         let deadline = Instant::now().checked_add(timeout);
-        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        let mut free = self.free.lock_recover();
         while *free == 0 {
             let left = match deadline {
                 Some(d) => d.checked_duration_since(Instant::now())?,
@@ -306,6 +307,7 @@ impl Semaphore {
             free = self
                 .freed
                 .wait_timeout(free, left)
+                // crate::sync has no Condvar helper: a poisoned wait recovers like lock_recover.
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }

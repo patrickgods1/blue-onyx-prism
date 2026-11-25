@@ -1317,8 +1317,7 @@ pub(super) async fn config_models_remove(
         let html = wants_html(&headers);
         let name = form
             .ok()
-            .and_then(|Form(f)| f.into_iter().find(|(k, _)| k == "name").map(|(_, v)| v))
-            .map(|v| v.trim().to_string())
+            .and_then(|Form(f)| super::form::field(&f, "name").map(str::to_string))
             .unwrap_or_default();
         let result = if name.is_empty() {
             Err(ActionError::BadRequest(

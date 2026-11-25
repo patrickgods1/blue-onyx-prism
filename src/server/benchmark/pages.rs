@@ -51,7 +51,8 @@ pub(super) struct Shell {
 impl Shell {
     fn of(state: &AppState, cfg: &Config, step: &'static str) -> Self {
         let g = &cfg.benchmark.goal;
-        let has_results = super::file_stamp(&results_path(&state.config_path)).is_some();
+        let has_results =
+            crate::benchmark::search::file_stamp(&results_path(&state.config_path)).is_some();
         let mut choices: Vec<String> = cfg.collect.classes.clone();
         for c in &g.classes {
             if !choices.iter().any(|x| x.eq_ignore_ascii_case(c)) {
@@ -85,7 +86,7 @@ pub(in crate::server) async fn index(
     RawQuery(query): RawQuery,
 ) -> Response {
     let has = super::super::blocking(move || {
-        super::file_stamp(&results_path(&state.config_path)).is_some()
+        crate::benchmark::search::file_stamp(&results_path(&state.config_path)).is_some()
     })
     .await;
     let to = if has {
@@ -304,8 +305,9 @@ pub(super) fn model_options(
         .map(|m| {
             let exists = c.data_path(&m.path).is_file();
             let name = m.effective_name();
+            let name_key = m.key();
             let t: serde_json::Map<String, serde_json::Value> = timing
-                .get(&key(&name))
+                .get(&name_key)
                 .map(|v| {
                     v.iter()
                         .map(|(d, ms)| (d.clone(), serde_json::json!((ms * 10.0).round() / 10.0)))
@@ -313,8 +315,8 @@ pub(super) fn model_options(
                 })
                 .unwrap_or_default();
             ModelOption {
-                checked: exists && defaults.iter().any(|d| key(d) == key(&name)),
-                is_default: default_model.as_deref() == Some(key(&name).as_str()),
+                checked: exists && defaults.iter().any(|d| key(d) == name_key),
+                is_default: default_model.as_deref() == Some(name_key.as_str()),
                 timing: serde_json::Value::Object(t).to_string(),
                 name,
                 family: m.family.to_string(),
@@ -330,7 +332,7 @@ fn devices_in_use(state: &AppState, snap: &DevicesSnapshot, c: &Config) -> Vec<S
     let loaded = loaded_devices(state);
     c.enabled_models()
         .filter_map(|m| {
-            let name = crate::registry::normalize_name(&m.effective_name());
+            let name = m.key();
             loaded
                 .get(&name)
                 .cloned()
@@ -540,14 +542,14 @@ pub(in crate::server) async fn run_page(State(state): State<Arc<AppState>>) -> R
 
 /// The Run form's reference model options: each configured model whose file is there, and
 /// whether it is `benchmark.reference_model`. The name is resolved as the run resolves it
-/// ([`crate::benchmark::find_model`], case and spacing ignored), so a hand-edited `RT-DETRv2-X`
+/// ([`Config::model`], case and spacing ignored), so a hand-edited `RT-DETRv2-X`
 /// for model `rt-detrv2-x` stays selected rather than posting "Automatic" back (QA-062).
 fn reference_rows(cfg: &Config) -> Vec<(String, bool)> {
     let want = cfg
         .benchmark
         .reference_model
         .as_deref()
-        .and_then(|r| crate::benchmark::find_model(cfg, r))
+        .and_then(|r| cfg.model(r))
         .map(|m| m.effective_name());
     cfg.models
         .iter()

@@ -63,16 +63,12 @@ switch_fields!(
 /// `models`' entry named `name` (spelled as the registry does).
 fn entry<'a>(models: &'a [ModelConfig], name: &str) -> Option<&'a ModelConfig> {
     let key = normalize_name(name);
-    models
-        .iter()
-        .find(|m| normalize_name(&m.effective_name()) == key)
+    models.iter().find(|m| m.key() == key)
 }
 
 fn entry_mut<'a>(models: &'a mut [ModelConfig], name: &str) -> Option<&'a mut ModelConfig> {
     let key = normalize_name(name);
-    models
-        .iter_mut()
-        .find(|m| normalize_name(&m.effective_name()) == key)
+    models.iter_mut().find(|m| m.key() == key)
 }
 
 /// The model serving `/v1/vision/detection` now (the name of the entry), if any.

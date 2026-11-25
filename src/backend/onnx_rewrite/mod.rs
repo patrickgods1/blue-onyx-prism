@@ -1030,10 +1030,7 @@ mod tests {
 
     #[test]
     fn rewrite_cached_writes_once_and_keeps_the_source() {
-        let dir =
-            std::env::temp_dir().join(format!("bop-onnx-rewrite-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dirs::TempDir::new("onnx-rewrite-test");
         let src = dir.join("tiny.onnx");
         let m = single(
             12,
@@ -1094,14 +1091,11 @@ mod tests {
             Cached::Original { .. }
         ));
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 1);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn rewrite_file_keeps_the_rewrite_in_memory() {
-        let dir =
-            std::env::temp_dir().join(format!("bop-onnx-rewrite-mem-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dirs::TempDir::new("onnx-rewrite-mem");
         let src = dir.join("fold.onnx");
         let m = single(
             12,
@@ -1126,7 +1120,6 @@ mod tests {
         // Over the limit: the original, unread.
         let (o, sha) = rewrite_file_capped(&src, &RewriteOptions::COREML, 1).unwrap();
         assert!(matches!(o, Outcome::Unchanged { .. }) && sha.is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1214,9 +1207,7 @@ mod tests {
     #[test]
     fn rewrite_size_limit() {
         assert_eq!(MAX_REWRITE_BYTES, 512 * 1024 * 1024);
-        let dir = std::env::temp_dir().join(format!("bop-onnx-rewrite-cap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dirs::TempDir::new("onnx-rewrite-cap");
         let src = dir.join("m.onnx");
         let m = single(
             12,
@@ -1240,14 +1231,11 @@ mod tests {
             rewrite_cached_capped(&src, &cache, &RewriteOptions::COREML, len).unwrap(),
             Cached::Rewritten { created: true, .. }
         ));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn file_equals_compares_in_chunks() {
-        let dir = std::env::temp_dir().join(format!("bop-onnx-rewrite-eq-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dirs::TempDir::new("onnx-rewrite-eq");
         let p = dir.join("f");
         let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         std::fs::write(&p, &data).unwrap();
@@ -1262,7 +1250,6 @@ mod tests {
         assert!(file_equals(&dir.join("missing"), &data).is_err());
         std::fs::write(&p, b"").unwrap();
         assert!(file_equals(&p, b"").unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

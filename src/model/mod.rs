@@ -770,7 +770,7 @@ mod tests {
             (640, 640)
         );
         // Hugging Face repo layout.
-        let repo = std::env::temp_dir().join(format!("bo-hf-repo-{}", std::process::id()));
+        let repo = crate::test_dirs::TempDir::new("hf-repo");
         std::fs::create_dir_all(repo.join("onnx")).unwrap();
         std::fs::write(
             repo.join("preprocessor_config.json"),
@@ -784,7 +784,6 @@ mod tests {
             dynamic_input_size(&repo.join("model.onnx"), &none, None),
             (640, 640)
         );
-        std::fs::remove_dir_all(&repo).ok();
 
         assert_eq!(
             parse_hf_preprocessor_size(r#"{"size":{"shortest_edge":800}}"#),

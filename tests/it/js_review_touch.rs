@@ -11,9 +11,8 @@
 //! makes a missing `node` a failure: a skip must not read as a pass there.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+use crate::js_harness::{asset, have_node, run_node_json};
 use serde_json::{Value, json};
-use std::path::PathBuf;
-use std::process::Command;
 
 /// Runs each request through `ReviewTouch` and prints the answers as one JSON array.
 /// `process.argv`: this script, the module, the request file.
@@ -47,51 +46,16 @@ console.log(JSON.stringify(req.map((r) => {
 })));
 "#;
 
-/// Whether `node` runs here. Missing: a skip, or with `BOP_REQUIRE_NODE=1` a failure.
-fn have_node() -> bool {
-    let ok = Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
-            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
-        );
-        println!("skipped: no node");
-    }
-    ok
-}
-
-fn module_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/review-touch.js")
-}
-
 /// Run [`DRIVER`] on `requests`, in a folder of its own, and read its answers.
 fn node(requests: &Value) -> Vec<Value> {
-    let dir = std::env::temp_dir().join(format!("bop-js-touch-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let (driver, cases) = (dir.join("driver.js"), dir.join("request.json"));
-    std::fs::write(&driver, DRIVER).unwrap();
-    std::fs::write(&cases, serde_json::to_vec(requests).unwrap()).unwrap();
-    let out = Command::new("node")
-        .arg(&driver)
-        .arg(module_path())
-        .arg(&cases)
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "node failed ({}): {}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice::<Value>(&out.stdout)
-        .unwrap()
-        .as_array()
-        .unwrap()
-        .clone()
+    run_node_json(
+        DRIVER,
+        &[asset("review-touch.js").as_os_str()],
+        &[("request.json", &serde_json::to_vec(requests).unwrap())],
+    )
+    .as_array()
+    .unwrap()
+    .clone()
 }
 
 /// The page's zoom limit (review.js `MAX_ZOOM`), pinned in
@@ -569,7 +533,7 @@ fn the_page_loads_the_touch_rules_first_and_they_touch_no_page() {
         page.find("/static/review.js?v=").unwrap(),
     );
     assert!(touch < own, "review.js reads ReviewTouch when it starts");
-    let js = std::fs::read_to_string(module_path()).unwrap();
+    let js = std::fs::read_to_string(asset("review-touch.js")).unwrap();
     for word in [
         "document",
         "window",

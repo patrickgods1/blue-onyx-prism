@@ -88,7 +88,7 @@ pub(crate) fn apply_config_locked(
                 let dev = |c: &Config| {
                     c.models
                         .iter()
-                        .find(|m| crate::registry::normalize_name(&m.effective_name()) == key)
+                        .find(|m| m.key() == key)
                         .filter(|m| m.enabled)
                         .map(|m| c.device_for(m))
                 };

@@ -20,11 +20,11 @@ use crate::startup::ModelState;
 use crate::sync::RwLockExt;
 use crate::worker::WorkerHandle;
 use askama::Template;
+use axum::Router;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
-use axum::{Json, Router};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -32,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 mod accounts;
+mod answer;
 mod apply;
 mod auth;
 mod benchmark;
@@ -69,6 +70,7 @@ mod train_jobs;
 mod training;
 mod training_switch;
 mod training_tasks;
+mod walk_cache;
 
 pub(crate) use apply::{apply_config, reload_models, sync_config};
 pub(crate) use auth::{FailureLimit, Logins};
@@ -615,11 +617,7 @@ async fn fallback(headers: HeaderMap) -> Response {
         )
             .into_response()
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "success": false, "error": "Not found" })),
-        )
-            .into_response()
+        answer::json_error(StatusCode::NOT_FOUND, "Not found")
     }
 }
 
@@ -653,7 +651,7 @@ fn panic_message(p: &(dyn std::any::Any + Send)) -> &str {
 
 /// Outermost middleware: a panic in a handler (or in its [`blocking`] work) becomes a 500
 /// answer instead of a dropped connection. The panic message is logged with the method and
-/// path (never the request body). API clients get `{"success":false,"error":"internal error"}`,
+/// path (never the request body). API clients get [`answer::json_error`] `internal error`,
 /// browsers a short HTML page.
 async fn catch_panic(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     use futures_util::FutureExt;
@@ -683,11 +681,7 @@ async fn catch_panic(req: axum::extract::Request, next: axum::middleware::Next) 
                 )
                     .into_response()
             } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "success": false, "error": "internal error" })),
-                )
-                    .into_response()
+                answer::json_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
             }
         }
     }
@@ -1267,7 +1261,11 @@ mod tests {
             let body: serde_json::Value = resp.json().await.unwrap();
             assert_eq!(
                 body,
-                serde_json::json!({ "success": false, "error": "internal error" })
+                serde_json::json!({
+                    "success": false,
+                    "message": "internal error",
+                    "error": "internal error"
+                })
             );
             let html = client
                 .get(format!("http://127.0.0.1:{port}/{path}"))
@@ -2064,6 +2062,11 @@ mod tests {
         assert!(
             !body.contains("script") && !body.contains("no/such"),
             "{body}"
+        );
+        // QA-221: the server core's one refusal shape, `message` and `error` alike.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap(),
+            serde_json::json!({"success": false, "message": "Not found", "error": "Not found"})
         );
         let (s, h, b) = call(&state, from(REMOTE, "GET", evil, true)).await;
         assert_eq!(s, StatusCode::NOT_FOUND);

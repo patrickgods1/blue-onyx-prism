@@ -1,5 +1,6 @@
 //! Read-only pages and assets: welcome, stats, test, logs, static files, fallback.
 
+use super::answer::json_error;
 use super::config_page::LevelChoice;
 use super::detect::{Upload, new_request_id, parse_detection_body, run_detection};
 use super::devices::{devices_snapshot, force_cpu_note, profile_view};
@@ -8,6 +9,7 @@ use crate::config::LogLevel;
 use crate::metrics::{DropReason, Histogram};
 use crate::registry::ModelRegistry;
 use crate::startup::ModelState;
+use crate::sync::RwLockExt;
 use crate::worker::WorkerHandle;
 use askama::Template;
 use axum::Json;
@@ -55,6 +57,7 @@ macro_rules! asset {
 pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("style.css", CSS),
     asset!("live.js", JS),
+    asset!("dom.js", JS),
     asset!("time.js", JS),
     asset!("sort.js", JS),
     asset!("bench-core.js", JS),
@@ -209,9 +212,9 @@ fn providers_in_use(reg: &ModelRegistry) -> Vec<String> {
     for w in reg.workers() {
         let p = w
             .device
-            .read()
-            .ok()
-            .and_then(|d| d.as_ref().map(|d| d.execution_provider()));
+            .read_recover()
+            .as_ref()
+            .map(|d| d.execution_provider());
         if let Some(p) = p
             && !out.contains(&p)
         {
@@ -451,7 +454,7 @@ pub(super) async fn stats_page(State(state): State<Arc<AppState>>) -> Response {
         .iter()
         .map(|w| {
             let m = &w.metrics;
-            let dev = w.device.read().ok().and_then(|d| d.clone());
+            let dev = w.device.read_recover().clone();
             let (state, state_class, state_detail) = state_view(w);
             StatsRow {
                 best: ranks
@@ -508,7 +511,7 @@ pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde
         .iter()
         .map(|w| {
             let m = &w.metrics;
-            let dev = w.device.read().ok().and_then(|d| d.clone());
+            let dev = w.device.read_recover().clone();
             let stat = |s: &Histogram| {
                 serde_json::json!({ "count": s.count(), "avg": s.avg(), "min": s.min(), "max": s.max() })
             };
@@ -552,7 +555,9 @@ pub(super) async fn stats_json(State(state): State<Arc<AppState>>) -> Json<serde
         "uptime": format_uptime(state.started.elapsed()),
         "openvino": reg.runtime_info,
         "models": models,
-        "rejectedOverloaded": state.metrics.rejected_overloaded.load(Ordering::Relaxed),
+        "rejectedOverloaded": state
+            .metrics
+            .rejected(crate::metrics::RejectReason::Overloaded),
         "inflightRequests": state.metrics.inflight(),
         // null where the platform has no cheap source; the footprint is macOS only.
         "residentMemoryBytes": process.resident_memory_bytes,
@@ -850,13 +855,7 @@ pub(super) async fn logs_json(
     query: Result<Query<HashMap<String, String>>, QueryRejection>,
 ) -> Response {
     let q = query.map(|Query(q)| q).unwrap_or_default();
-    let bad = |msg: String| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "success": false, "message": msg })),
-        )
-            .into_response()
-    };
+    let bad = |msg: String| json_error(StatusCode::BAD_REQUEST, msg);
     let after = match q.get("after").map(|s| s.trim()).filter(|s| !s.is_empty()) {
         None => 0,
         Some(v) => match v.parse::<u64>() {
@@ -921,14 +920,7 @@ fn serve_static(name: &str) -> Response {
             .into_response();
     }
     let Some((_, content_type, embedded)) = STATIC_FILES.iter().find(|(n, _, _)| *n == name) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "success": false,
-                "error": format!("Not found: /static/{name}"),
-            })),
-        )
-            .into_response();
+        return json_error(StatusCode::NOT_FOUND, format!("Not found: /static/{name}"));
     };
     match static_body(name, embedded) {
         Ok(body) => (
@@ -939,17 +931,13 @@ fn serve_static(name: &str) -> Response {
             body,
         )
             .into_response(),
-        Err(e) => (
+        Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "error": format!(
-                    "A debug build reads its pages from the source tree and could not read one \
-                     ({e}). Run it where it was built, or use a release build."
-                ),
-            })),
-        )
-            .into_response(),
+            format!(
+                "A debug build reads its pages from the source tree and could not read one \
+                 ({e}). Run it where it was built, or use a release build."
+            ),
+        ),
     }
 }
 

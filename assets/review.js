@@ -16,8 +16,9 @@
 // when it ends. Under Bulk tools, "Accept auto: accept frames" calls POST /v1/review/accept-auto and
 // "Reject auto boxes below" POST /v1/review/reject-low, "Reject boxes of unwanted classes"
 // POST /v1/review/reject-other-class, "Restore reopened frames" POST /v1/review/restore-reopened
-// and "Reject stacked duplicates" POST /v1/review/reject-stacked
-// (all five: dry run, confirm, run). *Suggest overlaps...* queues the overlap check
+// and "Reject stacked duplicates" POST /v1/review/reject-stacked, plus accept-repeats and
+// suggest-overlaps (each one bulkAction(): dry run, confirm, run, report; the shared DOM and fetch
+// helpers are assets/dom.js). *Suggest overlaps...* queues the overlap check
 // (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
 // the frame, and `y` accepts the one on screen. The dataset check's suggestions (`labels.refine`,
 // `refine_live`; Auto filter "dataset check suggestions", `auto=refine[&refine_kind=]`) come after
@@ -66,6 +67,11 @@
   var resolved = R.resolved, isDismissal = R.isDismissal, endDismissal = R.endDismissal;
   var iou = R.iou, sameObject = R.sameObject;
   var markRejected = R.markRejected, markDuplicate = R.markDuplicate;
+
+  // Shared helpers (dom.js): `api` rejects with an Error that keeps the answer (`status`,
+  // `conflict`, the JSON `body`).
+  var el = PrismDom.el, report = PrismDom.report;
+  var api = PrismFetch.json, postJson = PrismFetch.postJson;
 
   var $ = function (id) { return document.getElementById(id); };
   var canvas = $('rv-canvas');
@@ -440,30 +446,6 @@
   msg.addEventListener('click', function (ev) {
     if (ev.target && ev.target.closest && ev.target.closest('button') && msgSeq === msgSeqAtClick) closeMsg();
   });
-
-  // An error that keeps the answer: `status`, `conflict` and the JSON body (`body`).
-  function api(url, opts) {
-    return fetch(url, opts).then(function (r) {
-      return r.json().catch(function () { return null; }).then(function (j) {
-        if (!r.ok || !j || j.success === false) {
-          var err = new Error((j && j.message) || ('HTTP ' + r.status));
-          err.status = r.status;
-          err.body = j;
-          err.conflict = r.status === 409 || !!(j && j.conflict);
-          throw err;
-        }
-        return j;
-      });
-    });
-  }
-
-  function postJson(url, body) {
-    return api(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify(body)
-    });
-  }
 
   function filterParams() {
     var p = new URLSearchParams();
@@ -1958,13 +1940,6 @@
   }, { passive: false });
 
   // ---- side panel ---------------------------------------------------------------------------
-
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
-    return e;
-  }
 
   // `cls`: extra classes (`ok` / `bad` colour the decisions).
   function button(text, onClick, cls) {
@@ -5351,17 +5326,6 @@
 
   // ---- follow a job, bulk tools -------------------------------------
 
-  function report(box, lines, warnings) {
-    box.textContent = '';
-    lines.forEach(function (l) { box.appendChild(el('div', null, l)); });
-    if (warnings && warnings.length) {
-      var ul = el('ul', 'warn-list');
-      warnings.slice(0, 50).forEach(function (w) { ul.appendChild(el('li', null, w)); });
-      if (warnings.length > 50) ul.appendChild(el('li', null, '... ' + (warnings.length - 50) + ' more'));
-      box.appendChild(ul);
-    }
-  }
-
   var alStatus = $('rv-al-status');
   var alProgress = $('rv-al-progress');
   var polling = null;   // {id, box, bar, after, loop}: the task followed
@@ -5475,40 +5439,79 @@
       .catch(function () {});
   }
 
+  // The seven bulk buttons share one flow: a dry run of `o.url` ("Counting..."), nothing to do
+  // or a confirm, the real run, its report and a reload. `o`:
+  //   button, box   the button (disabled meanwhile) and the report box
+  //   url           POST /v1/review/<action>; body = `start` (default {}), then the filters named
+  //                 by `keys`, then `extra(body)`, then `dry_run`
+  //   keys          the filter fields sent. Required per action: SuggestOverlapsBody and the
+  //                 stacked walk take no `source` (SuggestOverlapsBody rejects unknown fields, so
+  //                 sending it would answer 400)
+  //   counting      the first line, while the dry run runs
+  //   count(j)      what the dry run found; 0 = nothing to do
+  //   none(j)       the report lines for nothing (afterNone(j), when given, runs next: a promise)
+  //   gate(j, body) optional, after "something found": true = stop (it has reported)
+  //   confirm(j, body, n)  the confirm text; cancelled: the line when the user says no
+  //   done(r)       the first report line of the real run; after(r) runs next (a promise)
+  //   finish(r)     replaces done/after (the overlap check queues a job and has no outcome colour)
+  // `failed` entries are strings (Vec<String> in bulk.rs); any other shape prints as JSON.
+  function bulkAction(o) {
+    var box = o.box, body = o.start || {};
+    o.keys.forEach(function (k) {
+      var e = filtersForm.elements[k];
+      if (e && e.value) body[k] = e.value;
+    });
+    if (o.extra) o.extra(body);
+    body.dry_run = true;
+    box.className = 'review-report';
+    report(box, [o.counting]);
+    o.button.disabled = true;
+    return postJson(o.url, body).then(function (j) {
+      var n = o.count(j);
+      if (!n) {
+        report(box, o.none(j));
+        return o.afterNone ? o.afterNone(j) : null;
+      }
+      if (o.gate && o.gate(j, body)) return null;
+      if (!window.confirm(o.confirm(j, body, n))) {
+        report(box, [o.cancelled]);
+        return null;
+      }
+      body.dry_run = false;
+      return postJson(o.url, body).then(function (r) {
+        if (o.finish) return o.finish(r);
+        var failed = r.failed || [];
+        report(box, [o.done(r)],
+          failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
+        box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
+        return o.after(r);
+      });
+    }).catch(function (e) {
+      box.className = 'review-report error-text';
+      report(box, [e.message]);
+    }).then(function () { o.button.disabled = false; });
+  }
+
+  var ALL_KEYS = ['bucket', 'scene', 'camera', 'label', 'source'];
+  var NO_SOURCE_KEYS = ['bucket', 'scene', 'camera', 'label'];
+
   var bulkBtn = $('rv-accept-auto');
   if (bulkBtn) {
     bulkBtn.addEventListener('click', function () {
-      var box = $('rv-accept-auto-msg');
-      var body = {};
-      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
-        var e = filtersForm.elements[k];
-        if (e && e.value) body[k] = e.value;
+      bulkAction({
+        button: bulkBtn, box: $('rv-accept-auto-msg'), url: '/v1/review/accept-auto', keys: ALL_KEYS,
+        counting: 'Counting the frames...',
+        count: function (j) { return j.eligible || 0; },
+        none: function (j) { return [j.message || 'No unreviewed frame with only auto: accept boxes matches the filters.']; },
+        confirm: function (j, body, n) {
+          return 'Accept ' + n + ' frame(s) whose boxes the auto-labeler marked accept? ' +
+            'They are saved as reviewed: those boxes accepted, unconfirmed hint boxes rejected. ' +
+            'Frames with a box flagged for review are left alone.';
+        },
+        cancelled: 'Nothing accepted.',
+        done: function (r) { return r.message || ('Accepted ' + (r.accepted || 0) + ' frame(s).'); },
+        after: function () { return reloadQueue(); }
       });
-      body.dry_run = true;
-      box.className = 'review-report';
-      report(box, ['Counting the frames...']);
-      bulkBtn.disabled = true;
-      postJson('/v1/review/accept-auto', body).then(function (j) {
-        var n = j.eligible || 0;
-        if (!n) { report(box, [j.message || 'No unreviewed frame with only auto: accept boxes matches the filters.']); return null; }
-        if (!window.confirm('Accept ' + n + ' frame(s) whose boxes the auto-labeler marked accept? ' +
-          'They are saved as reviewed: those boxes accepted, unconfirmed hint boxes rejected. ' +
-          'Frames with a box flagged for review are left alone.')) {
-          report(box, ['Nothing accepted.']);
-          return null;
-        }
-        body.dry_run = false;
-        return postJson('/v1/review/accept-auto', body).then(function (r) {
-          var failed = r.failed || [];
-          report(box, [r.message || ('Accepted ' + (r.accepted || 0) + ' frame(s).')],
-            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
-          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
-          return reloadQueue();
-        });
-      }).catch(function (e) {
-        box.className = 'review-report error-text';
-        report(box, [e.message]);
-      }).then(function () { bulkBtn.disabled = false; });
     });
   }
 
@@ -5516,35 +5519,19 @@
   var repeatsBtn = $('rv-accept-repeats');
   if (repeatsBtn) {
     repeatsBtn.addEventListener('click', function () {
-      var box = $('rv-accept-repeats-msg') || msg;
-      var body = {};
-      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
-        var e = filtersForm.elements[k];
-        if (e && e.value) body[k] = e.value;
+      bulkAction({
+        button: repeatsBtn, box: $('rv-accept-repeats-msg') || msg, url: '/v1/review/accept-repeats', keys: ALL_KEYS,
+        counting: 'Counting the frames...',
+        count: function (j) { return j.eligible || 0; },
+        none: function () { return ['No repeat-only frame matches the filters (a frame with a box still to decide never is).']; },
+        confirm: function (j, body, n) {
+          return 'Save ' + n + ' repeat-only frame(s) as reviewed? Their boxes were all settled by "this spot on all frames"; ' +
+            'nothing on them is pending.';
+        },
+        cancelled: 'Nothing saved.',
+        done: function (r) { return r.message || ('Saved ' + (r.accepted || 0) + ' frame(s).'); },
+        after: function () { return reloadQueue(); }
       });
-      body.dry_run = true;
-      box.className = 'review-report';
-      report(box, ['Counting the frames...']);
-      repeatsBtn.disabled = true;
-      postJson('/v1/review/accept-repeats', body).then(function (j) {
-        var n = j.eligible || 0;
-        if (!n) { report(box, ['No repeat-only frame matches the filters (a frame with a box still to decide never is).']); return null; }
-        if (!window.confirm('Save ' + n + ' repeat-only frame(s) as reviewed? Their boxes were all settled by "this spot on all frames"; ' +
-          'nothing on them is pending.')) {
-          report(box, ['Nothing saved.']);
-          return null;
-        }
-        body.dry_run = false;
-        return postJson('/v1/review/accept-repeats', body).then(function (r) {
-          var failed = r.failed || [];
-          report(box, [r.message || ('Saved ' + (r.accepted || 0) + ' frame(s).')], failed);
-          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
-          return reloadQueue();
-        });
-      }).catch(function (e) {
-        box.className = 'review-report error-text';
-        report(box, [e.message]);
-      }).then(function () { repeatsBtn.disabled = false; });
     });
   }
 
@@ -5559,35 +5546,21 @@
         report(box, ['Enter a score between 0.01 and 1.']);
         return;
       }
-      var body = { min_score: score };
-      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
-        var e = filtersForm.elements[k];
-        if (e && e.value) body[k] = e.value;
+      bulkAction({
+        button: rejectBtn, box: box, url: '/v1/review/reject-low', keys: ALL_KEYS,
+        start: { min_score: score },
+        counting: 'Counting the boxes...',
+        count: function (j) { return j.boxes || 0; },
+        none: function (j) { return [j.message || ('No pending auto box below ' + score + ' on the unreviewed frames the filters select.')]; },
+        confirm: function (j, body, n) {
+          return 'Reject ' + n + ' box(es) on ' + (j.eligible || 0) + ' frame(s): the pending auto boxes ' +
+            'scoring below ' + score + '? They are kept as hard negatives (reason low_score); the frames stay ' +
+            'unreviewed and a reviewer can still change them per frame.';
+        },
+        cancelled: 'Nothing rejected.',
+        done: function (r) { return r.message || ('Rejected ' + (r.boxes || 0) + ' box(es).'); },
+        after: function () { return reloadQueue(); }
       });
-      body.dry_run = true;
-      report(box, ['Counting the boxes...']);
-      rejectBtn.disabled = true;
-      postJson('/v1/review/reject-low', body).then(function (j) {
-        var n = j.boxes || 0;
-        if (!n) { report(box, [j.message || ('No pending auto box below ' + score + ' on the unreviewed frames the filters select.')]); return null; }
-        if (!window.confirm('Reject ' + n + ' box(es) on ' + (j.eligible || 0) + ' frame(s): the pending auto boxes ' +
-          'scoring below ' + score + '? They are kept as hard negatives (reason low_score); the frames stay ' +
-          'unreviewed and a reviewer can still change them per frame.')) {
-          report(box, ['Nothing rejected.']);
-          return null;
-        }
-        body.dry_run = false;
-        return postJson('/v1/review/reject-low', body).then(function (r) {
-          var failed = r.failed || [];
-          report(box, [r.message || ('Rejected ' + (r.boxes || 0) + ' box(es).')],
-            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
-          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
-          return reloadQueue();
-        });
-      }).catch(function (e) {
-        box.className = 'review-report error-text';
-        report(box, [e.message]);
-      }).then(function () { rejectBtn.disabled = false; });
     });
   }
 
@@ -5617,45 +5590,31 @@
   if (otherBtn) {
     otherBtn.addEventListener('click', function () {
       var box = $('rv-reject-other-msg');
-      var body = {};
-      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
-        var e = filtersForm.elements[k];
-        if (e && e.value) body[k] = e.value;
-      });
-      body.dry_run = true;
-      box.className = 'review-report';
-      report(box, ['Counting the boxes...']);
-      otherBtn.disabled = true;
-      postJson('/v1/review/reject-other-class', body).then(function (j) {
-        var n = j.boxes || 0;
-        if (!n) {
-          report(box, [j.message || 'No pending box of an unwanted class (hidden, or not in the class list) on the unreviewed frames the filters select.']);
-          return askReviewedUnwanted(j.reviewed_with_unwanted, box);
-        }
-        var renamed = j.relabelled || 0;
-        var text = 'Reject ' + (n - renamed) + ' pending model / auto box(es) of unwanted classes (hidden, or not in ' +
-          'the class list) on ' + (j.eligible || 0) + ' frame(s)? They are kept as evidence (reason other_class); ' +
-          'the frames stay unreviewed and a reviewer can still change them per frame.';
-        if (renamed) {
-          text += ' ' + renamed + ' box(es) whose label is a class of the list under another spelling ' +
-            '(e.g. pottedplant) are renamed to the list\'s spelling instead.';
-        }
-        if (!window.confirm(text)) {
-          report(box, ['Nothing rejected.']);
-          return null;
-        }
-        body.dry_run = false;
-        return postJson('/v1/review/reject-other-class', body).then(function (r) {
-          var failed = r.failed || [];
-          report(box, [r.message || ('Changed ' + (r.boxes || 0) + ' box(es).')],
-            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
-          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
+      bulkAction({
+        button: otherBtn, box: box, url: '/v1/review/reject-other-class', keys: ALL_KEYS,
+        counting: 'Counting the boxes...',
+        count: function (j) { return j.boxes || 0; },
+        none: function (j) {
+          return [j.message || 'No pending box of an unwanted class (hidden, or not in the class list) on the unreviewed frames the filters select.'];
+        },
+        afterNone: function (j) { return askReviewedUnwanted(j.reviewed_with_unwanted, box); },
+        confirm: function (j, body, n) {
+          var renamed = j.relabelled || 0;
+          var text = 'Reject ' + (n - renamed) + ' pending model / auto box(es) of unwanted classes (hidden, or not in ' +
+            'the class list) on ' + (j.eligible || 0) + ' frame(s)? They are kept as evidence (reason other_class); ' +
+            'the frames stay unreviewed and a reviewer can still change them per frame.';
+          if (renamed) {
+            text += ' ' + renamed + ' box(es) whose label is a class of the list under another spelling ' +
+              '(e.g. pottedplant) are renamed to the list\'s spelling instead.';
+          }
+          return text;
+        },
+        cancelled: 'Nothing rejected.',
+        done: function (r) { return r.message || ('Changed ' + (r.boxes || 0) + ' box(es).'); },
+        after: function (r) {
           return reloadQueue().then(function () { return askReviewedUnwanted(r.reviewed_with_unwanted, box); });
-        });
-      }).catch(function (e) {
-        box.className = 'review-report error-text';
-        report(box, [e.message]);
-      }).then(function () { otherBtn.disabled = false; });
+        }
+      });
     });
   }
 
@@ -5676,50 +5635,42 @@
   if (suggestBtn) {
     suggestBtn.addEventListener('click', function () {
       var box = $('rv-suggest-msg');
-      var body = {};
-      ['bucket', 'scene', 'camera', 'label'].forEach(function (k) {
-        var e = filtersForm.elements[k];
-        if (e && e.value) body[k] = e.value;
-      });
-      var large = $('rv-suggest-large');
-      if (large && large.checked) body.allow_large = true;
-      var askAgain = $('rv-suggest-again');
-      if (askAgain && askAgain.checked) body.again = true;
       // "Start anyway" shows beside a memory refusal of the dry run (PrismMemory, live.js).
       var anyway = $('rv-suggest-anyway');
       var anywayTicked = !!(window.PrismMemory && window.PrismMemory.ticked(anyway));
-      body.dry_run = true;
-      box.className = 'review-report';
-      report(box, ['Counting the pairs...']);
-      suggestBtn.disabled = true;
-      postJson('/v1/review/suggest-overlaps', body).then(function (j) {
-        if (!j.pairs) {
-          report(box, [j.message || 'No open overlap without a suggestion on these frames.']);
-          return null;
-        }
-        if (window.PrismMemory) window.PrismMemory.sync(anyway, j.memory);
-        if (j.memory && !anywayTicked) {
-          box.className = 'review-report error-text';
-          report(box, [j.memory.refusal, 'To queue it anyway, tick Start anyway above, then press Suggest overlaps again.']);
-          return null;
-        }
-        if (j.memory) body.ignore_memory_check = true;
-        if (!window.confirm((j.memory ? 'Warning: ' + j.memory.refusal + '\n\n' : '') + 'Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included' +
-          (body.again ? ', answered pairs asked again' : '') + ', ' +
-          'with RF-DETR L (' + j.crops + ' crops, on the training queue, about ' + Math.max(1, Math.ceil(j.crops * 0.08 / 60)) + ' min)? ' +
-          'It writes suggestions only: no box changes until you confirm one here.')) {
-          report(box, ['Nothing queued.']);
-          return null;
-        }
-        body.dry_run = false;
-        return postJson('/v1/review/suggest-overlaps', body).then(function (r) {
+      bulkAction({
+        button: suggestBtn, box: box, url: '/v1/review/suggest-overlaps', keys: NO_SOURCE_KEYS,
+        extra: function (body) {
+          var large = $('rv-suggest-large');
+          if (large && large.checked) body.allow_large = true;
+          var askAgain = $('rv-suggest-again');
+          if (askAgain && askAgain.checked) body.again = true;
+        },
+        counting: 'Counting the pairs...',
+        count: function (j) { return j.pairs; },
+        none: function (j) { return [j.message || 'No open overlap without a suggestion on these frames.']; },
+        gate: function (j, body) {
+          if (window.PrismMemory) window.PrismMemory.sync(anyway, j.memory);
+          if (j.memory && !anywayTicked) {
+            box.className = 'review-report error-text';
+            report(box, [j.memory.refusal, 'To queue it anyway, tick Start anyway above, then press Suggest overlaps again.']);
+            return true;
+          }
+          if (j.memory) body.ignore_memory_check = true;
+          return false;
+        },
+        confirm: function (j, body) {
+          return (j.memory ? 'Warning: ' + j.memory.refusal + '\n\n' : '') + 'Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included' +
+            (body.again ? ', answered pairs asked again' : '') + ', ' +
+            'with RF-DETR L (' + j.crops + ' crops, on the training queue, about ' + Math.max(1, Math.ceil(j.crops * 0.08 / 60)) + ' min)? ' +
+            'It writes suggestions only: no box changes until you confirm one here.';
+        },
+        cancelled: 'Nothing queued.',
+        finish: function (r) {
           report(box, [r.message || 'Queued.']);
           if (r.id) followOverlaps(r.id);
-        });
-      }).catch(function (e) {
-        box.className = 'review-report error-text';
-        report(box, [e.message]);
-      }).then(function () { suggestBtn.disabled = false; });
+        }
+      });
     });
   }
 
@@ -5729,41 +5680,23 @@
   var stackedBtn = $('rv-reject-stacked');
   if (stackedBtn) {
     stackedBtn.addEventListener('click', function () {
-      var box = $('rv-reject-stacked-msg');
-      var body = {};
-      ['bucket', 'scene', 'camera', 'label'].forEach(function (k) {
-        var e = filtersForm.elements[k];
-        if (e && e.value) body[k] = e.value;
-      });
-      body.dry_run = true;
-      box.className = 'review-report';
-      report(box, ['Counting the boxes...']);
-      stackedBtn.disabled = true;
-      postJson('/v1/review/reject-stacked', body).then(function (j) {
-        var n = j.boxes || 0;
-        if (!n) {
-          report(box, [j.message || 'No stacked duplicates on the frames these filters select.']);
-          return null;
-        }
-        if (!window.confirm('Reject ' + n + ' stacked duplicate box(es) on ' + (j.eligible || 0) + ' frame(s), reviewed frames ' +
-          'included? The best box of each stack stays. Frames stay reviewed and the boxes are kept as rejected evidence ' +
-          '(reason duplicate, left out of the hard negatives); drawn boxes are never rejected.')) {
-          report(box, ['Nothing rejected.']);
-          return null;
-        }
-        body.dry_run = false;
-        return postJson('/v1/review/reject-stacked', body).then(function (r) {
-          var failed = r.failed || [];
-          report(box, [r.message || ('Rejected ' + (r.boxes || 0) + ' box(es).')],
-            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
-          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
+      bulkAction({
+        button: stackedBtn, box: $('rv-reject-stacked-msg'), url: '/v1/review/reject-stacked', keys: NO_SOURCE_KEYS,
+        counting: 'Counting the boxes...',
+        count: function (j) { return j.boxes || 0; },
+        none: function (j) { return [j.message || 'No stacked duplicates on the frames these filters select.']; },
+        confirm: function (j, body, n) {
+          return 'Reject ' + n + ' stacked duplicate box(es) on ' + (j.eligible || 0) + ' frame(s), reviewed frames ' +
+            'included? The best box of each stack stays. Frames stay reviewed and the boxes are kept as rejected evidence ' +
+            '(reason duplicate, left out of the hard negatives); drawn boxes are never rejected.';
+        },
+        cancelled: 'Nothing rejected.',
+        done: function (r) { return r.message || ('Rejected ' + (r.boxes || 0) + ' box(es).'); },
+        after: function () {
           histories = {};   // the boxes rejected were decisions of these cameras
           return reloadQueue();
-        });
-      }).catch(function (e) {
-        box.className = 'review-report error-text';
-        report(box, [e.message]);
-      }).then(function () { stackedBtn.disabled = false; });
+        }
+      });
     });
   }
 
@@ -5771,39 +5704,19 @@
   var restoreBtn = $('rv-restore-reopened');
   if (restoreBtn) {
     restoreBtn.addEventListener('click', function () {
-      var box = $('rv-restore-reopened-msg');
-      var body = {};
-      ['bucket', 'scene', 'camera', 'label', 'source'].forEach(function (k) {
-        var e = filtersForm.elements[k];
-        if (e && e.value) body[k] = e.value;
+      bulkAction({
+        button: restoreBtn, box: $('rv-restore-reopened-msg'), url: '/v1/review/restore-reopened', keys: ALL_KEYS,
+        counting: 'Counting the frames...',
+        count: function (j) { return j.eligible || 0; },
+        none: function () { return ['No reopened frame with nothing left pending among the frames the filters select.']; },
+        confirm: function (j, body, n) {
+          return 'Put ' + n + ' reopened frame(s) back to reviewed? Their boxes stay as they are, and they ' +
+            'return to exports. Frames with a pending box are not touched.';
+        },
+        cancelled: 'Nothing restored.',
+        done: function (r) { return r.message || ('Restored ' + (r.restored || 0) + ' frame(s).'); },
+        after: function () { return reloadQueue(); }
       });
-      body.dry_run = true;
-      box.className = 'review-report';
-      report(box, ['Counting the frames...']);
-      restoreBtn.disabled = true;
-      postJson('/v1/review/restore-reopened', body).then(function (j) {
-        var n = j.eligible || 0;
-        if (!n) {
-          report(box, ['No reopened frame with nothing left pending among the frames the filters select.']);
-          return null;
-        }
-        if (!window.confirm('Put ' + n + ' reopened frame(s) back to reviewed? Their boxes stay as they are, and they ' +
-          'return to exports. Frames with a pending box are not touched.')) {
-          report(box, ['Nothing restored.']);
-          return null;
-        }
-        body.dry_run = false;
-        return postJson('/v1/review/restore-reopened', body).then(function (r) {
-          var failed = r.failed || [];
-          report(box, [r.message || ('Restored ' + (r.restored || 0) + ' frame(s).')],
-            failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
-          box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
-          return reloadQueue();
-        });
-      }).catch(function (e) {
-        box.className = 'review-report error-text';
-        report(box, [e.message]);
-      }).then(function () { restoreBtn.disabled = false; });
     });
   }
 

@@ -1061,12 +1061,7 @@ mod tests {
 
     #[test]
     fn linux_sysfs_tree() {
-        let root = std::env::temp_dir().join(format!(
-            "bop-detect-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::test_dirs::TempDir::unmade("detect");
         let drm = root.join("drm");
         let nv = root.join("nvidia");
         // card0: Intel iGPU, card1: NVIDIA, card2: virtual (no ids), plus connector/render nodes.
@@ -1118,7 +1113,6 @@ mod tests {
         );
         // Missing roots: nothing, no panic.
         assert!(linux::adapters(&root.join("none"), &root.join("none")).is_empty());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

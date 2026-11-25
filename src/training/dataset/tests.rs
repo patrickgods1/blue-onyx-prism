@@ -4571,3 +4571,6 @@ fn a_cancel_while_the_images_are_written_stops_the_writers() {
         "{images} of {planned} images written after the cancel"
     );
 }
+
+mod pins;
+mod steps;

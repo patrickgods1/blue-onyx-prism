@@ -231,13 +231,7 @@
     { kind: 'tighten', title: 'Loose boxes', text: 'Labels that cover their object only partly: a checking model and a closer look by a larger model agree on a better-fitting box.', key: 'tighten' }
   ];
 
-  function el(tag, cls, text) {
-    var e = document.createElement(tag);
-    if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
-    return e;
-  }
-  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  var el = PrismDom.el, clear = PrismDom.clear;
   function say(text, bad) {
     var box = $('refine-msg');
     box.textContent = text || '';
@@ -245,25 +239,9 @@
   }
 
   function getJson(url) {
-    return fetch(url, { headers: { Accept: 'application/json' }, cache: 'no-store' }).then(parse);
+    return PrismFetch.json(url, { headers: { Accept: 'application/json' }, cache: 'no-store' });
   }
-  function postJson(url, body) {
-    return fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(body)
-    }).then(parse);
-  }
-  function parse(r) {
-    return r.json().catch(function () { return null; }).then(function (j) {
-      if (!r.ok || !j || j.success === false) {
-        var e = new Error((j && j.message) || ('HTTP ' + r.status));
-        e.body = j;
-        throw e;
-      }
-      return j;
-    });
-  }
+  var postJson = PrismFetch.postJson;
 
   function pct(x) { return Math.round(x * 100) + '%'; }
   // A score or IoU as the page prints it: two decimals, trailing zeros trimmed (0.3, 0.5, 0.15).

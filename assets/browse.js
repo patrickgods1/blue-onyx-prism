@@ -21,7 +21,7 @@
     return r.ok ? r.json() : null;
   }).then(function (j) { native = !!(j && j.available); if (native) reveal(); }).catch(function () { native = false; });
 
-  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+  var el = PrismDom.el;
   function fill(target, path) {
     target.value = path;
     target.dispatchEvent(new Event("input", { bubbles: true }));

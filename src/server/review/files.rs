@@ -18,8 +18,8 @@
 //! guard) from happening.
 
 use super::{
-    Answer, AppState, blocking, context, fail, folder_problem, folder_unavailable, hidden,
-    json_body, now, success,
+    Answer, AppState, blocking, context, folder_problem, folder_unavailable, hidden, json_body,
+    json_fail, now, success,
 };
 use crate::collect::CollectSettings;
 use crate::collect::labels::export::{
@@ -251,7 +251,7 @@ pub(in crate::server) async fn export(
         .holdout_fraction
         .unwrap_or(export::DEFAULT_HOLDOUT_FRACTION);
     if !(fraction.is_finite() && (0.0..=1.0).contains(&fraction)) {
-        return Ok(fail(
+        return Ok(json_fail(
             StatusCode::BAD_REQUEST,
             format!("holdout_fraction: must be between 0 and 1, got {fraction}"),
         ));
@@ -263,7 +263,7 @@ pub(in crate::server) async fn export(
         }
         let filter = match class_filter(b.labels, b.include_empty, &classes) {
             Ok(f) => f,
-            Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+            Err(e) => return json_fail(StatusCode::BAD_REQUEST, e),
         };
         let out_dir = match b.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             None => {
@@ -271,7 +271,7 @@ pub(in crate::server) async fn export(
             }
             Some(raw) => match export_folder(&state, raw, &root) {
                 Ok(p) => p,
-                Err((s, m)) => return fail(s, m),
+                Err((s, m)) => return json_fail(s, m),
             },
         };
         let req = ExportRequest {
@@ -318,14 +318,14 @@ pub(in crate::server) async fn export(
             }
             Err(e) if export::is_stopped(&e) => {
                 tracing::info!("review export stopped: the service is stopping");
-                fail(
+                json_fail(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Not exported: the service is stopping, so the export was cancelled and \
                      nothing of it was kept. Export again once the service is back."
                         .to_string(),
                 )
             }
-            Err(e) => fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not exported: {e:#}")),
+            Err(e) => json_fail(StatusCode::UNPROCESSABLE_ENTITY, format!("Not exported: {e:#}")),
         }
     })
     .await)
@@ -355,18 +355,18 @@ pub(in crate::server) async fn import(
         let src = match named_folder(&state, "dir", &b.dir, &root) {
             Ok(Some(p)) if p.is_dir() => p,
             Ok(Some(_)) => {
-                return fail(
+                return json_fail(
                     StatusCode::BAD_REQUEST,
                     format!("dir: '{}' is not a folder", b.dir),
                 );
             }
             Ok(None) => {
-                return fail(
+                return json_fail(
                     StatusCode::NOT_FOUND,
                     format!("dir: '{}' does not exist; choose the folder again", b.dir),
                 );
             }
-            Err((s, m)) => return fail(s, m),
+            Err((s, m)) => return json_fail(s, m),
         };
         let hidden = hidden(&state);
         let (side, shutdown) = (state.side_jobs.clone(), state.shutdown.clone());
@@ -389,7 +389,7 @@ pub(in crate::server) async fn import(
             Ok(r) => success(serde_json::json!({ "report": r })),
             Err(e) if export::is_stopped(&e) => {
                 tracing::info!("X-AnyLabeling import stopped: the service is stopping ({e:#})");
-                fail(
+                json_fail(
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!(
                         "Not finished: {e:#}. Import the folder again once the service is back; \
@@ -397,7 +397,7 @@ pub(in crate::server) async fn import(
                     ),
                 )
             }
-            Err(e) => fail(
+            Err(e) => json_fail(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("Not imported: {e:#}"),
             ),
@@ -431,10 +431,10 @@ pub(in crate::server) async fn folder(
         } else {
             let p = match allowed_folder(&state, &config, raw) {
                 Ok(p) => p,
-                Err((s, m)) => return fail(s, format!("Folder not changed: {m}")),
+                Err((s, m)) => return json_fail(s, format!("Folder not changed: {m}")),
             };
             if !p.is_dir() {
-                return fail(
+                return json_fail(
                     StatusCode::BAD_REQUEST,
                     format!("Folder not changed: {raw} is not a folder"),
                 );
@@ -450,7 +450,7 @@ pub(in crate::server) async fn folder(
                 "message": msg,
                 "dir": chosen.as_ref().unwrap_or(&dataset),
             })),
-            Err(e) => fail(
+            Err(e) => json_fail(
                 StatusCode::BAD_REQUEST,
                 format!("Folder not changed: {e:#}"),
             ),
@@ -507,7 +507,7 @@ pub(in crate::server) async fn rescan(
             return folder_unavailable(message);
         }
         let Some(_one) = Rescanning::start(&dir) else {
-            return fail(
+            return json_fail(
                 StatusCode::CONFLICT,
                 "A rescan is already running; its counts show on the page as it goes.",
             );
@@ -609,7 +609,7 @@ pub(in crate::server) async fn classes(
         });
         let msg = match result {
             Ok(msg) => msg,
-            Err(e) => return fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
+            Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("Not saved: {e:#}")),
         };
         let wanted = bulk::Wanted {
             classes: &classes,
@@ -672,7 +672,7 @@ pub(in crate::server) async fn class_catalog(State(state): State<Arc<AppState>>)
         let cat = crate::training::autolabel::catalog::ClassCatalog::for_config(&config);
         match serde_json::to_value(&cat) {
             Ok(v) => success(v),
-            Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+            Err(e) => json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         }
     })
     .await

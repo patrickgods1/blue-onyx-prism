@@ -361,10 +361,9 @@ fn apply_staged(id: &str, pending: &Path, target: &Path) -> bool {
 mod tests {
     use super::*;
 
-    fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("bop-inuse-{tag}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// A scratch folder `bop-inuse-<tag>-<uuid>`, removed on drop (also when the test fails).
+    fn tmp(tag: &str) -> crate::test_dirs::TempDir {
+        crate::test_dirs::TempDir::new(&format!("inuse-{tag}"))
     }
 
     fn openvino() -> &'static Resource {
@@ -406,7 +405,6 @@ mod tests {
         assert_eq!(content(&target), b"v2");
         assert!(!pending_dir(&target).unwrap().exists());
         assert!(!staging.exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Another process has it loaded (its shared lock): the update waits beside it, the loaded
@@ -464,7 +462,6 @@ mod tests {
             Placed::Staged(pending.clone())
         );
         assert_eq!(content(&target), b"v2");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// QA-025: an install of ours merged into a user's folder (other files beside it) that a
@@ -527,7 +524,6 @@ mod tests {
         before_load(&target);
         assert_eq!(content(&target), b"v1");
         assert!(!pending.exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A user-managed runtime (no manifest of ours) is never swapped and gets no lock file.
@@ -543,7 +539,6 @@ mod tests {
         assert_eq!(content(&dir), b"mine");
         assert!(pending.exists());
         assert!(!lock_path(&dir).unwrap().exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// RA resources-11: an install into a folder that is gone (deleted by hand) supersedes the
@@ -560,7 +555,6 @@ mod tests {
         assert_eq!(place(res, &staging, &target).unwrap(), Placed::InPlace);
         assert_eq!(content(&target), b"v1");
         assert!(!pending.exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// RA resources-11: `apply_pending` (a generation about to load the runtime) swaps a staged
@@ -583,7 +577,6 @@ mod tests {
         assert_eq!(content(&target), b"v2");
         assert!(!pending.exists());
         assert!(!apply_pending(&target), "nothing staged any more");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// RA resources-10: a runtime missing after a swap that a crash cut between its renames is
@@ -604,7 +597,6 @@ mod tests {
         before_load(&target);
         assert_eq!(content(&target), b"v1");
         assert!(!parent.join(format!(".{name}.old-4242")).exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Plain files (models) and a fresh install are placed directly.
@@ -618,6 +610,5 @@ mod tests {
         assert_eq!(place(res, &staging, &target).unwrap(), Placed::InPlace);
         assert_eq!(content(&target), b"v1");
         assert!(!lock_path(&target).unwrap().exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

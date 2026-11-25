@@ -18,10 +18,11 @@
 //! snapshot file stamps, config revision, goal, set, scene, ...), so a page switching tabs does
 //! not recompute.
 
-use super::{ApiError, file_stamp, json_error};
+use super::{ApiError, json_fail};
 use crate::benchmark::combos::{Inputs, Parts};
 use crate::benchmark::current::ModelNow;
 use crate::benchmark::eval::{Goal, compare, tune};
+use crate::benchmark::search::file_stamp;
 use crate::benchmark::search::{CACHE_IDLE, IdleCache, StoredPreds, preds_path};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::config::Config;
@@ -189,7 +190,7 @@ type QueryMap = Result<Query<HashMap<String, String>>, QueryRejection>;
 
 fn query_map(query: QueryMap) -> Result<HashMap<String, String>, Box<Response>> {
     query.map(|Query(q)| q).map_err(|e| {
-        Box::new(json_error(
+        Box::new(json_fail(
             StatusCode::BAD_REQUEST,
             format!("invalid query: {e}"),
         ))
@@ -409,7 +410,7 @@ pub(in crate::server) async fn goal_route(
 ) -> Response {
     let form = match form {
         Ok(Form(f)) => f,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
     crate::server::blocking(move || goal_blocking(&state, &form)).await
 }
@@ -427,7 +428,7 @@ fn goal_blocking(state: &AppState, form: &[(String, String)]) -> Response {
         Ok(())
     }) {
         Ok(msg) => msg,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("{e:#}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
     let ranking = load(state)
         .ok()

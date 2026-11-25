@@ -21,6 +21,7 @@
 //! [`PAGING_DISK_MARGIN_BYTES`] free; a system-managed file may reach [`system_managed_max`]
 //! (3 x RAM, at least 4 GB, Windows' own rule).
 
+use crate::sync::LockExt;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -474,9 +475,7 @@ pub fn trim_due(first: Instant, latest: Instant, last: Option<Instant>) -> Insta
 /// trim is pending; a failed thread spawn skips that trim (logged).
 pub fn trim_soon(reason: &'static str) {
     let (lock, wake) = &TRIM;
-    let mut s = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut s = lock.lock_recover();
     let now = Instant::now();
     s.first.get_or_insert(now);
     s.latest = Some(now);
@@ -494,9 +493,7 @@ pub fn trim_soon(reason: &'static str) {
         .spawn(trim_thread);
     if let Err(e) = spawned {
         tracing::debug!("memory trim skipped: could not start its thread ({e})");
-        let mut s = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut s = lock.lock_recover();
         s.thread = false;
         s.first = None;
         s.latest = None;
@@ -506,9 +503,7 @@ pub fn trim_soon(reason: &'static str) {
 
 fn trim_thread() {
     let (lock, wake) = &TRIM;
-    let mut s = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut s = lock.lock_recover();
     loop {
         let (Some(first), Some(latest)) = (s.first, s.latest) else {
             s.thread = false;
@@ -530,9 +525,7 @@ fn trim_thread() {
         tracing::debug!("memory trim for: {}", reasons.join(", "));
         let _ = trim();
         TRIMS_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        s = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        s = lock.lock_recover();
         s.last = Some(Instant::now());
     }
 }

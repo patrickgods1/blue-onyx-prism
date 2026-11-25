@@ -1266,8 +1266,7 @@ mod tests {
 
     #[test]
     fn onnx_sibling_lookup() {
-        let dir = std::env::temp_dir().join(format!("bop-select-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dirs::TempDir::new("select");
         let xml = dir.join("m.xml");
         let onnx = dir.join("m.onnx");
         let lone = dir.join("lone.xml");
@@ -1279,6 +1278,5 @@ mod tests {
         assert_eq!(onnx_path_for(&onnx), Some(onnx.clone()));
         assert_eq!(onnx_path_for(&lone), None);
         assert_eq!(onnx_path_for(&dir.join("missing.onnx")), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

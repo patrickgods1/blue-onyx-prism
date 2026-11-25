@@ -79,7 +79,7 @@ pub fn from_config(
         .map(|m| {
             let name = m.effective_name();
             (
-                normalize_name(&name),
+                m.key(),
                 ModelNow {
                     threshold: m.confidence_threshold.unwrap_or(cfg.confidence_threshold),
                     running: running(&name),

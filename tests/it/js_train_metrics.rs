@@ -8,25 +8,9 @@
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI).
 #![allow(clippy::unwrap_used)]
 
+use crate::js_harness::{asset, have_node, run_node};
 use blue_onyx_prism::training::progress::{self, TrainProgress};
 use serde_json::{Value, json};
-use std::path::PathBuf;
-use std::process::Command;
-
-fn have_node() -> bool {
-    let ok = Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
-            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
-        );
-        println!("skipped: no node");
-    }
-    ok
-}
 
 /// A stub DOM big enough for train-metrics.js without charts (no `PrismBench`): `run(cases)`
 /// is the driver's body; it prints `RESULT: <json>`.
@@ -50,7 +34,12 @@ class N {
 const document = { createElement: t => new N(t), createTextNode: t => { const n = new N('#text'); n.textContent = t; return n; } };
 const window = { document };
 const ctx = { window, document, globalThis: {} };
+// dom.js (PrismDom, PrismFetch) sits next to the asset under test and is loaded first.
+const domJs = require('path').join(require('path').dirname(process.argv[2]), 'dom.js');
 vm.createContext(ctx);
+const domCtx = vm.createContext({document});
+vm.runInContext(fs.readFileSync(domJs, 'utf8'), domCtx);
+ctx.PrismDom = vm.runInContext('PrismDom', domCtx);
 vm.runInContext(src, ctx);
 const T = ctx.window.TrainMetrics;
 const hasClass = (n, c) => (n.className || '').split(' ').indexOf(c) >= 0;
@@ -58,27 +47,12 @@ const hasClass = (n, c) => (n.className || '').split(' ').indexOf(c) >= 0;
 
 /// Run `body` after [`STUB`] with `input` (JSON); the `RESULT: ` line's JSON.
 fn node(body: &str, input: &Value) -> Value {
-    let dir = std::env::temp_dir().join(format!("bop-js-train-metrics-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let driver = dir.join("driver.js");
-    let data = dir.join("input.json");
-    std::fs::write(&driver, format!("{STUB}\n{body}")).unwrap();
-    std::fs::write(&data, input.to_string()).unwrap();
-    let asset = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/train-metrics.js");
-    let out = Command::new("node")
-        .arg(&driver)
-        .arg(&asset)
-        .arg(&data)
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "node failed ({}): {stdout}{}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+    let out = run_node(
+        &format!("{STUB}\n{body}"),
+        &[asset("train-metrics.js").as_os_str()],
+        &[("input.json", input.to_string().as_bytes())],
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let line = stdout
         .lines()
         .find_map(|l| l.strip_prefix("RESULT: "))

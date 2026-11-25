@@ -5,7 +5,7 @@
 //! (inside the browsable folders or natively picked); the file is written atomically. The results
 //! themselves never move: `auto` device ordering reads them beside the config.
 
-use super::{devices_snapshot, json_error, models_now};
+use super::{devices_snapshot, json_fail, models_now};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::server::AppState;
 use axum::Json;
@@ -26,7 +26,7 @@ pub(in crate::server) async fn save_report(
 ) -> Response {
     let form = match form {
         Ok(Form(f)) => f,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
+        Err(e) => return json_fail(StatusCode::BAD_REQUEST, format!("invalid form: {e}")),
     };
     let dir = form
         .iter()
@@ -39,9 +39,9 @@ pub(in crate::server) async fn save_report(
 /// [`save_report`] off the runtime threads: it parses the results and writes the file.
 fn save_blocking(state: &AppState, raw: &str) -> Response {
     if raw.is_empty() {
-        return json_error(
+        return json_fail(
             StatusCode::BAD_REQUEST,
-            "No folder given: choose the folder to save the report in with Browse...".into(),
+            "No folder given: choose the folder to save the report in with Browse...",
         );
     }
     let cfg = state.config_read().clone();
@@ -49,7 +49,7 @@ fn save_blocking(state: &AppState, raw: &str) -> Response {
         Ok(d) => d,
         Err(e) => {
             let (status, message) = e.into_parts();
-            return json_error(
+            return json_fail(
                 status,
                 format!(
                     "The report was not saved: {message}. Choose the folder with Browse... (or \
@@ -59,7 +59,7 @@ fn save_blocking(state: &AppState, raw: &str) -> Response {
         }
     };
     if !dir.is_dir() {
-        return json_error(
+        return json_fail(
             StatusCode::BAD_REQUEST,
             format!(
                 "The report was not saved: {raw} is a file, not a folder. Use Browse... to choose \
@@ -69,7 +69,7 @@ fn save_blocking(state: &AppState, raw: &str) -> Response {
     }
     let results = results_path(&state.config_path);
     if !results.exists() {
-        return json_error(
+        return json_fail(
             StatusCode::NOT_FOUND,
             format!(
                 "No benchmark results to report yet ({} does not exist): run a benchmark in \
@@ -79,7 +79,7 @@ fn save_blocking(state: &AppState, raw: &str) -> Response {
         );
     }
     let Some(mut r) = BenchmarkResults::load_or_warn(&results) else {
-        return json_error(
+        return json_fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
                 "The report was not saved: {} could not be read (see the log); run the benchmark \
@@ -102,7 +102,7 @@ fn save_blocking(state: &AppState, raw: &str) -> Response {
     let path = report_path(&dir, crate::clock::zone(), chrono::Utc::now());
     let html = crate::benchmark::export::html(&r);
     if let Err(e) = crate::collect::layout::write_atomic(&path, html.as_bytes()) {
-        return json_error(
+        return json_fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
                 "The report was not saved: writing {} failed: {e}. Check that the folder is \

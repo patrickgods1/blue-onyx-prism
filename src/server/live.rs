@@ -15,7 +15,7 @@ use crate::config_merge::{self, Pending};
 use crate::config_store::ConfigRef;
 use crate::registry::normalize_name;
 use crate::startup::ModelState;
-use crate::sync::LockExt;
+use crate::sync::{LockExt, RwLockExt};
 use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -340,11 +340,7 @@ pub(super) fn running_view(state: &AppState, name: &str) -> RunningView {
     };
     let (st, class, detail) = super::state_view(&w);
     let provider = w.execution_provider();
-    let device = w
-        .device
-        .read()
-        .ok()
-        .and_then(|d| d.as_ref().map(|d| d.spec.clone()));
+    let device = w.device.read_recover().as_ref().map(|d| d.spec.clone());
     let (t, source) = w.effective_threshold();
     let threshold = Some(crate::config::round_threshold_f64(t));
     let source_text = match &source {
@@ -536,7 +532,7 @@ fn build_payload(state: &AppState, inputs: &Inputs) -> Value {
         .enumerate()
         .map(|(i, (m, running))| {
             let name = m.effective_name();
-            let key = normalize_name(&name);
+            let key = m.key();
             let reasons = pending.for_model(&name);
             let resolved = configured_resolved(state, cfg, m, probe);
             let facts = (**bench).as_ref().and_then(|b| b.models.get(&key).cloned());
@@ -636,9 +632,8 @@ fn pending_json(p: &Pending, cfg: &Config) -> Value {
     let display = |key: &str| {
         cfg.models
             .iter()
-            .map(|m| m.effective_name())
-            .find(|n| normalize_name(n) == key)
-            .unwrap_or_else(|| key.to_string())
+            .find(|m| m.key() == key)
+            .map_or_else(|| key.to_string(), |m| m.effective_name())
     };
     let mut all: Vec<String> = p.global.clone();
     for (k, reasons) in &p.models {
@@ -939,16 +934,12 @@ fn card_model<'a>(
     c: &'a mut Config,
     name: &str,
 ) -> anyhow::Result<&'a mut crate::config::ModelConfig> {
-    let key = normalize_name(name);
-    c.models
-        .iter_mut()
-        .find(|m| normalize_name(&m.effective_name()) == key)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "'{name}' is not one of the configured models (it was removed or renamed \
+    c.model_mut(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{name}' is not one of the configured models (it was removed or renamed \
                  meanwhile); reload the Config page"
-            )
-        })
+        )
+    })
 }
 
 /// The Models card over the current config `c`, applied as submitted: `enabled` (repeated; the
@@ -1068,12 +1059,9 @@ pub(super) fn saved_json(state: &AppState, message: String, restarting: bool) ->
     .into_response()
 }
 
+/// A Config page refusal: [`super::answer::json_error`] (`{success: false, message, error}`).
 pub(super) fn error_json(status: StatusCode, message: String) -> Response {
-    (
-        status,
-        Json(json!({ "success": false, "message": message })),
-    )
-        .into_response()
+    super::answer::json_error(status, message)
 }
 
 #[cfg(test)]

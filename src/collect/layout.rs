@@ -12,12 +12,14 @@
 //! The JSONL files survive a crash or a full disk: [`append_line`] ends a torn last line before
 //! writing, and [`read_lines`] costs a damaged line only that line, and counts it.
 //!
-//! Every writer of a day's `index.jsonl` (the collector's and the import's [`append_index`],
-//! retention's [`rewrite_index`] and its removal of emptied folders) holds the dataset's
-//! cross-process [`INDEX_LOCK_FILE`]; the frame files themselves go in through [`write_in_day`],
-//! which survives retention removing a just-created, still empty day folder.
+//! A frame (image, sidecar, index line, all or nothing) is written by [`write_frame`], the one
+//! writer the collector and the import share. Every writer of a day's `index.jsonl` (the frame
+//! writer's [`append_index`], retention's [`rewrite_index`] and its removal of emptied folders)
+//! holds the dataset's cross-process [`INDEX_LOCK_FILE`]; the frame files themselves go in through
+//! [`write_in_day`], which survives retention removing a just-created, still empty day folder.
 
 use super::record::{Bucket, IndexLine, Record};
+use crate::sync::LockExt as _;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -653,7 +655,7 @@ fn folder_lock(
     process: bool,
     keep_waiting: impl FnMut() -> bool,
 ) -> FolderLock {
-    let held = process.then(|| mutex.lock().unwrap_or_else(|e| e.into_inner()));
+    let held = process.then(|| mutex.lock_recover());
     let file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -812,6 +814,135 @@ pub fn write_in_day(day: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<()
         }
         r => r,
     }
+}
+
+/// Quality of the JPEG a frame that is not one is re-encoded to ([`write_frame`]).
+pub const REENCODE_QUALITY: u8 = 92;
+
+/// The steps of [`write_frame`] that touch the disk, in their order (what an
+/// [`FrameWriteError::Io`] failed at).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameStep {
+    /// Creating the day folder.
+    Folder,
+    /// Writing `<stem>.jpg`.
+    Image,
+    /// Writing `<stem>.json`.
+    Sidecar,
+    /// Appending the index line ([`append_index`]).
+    Index,
+}
+
+/// Why [`write_frame`] wrote no frame. Nothing of the frame is left (the day folder it made may
+/// stay, empty, for retention to remove).
+#[derive(Debug)]
+pub enum FrameWriteError {
+    /// The image is not a JPEG and does not decode.
+    Decode(anyhow::Error),
+    /// The decoded image or the record could not be encoded (the JPEG, the sidecar's JSON).
+    Encode(anyhow::Error),
+    /// A file operation failed at `step`.
+    Io {
+        step: FrameStep,
+        error: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for FrameWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode(e) | Self::Encode(e) => write!(f, "{e}"),
+            Self::Io { error, .. } => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameWriteError {}
+
+/// Write one frame into its day folder `day` as `<stem>.jpg`, `<stem>.json` and an index line,
+/// the one writer of the on-disk frame contract (`docs/DATASET.md`; the collector's
+/// [`super::store`] and the import's [`crate::training::import::write`] call it). `image` is kept
+/// as it is when it is a JPEG (starts with `FF D8`), else decoded and re-encoded at
+/// [`REENCODE_QUALITY`]; that happens before the day folder is made, so an image that does not
+/// decode leaves no folder. `record.id` becomes `stem` and `record.image` the written image; the
+/// sidecar is `record` as pretty JSON. The image goes in first ([`write_in_day`]), then the sidecar
+/// (each atomic), then the line ([`append_index`], under the dataset's index lock): a sidecar
+/// always has its image, and a frame is complete or absent, as a failed sidecar write removes the
+/// image and a failed append both. Returns the index line and the frame's bytes on disk (image +
+/// sidecar, the line's `bytes`).
+pub fn write_frame(
+    day: &Path,
+    stem: &str,
+    image: &[u8],
+    record: &mut Record,
+) -> Result<(IndexLine, u64), FrameWriteError> {
+    let (bytes, original) = if image.starts_with(&[0xFF, 0xD8]) {
+        (std::borrow::Cow::Borrowed(image), true)
+    } else {
+        let img = crate::image::decode(image).map_err(FrameWriteError::Decode)?;
+        let jpeg =
+            crate::image::encode_jpeg(&img, REENCODE_QUALITY).map_err(FrameWriteError::Encode)?;
+        (std::borrow::Cow::Owned(jpeg), false)
+    };
+    let io = |step: FrameStep| move |error: std::io::Error| FrameWriteError::Io { step, error };
+    record.id = stem.to_string();
+    record.image = super::record::ImageInfo {
+        file: format!("{stem}.jpg"),
+        bytes: bytes.len() as u64,
+        original,
+    };
+    let json = serde_json::to_vec_pretty(&*record)
+        .map_err(|e| FrameWriteError::Encode(anyhow::Error::from(e)))?;
+    std::fs::create_dir_all(day).map_err(io(FrameStep::Folder))?;
+    let jpg = day.join(format!("{stem}.jpg"));
+    fault(FrameStep::Image)
+        .and_then(|()| write_in_day(day, &jpg, &bytes))
+        .map_err(io(FrameStep::Image))?;
+    let side = day.join(format!("{stem}.json"));
+    if let Err(e) = fault(FrameStep::Sidecar).and_then(|()| write_atomic(&side, &json)) {
+        let _ = std::fs::remove_file(&jpg);
+        return Err(io(FrameStep::Sidecar)(e));
+    }
+    let total = (bytes.len() + json.len()) as u64;
+    let line = IndexLine::of(record, total);
+    if let Err(e) = fault(FrameStep::Index).and_then(|()| append_index(day, &line)) {
+        // Audit 2026-11 (QA-054): no index line, no frame. Left behind, it would be counted by
+        // retention and listed as a stray, yet missing from the summary and the review queue.
+        let _ = std::fs::remove_file(&side);
+        let _ = std::fs::remove_file(&jpg);
+        return Err(io(FrameStep::Index)(e));
+    }
+    Ok((line, total))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The step [`write_frame`] fails at on this thread, with this error kind (tests).
+    static FRAME_FAULT: std::cell::Cell<Option<(FrameStep, std::io::ErrorKind)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Make [`write_frame`] on this thread fail at a step, before doing it (`None`: never). Tests
+/// only.
+#[cfg(test)]
+pub(crate) fn fail_frames_at(fault: Option<(FrameStep, std::io::ErrorKind)>) {
+    FRAME_FAULT.with(|f| f.set(fault));
+}
+
+/// The error [`fail_frames_at`] asked for at `step`; always Ok outside the tests.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the test fault seam: an error only under cfg(test)"
+)]
+fn fault(step: FrameStep) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some((at, kind)) = FRAME_FAULT.with(std::cell::Cell::get)
+        && at == step
+    {
+        return Err(std::io::Error::from(kind));
+    }
+    let _ = step;
+    Ok(())
 }
 
 /// Queue the frames `rels` (image paths relative to `dir`) for review: every one must parse
@@ -974,6 +1105,126 @@ pub fn damaged_lines(dir: &Path, all_days: bool) -> u64 {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A 16x8 JPEG.
+    fn small_jpeg() -> Vec<u8> {
+        let img = crate::image::RgbImage {
+            width: 16,
+            height: 8,
+            rgb: (0..16 * 8 * 3).map(|i| (i % 251) as u8).collect(),
+        };
+        crate::image::encode_jpeg(&img, 90).unwrap()
+    }
+
+    fn frame_record() -> Record {
+        Record {
+            camera: "cam".into(),
+            scene: "day".into(),
+            ..super::super::record::empty_record()
+        }
+    }
+
+    /// The file names in `day`, sorted (none when it is missing).
+    fn names_in(day: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(day)
+            .map(|r| {
+                r.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Audit 2026-11 phase 9 (Q:collect-7): the shared writer keeps a JPEG as it is, names the
+    /// record after the stem, and lists the frame under the dataset's index lock.
+    #[test]
+    fn a_frame_is_its_image_its_sidecar_and_an_index_line() {
+        let root = crate::test_dirs::TempDir::new("write-frame");
+        let day = root.join("day/cam/2026-11-24");
+        let jpeg = small_jpeg();
+        let mut rec = frame_record();
+        let (line, total) = write_frame(&day, "s1", &jpeg, &mut rec).unwrap();
+        assert_eq!(rec.id, "s1");
+        assert_eq!(
+            rec.image,
+            super::super::record::ImageInfo {
+                file: "s1.jpg".into(),
+                bytes: jpeg.len() as u64,
+                original: true,
+            }
+        );
+        assert_eq!(std::fs::read(day.join("s1.jpg")).unwrap(), jpeg);
+        let side = std::fs::read(day.join("s1.json")).unwrap();
+        assert_eq!(side, serde_json::to_vec_pretty(&rec).unwrap());
+        assert_eq!(total, (jpeg.len() + side.len()) as u64);
+        assert_eq!(line, IndexLine::of(&rec, total));
+        assert_eq!(read_index(&day.join(INDEX_FILE)), [line]);
+        assert!(root.join(INDEX_LOCK_FILE).is_file(), "the index lock");
+        assert_eq!(names_in(&day), ["index.jsonl", "s1.jpg", "s1.json"]);
+    }
+
+    #[test]
+    fn another_image_is_reencoded_and_one_that_does_not_decode_leaves_no_folder() {
+        let root = crate::test_dirs::TempDir::new("write-frame-png");
+        let day = root.join("day/cam/2026-11-24");
+        let img = crate::image::decode(&small_jpeg()).unwrap();
+        let mut png = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut png),
+            &img.rgb,
+            img.width,
+            img.height,
+            image::ExtendedColorType::Rgb8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        let mut rec = frame_record();
+        write_frame(&day, "p", &png, &mut rec).unwrap();
+        let jpg = std::fs::read(day.join("p.jpg")).unwrap();
+        assert_eq!(
+            jpg,
+            crate::image::encode_jpeg(&img, REENCODE_QUALITY).unwrap()
+        );
+        assert!(!rec.image.original);
+        assert_eq!(rec.image.bytes, jpg.len() as u64);
+        let other = root.join("night/cam/2026-11-24");
+        let e = write_frame(&other, "x", b"not an image", &mut frame_record()).unwrap_err();
+        assert!(matches!(e, FrameWriteError::Decode(_)), "{e:?}");
+        assert!(
+            !other.exists(),
+            "no folder for a frame that does not decode"
+        );
+    }
+
+    /// Audit 2026-11 phase 9 (Q:collect-7): whichever write fails, the image, the sidecar or the
+    /// index line, nothing of the frame is left (and the day's other frames stay as they were).
+    #[test]
+    fn a_failed_write_leaves_no_part_of_the_frame() {
+        let jpeg = small_jpeg();
+        for step in [FrameStep::Image, FrameStep::Sidecar, FrameStep::Index] {
+            let root = crate::test_dirs::TempDir::new("write-frame-fault");
+            let day = root.join("day/cam/2026-11-24");
+            write_frame(&day, "before", &jpeg, &mut frame_record()).unwrap();
+            fail_frames_at(Some((step, std::io::ErrorKind::StorageFull)));
+            let out = write_frame(&day, "s1", &jpeg, &mut frame_record());
+            fail_frames_at(None);
+            match out {
+                Err(FrameWriteError::Io { step: at, error }) => {
+                    assert_eq!(at, step);
+                    assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+                }
+                other => panic!("{step:?}: {other:?}"),
+            }
+            assert_eq!(
+                names_in(&day),
+                ["before.jpg", "before.json", "index.jsonl"],
+                "{step:?}"
+            );
+            assert_eq!(read_index(&day.join(INDEX_FILE)).len(), 1, "{step:?}");
+        }
+    }
 
     #[test]
     fn camera_folder_names() {

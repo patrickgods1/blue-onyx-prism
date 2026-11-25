@@ -1462,6 +1462,10 @@ impl WorkerCtx {
     /// with verifier candidates is handed to the verify lane instead ([`super::verify`]),
     /// which replies once the verifier answered (or the request's deadline passed): this
     /// thread never waits for another model.
+    ///
+    /// Stages, in this order: threshold, collector record, collect, postprocess (+ filters),
+    /// health, the done line, then the response: handed to the verify lane (which replies),
+    /// or replied here, then the collector and the image saver get the frame.
     fn finish(&self, eng: &mut Engine, slot: usize, f: InFlight) {
         let name = &self.cfg.name;
         let infer_d = f
@@ -1470,16 +1474,7 @@ impl WorkerCtx {
             .saturating_duration_since(f.submitted);
         let t = Instant::now();
         let live = f.meta.live.clone();
-        // The profile for the device that actually loaded (`auto` and a fallback included),
-        // else the model's / global value, or on a night / IR frame the model's
-        // `night_threshold`; a request's `min_confidence` wins over all of them.
-        let (configured, source) = live.threshold_for_scene(&eng.device, f.stats.scene());
-        let threshold = effective_threshold(f.min_confidence(), configured);
-        let threshold_source = if threshold == effective_threshold(0.0, configured) {
-            source.label()
-        } else {
-            "request".to_string()
-        };
+        let (threshold, threshold_source) = request_threshold(&eng.device, &f);
         // Dataset collector: the record of this request (None: collection off). With the
         // `near_threshold` bucket on, postprocessing runs `margin` below the threshold and the
         // boxes under it are only recorded: greedy NMS and its caps keep the highest scores,
@@ -1503,96 +1498,43 @@ impl WorkerCtx {
                 near_margin,
             },
         );
-        let post_threshold = match (&collect_job, near_margin) {
-            (Some(_), Some(m)) => (threshold - m).max(crate::model::nms::MIN_CONFIDENCE_FLOOR),
-            _ => threshold,
-        };
         let params = PostParams {
-            confidence_threshold: post_threshold,
+            confidence_threshold: post_threshold(
+                threshold,
+                near_margin.filter(|_| collect_job.is_some()),
+            ),
             nms_iou: live.nms_iou,
         };
-        let collected = if f.overdue {
-            let watch = self.stuck_watch(eng);
-            let limit = f.meta.timeout();
-            collect_watched(&watch, limit, || eng.backend.collect(slot))
-        } else {
-            eng.backend.collect(slot)
-        };
-        if let Err(e) = &collected {
-            self.mark_if_dead(eng, f.submitted, e);
-        }
-        let mut degenerate = false;
-        let scene = f.stats.scene();
-        let crop = f.meta.verify_crop;
-        let mut suppressed = SuppressCounts::default();
-        let result = collected.and_then(|outs| {
-            degenerate = outputs_degenerate(&outs);
-            let dets = eng.family.postprocess(&outs, &f.ctx, &params);
-            eng.backend.recycle(slot, outs);
-            let dets = dets?;
-            if crop {
-                // A verifier check: the raw detections in the crop (see `Purpose::Verify`).
-                return Ok(crate::model::to_predictions(
-                    &dets,
-                    &f.ctx,
-                    &self.cfg.classes,
-                    None,
-                ));
-            }
-            let dets = match collect_job.as_mut() {
-                Some(job) => {
-                    let (raw, below): (Vec<_>, Vec<_>) =
-                        dets.into_iter().partition(|d| d.score >= threshold);
-                    let mut removed = Vec::new();
-                    let kept = self.filter_detections(
-                        raw.clone(),
-                        &f,
-                        scene,
-                        &live,
-                        &mut suppressed,
-                        Some(&mut removed),
-                    );
-                    job.draft
-                        .set_detections(&raw, &below, &removed, &self.cfg.classes);
-                    kept
-                }
-                None => self.filter_detections(dets, &f, scene, &live, &mut suppressed, None),
-            };
-            let filter = (!live.object_filter.is_empty()).then_some(live.object_filter.as_slice());
-            Ok(crate::model::to_predictions(
-                &dets,
-                &f.ctx,
-                &self.cfg.classes,
-                filter,
-            ))
-        });
+        let collected = self.collect_outputs(eng, slot, &f);
+        let Post {
+            result,
+            degenerate,
+            suppressed,
+        } = self.postprocess(
+            eng,
+            slot,
+            &f,
+            collected,
+            &params,
+            threshold,
+            collect_job.as_mut(),
+        );
         self.metrics.record_suppressed(&suppressed);
         self.note_health(eng, result.as_ref().err(), degenerate);
         let post_d = t.elapsed();
-        let process_d = f.decode + f.preprocess + infer_d + post_d;
-        let line = DoneLine {
-            model: name.clone(),
-            device: eng.device.clone(),
-            request_id: f.meta.request_id.clone(),
-            routed_from: f.meta.routed_from.clone(),
-            verify_crop: crop,
-            image: f.meta.image_name.clone(),
-            size: format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
-            scene,
-            luma: f64::from(f.stats.mean_luma),
-            chroma: f64::from(f.stats.chroma_spread.min(f.stats.tint_spread)),
-            suppressed: suppressed_summary(&suppressed),
+        let line = DoneLine::new(
+            name,
+            &eng.device,
+            &f,
+            slot,
             threshold,
             threshold_source,
-            slot,
-            queue_ms: millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
-            decode_ms: f.decode.as_secs_f64() * 1e3,
-            preprocess_ms: f.preprocess.as_secs_f64() * 1e3,
-            inference_ms: infer_d.as_secs_f64() * 1e3,
-            postprocess_ms: post_d.as_secs_f64() * 1e3,
-            process: process_d,
-            enqueued: f.meta.enqueued,
-        };
+            &suppressed,
+            infer_d,
+            post_d,
+        );
+        let process_d = line.process;
+        let (scene, crop) = (line.scene, line.verify_crop);
         let InFlight {
             meta,
             img,
@@ -1605,21 +1547,7 @@ impl WorkerCtx {
         let resp = match result {
             Ok(predictions) => {
                 self.metrics.inference_ms.record(millis_u64(infer_d));
-                let resp = VisionDetectionResponse {
-                    success: true,
-                    message: format!("Found {} objects", predictions.len()),
-                    error: None,
-                    count: i32::try_from(predictions.len()).unwrap_or(i32::MAX),
-                    predictions,
-                    command: "detect".into(),
-                    moduleId: crate::MODULE_ID.to_string(),
-                    executionProvider: eng.provider.clone(),
-                    canUseGPU: self.cfg.can_use_gpu,
-                    inferenceMs: ms(infer_d),
-                    processMs: ms(process_d),
-                    analysisRoundTripMs: 0,
-                    dropped: None,
-                };
+                let resp = self.success_response(eng, predictions, infer_d, process_d);
                 let plan = match (&live.verify, may_verify(&meta)) {
                     (Some(cfg), true) => {
                         crate::verify::plan(&resp.predictions, ctx.orig_w, ctx.orig_h, scene, cfg)
@@ -1688,6 +1616,123 @@ impl WorkerCtx {
         }
         if let Some(job) = save_job {
             save::submit(self.saver().as_deref(), job);
+        }
+    }
+
+    /// `slot`'s finished outputs: under the stuck watchdog (the request's timeout) when no
+    /// completion arrived in time ([`InFlight::overdue`]). A dead session marks the model.
+    fn collect_outputs(
+        &self,
+        eng: &mut Engine,
+        slot: usize,
+        f: &InFlight,
+    ) -> Result<Vec<crate::model::NamedOutput>> {
+        let collected = if f.overdue {
+            let watch = self.stuck_watch(eng);
+            let limit = f.meta.timeout();
+            collect_watched(&watch, limit, || eng.backend.collect(slot))
+        } else {
+            eng.backend.collect(slot)
+        };
+        if let Err(e) = &collected {
+            self.mark_if_dead(eng, f.submitted, e);
+        }
+        collected
+    }
+
+    /// The family's postprocess of `collected` at `params` (the slot's buffers go back to the
+    /// backend), then the request's predictions: a verifier check's raw detections in the crop
+    /// (see `Purpose::Verify`), else the night / IR rules, the static memory and the object
+    /// filter. With `collect_job`, the boxes under `threshold` and the ones the filters removed
+    /// go to its record.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one stage of `finish`: each argument is one of its inputs, named"
+    )]
+    fn postprocess(
+        &self,
+        eng: &mut Engine,
+        slot: usize,
+        f: &InFlight,
+        collected: Result<Vec<crate::model::NamedOutput>>,
+        params: &PostParams,
+        threshold: f32,
+        collect_job: Option<&mut super::collect::Job>,
+    ) -> Post {
+        let live = &f.meta.live;
+        let scene = f.stats.scene();
+        let mut degenerate = false;
+        let mut suppressed = SuppressCounts::default();
+        let result = collected.and_then(|outs| {
+            degenerate = outputs_degenerate(&outs);
+            let dets = eng.family.postprocess(&outs, &f.ctx, params);
+            eng.backend.recycle(slot, outs);
+            let dets = dets?;
+            if f.meta.verify_crop {
+                // A verifier check: the raw detections in the crop (see `Purpose::Verify`).
+                return Ok(crate::model::to_predictions(
+                    &dets,
+                    &f.ctx,
+                    &self.cfg.classes,
+                    None,
+                ));
+            }
+            let dets = match collect_job {
+                Some(job) => {
+                    let (raw, below): (Vec<_>, Vec<_>) =
+                        dets.into_iter().partition(|d| d.score >= threshold);
+                    let mut removed = Vec::new();
+                    let kept = self.filter_detections(
+                        raw.clone(),
+                        f,
+                        scene,
+                        live,
+                        &mut suppressed,
+                        Some(&mut removed),
+                    );
+                    job.draft
+                        .set_detections(&raw, &below, &removed, &self.cfg.classes);
+                    kept
+                }
+                None => self.filter_detections(dets, f, scene, live, &mut suppressed, None),
+            };
+            let filter = (!live.object_filter.is_empty()).then_some(live.object_filter.as_slice());
+            Ok(crate::model::to_predictions(
+                &dets,
+                &f.ctx,
+                &self.cfg.classes,
+                filter,
+            ))
+        });
+        Post {
+            result,
+            degenerate,
+            suppressed,
+        }
+    }
+
+    /// The answer to a request that found `predictions`.
+    fn success_response(
+        &self,
+        eng: &Engine,
+        predictions: Vec<crate::api::Prediction>,
+        infer_d: Duration,
+        process_d: Duration,
+    ) -> VisionDetectionResponse {
+        VisionDetectionResponse {
+            success: true,
+            message: format!("Found {} objects", predictions.len()),
+            error: None,
+            count: i32::try_from(predictions.len()).unwrap_or(i32::MAX),
+            predictions,
+            command: "detect".into(),
+            moduleId: crate::MODULE_ID.to_string(),
+            executionProvider: eng.provider.clone(),
+            canUseGPU: self.cfg.can_use_gpu,
+            inferenceMs: ms(infer_d),
+            processMs: ms(process_d),
+            analysisRoundTripMs: 0,
+            dropped: None,
         }
     }
 
@@ -1854,6 +1899,52 @@ thread_local! {
     static VERIFY_SPAWN: RefCell<SpawnBackoff> = const { RefCell::new(SpawnBackoff::new()) };
 }
 
+/// Request `f`'s confidence threshold on `device` (the one the model loaded on) and where it
+/// came from, for the done line: the profile for that device (`auto` and a fallback included),
+/// else the model's / global value, or on a night / IR frame the model's `night_threshold`; a
+/// request's `min_confidence` wins over all of them.
+fn request_threshold(device: &str, f: &InFlight) -> (f32, String) {
+    let (configured, source) = f.meta.live.threshold_for_scene(device, f.stats.scene());
+    threshold_with_source(f.min_confidence(), configured, &source)
+}
+
+/// [`effective_threshold`] of `min_confidence` over `configured`, labelled `source` unless the
+/// request's value is what changed it ("request").
+fn threshold_with_source(
+    min_confidence: f32,
+    configured: f32,
+    source: &crate::config::ThresholdSource,
+) -> (f32, String) {
+    let threshold = effective_threshold(min_confidence, configured);
+    let label = if threshold == effective_threshold(0.0, configured) {
+        source.label()
+    } else {
+        "request".to_string()
+    };
+    (threshold, label)
+}
+
+/// The confidence threshold postprocessing runs at: `threshold`, or `below` under it (never
+/// under [`crate::model::nms::MIN_CONFIDENCE_FLOOR`]) while the collector records the boxes
+/// just below the threshold (`near_threshold` bucket).
+fn post_threshold(threshold: f32, below: Option<f32>) -> f32 {
+    match below {
+        Some(m) => (threshold - m).max(crate::model::nms::MIN_CONFIDENCE_FLOOR),
+        None => threshold,
+    }
+}
+
+/// What postprocessing one request gave ([`WorkerCtx::postprocess`]).
+#[derive(Debug)]
+struct Post {
+    /// The predictions to answer with, or why there are none.
+    result: Result<Vec<crate::api::Prediction>>,
+    /// No output held a finite non-zero value ([`outputs_degenerate`]; health).
+    degenerate: bool,
+    /// What the night / IR rules and the static memory removed.
+    suppressed: SuppressCounts,
+}
+
 /// The one debug line per detection ("detection done"), built in `finish` and written there or,
 /// for a verified request, by the verify lane with the verifier's outcome.
 #[derive(Debug)]
@@ -1895,6 +1986,48 @@ pub(super) struct VerifyLog {
 }
 
 impl DoneLine {
+    /// The line of request `f`, answered by `model` on `device` from `slot`, with the threshold
+    /// it ran with and the times of its stages.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a constructor: each argument is one of the line's sources, named"
+    )]
+    fn new(
+        model: &str,
+        device: &str,
+        f: &InFlight,
+        slot: usize,
+        threshold: f32,
+        threshold_source: String,
+        suppressed: &SuppressCounts,
+        infer_d: Duration,
+        post_d: Duration,
+    ) -> Self {
+        Self {
+            model: model.to_string(),
+            device: device.to_string(),
+            request_id: f.meta.request_id.clone(),
+            routed_from: f.meta.routed_from.clone(),
+            verify_crop: f.meta.verify_crop,
+            image: f.meta.image_name.clone(),
+            size: format!("{}x{}", f.ctx.orig_w, f.ctx.orig_h),
+            scene: f.stats.scene(),
+            luma: f64::from(f.stats.mean_luma),
+            chroma: f64::from(f.stats.chroma_spread.min(f.stats.tint_spread)),
+            suppressed: suppressed_summary(suppressed),
+            threshold,
+            threshold_source,
+            slot,
+            queue_ms: millis_u64(f.submitted.saturating_duration_since(f.meta.enqueued)),
+            decode_ms: f.decode.as_secs_f64() * 1e3,
+            preprocess_ms: f.preprocess.as_secs_f64() * 1e3,
+            inference_ms: infer_d.as_secs_f64() * 1e3,
+            postprocess_ms: post_d.as_secs_f64() * 1e3,
+            process: f.decode + f.preprocess + infer_d + post_d,
+            enqueued: f.meta.enqueued,
+        }
+    }
+
     pub(super) fn emit(&self, predictions: &[crate::api::Prediction], verify: Option<&VerifyLog>) {
         let process = self.process.as_secs_f64() * 1e3 + verify.map_or(0.0, |v| v.ms);
         debug!(
@@ -2114,6 +2247,122 @@ pub(super) fn session_dead(e: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ThresholdSource;
+
+    /// QA-142: the threshold stage of `finish`. The configured value keeps its source; a
+    /// request's `min_confidence` that changes it is "request" (a fraction, or a percentage).
+    #[test]
+    fn threshold_with_source_names_the_request_only_when_it_changed_the_value() {
+        let t = |min, configured, source: ThresholdSource| {
+            threshold_with_source(min, configured, &source)
+        };
+        assert_eq!(t(0.0, 0.5, ThresholdSource::Model), (0.5, "model".into()));
+        assert_eq!(
+            t(0.7, 0.5, ThresholdSource::Global),
+            (0.7, "request".into())
+        );
+        assert_eq!(
+            t(40.0, 0.5, ThresholdSource::Global),
+            (0.4, "request".into())
+        );
+        // The same value as configured, or one ignored (over 100), keeps the source.
+        assert_eq!(t(0.5, 0.5, ThresholdSource::Model), (0.5, "model".into()));
+        assert_eq!(
+            t(250.0, 0.5, ThresholdSource::Device("openvino:gpu".into())),
+            (0.5, "profile for openvino:gpu".into())
+        );
+        let floor = crate::model::nms::MIN_CONFIDENCE_FLOOR;
+        assert_eq!(
+            t(0.0, 0.0, ThresholdSource::Global),
+            (floor, "global".into())
+        );
+    }
+
+    /// A night / IR frame runs at the model's `night_threshold`; a day frame at the fallback.
+    #[test]
+    fn request_threshold_follows_the_scene() {
+        let mut f = InFlight::for_test(1);
+        f.meta.live = Arc::new(super::super::LiveSettings {
+            confidence_threshold: 0.5,
+            fallback_source: ThresholdSource::Model,
+            night_threshold: Some(0.3),
+            ..super::super::LiveSettings::default()
+        });
+        assert_eq!(request_threshold("openvino:cpu", &f), (0.5, "model".into()));
+        f.stats.is_ir = true;
+        assert_eq!(
+            request_threshold("openvino:cpu", &f),
+            (0.3, "night threshold".into())
+        );
+        f.meta.min_confidence = 0.8;
+        assert_eq!(
+            request_threshold("openvino:cpu", &f),
+            (0.8, "request".into())
+        );
+    }
+
+    /// Postprocessing runs below the threshold only while the collector records the boxes
+    /// there, and never under the floor.
+    #[test]
+    fn post_threshold_goes_below_only_for_the_collector() {
+        assert!((post_threshold(0.5, None) - 0.5).abs() < 1e-6);
+        assert!((post_threshold(0.5, Some(0.1)) - 0.4).abs() < 1e-6);
+        let floor = crate::model::nms::MIN_CONFIDENCE_FLOOR;
+        assert!((post_threshold(0.05, Some(0.1)) - floor).abs() < 1e-6);
+    }
+
+    /// The done line carries the request's fields and the sum of its stage times.
+    #[test]
+    fn done_line_from_a_request() {
+        let mut f = InFlight::for_test(1);
+        f.meta.request_id = "abcd1234".into();
+        f.meta.image_name = "cam1.jpg".into();
+        f.meta.routed_from = Some("day".into());
+        f.ctx.orig_w = 640;
+        f.ctx.orig_h = 480;
+        f.stats.is_dark = true;
+        f.stats.mean_luma = 20.0;
+        f.stats.chroma_spread = 3.0;
+        f.stats.tint_spread = 2.0;
+        f.decode = Duration::from_millis(4);
+        f.preprocess = Duration::from_millis(3);
+        f.submitted = f.meta.enqueued + Duration::from_millis(7);
+        let mut suppressed = SuppressCounts::default();
+        suppressed.add(SuppressReason::Static, 1);
+        let line = DoneLine::new(
+            "m",
+            "openvino:gpu",
+            &f,
+            2,
+            0.45,
+            "request".into(),
+            &suppressed,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            (line.model.as_str(), line.device.as_str()),
+            ("m", "openvino:gpu")
+        );
+        assert_eq!(line.request_id, "abcd1234");
+        assert_eq!(line.routed_from.as_deref(), Some("day"));
+        assert!(!line.verify_crop);
+        assert_eq!(
+            (line.image.as_str(), line.size.as_str()),
+            ("cam1.jpg", "640x480")
+        );
+        assert_eq!(line.scene, Scene::Night);
+        assert!((line.luma - 20.0).abs() < 1e-9 && (line.chroma - 2.0).abs() < 1e-9);
+        assert_eq!(line.suppressed, suppressed_summary(&suppressed));
+        assert!((line.threshold - 0.45).abs() < 1e-6);
+        assert_eq!((line.threshold_source.as_str(), line.slot), ("request", 2));
+        assert_eq!(line.queue_ms, 7);
+        assert!((line.decode_ms - 4.0).abs() < 1e-9 && (line.preprocess_ms - 3.0).abs() < 1e-9);
+        assert!((line.inference_ms - 20.0).abs() < 1e-9);
+        assert!((line.postprocess_ms - 1.0).abs() < 1e-9);
+        assert_eq!(line.process, Duration::from_millis(28));
+        assert_eq!(line.enqueued, f.meta.enqueued);
+    }
 
     #[test]
     fn detections_summary_lists_labels_with_percent() {

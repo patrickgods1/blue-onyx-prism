@@ -470,6 +470,45 @@ struct Process {
 }
 
 impl Process {
+    /// What the run shares, for `config` and the listener bound at `bound_port`: the config
+    /// store, the benchmark runner, the sign-in state (accounts loaded from `config`'s data root,
+    /// read here) and the metrics. `started` is the run's start.
+    fn new(
+        config: &Config,
+        config_path: PathBuf,
+        log: LogReloadHandle,
+        provisioner: Arc<Provisioner>,
+        started: Instant,
+        bound_port: u16,
+    ) -> Self {
+        Self {
+            started,
+            bound_address: config.bind_address,
+            bound_port,
+            https: (
+                config.https_port,
+                config.tls_cert_path.clone(),
+                config.tls_key_path.clone(),
+            ),
+            store: Arc::new(crate::config_store::ConfigStore::new(
+                config.clone(),
+                config_path.clone(),
+            )),
+            config_path,
+            log,
+            provisioner,
+            benchmark: crate::benchmark::service::BenchmarkService::new(),
+            side_jobs: Arc::default(),
+            admin_failures: Arc::default(),
+            login: Arc::default(),
+            auth: Arc::new(crate::accounts::Auth::load(
+                &config.data_root(),
+                crate::accounts::now(),
+            )),
+            metrics: Arc::new(Metrics::new(crate::VERSION)),
+        }
+    }
+
     /// Start the registry of a generation (models compile in the background).
     fn start_registry(
         &self,
@@ -881,6 +920,68 @@ impl BindRetry {
     }
 }
 
+/// Bind the HTTP listener, once per process (it survives generation restarts; a port change in
+/// the config applies when the process restarts), then report it bound: `on_bound`, systemd's
+/// `READY=1`, and the watchdog. A bind failure is a [`BindFailed`] naming what holds the port;
+/// nothing is reported then.
+///
+/// HTTPS starts with the server (`serve_on`) and never holds HTTP up: a port it cannot bind, or a
+/// certificate that does not load, is logged and retried in the background.
+fn start_listener(
+    rt: &tokio::runtime::Runtime,
+    config: &Config,
+    config_path: &std::path::Path,
+    on_bound: Option<Box<dyn FnOnce(u16) + Send>>,
+    shutdown: &CancellationToken,
+) -> Result<server::Listeners> {
+    let listeners = match rt.block_on(server::bind(config.bind_address, config.port)) {
+        Ok(l) => l.with_https(server::HttpsPlan::of(config)),
+        Err(e) => {
+            let holder = (config.port != 0).then(|| crate::port_holder::lookup(config.port));
+            return Err(BindFailed::new(
+                config.bind_address,
+                config.port,
+                &e,
+                holder.as_ref(),
+                config_path,
+            )
+            .into());
+        }
+    };
+    if let Some(f) = on_bound {
+        f(listeners.port());
+    }
+    // systemd `Type=notify`: the listener is up (models compile in the background; `/v1/status`
+    // reports readiness). The watchdog pings while the listener accepts connections, so a hung
+    // process is restarted but a model that compiles for minutes is not.
+    crate::sdnotify::notify("READY=1");
+    let port = listeners.port();
+    let ip = watchdog_ip(config.bind_address);
+    crate::sdnotify::spawn_watchdog(
+        move || {
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::new(ip, port),
+                Duration::from_secs(5),
+            )
+            .is_ok()
+        },
+        shutdown.clone(),
+    );
+    Ok(listeners)
+}
+
+/// The address the watchdog connects to for a listener bound to `bind`: the loopback address of
+/// the same family for an unspecified (all-interfaces) one, else `bind` itself.
+fn watchdog_ip(bind: std::net::IpAddr) -> std::net::IpAddr {
+    match bind {
+        std::net::IpAddr::V4(a) if a.is_unspecified() => std::net::IpAddr::from([127, 0, 0, 1]),
+        std::net::IpAddr::V6(a) if a.is_unspecified() => {
+            std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
+        }
+        other => other,
+    }
+}
+
 fn run_server_inner(
     rt: &tokio::runtime::Runtime,
     mut config: Config,
@@ -898,77 +999,15 @@ fn run_server_inner(
     // starts its storage sweep.
     stop::remember_data_root(&config.data_root());
     stop::sweep_orphans_once(&config.data_root());
-    // The listener is bound once and survives generation restarts (a port change in the config
-    // applies when the process restarts).
-    // HTTPS starts with the server (`serve_on`) and never holds HTTP up: a port it cannot
-    // bind, or a certificate that does not load, is logged and retried in the background.
-    let listeners = match rt.block_on(server::bind(config.bind_address, config.port)) {
-        Ok(l) => l.with_https(server::HttpsPlan::of(&config)),
-        Err(e) => {
-            let holder = (config.port != 0).then(|| crate::port_holder::lookup(config.port));
-            return Err(BindFailed::new(
-                config.bind_address,
-                config.port,
-                &e,
-                holder.as_ref(),
-                &config_path,
-            )
-            .into());
-        }
-    };
-    if let Some(f) = on_bound {
-        f(listeners.port());
-    }
-    // systemd `Type=notify`: the listener is up (models compile in the background; `/v1/status`
-    // reports readiness). The watchdog pings while the listener accepts connections, so a hung
-    // process is restarted but a model that compiles for minutes is not.
-    crate::sdnotify::notify("READY=1");
-    {
-        let port = listeners.port();
-        let ip = match config.bind_address {
-            std::net::IpAddr::V4(a) if a.is_unspecified() => std::net::IpAddr::from([127, 0, 0, 1]),
-            std::net::IpAddr::V6(a) if a.is_unspecified() => {
-                std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
-            }
-            other => other,
-        };
-        crate::sdnotify::spawn_watchdog(
-            move || {
-                std::net::TcpStream::connect_timeout(
-                    &std::net::SocketAddr::new(ip, port),
-                    Duration::from_secs(5),
-                )
-                .is_ok()
-            },
-            shutdown.clone(),
-        );
-    }
-    let process = Process {
-        started,
-        bound_address: config.bind_address,
-        bound_port: listeners.port(),
-        https: (
-            config.https_port,
-            config.tls_cert_path.clone(),
-            config.tls_key_path.clone(),
-        ),
-        store: Arc::new(crate::config_store::ConfigStore::new(
-            config.clone(),
-            config_path.clone(),
-        )),
+    let listeners = start_listener(rt, &config, &config_path, on_bound, &shutdown)?;
+    let process = Process::new(
+        &config,
         config_path,
         log,
         provisioner,
-        benchmark: crate::benchmark::service::BenchmarkService::new(),
-        side_jobs: Arc::default(),
-        admin_failures: Arc::default(),
-        login: Arc::default(),
-        auth: Arc::new(crate::accounts::Auth::load(
-            &config.data_root(),
-            crate::accounts::now(),
-        )),
-        metrics: Arc::new(Metrics::new(crate::VERSION)),
-    };
+        started,
+        listeners.port(),
+    );
     // A benchmark the machine died in names its last device at start, not at the next page view.
     process.benchmark.claim_breadcrumb(&config.data_root());
     // The one stop timeline of this run: started by the stop request itself, wherever the loop
@@ -1335,6 +1374,25 @@ fn spawn_watcher(
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
+
+    /// The watchdog reaches an all-interfaces listener over loopback of the same family, and a
+    /// listener bound to one address at that address.
+    #[test]
+    fn watchdog_connects_to_loopback_for_an_unspecified_bind() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let v4 = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            watchdog_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(
+            watchdog_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(watchdog_ip(v4("192.168.1.20")), v4("192.168.1.20"));
+        assert_eq!(watchdog_ip(v4("fe80::1")), v4("fe80::1"));
+        assert_eq!(watchdog_ip(v4("127.0.0.1")), v4("127.0.0.1"));
+    }
 
     #[test]
     fn takeover_waits_only_for_models_the_old_generation_serves() {

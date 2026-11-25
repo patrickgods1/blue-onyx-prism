@@ -4453,36 +4453,36 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-120 | `workers-registry/workers-3` | bug | low | 8 | fixed (phase 8): capped values warned once per model/key/value | inflight / ort_sessions / preprocess_threads are accepted up to 64/16/256 but silently clamped to 8/8/32 |
 | QA-121 | `workers-registry/workers-4` | bug | low | 8 | fixed (phase 8): only `set_waiting_for_download` details read "Waiting for download" | Initializing detail is free text that the server classifies by prefix; the hand-over placeholder shows as 'Waiting for download' |
 | QA-122 | `workers-registry/workers-5` | bug | low | 8 | fixed (phase 8): decided from the removed worker (`Stop::replaced`) | reload decides 'serving' under a read lock, then swaps under a later write lock; a concurrent swap thread can install a Ready replacement that is then retired with no drain |
-| QA-123 | `benchmark/bench-12` | refactor | medium | 9 | open | One results save transaction, implemented twice (CLI save_results and ServiceRun::save) |
-| QA-124 | `benchmark/bench-13` | refactor | medium | 9 | open | Three 'which stored run of a model' rules that disagree (search, tune, advise) |
-| QA-125 | `collect/collect-7` | refactor | medium | 9 | open | The collector and the import each write a frame (image, sidecar, index line, rollback) with their own copy of the code, and the copies have already drifted |
+| QA-123 | `benchmark/bench-12` | refactor | medium | 9 | fixed (phase 9) | One results save transaction, implemented twice (CLI save_results and ServiceRun::save) |
+| QA-124 | `benchmark/bench-13` | refactor | medium | 9 | fixed (phase 9) | Three 'which stored run of a model' rules that disagree (search, tune, advise) |
+| QA-125 | `collect/collect-7` | refactor | medium | 9 | fixed (phase 9) | The collector and the import each write a frame (image, sidecar, index line, rollback) with their own copy of the code, and the copies have already drifted |
 | QA-126 | `gap-helpers-duplicated-across/gap-8` | refactor | medium | 9 | fixed (phase 7): `src/json_aside.rs` primitives | Two `load_or_move_aside` functions with opposite rules; extract one json-aside module with training's policy |
-| QA-127 | `gap-the-training-dataset/gap-3` | refactor | medium | 9 | open | The full and quick checks' stage functions copy the write, look, report and summary tail |
-| QA-128 | `platform-config/platform-12` | refactor | medium | 9 | open | Config migration is copied between install_launchd.sh and systemd_common.sh; launchd_common's bop_seed_config is not used by the zip flow |
-| QA-129 | `resources/resources-13` | refactor | medium | 9 | open | ResourceRow: 30-field literal built three times and a stringly-typed state matched as strings |
-| QA-130 | `resources/resources-9` | refactor | medium | 9 | open | 'Relative to the data root, else absolute' is re-implemented five times |
-| QA-131 | `server-handlers/handlers-10` | refactor | medium | 9 | open | JSON error answers and the JSON body reader are copied in four to six modules |
-| QA-132 | `server-handlers/handlers-11` | refactor | medium | 9 | open | Four hand-written copies of the 'kept walk' cache (double-checked lock, generation, eviction) in the refine modules |
-| QA-133 | `server-handlers/handlers-12` | refactor | medium | 9 | open | Form-field helpers re-implemented with different trim/empty rules; a custom urlencoded parser sits next to axum::Form |
-| QA-134 | `server-handlers/handlers-16` | refactor | medium | 9 | open | training::view_with is a ~480-line function and training.rs mixes view, forms, hooks and twelve handlers in 3500 non-test lines |
-| QA-135 | `training-core/tcore-10` | refactor | medium | 9 | open | job::stages is an ~810-line function doing eight stages, the export retry and two OOM retry loops |
+| QA-127 | `gap-the-training-dataset/gap-3` | refactor | medium | 9 | fixed (phase 9) | The full and quick checks' stage functions copy the write, look, report and summary tail |
+| QA-128 | `platform-config/platform-12` | refactor | medium | 9 | fixed (phase 9) | Config migration is copied between install_launchd.sh and systemd_common.sh; launchd_common's bop_seed_config is not used by the zip flow |
+| QA-129 | `resources/resources-13` | refactor | medium | 9 | fixed (phase 9) | ResourceRow: 30-field literal built three times and a stringly-typed state matched as strings |
+| QA-130 | `resources/resources-9` | refactor | medium | 9 | fixed (phase 9) | 'Relative to the data root, else absolute' is re-implemented five times |
+| QA-131 | `server-handlers/handlers-10` | refactor | medium | 9 | fixed (phase 9) | JSON error answers and the JSON body reader are copied in four to six modules |
+| QA-132 | `server-handlers/handlers-11` | refactor | medium | 9 | fixed (phase 9) | Four hand-written copies of the 'kept walk' cache (double-checked lock, generation, eviction) in the refine modules |
+| QA-133 | `server-handlers/handlers-12` | refactor | medium | 9 | fixed (phase 9) | Form-field helpers re-implemented with different trim/empty rules; a custom urlencoded parser sits next to axum::Form |
+| QA-134 | `server-handlers/handlers-16` | refactor | medium | 9 | fixed (phase 9) | training::view_with is a ~480-line function and training.rs mixes view, forms, hooks and twelve handlers in 3500 non-test lines |
+| QA-135 | `training-core/tcore-10` | refactor | medium | 9 | fixed (phase 9) | job::stages is an ~810-line function doing eight stages, the export retry and two OOM retry loops |
 | QA-136 | `training-jobs/training-jobs-3` | refactor | medium | 9 | fixed (phase 7): `dataset::names` (+ `legacy_spelling`) | Five copies of the prepared-dataset naming rule (sanitize, 120-byte cut, s<N>- prefix) must stay equal by hand |
-| QA-137 | `training-jobs/training-jobs-9` | refactor | medium | 9 | open | ImportJob::stages is one 860-line function carrying seven stages |
-| QA-138 | `web-assets/web-10` | refactor | medium | 9 | open | Seven copy-pasted dry-run/confirm/run bulk handlers in review.js |
-| QA-139 | `web-assets/web-11` | refactor | medium | 9 | open | review.js is one 5966-line IIFE mixing canvas editing, queue/prefetch, drafts, pace, bulk tools, job following and pickers |
-| QA-140 | `web-assets/web-14` | refactor | medium | 9 | open | live.js config poll re-implements PrismPoll (own timer, backoff, visibility, pageshow/online) |
-| QA-141 | `web-assets/web-9` | refactor | medium | 9 | open | One shared DOM/fetch helper module instead of ~10 copies of el(), 7 JSON request wrappers and 2 report()s |
-| QA-142 | `workers-registry/workers-8` | refactor | medium | 9 | open | WorkerCtx::finish is ~230 lines doing seven jobs |
+| QA-137 | `training-jobs/training-jobs-9` | refactor | medium | 9 | fixed (phase 9) | ImportJob::stages is one 860-line function carrying seven stages |
+| QA-138 | `web-assets/web-10` | refactor | medium | 9 | fixed (phase 9) | Seven copy-pasted dry-run/confirm/run bulk handlers in review.js |
+| QA-139 | `web-assets/web-11` | refactor | medium | 10 | open | review.js is one 5966-line IIFE mixing canvas editing, queue/prefetch, drafts, pace, bulk tools, job following and pickers |
+| QA-140 | `web-assets/web-14` | refactor | medium | 9 | fixed (phase 9) | live.js config poll re-implements PrismPoll (own timer, backoff, visibility, pageshow/online) |
+| QA-141 | `web-assets/web-9` | refactor | medium | 9 | fixed (phase 9) | One shared DOM/fetch helper module instead of ~10 copies of el(), 7 JSON request wrappers and 2 report()s |
+| QA-142 | `workers-registry/workers-8` | refactor | medium | 9 | fixed (phase 9) | WorkerCtx::finish is ~230 lines doing seven jobs |
 | QA-143 | `benchmark/bench-25` | test-gap | medium | 10 | fixed (phase 7) | No test of B10 (own labels) for As served / variant result names |
 | QA-144 | `gap-helpers-duplicated-across/gap-13` | test-gap | medium | 10 | fixed (phase 7) | Benchmark load_or_move_aside has no test for an unreadable file, a second aside, or keeping dropped entries |
 | QA-145 | `resources/resources-20` | test-gap | medium | 10 | open | No tests for put_in_place's merge branch, the cleanup name rules, or under_root escapes |
 | QA-146 | `server-core/srvcore-test-1` | test-gap | medium | 4 | fixed (phase 4): sessions, devices and an HTTP test through `accounts::commands` remove + add | No test that a removed-then-re-added account does not inherit old sessions / device trust |
 | QA-147 | `web-assets/web-18` | test-gap | medium | 10 | open | Async node drivers can pass without running their later asserts: most harnesses do not check the final 'ok' |
 | QA-148 | `web-assets/web-19` | test-gap | medium | 10 | open | ClassPicker.util and ModelPicker.util claim node tests that do not exist |
-| QA-149 | `web-assets/web-20` | test-gap | medium | 10 | open | PrismLive.ui refresh rules (whether a server change overwrites a user's unsaved field) and keep/patch have no node test |
+| QA-149 | `web-assets/web-20` | test-gap | medium | 9 | fixed (phase 9) | PrismLive.ui refresh rules (whether a server change overwrites a user's unsaved field) and keep/patch have no node test |
 | QA-150 | `workers-registry/workers-14` | test-gap | medium | 10 | open | The lazy-model path of the worker loop has no non-ignored test |
 | QA-151 | `workers-registry/workers-15` | test-gap | medium | 10 | open | plan_model's 'load on an interim device while a runtime downloads' branch is untested |
-| QA-152 | `backend/backend-10` | refactor | low | 10 | open | Lock poisoning is handled ad hoc in backend; libs.rs silently skips work on a poisoned lock |
+| QA-152 | `backend/backend-10` | refactor | low | 9 | fixed (phase 9) | Lock poisoning is handled ad hoc in backend; libs.rs silently skips work on a poisoned lock |
 | QA-153 | `backend/backend-11` | refactor | low | 10 | open | OpenVINO GPU-name resolution is written four times, with slightly different rules |
 | QA-154 | `backend/backend-12` | refactor | low | 10 | open | The prep pool's public API is mostly test-only and carries 7-8-argument associated functions |
 | QA-155 | `backend/backend-13` | refactor | low | 10 | open | The PDH query setup and teardown is duplicated unsafe code in memory.rs and video_decode.rs |
@@ -4490,7 +4490,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-157 | `backend/backend-16` | refactor | low | 10 | open | `load_model` re-introspects an unchanged model when nothing was reshaped |
 | QA-158 | `backend/backend-17` | refactor | low | 10 | open | ort.rs (2393 lines) mixes pure planning logic with the `ort`-crate code it must contain |
 | QA-159 | `backend/backend-18` | test-gap | low | 10 | open | The image_stats twin in scripts/build_bench_sets.py has no parity test |
-| QA-160 | `backend/backend-19` | test-gap | low | 10 | open | Unit tests in this area use their own temp dirs without cleanup on panic; the crate has about 17 private guard structs |
+| QA-160 | `backend/backend-19` | test-gap | low | 9 | fixed (phase 9) | Unit tests in this area use their own temp dirs without cleanup on panic; the crate has about 17 private guard structs |
 | QA-161 | `backend/backend-20` | test-gap | low | 10 | open | `OrtBackend::abort` sharing one deadline across several busy slots is untested |
 | QA-162 | `backend/backend-6` | refactor | low | 10 | open | The extra-input conversion is written twice, OpenVINO's copy has no test, and the image-index lookup is duplicated too |
 | QA-163 | `backend/backend-7` | refactor | low | 10 | open | Output helpers shared by every model family live in yolo26.rs, and the find-output and class-id caps are duplicated |
@@ -4507,15 +4507,15 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-174 | `benchmark/bench-24` | refactor | low | 10 | open | Lenient per-entry loading implemented twice (parse_lenient and the streaming RunsVisitor) |
 | QA-175 | `benchmark/bench-26` | test-gap | low | 10 | open | results_io tests cannot detect a start that does not wait for a writer |
 | QA-176 | `benchmark/bench-27` | test-gap | low | 10 | open | Untested failure paths: damaged preds during Re-score, newer-format snapshot during a run save, unreadable YOLO label file, pick_reference longest prefix |
-| QA-177 | `collect/collect-10` | refactor | low | 10 | open | `build_export` is about 240 lines doing statistics plus five output formats |
+| QA-177 | `collect/collect-10` | refactor | low | 9 | fixed (phase 9) | `build_export` is about 240 lines doing statistics plus five output formats |
 | QA-178 | `collect/collect-11` | refactor | low | 10 | open | Scene strings are parsed by hand in several places, and the scene list constant is defined twice in this area |
 | QA-179 | `collect/collect-12` | refactor | low | 10 | open | Copies of the IoU and box-area helpers |
 | QA-180 | `collect/collect-13` | refactor | low | 10 | open | Two module docs say a per-thread priority helper does not exist; it does, and other walks use it |
-| QA-181 | `collect/collect-14` | refactor | low | 10 | open | Mutex poisoning is handled three different ways; in repeats.rs a poisoned lock makes `written` silently stop invalidating the history |
+| QA-181 | `collect/collect-14` | refactor | low | 9 | fixed (phase 9) | Mutex poisoning is handled three different ways; in repeats.rs a poisoned lock makes `written` silently stop invalidating the history |
 | QA-182 | `collect/collect-15` | refactor | low | 10 | open | The frame path of an index line is built by the same `format!` in three places |
 | QA-183 | `collect/collect-16` | refactor | low | 10 | open | Sidecar verify outcomes and suppress reasons are compared as string literals in one place and through the enum in another |
 | QA-184 | `collect/collect-17` | refactor | low | 10 | open | Export grouping by camera day and the split assignment are written out twice |
-| QA-185 | `collect/collect-9` | test-gap | low | 10 | open | No test checks that the export's file count `written_files` matches what `build_export` actually writes |
+| QA-185 | `collect/collect-9` | test-gap | low | 9 | fixed (phase 9) | No test checks that the export's file count `written_files` matches what `build_export` actually writes |
 | QA-186 | `gap-helpers-duplicated-across/gap-14` | test-gap | low | 7 | fixed (phase 7) | camera_dir / camera_of have no test for Windows device names, or that legacy folders still parse |
 | QA-187 | `gap-helpers-duplicated-across/gap-15` | test-gap | low | 10 | fixed (phase 7) | Training move_aside's copy fallback (rename fails, copy works) is never exercised |
 | QA-188 | `gap-most-of-the/benchgap-11` | refactor | low | 10 | open | Two Mann-Whitney AUC implementations; the weighted one never ends on a NaN score (roc::auc guards against it) |
@@ -4529,13 +4529,13 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-196 | `gap-the-review-index/labels-7` | refactor | low | 10 | open | need::Scorer::score is a 176-line function that also builds the page's Detail |
 | QA-197 | `gap-the-review-index/labels-8` | test-gap | low | 10 | open | Dataset counters are indexed by enum discriminant with no test that the index matches `ALL` |
 | QA-198 | `gap-the-review-index/labels-9` | refactor | low | 10 | open | Stale or incomplete docs: refine.rs says the JS twins do not exist yet; the index lock list omits the need cache's mutex |
-| QA-199 | `gap-the-training-dataset/gap-10` | refactor | low | 10 | open | The refine module reads runs.json three ways |
+| QA-199 | `gap-the-training-dataset/gap-10` | refactor | low | 9 | fixed (phase 9) | The refine module reads runs.json three ways |
 | QA-200 | `gap-the-training-dataset/gap-11` | test-gap | low | 10 | open | No test pins the summary wording of a check whose fold failed after the closer look ran |
-| QA-201 | `gap-the-training-dataset/gap-4` | refactor | low | 10 | open | The left-out counts of the dataset check are recovered by matching the export's warning sentences |
+| QA-201 | `gap-the-training-dataset/gap-4` | refactor | low | 9 | fixed (phase 9) | The left-out counts of the dataset check are recovered by matching the export's warning sentences |
 | QA-202 | `gap-the-training-dataset/gap-5` | refactor | low | 10 | open | The quick check reads its last report with no size cap or version check; the checked reader lives in server/refine.rs |
-| QA-203 | `gap-the-training-dataset/gap-6` | refactor | low | 10 | open | Two parsers of the same `@tag {json}` child-event protocol, with different rules |
+| QA-203 | `gap-the-training-dataset/gap-6` | refactor | low | 9 | fixed (phase 9) | Two parsers of the same `@tag {json}` child-event protocol, with different rules |
 | QA-204 | `gap-the-training-dataset/gap-9` | refactor | low | 10 | open | `judge::tighten` is a dead public wrapper that two module docs present as the entry point |
-| QA-205 | `platform-config/platform-10` | refactor | low | 10 | open | Model lookup by normalized name is copied at 43 sites; add Config/ModelConfig helpers |
+| QA-205 | `platform-config/platform-10` | refactor | low | 9 | fixed (phase 9) | Model lookup by normalized name is copied at 43 sites; add Config/ModelConfig helpers |
 | QA-206 | `platform-config/platform-11` | refactor | low | 10 | open | Tray matches /v1/status labels as bare strings with no parity test against the server; it also copies crate constants |
 | QA-207 | `platform-config/platform-13` | refactor | low | 10 | open | Dead or misleading code: config_merge's `default` key, validate_https port-0 branches, stale module docs |
 | QA-208 | `platform-config/platform-14` | refactor | low | 10 | open | Load-test client: two nearest-rank percentile implementations, two copies of request plus result classification, and a Bearer+pin client duplicated with diagnostics |
@@ -4546,16 +4546,16 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-213 | `resources/resources-16` | refactor | low | 10 | open | `flavor.txt` / `VERSION` names defined in several places; small helper duplicates |
 | QA-214 | `resources/resources-17` | refactor | low | 10 | open | Download state text and retry seconds formatted in four places |
 | QA-215 | `resources/resources-19` | test-gap | low | 10 | open | Python twin export_model.py recipe_for/family_for drifted from catalog::export_recipe and has no parity test |
-| QA-216 | `resources/resources-21` | test-gap | low | 10 | open | Manager unit tests leak temp dirs on failure; resolve tests too |
-| QA-217 | `server-core/srvcore-10` | refactor | low | 10 | open | render_prometheus is a 310-line function with ~20 hand-written HELP/TYPE blocks; Metrics keeps six parallel rejected_* fields with two mirrored matches |
+| QA-216 | `resources/resources-21` | test-gap | low | 9 | fixed (phase 9) | Manager unit tests leak temp dirs on failure; resolve tests too |
+| QA-217 | `server-core/srvcore-10` | refactor | low | 9 | fixed (phase 9) | render_prometheus is a 310-line function with ~20 hand-written HELP/TYPE blocks; Metrics keeps six parallel rejected_* fields with two mirrored matches |
 | QA-218 | `server-core/srvcore-11` | refactor | low | 10 | open | sessions.rs and devices.rs duplicate the whole hash-file store (Head/FileRepr/parse/load warnings/flush) |
 | QA-219 | `server-core/srvcore-12` | refactor | low | 10 | open | Router admin_routes is a 280-line flat list with the same body-limit layer copied 20+ times |
 | QA-220 | `server-core/srvcore-13` | refactor | low | 6 | fixed (phase 6) | Three implementations of the warning throttle (and one throttle shared by two unrelated warnings) |
-| QA-221 | `server-core/srvcore-14` | refactor | low | 10 | open | JSON error bodies built ad hoc in ~10 places in this area with inconsistent keys |
+| QA-221 | `server-core/srvcore-14` | refactor | low | 9 | fixed (phase 9) | JSON error bodies built ad hoc in ~10 places in this area with inconsistent keys |
 | QA-222 | `server-core/srvcore-15` | refactor | low | 10 | open | Small duplicated helpers: panic payload text (3x), unix-seconds display (3x), constant-time digest compare (2x), User literal (2x) |
 | QA-223 | `server-core/srvcore-16` | refactor | low | 10 | open | Dead or test-only pub items and stale docs in accounts/ and body_budget |
-| QA-224 | `server-core/srvcore-17` | refactor | low | 10 | open | Ad-hoc poison handling bypasses crate::sync helpers (worker.device read().ok(), manual into_inner) |
-| QA-225 | `server-core/srvcore-18` | refactor | low | 10 | open | run_server_inner is ~260 lines mixing bind/notify/watchdog, process setup and the generation loop |
+| QA-224 | `server-core/srvcore-17` | refactor | low | 9 | fixed (phase 9) | Ad-hoc poison handling bypasses crate::sync helpers (worker.device read().ok(), manual into_inner) |
+| QA-225 | `server-core/srvcore-18` | refactor | low | 9 | partial (phase 9): `start_listener` + `Process::new`; the per-generation build stays (needs the ignored restart tests) | run_server_inner is ~260 lines mixing bind/notify/watchdog, process setup and the generation loop |
 | QA-226 | `server-core/srvcore-19` | refactor | low | 10 | open | tls own-files error hard-codes the HTTPS retry period |
 | QA-227 | `server-core/srvcore-8` | refactor | low | 10 | open | Password re-check machinery copy-pasted between /login and the Accounts card's reauth, and already drifting |
 | QA-228 | `server-core/srvcore-9` | refactor | low | 10 | open | AppState is assembled in two struct literals (test-only AppState::new and runner's state_for) that must be kept in sync |
@@ -4563,7 +4563,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-230 | `server-core/srvcore-test-3` | test-gap | low | 10 | open | reauth's per-account lockout and trusted-device paths are untested |
 | QA-231 | `server-core/srvcore-test-4` | test-gap | low | 10 | open | No concurrency test for admin_token::ensure (two first-start writers) |
 | QA-232 | `server-core/srvcore-test-5` | test-gap | low | 10 | open | Lockout and log-ring edge inputs unpinned: future last_failure, after=u64::MAX, bridged log fields |
-| QA-233 | `server-handlers/handlers-13` | refactor | low | 10 | open | Three file-stamp helpers and two identical single-slot stamp caches |
+| QA-233 | `server-handlers/handlers-13` | refactor | low | 9 | fixed (phase 9) | Three file-stamp helpers and two identical single-slot stamp caches |
 | QA-234 | `server-handlers/handlers-14` | refactor | low | 10 | open | benchmark RunContext built three times from the same AppState fields |
 | QA-235 | `server-handlers/handlers-15` | refactor | low | 10 | open | Bulk route bodies: two identical structs and seven copies of the same filter/limit/message boilerplate |
 | QA-236 | `server-handlers/handlers-17` | refactor | low | 10 | open | Flash-page answer boilerplate repeated in about 13 training handlers |
@@ -4585,7 +4585,7 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-252 | `training-core/tcore-23` | test-gap | low | 10 | open | MPS watermark values are set in both Rust and train_model.py with no parity test |
 | QA-253 | `training-core/tcore-9` | refactor | low | 10 | open | service.rs: worker_loop and run_task duplicate the claim, log-tail and record-describe boilerplate |
 | QA-254 | `training-jobs/training-jobs-10` | refactor | low | 10 | open | AutolabelJob::stages inlines the whole labelers run (~290 lines) beside a separate run_model |
-| QA-255 | `training-jobs/training-jobs-11` | refactor | low | 10 | open | dataset::plan is a 625-line function; write_reusing is 355 lines |
+| QA-255 | `training-jobs/training-jobs-11` | refactor | low | 9 | fixed (phase 9) | dataset::plan is a 625-line function; write_reusing is 355 lines |
 | QA-256 | `training-jobs/training-jobs-12` | refactor | low | 10 | open | The seeded rank is implemented twice (dataset and refine folds) and must stay byte-identical |
 | QA-257 | `training-jobs/training-jobs-13` | refactor | low | 10 | open | The scene -> SceneCounts slot match is repeated in three places |
 | QA-258 | `training-jobs/training-jobs-14` | refactor | low | 10 | open | The 'queue the frame for review' predicate of an ApplyReport is written three times |
@@ -4598,17 +4598,17 @@ Counts: 128 resource items (RA), 278 quality items (QA).
 | QA-265 | `web-assets/web-13` | refactor | low | 10 | open | Dead 'older live.js' fallbacks and PrismPoll existence guards |
 | QA-266 | `web-assets/web-15` | refactor | low | 10 | open | 'Latest request wins' re-implemented with seq counters in training.js and browse.js; BenchCore.latest exists |
 | QA-267 | `web-assets/web-16` | refactor | low | 10 | open | Four separate followers of GET /v1/train/jobs with the same parsing |
-| QA-268 | `web-assets/web-17` | refactor | low | 10 | open | 11 copies of have_node() and the node runner in tests/it/js_*.rs; temp dirs bypass common::temp_dir |
+| QA-268 | `web-assets/web-17` | refactor | low | 9 | fixed (phase 9) | 11 copies of have_node() and the node runner in tests/it/js_*.rs; temp dirs bypass common::temp_dir |
 | QA-269 | `web-assets/web-21` | test-gap | low | 10 | open | Twin constants checked against literals rather than their Rust sources (cellTag, isDismissal) |
-| QA-270 | `workers-registry/workers-11` | refactor | low | 10 | open | StateHandle bypasses the crate's poison-recovering lock helpers; a poisoned lock silently drops every later state change |
+| QA-270 | `workers-registry/workers-11` | refactor | low | 9 | fixed (phase 9) | StateHandle bypasses the crate's poison-recovering lock helpers; a poisoned lock silently drops every later state change |
 | QA-271 | `workers-registry/workers-12` | refactor | low | 10 | open | Small duplicated helpers in supervisor, reap and registry |
 | QA-272 | `workers-registry/workers-13` | refactor | low | 10 | open | Generic UTF-8 byte-cap helpers live in static_memory.rs and are reimplemented in logbuf |
 | QA-273 | `workers-registry/workers-16` | test-gap | low | 10 | open | Worker download-wait path (wait_for_downloads, classes resolved after download) is untested |
-| QA-274 | `workers-registry/workers-17` | test-gap | low | 10 | open | Unit-test temp dirs leak; one parallel test is timing-sensitive |
+| QA-274 | `workers-registry/workers-17` | test-gap | low | 9 | fixed (phase 9) | Unit-test temp dirs leak; one parallel test is timing-sensitive |
 | QA-275 | `workers-registry/workers-18` | test-gap | low | 10 | open | WorkerHandle::join_within has no unit test of its three outcomes |
 | QA-276 | `workers-registry/workers-6` | refactor | low | 10 | open | Two copies of 'ready peer with room' lookup (night routing vs verify lane) with parallel reason enums |
 | QA-277 | `workers-registry/workers-7` | refactor | low | 10 | open | Reply-then-collect-then-save tail duplicated between WorkerCtx::finish and the verify lane; LaneCtx built twice in hand_off |
-| QA-278 | `workers-registry/workers-9` | refactor | low | 10 | open | 'config entry by normalized name' and the reload counter are reimplemented across registry.rs |
+| QA-278 | `workers-registry/workers-9` | refactor | low | 9 | fixed (phase 9) | 'config entry by normalized name' and the reload counter are reimplemented across registry.rs |
 
 ### Audit 2026-11, phase 0 notes
 
@@ -5054,3 +5054,52 @@ QA-068, QA-056, QA-102.
 Not verified here: the IPv4 companion socket on Windows, the macOS lsof answer for another account's listener, the
 f16 output path on a GPU provider (ORT CPU/CoreML 1.24.4 only), the restart page across a real Windows service
 restart.
+
+### Audit 2026-11, phase 9 notes
+
+Refactors, cross-cutting first: the ledger's phase-9 items except QA-139 (the review.js split waits for phase 10, as
+planned) plus the plan's phase-9 helpers taken from ledger phase 10 (model lookups, JSON errors, lock poisoning, file
+stamps, test folders and the node runner, the runner split, the dataset plan, the review export, the dataset check's
+runs/counts/events, PrismLive.ui and Prometheus characterisation). Behaviour-preserving: each split was pinned by a
+characterisation test run green on the old code first (job transcripts, dataset plan hashes, import progress, the
+refine summaries, the export's files per format, the frame writer's bytes, the Prometheus text, the config poll's
+timing, PrismLive.ui refresh rules, the install scripts' output under dash), and existing tests kept their expected
+values (signature and fixture-shape edits only, listed in the PR).
+
+| what was duplicated or too long | now | IDs |
+|---|---|---|
+| JSON error bodies and the JSON body reader copied in 4-6 route modules and ~10 core sites | `server/answer.rs`: `json_fail`, `json_error`, `Refused` / `Answer`, `json_body`, `is_json` | QA-131, QA-221 |
+| four hand-written "kept walk" caches in the refine routes; three file-stamp helpers | `server/walk_cache.rs` `WalkCache` (+ `wanted_key`); `benchmark::search::file_stamp` | QA-132, QA-233 |
+| form helpers with different trim rules, a hand-written urlencoded parser; a 6 900-line `server/training.rs` | `server/form.rs` (`parse` on `form_urlencoded`, `value`, `field`, `all`, `num`); `server/training/{mod,hooks,view,fields,routes}.rs`, `view_with` in named stages | QA-133, QA-134 |
+| model lookup by normalized name at 43 sites; "relative to the data root" five times | `ModelConfig::key` / `is_named`, `Config::model_index` / `model` / `model_mut`; `Config::relative_to_data_root` | QA-205, QA-278, QA-130 |
+| ad-hoc lock poisoning (a poisoned lock skipped work in libs.rs, dropped StateHandle changes, stopped repeats invalidating) | `lock_recover` / `read_recover` / `write_recover` (Condvar waits stay manual, commented) | QA-152, QA-270, QA-224, QA-181 |
+| test folders without cleanup on panic; 12 copies of the node runner | `crate::test_dirs::TempDir` everywhere (extract's copy folded in); `tests/it/js_harness.rs` (`run_node_ok` wants a final `ok`) | QA-160, QA-274, QA-216, QA-268 |
+| `WorkerCtx::finish` (230 lines), `job::stages` (810), `ImportJob::stages` (860), `dataset::plan` (625) / `write_reusing` (355), `build_export` (240), the full/quick checks' tails, `run_server_inner` (260), `render_prometheus` (310) | named stages with unit tests; pure `job/attempt.rs::next_attempt` (OOM rules table); `collect/labels/export/formats.rs` writers with their file counts; `refine::job` `Who` / `write_into` / `run_look` / `finish_report`; `runner::start_listener` + `Process::new`; Prometheus family helpers and a `rejected` array | QA-142, QA-135, QA-137, QA-255, QA-177, QA-127, QA-225 (partial), QA-217 |
+| collector and import each wrote a frame | `layout::write_frame` (image, sidecar, index line, all or nothing; typed `FrameWriteError`) | QA-125 |
+| two results-save transactions; three "which stored run" rules; ResourceRow built three times with string states | `benchmark/save.rs::commit`; `StoredPreds::run_for`; `RowState` enum (same JSON), `ResourceRow::base`, `download_row` | QA-123, QA-124, QA-129 |
+| refine read runs.json three ways, recovered left-out counts from warning sentences, two `@tag` event parsers | `refine::read_runs` (typed, read-only); `Selection.{pending, off_class_list, unreadable_frames, other_warnings}`; one lenient `pyenv::parse_event` | QA-199, QA-201, QA-203 |
+| JS: ~10 `el()` / 7 JSON fetch wrappers / 2 `report()`s; seven bulk handlers; the config poll's own timer | `assets/dom.js` (`PrismDom`, `PrismFetch`); `bulkAction`; the config poll on `PrismPoll` (characterised first) | QA-141, QA-138, QA-140, QA-149 |
+| install scripts' config migration copied between launchd and systemd | POSIX `scripts/install_common.sh` (`bop_migrate_config`, `bop_print_urls`), shipped in deb/rpm/pkg | QA-128 |
+| no test that the export's `written_files` matches what it writes | `every_format_writes_the_files_it_counts`, `formats` unit tests | QA-185 |
+
+Deliberate small changes (all reported by the agents and kept): core refusals, the fallback, panics and static-file
+errors answer `{success, message, error}` (a superset; the Config page's live errors and `/logs.json` gain `error`);
+a refine POST whose JSON does not parse says `invalid JSON body: ...` like every other route; Tune with no device and
+no recommendation opens the CPU reference run (as Search does), and Search's explicit device also matches the same
+device spelled differently (`openvino:gpu` finds `openvino:gpu.0`); the service logs its benchmark load warnings; a
+sidecar that cannot be serialized leaves no image behind; `@tag` events parse after a prefix; three Resources
+"add to config" paths also try the canonical data root; refine skips a runs.json entry that is not a full record (only
+the queue writes the file); the config poll: a tab shown while a poll is out polls once more after it, a failed forced
+`PrismLive.poll(true)` no longer writes the retry line, a focus poll restarts the period; a form body with raw invalid
+UTF-8 beside `%` escapes decodes per `form_urlencoded` (browsers always encode).
+
+Left open: QA-139 (review.js split) and QA-225's per-generation build (phase 10); the collector still reports a frame
+that does not decode as "could not save a frame..." (a one-arm change in `Store::write` now that the error is typed);
+workers-7 / QA-277 (the delivery tail of `finish`); bench-*.js, training.js, stats/logs/welcome keep their own fetch
+wrappers and `el` copies (different contracts); `normalize_name` is not idempotent (`a.onnx.xml`), so the lookup
+helpers take raw names and key-holding sites compare `m.key()`; `dataset/valid.rs` keeps its own `frame_key`. On Windows the refine full-check test's look stage probes the host's real `msvcp140.dll` (existing `resources/export` behaviour; the test masks only its version and folder).
+
+Tests: 3803 lib + 216 integration green with `BOP_REQUIRE_NODE=1 BOP_REQUIRE_PYTHON=1`. The two lock-poison fixes are
+shown failing on the old code by the lead (one private copy, old non-test code + new tests): QA-270
+`a_poisoned_state_lock_still_reads_and_changes`, QA-181 `a_poisoned_lock_still_caches_and_a_write_still_drops_the_history`.
+Characterisation tests were run green on the old code by the agents before each split.

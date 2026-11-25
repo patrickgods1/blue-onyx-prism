@@ -1,5 +1,6 @@
 //! The collector thread's state: bucket selection with per-camera rate limits and sampling,
-//! near-duplicate dedup per camera, the atomic writes of image + sidecar + index line, the size /
+//! near-duplicate dedup per camera, the frame's image + sidecar + index line (named in the
+//! configured zone, written by [`layout::write_frame`]), the size /
 //! age caps (through [`crate::retention::prune_dataset_with`], walking only when [`pass_due`] says
 //! a cap may have work) and the disk guard that stops collection
 //! on low free space or a full disk and re-arms it once space is back. Single-threaded: only the
@@ -39,10 +40,11 @@ use super::config::DedupMode;
 use super::health::LastError;
 use super::layout::{self, Summary};
 use super::metrics::{Dropped, METRICS};
-use super::record::{Bucket, DedupInfo, IndexLine, RECORD_VERSION};
+use super::record::{Bucket, DedupInfo, RECORD_VERSION};
 use super::{CollectSettings, Frame, Status, dhash};
 use crate::image_stats::Scene;
 use crate::retention::DatasetUsage;
+use crate::sync::LockExt as _;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -501,7 +503,7 @@ impl Store {
     fn publish(&self) {
         METRICS.set_bytes(self.summary.bytes);
         METRICS.set_disabled(self.disabled.is_some());
-        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.shared.lock_recover();
         s.dir = self.dir.clone();
         s.summary = self.summary.clone();
         s.usage = self.usage;
@@ -876,10 +878,9 @@ impl Store {
         crate::retention::low_space_message(&settings.dir, free, crate::retention::MIN_FREE_MB)
     }
 
-    /// Image, sidecar, index line: each atomic; the sidecar after the image, so a sidecar
-    /// always has its image. A frame is complete or absent: a failed sidecar write removes the
-    /// image, a failed index append both (as the import's writer does). Returns the image path
-    /// relative to `dir`.
+    /// Image, sidecar, index line through [`layout::write_frame`] (each atomic; a frame is
+    /// complete or absent), in the day folder and with the stem of the configured zone; then the
+    /// summary and the usage count it. Returns the image path relative to `dir`.
     fn write(
         &mut self,
         dir: &Path,
@@ -909,46 +910,19 @@ impl Store {
             stem: stem.clone(),
         };
         let day = dir.join(&rel.scene).join(&rel.camera).join(&date);
-        // Decoded before the day folder is made, so an image that does not decode leaves no
-        // empty folder (retention removes one a failed write leaves anyway).
-        let (bytes, original) = if image.starts_with(&[0xFF, 0xD8]) {
-            (std::borrow::Cow::Borrowed(image), true)
-        } else {
-            let img = crate::image::decode(image).map_err(std::io::Error::other)?;
-            let jpeg = crate::image::encode_jpeg(&img, 92).map_err(std::io::Error::other)?;
-            (std::borrow::Cow::Owned(jpeg), false)
-        };
-        std::fs::create_dir_all(&day)?;
-        r.id = stem.clone();
-        r.image = super::record::ImageInfo {
-            file: format!("{stem}.jpg"),
-            bytes: bytes.len() as u64,
-            original,
-        };
-        let jpg = day.join(format!("{stem}.jpg"));
-        layout::write_in_day(&day, &jpg, &bytes)?;
-        let json = serde_json::to_vec_pretty(&*r).map_err(std::io::Error::other)?;
-        let side = day.join(format!("{stem}.json"));
-        if let Err(e) = layout::write_atomic(&side, &json) {
-            let _ = std::fs::remove_file(&jpg);
-            return Err(e);
-        }
-        let total = (bytes.len() + json.len()) as u64;
-        let line = IndexLine::of(r, total);
         #[cfg(test)]
-        let appended = match self.fail_index {
-            Some(kind) => Err(std::io::Error::from(kind)),
-            None => layout::append_index(&day, &line),
-        };
-        #[cfg(not(test))]
-        let appended = layout::append_index(&day, &line);
-        if let Err(e) = appended {
-            // QA-054: no index line, no frame. Left behind, it would be counted by retention and
-            // listed as a stray, yet missing from the summary and the review queue.
-            let _ = std::fs::remove_file(&side);
-            let _ = std::fs::remove_file(&jpg);
-            return Err(e);
-        }
+        layout::fail_frames_at(self.fail_index.map(|kind| (layout::FrameStep::Index, kind)));
+        let written = layout::write_frame(&day, &stem, image, r);
+        #[cfg(test)]
+        layout::fail_frames_at(None);
+        let (line, total) = written.map_err(|e| match e {
+            // An upload that does not decode (the worker decoded it already, so hardly ever) is
+            // told as a failed write, as before the shared writer.
+            layout::FrameWriteError::Decode(e) | layout::FrameWriteError::Encode(e) => {
+                std::io::Error::other(e)
+            }
+            layout::FrameWriteError::Io { error, .. } => error,
+        })?;
         self.summary.add(&line, &date);
         self.usage.prunable_bytes = self.usage.prunable_bytes.saturating_add(total);
         Ok(rel.jpg())
@@ -1173,6 +1147,39 @@ mod tests {
         // The summary rebuilt from disk equals the live one.
         assert_eq!(Summary::scan(&tmp.0), st.summary);
         assert_eq!(st.summary.count("day", Bucket::Positive), 1);
+    }
+
+    /// Audit 2026-11 phase 9 (Q:collect-7), pinned before the shared frame writer: the record's id
+    /// and image, the index line's bytes (image + sidecar) and the usage the store adds them to.
+    #[test]
+    fn a_saved_frame_counts_its_image_and_sidecar_bytes() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let mut st = store();
+        st.zone = Some(crate::clock::Zone::Utc);
+        let before = st.usage.prunable_bytes;
+        let out = st.handle(frame(&s, positive("drive", "ab/cd", t(0)), 1));
+        let Handled::Saved { rel, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(rel, "day/drive/2026-09-21/20260921T141320000Z_abcd.jpg");
+        let jpg = layout::resolve(&tmp.0, &rel, "jpg").unwrap();
+        let side = std::fs::read(jpg.with_extension("json")).unwrap();
+        let rec: Record = serde_json::from_slice(&side).unwrap();
+        assert_eq!(rec.id, "20260921T141320000Z_abcd");
+        assert_eq!(
+            rec.image,
+            crate::collect::record::ImageInfo {
+                file: "20260921T141320000Z_abcd.jpg".into(),
+                bytes: jpeg(1).len() as u64,
+                original: true,
+            }
+        );
+        assert_eq!(side, serde_json::to_vec_pretty(&rec).unwrap());
+        let total = (jpeg(1).len() + side.len()) as u64;
+        let idx = layout::read_index(&jpg.parent().unwrap().join(layout::INDEX_FILE));
+        assert_eq!(idx, [crate::collect::record::IndexLine::of(&rec, total)]);
+        assert_eq!(st.usage.prunable_bytes, before + total);
     }
 
     #[test]

@@ -428,7 +428,7 @@ fn run(cli: Cli) -> Result<()> {
                 // Under the config lock: a page save of a running service is never undone.
                 // Paths relative to that config's data root, which resolves them (QA-036).
                 let edited = config_file::edit_file(&path, config_file::Missing::Default, |cfg| {
-                    let models = download::model_configs_for(&files, cfg);
+                    let models = download::model_configs(&files, cfg);
                     Ok(download::add_to_config(cfg, models))
                 })?;
                 for o in &edited.value {

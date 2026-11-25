@@ -49,10 +49,11 @@ pub(super) use history::{history_compare, history_delete, history_get, history_p
 pub(super) use report::save_report;
 pub(super) use run::{cancel, image_file, images_detail, remove_dataset, settings, start};
 
+use super::answer::json_fail;
 use super::{AppState, DevicesSnapshot, devices_snapshot, global_device_label};
+use crate::benchmark::search::file_stamp;
 use crate::benchmark::{BenchmarkResults, configured_device, results_path};
 use crate::config::Config;
-use axum::Json;
 use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -92,7 +93,7 @@ fn config_view(state: &AppState, snap: &DevicesSnapshot) -> serde_json::Value {
         .iter()
         .map(|m| {
             let name = m.effective_name();
-            let key = crate::registry::normalize_name(&name);
+            let key = m.key();
             let sel = snap.model_selection(state, &cfg, m);
             let configured = configured_device(&cfg, m, &sel);
             let loaded_spec = loaded.get(&key).cloned().filter(|_| m.enabled);
@@ -170,13 +171,6 @@ fn models_now(
         &|m| configured_device(cfg, m, &snap.model_selection(state, cfg, m)),
         &running,
     )
-}
-
-/// (modified, length) of a file; None when it does not exist.
-pub(super) fn file_stamp(p: &std::path::Path) -> Option<(Option<std::time::SystemTime>, u64)> {
-    std::fs::metadata(p)
-        .ok()
-        .map(|m| (m.modified().ok(), m.len()))
 }
 
 /// Each benchmarked model's place in the cross-model ranking ([`BenchmarkResults::ranking`],
@@ -449,16 +443,8 @@ pub(super) async fn status(
     super::blocking(move || poll::answer(&state, query.as_deref(), if_none_match.as_deref())).await
 }
 
-pub(super) fn json_error(status: StatusCode, message: String) -> Response {
-    (
-        status,
-        Json(serde_json::json!({ "success": false, "message": message })),
-    )
-        .into_response()
-}
-
-/// An API error answered as `{"success": false, "message": ...}` with its status (see
-/// [`json_error`]); small, unlike a [`Response`], so helpers can return it in a `Result`.
+/// An API error answered as `{"success": false, "message": ...}` with its status
+/// ([`json_fail`]); small, unlike a [`Response`], so helpers can return it in a `Result`.
 #[derive(Debug)]
 pub(super) struct ApiError {
     status: StatusCode,
@@ -476,7 +462,7 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        json_error(self.status, self.message)
+        json_fail(self.status, self.message)
     }
 }
 
@@ -485,12 +471,11 @@ pub(super) fn form_field<'f>(form: &'f [(String, String)], key: &str) -> Option<
     form.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
-/// The non-empty `model` fields of a form, trimmed.
+/// The non-empty `model` fields of a form, trimmed ([`crate::server::form::all`]).
 pub(super) fn form_models(form: &[(String, String)]) -> Vec<String> {
-    form.iter()
-        .filter(|(k, _)| k == "model")
-        .map(|(_, v)| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+    crate::server::form::all(form, "model")
+        .into_iter()
+        .map(str::to_string)
         .collect()
 }
 

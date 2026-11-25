@@ -1121,11 +1121,7 @@ process.stdout.write(JSON.stringify({
         st.config
             .update("test", |c| {
                 for m in &saved.models {
-                    let key = crate::registry::normalize_name(&m.model);
-                    if c.models
-                        .iter()
-                        .any(|x| crate::registry::normalize_name(&x.effective_name()) == key)
-                    {
+                    if c.model(&m.model).is_some() {
                         continue;
                     }
                     c.models.push(ModelConfig {

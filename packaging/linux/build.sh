@@ -31,6 +31,9 @@ for b in blue-onyx-prism blue-onyx-prism-benchmark; do
 done
 
 # The unit comes from deploy/ with the same substitution install_systemd.sh applies.
+# (BOP_SCRIPTS: where systemd_common.sh finds install_common.sh, here the source tree.)
+# shellcheck disable=SC2034 # read by the sourced systemd_common.sh
+BOP_SCRIPTS="$ROOT/scripts"
 # shellcheck source=../../scripts/systemd_common.sh
 . "$ROOT/scripts/systemd_common.sh"
 mkdir -p packaging/linux/build

@@ -6,52 +6,13 @@
 //! keeps `:hover` set after a tap, which froze the section), run in `node` with a stub DOM.
 //!
 //! Needs `node`. Without it these tests say so and pass, unless `BOP_REQUIRE_NODE=1` (CI).
-#![allow(clippy::unwrap_used)]
 
-use std::path::PathBuf;
-use std::process::Command;
+use crate::js_harness::{asset, have_node, run_node_ok};
 
-fn have_node() -> bool {
-    let ok = Command::new("node")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        assert!(
-            std::env::var("BOP_REQUIRE_NODE").as_deref() != Ok("1"),
-            "BOP_REQUIRE_NODE=1 but `node` does not run: install Node or unset the variable"
-        );
-        println!("skipped: no node");
-    }
-    ok
-}
-
-fn asset(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join(name)
-}
-
-/// Run `driver_js` with `asset` as its argument; it asserts and exits non-zero on a failure.
+/// Run `driver_js` with `asset` as its argument; it asserts, exits non-zero on a failure and
+/// prints `ok` at the end.
 fn run(driver_js: &str, asset_name: &str) {
-    let dir = std::env::temp_dir().join(format!("bop-js-charts-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let driver = dir.join("driver.js");
-    std::fs::write(&driver, driver_js).unwrap();
-    let out = Command::new("node")
-        .arg(&driver)
-        .arg(asset(asset_name))
-        .output()
-        .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "node failed ({}): {}{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("ok"));
+    run_node_ok(driver_js, &[asset(asset_name).as_os_str()]);
 }
 
 /// A stub DOM just big enough for bench-charts.js, loaded at window width `vw` with a coarse or

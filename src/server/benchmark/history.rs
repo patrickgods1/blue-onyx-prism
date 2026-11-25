@@ -9,6 +9,9 @@
 use crate::benchmark::history::{self, History, HistoryEntry, comparable, history_path};
 use crate::benchmark::{BenchmarkResults, results_path};
 use crate::server::AppState;
+// The history routes answer `error` too ([`json_error`]); `message` keeps the shape of the other
+// benchmark endpoints.
+use crate::server::answer::json_error;
 use axum::Json;
 use axum::extract::rejection::{FormRejection, QueryRejection};
 use axum::extract::{Form, Query, State};
@@ -17,17 +20,6 @@ use axum::response::{IntoResponse, Response};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
-
-/// `{"success": false, "error": ..., "message": ...}` with `status` (the history routes answer
-/// `error`; `message` keeps the shape of the other benchmark endpoints).
-fn fail(status: StatusCode, msg: impl Into<String>) -> Response {
-    let msg = msg.into();
-    (
-        status,
-        Json(serde_json::json!({ "success": false, "error": msg, "message": msg })),
-    )
-        .into_response()
-}
 
 /// The saved results (for seeding) and the history beside them.
 fn load(state: &AppState) -> (Option<BenchmarkResults>, History, std::path::PathBuf) {
@@ -106,14 +98,14 @@ pub(in crate::server) async fn history_compare(
     crate::server::blocking(move || {
         let field = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let (Some(model), Some(a), Some(b)) = (field("model"), field("a"), field("b")) else {
-            return fail(
+            return json_error(
                 StatusCode::BAD_REQUEST,
                 "give `model`, `a` (the earlier run id) and `b` (the later run id)",
             );
         };
         let (_, h, _) = load(&state);
         let missing = |id: &str| {
-            fail(
+            json_error(
                 StatusCode::NOT_FOUND,
                 format!(
                     "'{model}' has no run {id} in the benchmark history; reload the page (the \
@@ -203,7 +195,7 @@ fn edit_history(
         Ok(l) => l,
         Err(e) => {
             warn!("benchmark history {what} waited for the results lock in vain: {e:#}");
-            return fail(
+            return json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
                     "The benchmark history was not changed: the benchmark results are busy ({e:#}). \
@@ -225,11 +217,11 @@ fn edit_history(
             .into_response()
         }
         Err(e) if e.downcast_ref::<UnknownRun>().is_some() => {
-            fail(StatusCode::NOT_FOUND, e.to_string())
+            json_error(StatusCode::NOT_FOUND, e.to_string())
         }
         Err(e) => {
             warn!("benchmark history {what} failed: {e:#}");
-            fail(
+            json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
                     "The benchmark history was not changed: {e:#}. Check that {} is writable.",
@@ -249,11 +241,11 @@ pub(in crate::server) async fn history_pin(
 ) -> Response {
     let form = match form_of(form) {
         Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
     };
     crate::server::blocking(move || {
         let (Some(model), Some(run_id)) = (field(&form, "model"), field(&form, "run_id")) else {
-            return fail(StatusCode::BAD_REQUEST, "give `model` and `run_id`");
+            return json_error(StatusCode::BAD_REQUEST, "give `model` and `run_id`");
         };
         let pinned = field(&form, "pinned").is_none_or(crate::server::form::truthy);
         let (model, run_id) = (model.to_string(), run_id.to_string());
@@ -284,7 +276,7 @@ pub(in crate::server) async fn history_delete(
 ) -> Response {
     let form = match form_of(form) {
         Ok(f) => f,
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, e),
     };
     crate::server::blocking(move || {
         let model = field(&form, "model").map(str::to_string);
@@ -311,7 +303,7 @@ pub(in crate::server) async fn history_delete(
                      kept; the next run starts a new history."
                 ))
             }),
-            _ => fail(
+            _ => json_error(
                 StatusCode::BAD_REQUEST,
                 "give `model` and `run_id` (one run), `model` and `all=1` (every run of the \
                  model), or `all=1` (the whole history)",

@@ -115,7 +115,7 @@ fn default_by_name(
     config
         .effective_default_index()
         .and_then(|i| config.models.get(i))
-        .and_then(|m| by_name.get(&normalize_name(&m.effective_name())).copied())
+        .and_then(|m| by_name.get(&m.key()).copied())
         .or((served > 0).then_some(0))
 }
 
@@ -202,14 +202,7 @@ impl Slots {
     /// Put the workers in `config` order (models it does not list keep their order at the end),
     /// rebuild the name map and resolve the default model.
     fn reindex(&mut self, config: &Config) {
-        let pos = |name: &str| {
-            let key = normalize_name(name);
-            config
-                .models
-                .iter()
-                .position(|m| normalize_name(&m.effective_name()) == key)
-                .unwrap_or(usize::MAX)
-        };
+        let pos = |name: &str| config.model_index(name).unwrap_or(usize::MAX);
         self.workers.sort_by_key(|w| pos(&w.handle.name));
         self.rebuild_names();
         self.default_idx = default_by_name(config, &self.by_name, self.workers.len());
@@ -1199,10 +1192,18 @@ impl ModelRegistry {
             info!(model = %w.handle.name, "default model for /v1/vision/detection");
         }
 
-        let peers = spawner.peers.clone();
+        let slots = Slots::from_slots(workers, default_idx, spawner.peers.clone());
+        // Startup counts the enabled models before the default; every later change looks the
+        // default up by name. They agree while the workers are the enabled models in config
+        // order, one per plan (`plan_models`), failed ones included (QA-278).
+        debug_assert_eq!(
+            slots.default_idx,
+            default_by_name(config, &slots.by_name, slots.workers.len()),
+            "the startup default and the by-name default disagree"
+        );
         Self {
             served: Arc::new(Served {
-                slots: RwLock::new(Slots::from_slots(workers, default_idx, peers)),
+                slots: RwLock::new(slots),
                 ..Served::default()
             }),
             runtime_info,
@@ -1384,12 +1385,7 @@ impl ModelRegistry {
         let mut out = LiveApplied::default();
         let mut s = self.write();
         for w in &s.workers {
-            let key = normalize_name(&w.handle.name);
-            let Some(m) = config
-                .models
-                .iter()
-                .find(|m| normalize_name(&m.effective_name()) == key)
-            else {
+            let Some(m) = config.model(&w.handle.name) else {
                 continue;
             };
             if w.handle.set_live(LiveSettings::for_model(config, m)) {
@@ -1398,11 +1394,7 @@ impl ModelRegistry {
         }
         // A replacement takes over later, with what applies then.
         for (key, r) in &s.pending {
-            if let Some(m) = config
-                .models
-                .iter()
-                .find(|m| normalize_name(&m.effective_name()) == *key)
-            {
+            if let Some(m) = config.models.iter().find(|m| m.key() == *key) {
                 r.slot.handle.set_live(LiveSettings::for_model(config, m));
             }
         }
@@ -1462,11 +1454,7 @@ impl ModelRegistry {
         let _one = sp.reload.lock_recover();
         validate_names(config)?;
         let key = normalize_name(name);
-        let entry = config
-            .models
-            .iter()
-            .find(|m| normalize_name(&m.effective_name()) == key);
-        let Some(m) = entry.filter(|m| m.enabled) else {
+        let Some(m) = config.model(name).filter(|m| m.enabled) else {
             let (old, stale) = {
                 let mut s = self.write();
                 let stale = s.pending.remove(&key);
@@ -1653,21 +1641,15 @@ impl ModelRegistry {
         let (old, stale) = {
             let mut s = self.write();
             let stale = s.pending.remove(key);
-            let old = s
-                .by_name
-                .get(key)
-                .copied()
-                .filter(|&i| i < s.workers.len())
-                .map(|i| s.workers.remove(i));
+            // `install` counts the reload; `reindex` puts the worker in its config place.
+            let old = s.install(key, slot);
+            s.reindex(config);
             // Decided from the worker actually removed (QA-122): a background replacement may
             // have taken over, Ready, since the caller looked.
             let old = old.map(|o| {
                 let serves = o.handle.state.is_ready() && !o.handle.is_stuck();
                 (o, serves)
             });
-            s.workers.push(slot);
-            *s.reloads.entry(key.to_string()).or_default() += u64::from(old.is_some());
-            s.reindex(config);
             (old, stale)
         };
         self.discard(stale);
@@ -1696,11 +1678,7 @@ impl ModelRegistry {
             return Ok(false);
         }
         let key = normalize_name(name);
-        let Some(m) = config
-            .models
-            .iter()
-            .find(|m| m.enabled && normalize_name(&m.effective_name()) == key)
-        else {
+        let Some(m) = config.models.iter().find(|m| m.enabled && m.key() == key) else {
             return Ok(false);
         };
         {
@@ -1878,7 +1856,7 @@ impl ModelRegistry {
 fn validate_names(config: &Config) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for m in &config.models {
-        let key = normalize_name(&m.effective_name());
+        let key = m.key();
         if !seen.insert(key.clone()) {
             bail!(
                 "duplicate model name '{key}' in the config: two entries have the same `name` or \
@@ -2212,6 +2190,49 @@ mod tests {
             m.enabled = false;
         }
         assert_eq!(resolve_default(&c), None);
+    }
+
+    /// Startup's default (enabled models counted before it) equals the by-name one every later
+    /// change uses, with disabled entries before the default (QA-278).
+    #[test]
+    fn startup_and_by_name_defaults_agree_with_disabled_entries_first() {
+        let mut c = Config::default();
+        for (p, enabled) in [
+            ("a.onnx", false),
+            ("b.onnx", false),
+            ("c.onnx", true),
+            ("d.onnx", false),
+            ("e.onnx", true),
+        ] {
+            c.models.push(ModelConfig {
+                path: p.into(),
+                enabled,
+                ..Default::default()
+            });
+        }
+        // The workers are the enabled models in config order, as `plan_models` makes them.
+        let by_name: HashMap<String, usize> = c
+            .enabled_models()
+            .enumerate()
+            .map(|(i, m)| (m.key(), i))
+            .collect();
+        for default in [
+            None,
+            Some("a"),
+            Some("C"),
+            Some("d"),
+            Some("e.onnx"),
+            Some("nope"),
+        ] {
+            c.default_model = default.map(str::to_string);
+            assert_eq!(
+                resolve_default(&c),
+                default_by_name(&c, &by_name, by_name.len()),
+                "{default:?}"
+            );
+        }
+        c.default_model = Some("e".into());
+        assert_eq!(resolve_default(&c), Some(1));
     }
 
     #[test]
