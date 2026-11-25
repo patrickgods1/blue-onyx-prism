@@ -404,29 +404,21 @@ mod nvml {
     fn load() -> Result<Api, String> {
         // SAFETY: loads the NVIDIA management library the driver installs (System32 / the
         // driver's ld.so.conf dir, never the working directory); its initializers have no
-        // preconditions.
-        let lib = unsafe { crate::backend::libs::open_system(LIBRARY) }
+        // preconditions. Never unloaded: the function pointers below live for the process.
+        let lib = unsafe { crate::backend::libs::leak_system(LIBRARY) }
             .map_err(|e| format!("{LIBRARY}: {e}"))?;
-        // Never unloaded: the function pointers below live for the process.
-        let lib: &'static libloading::Library = Box::leak(Box::new(lib));
-        let sym = |name: &[u8]| -> Result<*const (), String> {
-            // SAFETY: `lib` stays loaded for the whole process (leaked above); the symbol is
-            // read as a plain code pointer and cast to its nvml.h signature below.
-            unsafe { crate::backend::libs::symbol::<*const ()>(lib, name) }
-                .map(|s| *s)
-                .map_err(|e| format!("{LIBRARY}: {e}"))
-        };
-        // SAFETY: each pointer comes from the symbol of that name and is transmuted to its
-        // nvml.h signature.
+        let in_lib = |e: String| format!("{LIBRARY}: {e}");
+        // SAFETY: each symbol is read with its nvml.h signature.
         let (init, count, by_bus, by_index, memory) = unsafe {
+            use crate::backend::libs::static_symbol;
             (
-                std::mem::transmute::<*const (), Init>(sym(b"nvmlInit_v2\0")?),
-                std::mem::transmute::<*const (), GetCount>(sym(b"nvmlDeviceGetCount_v2\0")?),
-                std::mem::transmute::<*const (), ByBusId>(sym(
-                    b"nvmlDeviceGetHandleByPciBusId_v2\0",
-                )?),
-                std::mem::transmute::<*const (), ByIndex>(sym(b"nvmlDeviceGetHandleByIndex_v2\0")?),
-                std::mem::transmute::<*const (), MemoryInfo>(sym(b"nvmlDeviceGetMemoryInfo\0")?),
+                static_symbol::<Init>(lib, b"nvmlInit_v2\0").map_err(in_lib)?,
+                static_symbol::<GetCount>(lib, b"nvmlDeviceGetCount_v2\0").map_err(in_lib)?,
+                static_symbol::<ByBusId>(lib, b"nvmlDeviceGetHandleByPciBusId_v2\0")
+                    .map_err(in_lib)?,
+                static_symbol::<ByIndex>(lib, b"nvmlDeviceGetHandleByIndex_v2\0")
+                    .map_err(in_lib)?,
+                static_symbol::<MemoryInfo>(lib, b"nvmlDeviceGetMemoryInfo\0").map_err(in_lib)?,
             )
         };
         // SAFETY: plain initialization call, no arguments.

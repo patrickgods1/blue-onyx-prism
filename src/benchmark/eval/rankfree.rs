@@ -211,8 +211,11 @@ impl AucData {
         while i < self.samples.len() {
             let score = self.samples.get(i).map_or(0.0, |s| s.0);
             let (mut bp, mut bn) = (0.0, 0.0);
+            // The group's first sample is always taken: a NaN score (never equal to itself)
+            // forms its own group instead of looping forever (QA-188).
+            let start = i;
             while let Some(&(s, pos, g)) = self.samples.get(i) {
-                if s != score {
+                if i > start && s != score {
                     break;
                 }
                 if pos {
@@ -235,6 +238,34 @@ impl AucData {
 mod tests {
     use super::*;
     use crate::benchmark::metrics::evaluate;
+
+    /// QA-188: a NaN score ends (each NaN its own group); ties keep half credit, -0.0 and 0.0
+    /// still tie (no `total_cmp` grouping).
+    #[test]
+    fn auc_with_nan_scores_terminates() {
+        let data = |samples: Vec<(f32, bool, u32)>| {
+            let mut samples = samples;
+            samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+            AucData { samples }
+        };
+        let nan = data(vec![
+            (0.9, true, 0),
+            (f32::NAN, true, 0),
+            (0.2, false, 0),
+            (f32::NAN, false, 0),
+        ]);
+        // Sorted: 0.2 neg, 0.9 pos, NaN pos, NaN neg (one group each). Pairs (pos, neg) where
+        // the positive ranks above: (0.9, 0.2), (NaN+, 0.2); 2 of 4.
+        assert_eq!(nan.auc(None), Some(0.5));
+        // Ties: half credit, -0.0 and 0.0 one group.
+        let tie = data(vec![(0.0, true, 0), (-0.0, false, 0)]);
+        assert_eq!(tie.auc(None), Some(0.5));
+        let ranked = data(vec![(0.8, true, 0), (0.3, false, 0), (0.3, true, 1)]);
+        // (0.8 > 0.3) = 1, (0.3 = 0.3) = 0.5: 1.5 of 2.
+        assert_eq!(ranked.auc(None), Some(0.75));
+        // Group weights: group 1 left out.
+        assert_eq!(ranked.auc(Some(&[1, 0])), Some(1.0));
+    }
 
     fn gt(label: &str, x: f32, ignore: bool) -> GtBox {
         GtBox {

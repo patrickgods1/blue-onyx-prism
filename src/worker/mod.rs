@@ -32,6 +32,7 @@ use crate::backend::plan::Better;
 use crate::backend::{Candidate, DeviceInfo, DeviceSpec, LoadRequest, Runtimes};
 use crate::config::{Config, ModelConfig, ThresholdSource};
 use crate::metrics::{ModelGauges, ModelMetrics, ModelStateLabel};
+use crate::model::name::normalize_name;
 use crate::prep::PrepPool;
 use crate::profile::{Overrides, Profile};
 use crate::startup::{ModelState, StateHandle};
@@ -171,7 +172,7 @@ impl Peers {
     pub fn get(&self, name: &str) -> Option<Arc<WorkerHandle>> {
         self.0
             .read_recover()
-            .get(&crate::registry::normalize_name(name))
+            .get(&normalize_name(name))
             .and_then(std::sync::Weak::upgrade)
     }
 
@@ -179,7 +180,7 @@ impl Peers {
     pub fn publish<'a>(&self, handles: impl IntoIterator<Item = &'a Arc<WorkerHandle>>) {
         let map = handles
             .into_iter()
-            .map(|h| (crate::registry::normalize_name(&h.name), Arc::downgrade(h)))
+            .map(|h| (normalize_name(&h.name), Arc::downgrade(h)))
             .collect();
         *self.0.write_recover() = map;
     }
@@ -188,6 +189,37 @@ impl Peers {
     pub fn clear(&self) {
         self.0.write_recover().clear();
     }
+
+    /// The served worker named `name` when a request can be handed to it now, for a worker
+    /// named `own` (the night model switch and the verify lane share this rule): never `own`
+    /// itself; a peer that is not Ready misses (and a lazy one is asked to compile, see
+    /// [`WorkerHandle::trigger_load`]); a full queue misses.
+    pub(crate) fn ready(&self, name: &str, own: &str) -> Result<Arc<WorkerHandle>, PeerMiss> {
+        let h = self
+            .get(name)
+            .filter(|h| normalize_name(&h.name) != normalize_name(own))
+            .ok_or(PeerMiss::Unknown)?;
+        if h.state.get() != ModelState::Ready {
+            h.trigger_load();
+            return Err(PeerMiss::NotReady);
+        }
+        if h.is_full() {
+            return Err(PeerMiss::QueueFull);
+        }
+        Ok(h)
+    }
+}
+
+/// Why [`Peers::ready`] found no worker to hand a request to; each caller maps it to its own
+/// reason (the night switch's `RouteFallback`, the verify lane's failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerMiss {
+    /// Not served (unknown name, disabled, removed), or the asking worker itself.
+    Unknown,
+    /// Compiling, lazy and not loaded yet, or failed.
+    NotReady,
+    /// Its queue is full.
+    QueueFull,
 }
 
 /// A short request id for the per-request log line (8 hex digits, random).
@@ -1369,6 +1401,123 @@ mod tests {
         // Eager models and failed handles never send Load.
         let m = Arc::new(ModelMetrics::new("x", "CPU", ""));
         assert!(!WorkerHandle::failed("x", "boom", m).trigger_load());
+    }
+
+    /// QA-276: the rule the night switch and the verify lane share. Unknown names and the
+    /// asking worker itself miss as Unknown; a peer that is not Ready misses (a lazy one gets
+    /// its Load, a failed one nothing); a full queue misses; a Ready peer with room is found.
+    #[test]
+    fn peers_ready_finds_only_a_ready_peer_with_room() {
+        let (h, rx) = lazy_handle(2);
+        h.soft_capacity.store(2, Ordering::Relaxed);
+        let h = Arc::new(h);
+        let failed = Arc::new(WorkerHandle::failed(
+            "Broken",
+            "boom",
+            Arc::new(ModelMetrics::new("Broken", "CPU", "")),
+        ));
+        let peers = Peers::new();
+        peers.publish([&h, &failed]);
+
+        assert_eq!(peers.ready("other", "me").err(), Some(PeerMiss::Unknown));
+        // Never itself, whatever the spelling.
+        assert_eq!(
+            peers.ready("lazy", "Lazy.onnx").err(),
+            Some(PeerMiss::Unknown)
+        );
+
+        // Lazy and not loaded: not ready, and asked to compile (once).
+        assert_eq!(
+            peers.ready("LAZY.xml", "me").err(),
+            Some(PeerMiss::NotReady)
+        );
+        assert!(matches!(rx.try_recv(), Ok(WorkItem::Load)));
+        assert_eq!(peers.ready("lazy", "me").err(), Some(PeerMiss::NotReady));
+        assert!(rx.try_recv().is_err());
+        // Failed: not ready, and no Load (it is not lazy).
+        assert_eq!(peers.ready("broken", "me").err(), Some(PeerMiss::NotReady));
+
+        h.state.set(ModelState::Ready);
+        let found = peers.ready("lazy", "me").expect("ready with room");
+        assert!(Arc::ptr_eq(&found, &h));
+        // A queue at its soft capacity is full.
+        for _ in 0..2 {
+            let (tx, _r) = tokio::sync::oneshot::channel();
+            h.sender
+                .try_send(WorkItem::Detect(
+                    VisionDetectionRequest::default(),
+                    tx,
+                    Instant::now(),
+                ))
+                .unwrap();
+        }
+        assert_eq!(peers.ready("lazy", "me").err(), Some(PeerMiss::QueueFull));
+        drop(rx.try_recv());
+        assert!(peers.ready("lazy", "me").is_ok());
+        // A dropped worker is no longer served.
+        drop(found);
+        drop(failed);
+        assert_eq!(peers.ready("broken", "me").err(), Some(PeerMiss::Unknown));
+    }
+
+    /// A failed handle whose `join` is a thread that runs until `release` is set.
+    fn handle_with_thread() -> (WorkerHandle, Arc<AtomicBool>) {
+        let release = Arc::new(AtomicBool::new(false));
+        let r = release.clone();
+        let mut h = WorkerHandle::failed("t", "x", Arc::new(ModelMetrics::new("t", "CPU", "")));
+        h.join = Some(std::thread::spawn(move || {
+            while !r.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }));
+        (h, release)
+    }
+
+    /// QA-275: the three outcomes of `join_within`, and Stuck reported before the deadline.
+    #[test]
+    fn join_within_reports_ended_stuck_or_running() {
+        // No thread.
+        let m = Arc::new(ModelMetrics::new("x", "CPU", ""));
+        let far = Instant::now() + Duration::from_secs(600);
+        assert_eq!(
+            WorkerHandle::failed("x", "boom", m).join_within(far),
+            Joined::Ended
+        );
+
+        // A thread that ends while waited for.
+        let (h, release) = handle_with_thread();
+        let r = release.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            r.store(true, Ordering::Release);
+        });
+        assert_eq!(h.join_within(far), Joined::Ended);
+        setter.join().unwrap();
+
+        // Still running at the deadline: left behind.
+        let (h, release) = handle_with_thread();
+        assert_eq!(
+            h.join_within(Instant::now() + Duration::from_millis(50)),
+            Joined::Running
+        );
+        release.store(true, Ordering::Release);
+
+        // Stuck while waited for: reported long before the (far) deadline.
+        let (h, release) = handle_with_thread();
+        let stuck = h.stuck_flag();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            stuck.store(true, Ordering::Release);
+        });
+        assert_eq!(h.join_within(far), Joined::Stuck);
+        setter.join().unwrap();
+        release.store(true, Ordering::Release);
+
+        // Stuck at the start wins over a deadline already passed.
+        let (h, release) = handle_with_thread();
+        h.stuck_flag().store(true, Ordering::Release);
+        assert_eq!(h.join_within(Instant::now()), Joined::Stuck);
+        release.store(true, Ordering::Release);
     }
 
     #[test]

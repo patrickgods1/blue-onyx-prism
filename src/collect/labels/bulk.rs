@@ -825,14 +825,48 @@ fn accept_frame(
     Ok(accepted)
 }
 
-/// Accept one eligible frame (see [`bulk_accept`]); `Ok(false)` when it is not eligible (any
-/// more).
+/// Accept one eligible frame (tests; [`bulk_accept`]'s save of one frame); `Ok(false)` when it is
+/// not eligible (any more). Hidden classes are not applied: their pending boxes would be accepted.
+/// A production caller must take a [`Wanted`] (with the live hidden classes) instead.
+#[cfg(test)]
 pub fn accept_one(dir: &Path, rel: &str, classes: &[String], now: &str) -> anyhow::Result<bool> {
     let wanted = Wanted {
         classes,
         hidden: &[],
     };
     accept_frame(dir, rel, &wanted, now).map(|n| n.is_some())
+}
+
+/// The frames of `dir` that `filters`, with the status forced to unreviewed and `auto` to `auto`,
+/// and then `keep` select, in queue order ([`queue::build`]): what a bulk accept may save.
+fn eligible_unreviewed(
+    dir: &Path,
+    filters: &Filters,
+    auto: AutoFilter,
+    keep: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut f = filters.clone();
+    f.status = StatusFilter::Is(Status::Unreviewed);
+    f.auto = Some(auto);
+    queue::build(dir, &f)
+        .items
+        .into_iter()
+        .map(|i| i.frame)
+        .filter(|r| keep(r))
+        .collect()
+}
+
+/// The outcome a bulk accept starts from: `eligible` counted and, for a dry run, the first
+/// [`LISTED`] of them named as `done` (a dry run's whole answer).
+fn listed(eligible: &[String], dry_run: bool) -> BulkOutcome {
+    let mut out = BulkOutcome {
+        eligible: eligible.len(),
+        ..BulkOutcome::default()
+    };
+    if dry_run {
+        out.done = eligible.iter().take(LISTED).cloned().collect();
+    }
+    out
 }
 
 /// Save the unreviewed frames of `dir` whose auto-label triage alone settles them
@@ -850,36 +884,19 @@ pub fn bulk_accept(
     dry_run: bool,
     keep: &dyn Fn(&str) -> bool,
 ) -> BulkOutcome {
-    let mut f = filters.clone();
-    f.status = StatusFilter::Is(Status::Unreviewed);
-    f.auto = Some(AutoFilter::Accept);
-    let built = queue::build(dir, &f);
-    let eligible: Vec<&str> = built
-        .items
-        .iter()
-        .map(|i| i.frame.as_str())
-        .filter(|r| keep(r))
-        .collect();
-    let mut out = BulkOutcome {
-        eligible: eligible.len(),
-        ..BulkOutcome::default()
-    };
+    let eligible = eligible_unreviewed(dir, filters, AutoFilter::Accept, keep);
+    let mut out = listed(&eligible, dry_run);
     if dry_run {
-        out.done = eligible
-            .iter()
-            .take(LISTED)
-            .map(|r| (*r).to_string())
-            .collect();
         return out;
     }
     let wanted = Wanted {
         classes,
-        hidden: f
+        hidden: filters
             .wanted
             .as_ref()
             .map_or(&[], |(_, hidden)| hidden.as_slice()),
     };
-    for rel in eligible.into_iter().take(limit) {
+    for rel in eligible.iter().take(limit) {
         match accept_frame(dir, rel, &wanted, now) {
             Ok(Some(n)) => {
                 out.boxes += n;
@@ -963,22 +980,9 @@ pub fn bulk_accept_repeats(
     dry_run: bool,
     keep: &dyn Fn(&str) -> bool,
 ) -> BulkOutcome {
-    let mut f = filters.clone();
-    f.status = StatusFilter::Is(Status::Unreviewed);
-    f.auto = Some(AutoFilter::Repeats);
-    let built = queue::build(dir, &f);
-    let eligible: Vec<String> = built
-        .items
-        .into_iter()
-        .map(|i| i.frame)
-        .filter(|r| keep(r))
-        .collect();
-    let mut out = BulkOutcome {
-        eligible: eligible.len(),
-        ..BulkOutcome::default()
-    };
+    let eligible = eligible_unreviewed(dir, filters, AutoFilter::Repeats, keep);
+    let mut out = listed(&eligible, dry_run);
     if dry_run {
-        out.done = eligible.iter().take(LISTED).cloned().collect();
         return out;
     }
     for rel in eligible.iter().take(limit) {
@@ -1106,6 +1110,22 @@ mod tests {
     use super::super::{Origin, Triage, auto_accept_eligible};
     use super::test_support::{auto_box, labels_of, put_frame, put_frame_at};
     use super::*;
+
+    // QA-195: the start of a bulk accept: every eligible frame counted, a dry run names the
+    // first LISTED of them.
+    #[test]
+    fn listed_counts_all_and_a_dry_run_names_the_first() {
+        let eligible: Vec<String> = (0..LISTED + 3).map(|i| format!("f{i}")).collect();
+        let dry = listed(&eligible, true);
+        assert_eq!(dry.eligible, LISTED + 3);
+        assert_eq!(dry.done, eligible[..LISTED].to_vec());
+        assert_eq!(dry.done_count, 0);
+        let real = listed(&eligible, false);
+        assert_eq!(real.eligible, LISTED + 3);
+        assert!(real.done.is_empty() && real.failed.is_empty());
+        let none = listed(&[], true);
+        assert_eq!((none.eligible, none.done.len()), (0, 0));
+    }
 
     #[test]
     fn a_spot_everywhere_takes_only_that_cameras_unreviewed_frames_of_its_size() {

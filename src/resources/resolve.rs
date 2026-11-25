@@ -248,9 +248,10 @@ impl Need {
         self.resource.size()
     }
 
-    /// Command that downloads just this resource.
+    /// Command that downloads just this resource ([`super::manager::fetch_command`]: with
+    /// `--allow-large` when it needs it).
     pub fn fetch_command(&self) -> String {
-        format!("blue-onyx-prism fetch --resource {}", self.resource.id)
+        super::manager::fetch_command(self.resource)
     }
 }
 
@@ -1204,7 +1205,8 @@ pub fn download_root(config: &Config) -> PathBuf {
 /// install, never a legacy one: the ONNX Runtime flavors' rule in [`detect_installed`].
 fn installed_in(dir: &Path, id: &str) -> bool {
     intact_manifest(dir, id).is_some()
-        || (!dir.join(super::manager::MANIFEST_FILE).exists() && dir.join("VERSION").is_file())
+        || (!dir.join(super::manager::MANIFEST_FILE).exists()
+            && dir.join(super::extract::VERSION_FILE).is_file())
 }
 
 /// The manifest of `id` in `dir`, when there is one and the files it lists are intact.
@@ -1216,7 +1218,7 @@ fn intact_manifest(dir: &Path, id: &str) -> Option<super::manager::Manifest> {
 
 /// The `VERSION` marker of an install directory, when present and non-empty.
 fn version_file(dir: &Path) -> Option<String> {
-    std::fs::read_to_string(dir.join("VERSION"))
+    std::fs::read_to_string(dir.join(super::extract::VERSION_FILE))
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())

@@ -16,10 +16,16 @@
 //! at most once every [`WARN_EVERY_SECS`] and changes nothing in memory, which stays
 //! authoritative. Reads never quote the file: a damaged one is described by the kind of problem
 //! and its line and column only.
+//!
+//! **The two stores' shared steps**: [`load_or_warn`] (read and parse at start, a missing file
+//! is empty, an unreadable or damaged one is empty with a warning) and [`write_due`] (a flush:
+//! drop expired entries, write the rest sorted by hash when [`Versions::due`]). Each store keeps
+//! its own entry and file shapes, its parser and its expiry rule.
 
 use crate::sync::LockExt;
 use anyhow::{Context, Result};
 use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -150,6 +156,92 @@ pub fn read(path: &Path) -> Loaded {
         ));
     }
     Loaded::Bytes(bytes)
+}
+
+/// Read the file at `path` and `parse` it: what a store starts with. A missing file is empty
+/// (`T::default()`); one that cannot be read or does not parse is empty too, and `warn` gets the
+/// line to log (the caller logs it, under its own module), `lost` saying what that costs.
+pub fn load_or_warn<T: Default>(
+    path: &Path,
+    lost: &str,
+    parse: impl FnOnce(&[u8]) -> Result<T, String>,
+    warn: impl FnOnce(&str),
+) -> T {
+    let line = match read(path) {
+        Loaded::Missing => return T::default(),
+        Loaded::Failed(why) => format!(
+            "{}: {why}; {lost}. Check that the service's account may read it",
+            path.display()
+        ),
+        Loaded::Bytes(bytes) => match parse(&bytes) {
+            Ok(t) => return t,
+            Err(why) => format!(
+                "{} is damaged ({why}); {lost}. The file is replaced at the next sign-in",
+                path.display()
+            ),
+        },
+    };
+    warn(&line);
+    T::default()
+}
+
+/// What a store keeps under its mutex: its entries by digest and their change counters.
+#[derive(Debug, Default)]
+pub struct Kept<V> {
+    pub map: HashMap<Digest, V>,
+    pub v: Versions,
+}
+
+/// A store's flush at `now`. With `persist`'s writer held from the snapshot to the write (so
+/// writes land in order), then the state lock: the entries `keep` refuses are dropped (a change
+/// that may wait); when [`Versions::due`] (`force`, a forced change, or `every` seconds since the
+/// last write), the rest become `wrap(entries)`, each made by `entry` from its digest as hex and
+/// sorted by it, as text. The state lock is let go for the write; when it landed, the snapshot's
+/// version counts as written. Whether it wrote. `what` names the contents in a (never expected)
+/// serialization error.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each store's own pieces, passed in one call"
+)]
+pub fn write_due<V, E: serde::Serialize, F: serde::Serialize>(
+    persist: &Persist,
+    state: &Mutex<Kept<V>>,
+    now: u64,
+    force: bool,
+    every: u64,
+    keep: impl Fn(&V) -> bool,
+    entry: impl Fn(String, &V) -> E,
+    wrap: impl FnOnce(Vec<E>) -> F,
+    what: &str,
+) -> bool {
+    let mut w = persist.writer();
+    let (text, version) = {
+        let mut s = state.lock_recover();
+        let before = s.map.len();
+        s.map.retain(|_, x| keep(x));
+        if s.map.len() != before {
+            s.v.lazy();
+        }
+        if !s.v.due(force, now, w.last, every) {
+            return false;
+        }
+        let mut sorted: Vec<(String, &V)> = s.map.iter().map(|(k, x)| (digest_hex(k), x)).collect();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let entries = sorted.into_iter().map(|(h, x)| entry(h, x)).collect();
+        match to_text(&wrap(entries), what) {
+            Ok(t) => (t, s.v.changed),
+            Err(e) => {
+                tracing::warn!("{e:#}");
+                return false;
+            }
+        }
+    };
+    if !persist.write(&mut w, &text, now) {
+        return false;
+    }
+    let mut s = state.lock_recover();
+    s.v.written = s.v.written.max(version);
+    true
 }
 
 /// Change counters of a store, kept inside its state mutex.

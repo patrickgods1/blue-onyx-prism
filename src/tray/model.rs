@@ -3,7 +3,7 @@
 //! and which menu actions are enabled). No GUI and no I/O, so it is unit-tested everywhere.
 
 use crate::service_ctl::{Action, ServiceState};
-use crate::tray::probe::{HttpStatus, StatusReport};
+use crate::tray::probe::{HttpStatus, StatusReport, label};
 
 /// Product name used in every text.
 pub const PRODUCT: &str = "Blue Onyx Prism";
@@ -162,21 +162,25 @@ fn from_report(r: &StatusReport) -> (Health, String) {
     let usable = r
         .models
         .iter()
-        .filter(|m| m.state == "ready" || m.state == "lazy")
+        .filter(|m| m.state == label::READY || m.state == label::LAZY)
         .count();
-    let failed: Vec<_> = r.models.iter().filter(|m| m.state == "failed").collect();
+    let failed: Vec<_> = r
+        .models
+        .iter()
+        .filter(|m| m.state == label::FAILED)
+        .collect();
     let total = r.models.len();
     match r.status.as_str() {
-        "ready" => (
+        label::READY => (
             Health::Ready,
             format!("running \u{2014} {}", models_ready(usable)),
         ),
         // Degraded is also "one serves while another still loads" (QA-069): name what it is.
-        "degraded" => {
+        label::DEGRADED => {
             let loading = r
                 .models
                 .iter()
-                .filter(|m| m.state == "initializing")
+                .filter(|m| m.state == label::INITIALIZING)
                 .count();
             let (n, what) = if failed.is_empty() && loading > 0 {
                 (loading, "loading")
@@ -191,11 +195,11 @@ fn from_report(r: &StatusReport) -> (Health, String) {
                 ),
             )
         }
-        "initializing" => {
+        label::INITIALIZING => {
             let detail = r
                 .models
                 .iter()
-                .filter(|m| m.state == "initializing")
+                .filter(|m| m.state == label::INITIALIZING)
                 .find_map(|m| m.detail.as_deref().filter(|d| !d.trim().is_empty()));
             let text = match detail {
                 Some(d) => format!("starting ({})", clip(d.trim(), MAX_DETAIL_CHARS)),
@@ -203,7 +207,7 @@ fn from_report(r: &StatusReport) -> (Health, String) {
             };
             (Health::Starting, text)
         }
-        "failed" => {
+        label::FAILED => {
             let text = match failed.first() {
                 Some(m) => match m.detail.as_deref().filter(|d| !d.trim().is_empty()) {
                     Some(d) => format!("failed ({}: {})", m.name, clip(d.trim(), MAX_DETAIL_CHARS)),

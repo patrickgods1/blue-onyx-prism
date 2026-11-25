@@ -207,6 +207,23 @@ impl Zone {
         DateTime::parse_from_rfc3339(raw).map_or_else(|_| raw.to_string(), |t| self.display(t))
     }
 
+    /// `secs` (unix seconds, as `users.json` stores them) as [`Self::display`] shows it; the
+    /// number itself when chrono cannot represent it.
+    ///
+    /// ```
+    /// # use blue_onyx_prism::clock::Zone;
+    /// let la: Zone = "America/Los_Angeles".parse().unwrap();
+    /// assert_eq!(la.display_unix(1_763_330_531), "2025-11-16 14:02 PST");
+    /// assert_eq!(Zone::Utc.display_unix(0), "1970-01-01 00:00 UTC");
+    /// assert_eq!(Zone::Utc.display_unix(u64::MAX), u64::MAX.to_string());
+    /// ```
+    pub fn display_unix(self, secs: u64) -> String {
+        i64::try_from(secs)
+            .ok()
+            .and_then(|s| DateTime::<Utc>::from_timestamp(s, 0))
+            .map_or_else(|| secs.to_string(), |t| self.display(t))
+    }
+
     /// The date of `t` in this zone, `YYYY-MM-DD`.
     ///
     /// ```

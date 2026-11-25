@@ -1903,3 +1903,49 @@ fn removing_the_toolchain_makes_the_training_env_not_ready() {
     assert!(!tp.export.env.join(ENV_MARKER).exists());
     assert!(!train::train_env_ready(&tp, LINUX, lane));
 }
+
+/// QA-215: `export_model.py`'s `recipe_for` / `family_for` (what a by-hand run without
+/// `--recipe` / `--family` uses) give every [`catalog::EXPORT_MODELS`] entry the recipe and
+/// family the service passes ([`catalog::export_recipe`], the catalog's model family). Runs the
+/// real script's functions (loaded with importlib: its top level imports only the standard
+/// library); skips without Python unless `BOP_REQUIRE_PYTHON` is set.
+#[test]
+fn the_export_script_names_every_catalog_model_like_the_catalog() {
+    use crate::training::progress::test_python;
+    let Some(python) = test_python::python3("export_model.py recipe parity") else {
+        return;
+    };
+    let code = "import importlib.util, sys\n\
+                spec = importlib.util.spec_from_file_location('export_model', sys.argv[1])\n\
+                m = importlib.util.module_from_spec(spec)\n\
+                spec.loader.exec_module(m)\n\
+                for n in sys.stdin.read().split():\n    \
+                    r = m.recipe_for(n)\n    \
+                    print(n, r, m.family_for(n, r))\n";
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/export_model.py");
+    let mut want = Vec::new();
+    for res in catalog::EXPORT_MODELS {
+        let name = res.model_name().unwrap();
+        let recipe = catalog::export_recipe(res)
+            .unwrap_or_else(|| panic!("{name} has no recipe"))
+            .as_str();
+        let catalog::Provides::Model { family, .. } = res.provides else {
+            panic!("{name} is not a model");
+        };
+        want.push(format!("{name} {recipe} {family}"));
+    }
+    assert!(
+        want.iter().any(|l| l.starts_with("exdark-rfdetr")),
+        "the ExDark models are in the catalog: {want:?}"
+    );
+    let names: Vec<&str> = catalog::EXPORT_MODELS
+        .iter()
+        .filter_map(|r| r.model_name())
+        .collect();
+    let out = test_python::run(python, &["-I", "-c", code, script], &names.join("\n"));
+    let got: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(got, want);
+}

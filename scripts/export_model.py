@@ -134,7 +134,7 @@ def recipe_for(name: str) -> str:
     n = name.lower()
     if n.startswith(("yolo", "mdv6-yolo")):
         return "ultralytics"
-    if n.startswith("rfdetr"):
+    if n.startswith(("rfdetr", "exdark-rfdetr")):
         return "rfdetr"
     if n.startswith("deimv2"):
         return "deimv2"

@@ -202,8 +202,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   or `performance_hint`, LATENCY by default on an integrated GPU, THROUGHPUT on Arc; cache dir
   `<cache>/openvino-<device>-<prec>/<stem>-<key16>/`, one per model file with its `model.txt`, TensorRT likewise in
   `tensorrt/`, the CPU cache hash ignores precision; `LoadRequest::no_cache` also turns off ORT's TensorRT/CoreML
-  caches); `ort.rs` holds all `ort` code; `spec.rs`
-  parses device specs; `detect.rs` finds GPUs (DXGI / sysfs / Apple); `select.rs` builds the ranked, pure `DeviceOption`
+  caches); `ort.rs` holds all `ort` crate calls (its crate-free rules: dependency checks, env switches, shape
+  pinning in `ort_plan.rs`); `pdh.rs` owns the Windows PDH query handles; `spec.rs` parses device specs; `detect.rs` finds GPUs (DXGI / sysfs / Apple); `select.rs` builds the ranked, pure `DeviceOption`
   list and the `auto` pick; `plan.rs` turns it into per-model load candidates (compile + warm-up, falling down the list,
   CPU last); `vram.rs` reads free GPU memory live (NVML / DXGI / amdgpu sysfs, never a CUDA context); `memory.rs` the
   commit charge.
@@ -383,7 +383,9 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   nine tabs `/train/{collect,import,autolabel,review,refine,dataset,train,models,jobs}`; old `/dataset`, `/review`,
   `/training` redirect (307). `GET /v1/train/summary` + `train_area::next_step` fill the strip (`queue::tally` on its own
   thread, a stale answer served while it walks; the check steps' counts come from `server::refine::open_cached`, never
-  waited for). Jobs tab: `server/train_jobs.rs`, `training/eta.rs` (`JobClock`, memory only).
+  waited for). Jobs tab: `server/train_jobs.rs`, `training/eta.rs` (`JobClock`, memory only). Import / Auto-label /
+  Train / Models load one script each (`assets/train-{import,autolabel,train,models}.js`) over `TrainArea`
+  (`train-area.js`: form helpers, `jobs(query)`, the Jobs card's `follow` poll; `tests/it/js_training.rs`).
 
 - **Training** (`src/training/`, `scripts/train_model.py`; docs/TRAINING.md): user-triggered only; `capability` gates by
   GPU (CUDA lanes by compute capability + driver, MPS on Apple); a separate `tools/train-env` from
@@ -467,7 +469,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
 
 - **Web UI assets** (`assets/`, `templates/`, askama): debug builds read `assets/` from the source tree per request
   (`embedded!` in `server/pages.rs`; a debug binary moved off its tree answers 500 on `/static/*`); release embeds them.
-  - `assets/live.js`: `PrismPoll` (chained, never two in flight, nothing while hidden; `tests/it/js_poll.rs`; polls send
+  - `assets/live.js`: `PrismPoll` (chained, never two in flight, nothing while hidden; `PrismPoll.latest` aborts a
+    superseded request; `tests/it/js_poll.rs`; polls send
     `X-Prism-Poll: 1`, reloads they make go through `PrismPoll.navigate`), the in-page sign-in dialog on a 401 that
     replays waiting requests once (native POST forms check the session first unless `data-no-auth-check`),
     `PrismDraft` (sessionStorage drafts restored only at the same revision), `PrismViewport`, `PrismPointer`,
@@ -480,7 +483,8 @@ loaded library's version (the resolver's hypothetical probe carries the version 
     or `PrismSort.attach`; re-renders call `PrismSort.apply`); ranked defaults come from Rust `data-best`, never
     a JS ranking twin.
   - Pure modules are node-tested from `tests/it/`: `review-rules.js` (`js_rules.rs`), `review-touch.js`
-    (`js_review_touch.rs`), charts, viewport, poll.
+    (`js_review_touch.rs`), charts, viewport, poll, pickers (`js_pickers.rs`). review.js keeps the canvas and editing
+    core; `review-{bulk,pace,keys,draft}.js` load before it (`tests/it/js_review_{bulk,pace,keys,draft}.rs`).
   - Phones (`assets/style.css`, *Phones and tablets*): every `vh` height is followed by `dvh`/`svh` and every `:hover`
     rule sits in `@media (hover: hover)` (pages.rs tests check both; iOS keeps `:hover` after a tap);
     `viewport-fit=cover`, never `maximum-scale` / `user-scalable`; side paddings `max(<pad>, env(safe-area-inset-*))`.
@@ -523,7 +527,7 @@ loaded library's version (the resolver's hypothetical probe carries the version 
   (`#![deny(unsafe_code)]` elsewhere).
 - Everything portable unless it must be `#[cfg(windows)]` (service, event log, DXGI).
 - Copy ideas and API shapes from the blue-onyx reference freely (MIT, attributed in LICENSE), including its ONNX
-  Runtime usage. Keep all `ort` code in `src/backend/ort.rs`.
+  Runtime usage. Keep all `ort` crate calls in `src/backend/ort.rs`.
 - Model weights, `models/`, `cache/`, `openvino/` and `*_config*.json` are git-ignored. Never commit weights (YOLO26 is
   AGPL-3.0).
 - Keep the Blue Iris response shape byte-compatible with CodeProject.AI: `success, message, error,

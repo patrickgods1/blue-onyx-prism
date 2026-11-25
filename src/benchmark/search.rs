@@ -21,7 +21,7 @@
 use super::images::GroundTruth;
 use super::metrics::{
     Breakpoints, ClassMap, EvalImage, PredBox, SWEEP_THRESHOLDS, SweepImage, SweepScope,
-    ThresholdPoint, canonical_label,
+    ThresholdPoint,
 };
 use super::report::{BenchmarkResults, ImageInfo, ImageSetInfo, ModelResult};
 use super::roc::{FrameRoc, ROC_POINTS};
@@ -711,12 +711,7 @@ mod lenient {
             let mut i = 0usize;
             while let Some(e) = seq.next_element::<serde_json::Value>()? {
                 i += 1;
-                let field = |k: &str| e.get(k).and_then(|x| x.as_str()).map(str::to_string);
-                let name = match (field("model"), field("device")) {
-                    (Some(m), Some(d)) => format!("#{i} ('{m}' on {d})"),
-                    (Some(m), None) => format!("#{i} ('{m}')"),
-                    _ => format!("#{i}"),
-                };
+                let name = crate::benchmark::report::entry_name(i, &e);
                 match serde_json::from_value::<StoredRun>(e) {
                     Ok(r) => runs.push(r),
                     Err(err) => dropped.push((name, err.to_string())),
@@ -1097,6 +1092,35 @@ fn scored_inputs<'a>(
     inputs
 }
 
+/// The inputs of the overall score: those with real ground truth, else every input; `true`
+/// when that is pseudo ground truth (relative). The run's own advice chooses its images the
+/// same way, which `points_at`'s `at_run` relies on.
+fn chosen_inputs(inputs: &[Input<'_>]) -> (Vec<usize>, bool) {
+    let real: Vec<usize> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.0.ground_truth.is_real())
+        .map(|(k, _)| k)
+        .collect();
+    if real.is_empty() {
+        ((0..inputs.len()).collect(), true)
+    } else {
+        (real, false)
+    }
+}
+
+/// The indexes of `inputs` per dataset, the datasets in the order they first appear.
+fn by_set<'a>(inputs: &[Input<'a>]) -> Vec<(&'a ImageSetInfo, Vec<usize>)> {
+    let mut out: Vec<(&'a ImageSetInfo, Vec<usize>)> = Vec::new();
+    for (k, (set, _, _, _)) in inputs.iter().enumerate() {
+        match out.iter_mut().find(|(s, _)| s.id == set.id) {
+            Some((_, ks)) => ks.push(k),
+            None => out.push((set, vec![k])),
+        }
+    }
+    out
+}
+
 /// A stored run evaluated at one threshold, grouped like the run's own threshold sweep (see
 /// [`super::threshold::ThresholdAdvice`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -1130,31 +1154,12 @@ pub fn points_at(image_sets: &[ImageSetInfo], run: &StoredRun, t: f32) -> Option
         .iter()
         .map(|(_, _, e, fc)| SweepImage::of(e).with_frames(e, fc))
         .collect();
-    let real: Vec<usize> = inputs
-        .iter()
-        .enumerate()
-        .filter(|(_, i)| i.0.ground_truth.is_real())
-        .map(|(k, _)| k)
-        .collect();
-    let chosen: Vec<usize> = if real.is_empty() {
-        (0..inputs.len()).collect()
-    } else {
-        real
-    };
+    let (chosen, _) = chosen_inputs(&inputs);
     let refs =
         |ks: &[usize]| -> Vec<&SweepImage> { ks.iter().filter_map(|&k| matched.get(k)).collect() };
     let overall = Breakpoints::new(&refs(&chosen), SweepScope::All);
     let mut by_dataset = HashMap::new();
-    for (s, _, _, _) in &inputs {
-        if by_dataset.contains_key(&s.id) {
-            continue;
-        }
-        let ks: Vec<usize> = inputs
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| i.0.id == s.id)
-            .map(|(k, _)| k)
-            .collect();
+    for (s, ks) in by_set(&inputs) {
         let bp = Breakpoints::new(&refs(&ks), SweepScope::All);
         by_dataset.insert(s.id.clone(), bp.point_at(t));
     }
@@ -1235,17 +1240,7 @@ fn search_run(
         }
         bail!("no scored images match these filters");
     }
-    let real: Vec<usize> = inputs
-        .iter()
-        .enumerate()
-        .filter(|(_, i)| i.0.ground_truth.is_real())
-        .map(|(k, _)| k)
-        .collect();
-    let (chosen, relative) = if real.is_empty() {
-        ((0..inputs.len()).collect::<Vec<_>>(), true)
-    } else {
-        (real, false)
-    };
+    let (chosen, relative) = chosen_inputs(&inputs);
     let matched: Vec<SweepImage> = inputs
         .iter()
         .map(|(_, _, e, fc)| SweepImage::with_iou(e, req.iou).with_frames(e, fc))
@@ -1282,18 +1277,7 @@ fn search_run(
         now: Some(bp.point_at(now)),
     };
     let mut by_dataset = Vec::new();
-    let mut seen: Vec<&str> = Vec::new();
-    for (s, _, _, _) in &inputs {
-        if seen.contains(&s.id.as_str()) {
-            continue;
-        }
-        seen.push(&s.id);
-        let ks: Vec<usize> = inputs
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| i.0.id == s.id)
-            .map(|(k, _)| k)
-            .collect();
+    for (s, ks) in by_set(&inputs) {
         let bp = Breakpoints::new(&refs(&ks), SweepScope::All);
         if bp.npos > 0 {
             let auc = roc_of(&ks, &wanted, 0).auc;
@@ -1348,21 +1332,12 @@ fn wanted_classes(map: &ClassMap, requested: &[String]) -> Result<Vec<String>> {
     }
     let mut v = Vec::new();
     for c in requested {
-        let canon = canonical_label(c);
-        let class = map
-            .classes
-            .iter()
-            .find(|k| **k == canon)
-            .or_else(|| {
-                map.gt_class(&canon)
-                    .and_then(|g| map.classes.iter().find(|k| *k == g))
-            })
-            .with_context(|| {
-                format!(
-                    "class '{c}' is not scored for this model (scored: {})",
-                    map.classes.join(", ")
-                )
-            })?;
+        let class = map.scored_class(c).with_context(|| {
+            format!(
+                "class '{c}' is not scored for this model (scored: {})",
+                map.classes.join(", ")
+            )
+        })?;
         if !v.contains(class) {
             v.push(class.clone());
         }
@@ -1373,17 +1348,12 @@ fn wanted_classes(map: &ClassMap, requested: &[String]) -> Result<Vec<String>> {
 /// [`SearchResult::ground_truth`] of the `chosen` inputs.
 fn ground_truth_desc(inputs: &[Input], chosen: &[usize], relative: bool) -> String {
     if relative {
-        let refs: std::collections::BTreeSet<String> = chosen
-            .iter()
-            .filter_map(|&k| match &inputs.get(k)?.0.ground_truth {
+        super::images::relative_desc(chosen.iter().filter_map(|&k| {
+            match &inputs.get(k)?.0.ground_truth {
                 GroundTruth::Pseudo(r) => Some(r.clone()),
                 _ => None,
-            })
-            .collect();
-        format!(
-            "relative to {}, not ground truth",
-            refs.into_iter().collect::<Vec<_>>().join(", ")
-        )
+            }
+        }))
     } else {
         "ground truth".to_string()
     }
@@ -1511,6 +1481,38 @@ pub(crate) mod tests {
             ignore,
             crowd: false,
         }
+    }
+
+    /// QA-173: the overall score's images (real ground truth, else all) and the per-dataset
+    /// groups (first-seen order, ascending indexes) that `points_at` and `search_run` share.
+    #[test]
+    fn chosen_inputs_and_by_set() {
+        let (results, _) = fixture();
+        let sets = &results.image_sets;
+        let real = sets.iter().find(|s| s.ground_truth.is_real()).unwrap();
+        let pseudo = sets.iter().find(|s| !s.ground_truth.is_real()).unwrap();
+        let info = real.images.first().unwrap();
+        fn inputs<'a>(of: &[&'a ImageSetInfo], info: &'a ImageInfo) -> Vec<Input<'a>> {
+            of.iter()
+                .map(|&s| (s, info, EvalImage::default(), Vec::new()))
+                .collect()
+        }
+        let mixed = inputs(&[pseudo, real, pseudo, real], info);
+        assert_eq!(chosen_inputs(&mixed), (vec![1, 3], false));
+        let ids = |v: Vec<(&ImageSetInfo, Vec<usize>)>| -> Vec<(String, Vec<usize>)> {
+            v.into_iter().map(|(s, ks)| (s.id.clone(), ks)).collect()
+        };
+        assert_eq!(
+            ids(by_set(&mixed)),
+            [
+                (pseudo.id.clone(), vec![0, 2]),
+                (real.id.clone(), vec![1, 3])
+            ]
+        );
+        let only_pseudo = inputs(&[pseudo, pseudo], info);
+        assert_eq!(chosen_inputs(&only_pseudo), (vec![0, 1], true));
+        assert_eq!(chosen_inputs(&[]), (vec![], true));
+        assert!(by_set(&[]).is_empty());
     }
 
     /// Results with two datasets (one real, night-tagged; one pseudo) and stored predictions of

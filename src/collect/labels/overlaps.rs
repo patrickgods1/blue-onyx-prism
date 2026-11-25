@@ -233,13 +233,7 @@ pub fn guarded(b: &LabelBox, classes: &[String]) -> bool {
 
 /// `true` when `x` comes before `y` by bbox, so a pair has one order whatever the file's.
 fn before(x: &LabelBox, y: &LabelBox) -> bool {
-    let first = x
-        .bbox
-        .iter()
-        .zip(&y.bbox)
-        .map(|(p, q)| p.total_cmp(q))
-        .find(|o| o.is_ne());
-    first.is_none_or(std::cmp::Ordering::is_lt)
+    super::cmp_box(&x.bbox, &y.bbox).is_le()
 }
 
 /// The open pairs of `f` ([`stacks::overlaps`]), each lower bbox first with its witnesses.

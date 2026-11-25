@@ -66,7 +66,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
 
 /// Default most frames of one run.
 pub const DEFAULT_LIMIT: usize = 200;
@@ -720,7 +719,7 @@ fn scoped_job(config: &Config, mut request: AutolabelRequest) -> Result<Autolabe
         paths: TrainPaths::for_config(config),
         platform: Platform::current(),
         accelerator: None,
-        timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
+        timeout: config.training.timeout(),
         config: Box::new(config.clone()),
         model,
         detector: None,

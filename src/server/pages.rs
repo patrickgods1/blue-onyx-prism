@@ -73,8 +73,11 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("logs.js", JS),
     asset!("stats.js", JS),
     asset!("test.js", JS),
-    asset!("training.js", JS),
     asset!("train-area.js", JS),
+    asset!("train-import.js", JS),
+    asset!("train-autolabel.js", JS),
+    asset!("train-train.js", JS),
+    asset!("train-models.js", JS),
     asset!("train-dataset.js", JS),
     asset!("train-refine.js", JS),
     asset!("train-metrics.js", JS),
@@ -84,6 +87,10 @@ pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("review-rules.js", JS),
     asset!("review-touch.js", JS),
     asset!("review-need.js", JS),
+    asset!("review-draft.js", JS),
+    asset!("review-pace.js", JS),
+    asset!("review-keys.js", JS),
+    asset!("review-bulk.js", JS),
     asset!("review.js", JS),
     asset!("welcome.js", JS),
     asset!("manifest.webmanifest", "application/manifest+json"),
@@ -1860,9 +1867,9 @@ console.log('ok');
         for (uri, own_js) in [
             ("/train/review", "/static/review.js?v="),
             ("/train/dataset", "/static/train-dataset.js?v="),
-            ("/train/import", "/static/training.js?v="),
-            ("/train/autolabel", "/static/training.js?v="),
-            ("/train/train", "/static/training.js?v="),
+            ("/train/import", "/static/train-import.js?v="),
+            ("/train/autolabel", "/static/train-autolabel.js?v="),
+            ("/train/train", "/static/train-train.js?v="),
             ("/config", "/static/config.js?v="),
         ] {
             let (s, html) = get_text(&state, uri).await;
@@ -1923,6 +1930,23 @@ console.log('ok');
             "review-need.js before review.js"
         );
         assert!(static_file("review-need.js").is_some_and(|js| js.contains("ReviewNeed")));
+        // The parts split out of review.js (QA-139): each before it, each defining its global.
+        for (file, global) in [
+            ("review-draft.js", "ReviewDraft"),
+            ("review-pace.js", "ReviewPace"),
+            ("review-keys.js", "ReviewKeys"),
+            ("review-bulk.js", "ReviewBulk"),
+        ] {
+            let part = review.find(&format!("/static/{file}?v="));
+            assert!(
+                part.is_some() && part < review.find("/static/review.js?v="),
+                "{file} before review.js"
+            );
+            assert!(
+                static_file(file).is_some_and(|js| js.contains(&format!("globalThis.{global} ="))),
+                "{file}"
+            );
+        }
         for id in ["rv-draw", "rv-redraw", "rv-view-menu"] {
             assert!(review.contains(&format!("id=\"{id}\"")), "missing #{id}");
         }
@@ -2258,10 +2282,10 @@ console.log('ok');
             assert!(!row.contains(" checked"), "it starts unticked: {row}");
         }
         for (js, id) in [
-            ("training.js", "al-memory-anyway"),
-            ("training.js", "train-memory-anyway"),
+            ("train-autolabel.js", "al-memory-anyway"),
+            ("train-train.js", "train-memory-anyway"),
             ("train-refine.js", "refine-memory-anyway"),
-            ("review.js", "rv-suggest-anyway"),
+            ("review-bulk.js", "rv-suggest-anyway"),
         ] {
             let text = static_file(js).unwrap();
             assert!(
@@ -2286,7 +2310,7 @@ console.log('ok');
                 .contains("o.ignore_memory_check = true")
         );
         assert!(
-            static_file("review.js")
+            static_file("review-bulk.js")
                 .unwrap()
                 .contains("body.ignore_memory_check = true")
         );

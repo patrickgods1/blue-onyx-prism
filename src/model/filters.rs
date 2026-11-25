@@ -8,6 +8,7 @@
 //! Each removed box is counted once, under the first rule that removed it.
 
 use super::Detection;
+pub use super::label_of;
 use crate::image_stats::Scene;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -145,14 +146,6 @@ impl SuppressCounts {
             .into_iter()
             .map(|r| (r, self.get(r)))
             .filter(|(_, n)| *n > 0)
-    }
-}
-
-/// The label of class `id`, as [`super::to_predictions`] reports it.
-pub fn label_of(class_names: &[String], id: usize) -> std::borrow::Cow<'_, str> {
-    match class_names.get(id) {
-        Some(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        None => std::borrow::Cow::Owned(format!("class_{id}")),
     }
 }
 

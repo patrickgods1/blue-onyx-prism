@@ -4796,4 +4796,26 @@ print("RESULT: " + json.dumps(out))
             }
         }
     }
+
+    /// Twin: the MPS allocator limits the job passes (`job::MPS_WATERMARKS`) are
+    /// the ones the script sets by `setdefault` for runs by hand, and the low watermark stays
+    /// below the high one (the script's comment; PyTorch refuses the pair otherwise).
+    #[test]
+    fn mps_watermarks_match_the_script() {
+        use crate::training::job::MPS_WATERMARKS;
+        let script = include_str!("../../scripts/train_model.py");
+        for (k, v) in MPS_WATERMARKS {
+            let line = format!("os.environ.setdefault(\"{k}\", \"{v}\")");
+            assert!(script.contains(&line), "train_model.py lacks {line}");
+        }
+        let ratio = |name: &str| -> f64 {
+            let (_, v) = MPS_WATERMARKS
+                .iter()
+                .find(|(k, _)| k.contains(name))
+                .unwrap_or_else(|| panic!("no {name} watermark"));
+            v.parse().unwrap()
+        };
+        assert!(ratio("LOW") < ratio("HIGH"));
+        assert_eq!(script.matches("_WATERMARK_RATIO\", ").count(), 2);
+    }
 }

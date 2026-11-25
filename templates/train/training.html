@@ -17,6 +17,9 @@
 {% endif %}{% if !runs.is_empty() || !results.is_empty() %}<script src="/static/bench-core.js?v={{ version }}"></script>
 <script src="/static/bench-charts.js?v={{ version }}"></script>
 <script src="/static/train-metrics.js?v={{ version }}"></script>
-{% endif %}<script src="/static/training.js?v={{ version }}"></script>
-{% if tab == "import" || tab == "train" %}{% include "train/browse_dialog.html" %}{% endif %}
+{% endif %}{# The tab's own script; every one ends with TrainArea.follow, the Jobs card. A job action of another tab answered with this page (Refine's Pause, read by its fetch) gets the Models one, as only its Jobs card shows. #}{% if tab == "import" %}<script src="/static/train-import.js?v={{ version }}"></script>
+{% else if tab == "autolabel" %}<script src="/static/train-autolabel.js?v={{ version }}"></script>
+{% else if tab == "train" %}<script src="/static/train-train.js?v={{ version }}"></script>
+{% else %}<script src="/static/train-models.js?v={{ version }}"></script>
+{% endif %}{% if tab == "import" || tab == "train" %}{% include "train/browse_dialog.html" %}{% endif %}
 {% endblock %}

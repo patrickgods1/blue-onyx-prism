@@ -166,13 +166,8 @@ fn metrics_client(args: &Args) -> Result<(reqwest::Client, String)> {
         };
         blue_onyx_prism::tls::pinned_client(&cert)?
     };
-    let mut headers = reqwest::header::HeaderMap::new();
-    let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-        .context("the API token is not a header value")?;
-    auth.set_sensitive(true);
-    headers.insert(reqwest::header::AUTHORIZATION, auth);
     let client = builder
-        .default_headers(headers)
+        .default_headers(blue_onyx_prism::tls::bearer_header(&token)?)
         .timeout(Duration::from_secs(10))
         .build()?;
     Ok((
@@ -213,18 +208,11 @@ fn schedule(rate: f64, duration: f64) -> Result<Vec<Duration>> {
 /// Largest open-loop run (requests).
 const MAX_OPEN_LOOP_REQUESTS: usize = 1_000_000;
 
-/// Nearest-rank percentile `p` (0..=100) of ascending `sorted`; NaN when empty.
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return f64::NAN;
-    }
+/// Nearest-rank percentile `p` (0..=100) of ascending `sorted`: the value at 1-based rank
+/// `ceil(p * n / 100)`, in integers (no float rounding at the boundary); NaN when empty.
+fn percentile(sorted: &[f64], p: usize) -> f64 {
     let n = sorted.len();
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "clamped to 1..=n before the cast"
-    )]
-    let rank = ((p / 100.0) * n as f64).ceil().clamp(1.0, n as f64) as usize;
+    let rank = n.saturating_mul(p).div_ceil(100).clamp(1, n.max(1));
     sorted.get(rank - 1).copied().unwrap_or(f64::NAN)
 }
 
@@ -271,6 +259,50 @@ struct OpenOutcome {
     note: String,
 }
 
+/// POST `image` (as the `image` part, with `min_confidence` when above 0) to `url`: the HTTP
+/// status and body, or the transport error.
+async fn post_image(
+    client: &reqwest::Client,
+    url: &str,
+    image: Vec<u8>,
+    min_confidence: f32,
+) -> Result<(reqwest::StatusCode, String), reqwest::Error> {
+    let part = reqwest::multipart::Part::bytes(image).file_name("image.jpg");
+    let mut form = reqwest::multipart::Form::new().part("image", part);
+    if min_confidence > 0.0 {
+        form = form.text("min_confidence", min_confidence.to_string());
+    }
+    let resp = client.post(url).multipart(form).send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    Ok((status, body))
+}
+
+/// How an answer ended: [`Ended`], the parsed response when the body is one (also for
+/// `success: false`) and the note for the failure list (empty on success).
+fn classify(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> (Ended, Option<VisionDetectionResponse>, String) {
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return (Ended::Overloaded, None, "HTTP 503".to_string());
+    }
+    if !status.is_success() {
+        return (Ended::Failed, None, format!("HTTP {status}: {body}"));
+    }
+    match serde_json::from_str::<VisionDetectionResponse>(body) {
+        Ok(r) if r.success => (Ended::Ok, Some(r), String::new()),
+        Ok(r) => {
+            let note = format!(
+                "success=false: {}",
+                r.error.clone().unwrap_or(r.message.clone())
+            );
+            (Ended::Failed, Some(r), note)
+        }
+        Err(e) => (Ended::Failed, None, format!("invalid JSON ({e}): {body}")),
+    }
+}
+
 async fn send_scheduled(
     client: reqwest::Client,
     url: String,
@@ -280,36 +312,15 @@ async fn send_scheduled(
 ) -> OpenOutcome {
     tokio::time::sleep_until(due).await;
     let sent = tokio::time::Instant::now();
-    let part = reqwest::multipart::Part::bytes(image.as_ref().clone()).file_name("image.jpg");
-    let mut form = reqwest::multipart::Form::new().part("image", part);
-    if min_confidence > 0.0 {
-        form = form.text("min_confidence", min_confidence.to_string());
-    }
-    let result = async {
-        let resp = client.post(&url).multipart(form).send().await?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        Ok::<_, reqwest::Error>((status, body))
-    }
-    .await;
+    let result = post_image(&client, &url, image.as_ref().clone(), min_confidence).await;
     let done = tokio::time::Instant::now();
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     let (ended, note) = match result {
         Err(e) => (Ended::Transport, format!("request failed: {e}")),
-        Ok((status, _)) if status == reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-            (Ended::Overloaded, "HTTP 503".to_string())
+        Ok((status, body)) => {
+            let (ended, _, note) = classify(status, &body);
+            (ended, note)
         }
-        Ok((status, body)) if !status.is_success() => {
-            (Ended::Failed, format!("HTTP {status}: {body}"))
-        }
-        Ok((_, body)) => match serde_json::from_str::<VisionDetectionResponse>(&body) {
-            Ok(r) if r.success => (Ended::Ok, String::new()),
-            Ok(r) => (
-                Ended::Failed,
-                format!("success=false: {}", r.error.unwrap_or(r.message)),
-            ),
-            Err(e) => (Ended::Failed, format!("invalid JSON ({e}): {body}")),
-        },
     };
     OpenOutcome {
         ended,
@@ -356,9 +367,9 @@ fn latency_line(label: &str, mut v: Vec<f64>) {
     v.sort_by(f64::total_cmp);
     println!(
         "  {label:<26} p50 {:>8.1}  p95 {:>8.1}  p99 {:>8.1}  max {:>8.1}",
-        percentile(&v, 50.0),
-        percentile(&v, 95.0),
-        percentile(&v, 99.0),
+        percentile(&v, 50),
+        percentile(&v, 95),
+        percentile(&v, 99),
         v.last().copied().unwrap_or(f64::NAN)
     );
 }
@@ -503,18 +514,7 @@ async fn send_one(
 ) -> Outcome {
     tokio::time::sleep_until(start_at).await;
     let start = Instant::now();
-    let part = reqwest::multipart::Part::bytes(image.to_vec()).file_name("image.jpg");
-    let mut form = reqwest::multipart::Form::new().part("image", part);
-    if min_confidence > 0.0 {
-        form = form.text("min_confidence", min_confidence.to_string());
-    }
-    let result = async {
-        let resp = client.post(url).multipart(form).send().await?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        Ok::<_, reqwest::Error>((status, body))
-    }
-    .await;
+    let result = post_image(client, url, image.to_vec(), min_confidence).await;
     let round_trip_ms = start.elapsed().as_secs_f64() * 1000.0;
     let mut out = Outcome {
         ok: false,
@@ -527,25 +527,18 @@ async fn send_one(
     match result {
         Err(e) => out.note = format!("request failed: {e}"),
         Ok((status, body)) => {
-            if !status.is_success() {
-                out.note = format!("HTTP {status}: {body}");
-            } else {
-                match serde_json::from_str::<VisionDetectionResponse>(&body) {
-                    Ok(r) => {
-                        out.ok = r.success;
-                        out.inference_ms = r.inferenceMs;
-                        out.process_ms = r.processMs;
-                        if !r.success {
-                            out.note = format!(
-                                "success=false: {}",
-                                r.error.clone().unwrap_or(r.message.clone())
-                            );
-                        }
-                        out.response = Some(r);
-                    }
-                    Err(e) => out.note = format!("invalid JSON ({e}): {body}"),
-                }
+            let (ended, response, note) = classify(status, &body);
+            out.ok = ended == Ended::Ok;
+            // The closed loop has no overload class: a 503 is an HTTP error with its body.
+            out.note = match ended {
+                Ended::Overloaded => format!("HTTP {status}: {body}"),
+                _ => note,
+            };
+            if let Some(r) = &response {
+                out.inference_ms = r.inferenceMs;
+                out.process_ms = r.processMs;
             }
+            out.response = response;
         }
     }
     out
@@ -558,14 +551,12 @@ fn stats(label: &str, mut v: Vec<f64>) {
     v.sort_by(f64::total_cmp);
     let n = v.len();
     let mean = v.iter().sum::<f64>() / n as f64;
-    // Nearest-rank p95: ceil(0.95 * n) in integers, 1-based.
-    let rank = n.saturating_mul(95).div_ceil(100).clamp(1, n);
     let at = |i: usize| v.get(i).copied().unwrap_or(f64::NAN);
     println!(
         "  {label:<22} min {:>8.1}  mean {:>8.1}  p95 {:>8.1}  max {:>8.1}",
         at(0),
         mean,
-        at(rank - 1),
+        percentile(&v, 95),
         at(n - 1)
     );
 }
@@ -717,13 +708,63 @@ mod tests {
     #[test]
     fn percentiles_are_nearest_rank() {
         let v: Vec<f64> = (1..=100).map(f64::from).collect();
-        assert_eq!(percentile(&v, 50.0), 50.0);
-        assert_eq!(percentile(&v, 95.0), 95.0);
-        assert_eq!(percentile(&v, 99.0), 99.0);
-        assert_eq!(percentile(&v, 100.0), 100.0);
-        assert_eq!(percentile(&[7.0], 99.0), 7.0);
-        assert_eq!(percentile(&[1.0, 2.0, 3.0], 50.0), 2.0);
-        assert!(percentile(&[], 50.0).is_nan());
+        assert_eq!(percentile(&v, 50), 50.0);
+        assert_eq!(percentile(&v, 95), 95.0);
+        assert_eq!(percentile(&v, 99), 99.0);
+        assert_eq!(percentile(&v, 100), 100.0);
+        assert_eq!(percentile(&[7.0], 99), 7.0);
+        assert_eq!(percentile(&[1.0, 2.0, 3.0], 50), 2.0);
+        assert!(percentile(&[], 50).is_nan());
+        // The rank is exact in integers: p95 of 20 values is the 19th, of 21 the 20th.
+        let w: Vec<f64> = (1..=21).map(f64::from).collect();
+        assert_eq!(percentile(&w[..20], 95), 19.0);
+        assert_eq!(percentile(&w, 95), 20.0);
+        assert_eq!(percentile(&w, 0), 1.0, "rank 1 at least");
+    }
+
+    /// QA-208: one classification for both loops: 503 is overload, another error status a
+    /// failure with its body, `success: false` a failure that keeps the answer, bad JSON a
+    /// failure quoting the body.
+    #[test]
+    fn answers_are_classified() {
+        use reqwest::StatusCode;
+        let (e, r, n) = classify(StatusCode::SERVICE_UNAVAILABLE, "busy");
+        assert_eq!(
+            (e, r.is_none(), n.as_str()),
+            (Ended::Overloaded, true, "HTTP 503")
+        );
+        let (e, r, n) = classify(StatusCode::BAD_REQUEST, "no image");
+        assert_eq!(e, Ended::Failed);
+        assert!(r.is_none());
+        assert_eq!(n, "HTTP 400 Bad Request: no image");
+        let ok = serde_json::to_string(&VisionDetectionResponse {
+            success: true,
+            inferenceMs: 12,
+            ..VisionDetectionResponse::default()
+        })
+        .unwrap();
+        let (e, r, n) = classify(StatusCode::OK, &ok);
+        assert_eq!(e, Ended::Ok);
+        assert_eq!(r.unwrap().inferenceMs, 12);
+        assert_eq!(n, "");
+        let refused = serde_json::to_string(&VisionDetectionResponse {
+            success: false,
+            message: "m".into(),
+            error: Some("no model".into()),
+            ..VisionDetectionResponse::default()
+        })
+        .unwrap();
+        let (e, r, n) = classify(StatusCode::OK, &refused);
+        assert_eq!(e, Ended::Failed);
+        assert!(r.is_some(), "the answer is kept");
+        assert_eq!(n, "success=false: no model");
+        let (e, r, n) = classify(StatusCode::OK, "{oops");
+        assert_eq!(e, Ended::Failed);
+        assert!(r.is_none());
+        assert!(
+            n.starts_with("invalid JSON (") && n.ends_with("): {oops"),
+            "{n}"
+        );
     }
 
     #[test]

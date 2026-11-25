@@ -907,7 +907,6 @@ fn parse_card_threshold(
     Ok(Some(t))
 }
 
-/// The config entry of model `name` (matched like `/v1/vision/custom/{model}`).
 /// `object_filter.<name>` of the Models card: [`OBJECT_FILTER_GLOBAL`] = no per-model filter
 /// (`None`, the global one applies), empty = every class (`Some([])`), else a comma list.
 fn parse_card_object_filter(name: &str, v: &str) -> anyhow::Result<Option<Vec<String>>> {
@@ -930,6 +929,7 @@ fn parse_card_object_filter(name: &str, v: &str) -> anyhow::Result<Option<Vec<St
     Ok(Some(names))
 }
 
+/// The config entry of model `name` (matched like `/v1/vision/custom/{model}`).
 fn card_model<'a>(
     c: &'a mut Config,
     name: &str,

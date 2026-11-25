@@ -146,10 +146,7 @@ pub struct Sessions {
     state: Mutex<State>,
 }
 
-struct State {
-    map: HashMap<Digest, Record>,
-    v: Versions,
-}
+type State = opaque::Kept<Record>;
 
 impl std::fmt::Debug for Sessions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -222,25 +219,12 @@ impl Sessions {
     pub fn load(data_root: &Path, now: u64) -> Self {
         let persist = Persist::new(data_root, FILE_NAME, now);
         let path = persist.path();
-        let mut map = match opaque::read(&path) {
-            opaque::Loaded::Missing => HashMap::new(),
-            opaque::Loaded::Failed(why) => {
-                tracing::warn!(
-                    "{}: {why}; starting with no web UI sessions (everyone signs in again). \
-                     Check that the service's account may read it",
-                    path.display()
-                );
-                HashMap::new()
-            }
-            opaque::Loaded::Bytes(bytes) => parse(&bytes).unwrap_or_else(|why| {
-                tracing::warn!(
-                    "{} is damaged ({why}); starting with no web UI sessions (everyone signs \
-                     in again). The file is replaced at the next sign-in",
-                    path.display()
-                );
-                HashMap::new()
-            }),
-        };
+        let mut map = opaque::load_or_warn(
+            &path,
+            "starting with no web UI sessions (everyone signs in again)",
+            parse,
+            |line| tracing::warn!("{line}"),
+        );
         map.retain(|_, r| r.timed_out(now).is_none());
         Self {
             persist,
@@ -420,7 +404,9 @@ impl Sessions {
         alive.then_some(id)
     }
 
-    /// Remove the sessions timed out at `now`: how many.
+    /// Remove the sessions timed out at `now`: how many. Tests only: the flusher prunes with
+    /// [`Self::prune_users`], which drops timed-out sessions too.
+    #[cfg(test)]
     pub fn prune(&self, now: u64) -> usize {
         let mut s = self.state.lock_recover();
         let before = s.map.len();
@@ -460,47 +446,26 @@ impl Sessions {
     /// (creating, ending, rotating), or [`FLUSH_EVERY_SECS`] since the last write; expired
     /// sessions are dropped first. Whether it wrote. A failure is logged (throttled).
     pub fn flush(&self, now: u64, force: bool) -> bool {
-        let mut w = self.persist.writer();
-        let (text, version) = {
-            let mut s = self.state.lock_recover();
-            let before = s.map.len();
-            s.map.retain(|_, r| r.timed_out(now).is_none());
-            if s.map.len() != before {
-                s.v.lazy();
-            }
-            if !s.v.due(force, now, w.last, FLUSH_EVERY_SECS) {
-                return false;
-            }
-            let mut sessions: Vec<Entry> = s
-                .map
-                .iter()
-                .map(|(k, r)| Entry {
-                    hash: opaque::digest_hex(k),
-                    user: r.user.clone(),
-                    generation: r.generation,
-                    created: r.created,
-                    last_active: r.last_active,
-                })
-                .collect();
-            sessions.sort_unstable_by(|a, b| a.hash.cmp(&b.hash));
-            let file = FileRepr {
+        opaque::write_due(
+            &self.persist,
+            &self.state,
+            now,
+            force,
+            FLUSH_EVERY_SECS,
+            |r| r.timed_out(now).is_none(),
+            |hash, r| Entry {
+                hash,
+                user: r.user.clone(),
+                generation: r.generation,
+                created: r.created,
+                last_active: r.last_active,
+            },
+            |sessions| FileRepr {
                 format: FORMAT,
                 sessions,
-            };
-            match opaque::to_text(&file, "the web UI sessions") {
-                Ok(t) => (t, s.v.changed),
-                Err(e) => {
-                    tracing::warn!("{e:#}");
-                    return false;
-                }
-            }
-        };
-        if !self.persist.write(&mut w, &text, now) {
-            return false;
-        }
-        let mut s = self.state.lock_recover();
-        s.v.written = s.v.written.max(version);
-        true
+            },
+            "the web UI sessions",
+        )
     }
 
     /// Tests only: a session with the known id `id` (64 lowercase hex characters) for `user` at
@@ -846,6 +811,51 @@ mod tests {
         // Expired ones are not loaded.
         let late = Sessions::load(&d.0, T + ABSOLUTE_SECS + 2);
         assert!(late.is_empty());
+    }
+
+    /// The file's exact text: pretty JSON, entries sorted by hash, a final newline (QA-218
+    /// characterisation of the write shared with `devices` through `opaque`).
+    #[test]
+    fn the_file_is_pretty_json_sorted_by_hash() {
+        let d = scratch();
+        let s = Sessions::load(&d.0, T);
+        let ids = [
+            "c".repeat(64),
+            "a".repeat(64),
+            "b".repeat(64),
+            "0".repeat(64),
+        ];
+        let mut want = Vec::new();
+        for (at, id) in (T..).zip(&ids) {
+            s.insert_known(id, "alice", 7, at);
+            let hash = opaque::digest_hex(&opaque::digest_of(id.as_bytes()).unwrap());
+            want.push((hash, at));
+        }
+        want.sort();
+        assert!(s.flush(T + 10, true));
+        let entries: Vec<String> = want
+            .iter()
+            .map(|(hash, at)| {
+                format!(
+                    "    {{\n      \"hash\": \"{hash}\",\n      \"user\": \"alice\",\n      \
+                     \"generation\": 7,\n      \"created\": {at},\n      \"last_active\": {at}\n    }}"
+                )
+            })
+            .collect();
+        let expected = format!(
+            "{{\n  \"format\": 1,\n  \"sessions\": [\n{}\n  ]\n}}\n",
+            entries.join(",\n")
+        );
+        assert_eq!(file_text(&s), expected);
+        // An empty store writes an empty list.
+        for id in &ids {
+            let id = SessionId::from_presented(id.as_bytes()).unwrap();
+            s.end(&id, T + 11);
+        }
+        assert_eq!(
+            file_text(&s),
+            "{\n  \"format\": 1,\n  \"sessions\": []\n}\n"
+        );
     }
 
     #[test]

@@ -11,19 +11,27 @@
 //! - [`config_store`] the live config with a revision and change log (every writer goes through it)
 //! - [`config_file`] the cross-process config file lock and the commands' load-edit-save (`edit_file`)
 //! - [`config_merge`] field-level config view: change summaries, pending restart, 3-way form merge
-//! - [`backend`]   runtimes (OpenVINO today), device specs, load plans, inference backends
-//! - [`model`]     model families (yolo26, yolo5, yolo8, rtdetr): pre/post-processing
+//! - [`backend`]   runtimes (OpenVINO, ONNX Runtime), device specs, load plans, inference backends
+//! - [`model`]     model families (yolo26, yolo5, yolo8, detr, rfdetr, rtdetr): pre/post-processing
+//! - [`image`]     image decode / encode and annotation (boxes + labels)
 //! - [`prep`]      process-wide decode + preprocess pool shared by the workers
 //! - [`image_stats`] cheap per-frame luma / colour statistics and the day / night / IR scene
 //! - [`static_memory`] static-box memory: suppress boxes that repeat at the same place
 //! - [`collect`]   dataset collector: frames + sidecar JSON for review and training
 //! - [`verify`]    verifier cascade: candidate crops and the keep / reject rule (pure)
+//! - [`geom`]      box geometry (`[x0, y0, x1, y1]`): area, IoU, inside share, proper box, box order
 //! - [`profile`]   hardware profile (low/mid/high): defaults of the concurrency settings
 //! - [`registry`]  loads all configured models and owns their worker threads
 //! - [`worker`]    per-model inference thread
 //! - [`startup`]   model readiness state shared with the HTTP layer
+//! - [`supervisor`] automatic recovery of models that failed while serving
 //! - [`server`]    axum HTTP server
 //! - [`runner`]    server run loop (generations, restart) shared by the CLI and the service
+//! - [`cli`]       command line, config resolution and logging setup
+//! - [`main_thread`] a binary's `main` body on a thread with a larger stack
+//! - [`sdnotify`]  systemd `Type=notify` / watchdog datagrams (no-op elsewhere)
+//! - [`service_ctl`] start / stop / restart / query the installed service (SCM, launchd, systemd)
+//! - [`tray`]      the tray / menu bar app's logic (Windows, macOS)
 //! - [`metrics`]   request/latency counters and Prometheus rendering
 //! - [`logbuf`]    in-memory ring of recent log events for the web UI's Logs page
 //! - [`logthrottle`] the one rate limiter for log lines a lasting fault would repeat
@@ -31,15 +39,23 @@
 //! - [`diagnostics`] the support bundle (`diagnostics` command, `GET /v1/diagnostics`)
 //! - [`port_holder`] which process listens on a port (for a bind failure's message)
 //! - [`private_dir`] `<data root>/auth/`: the folder only the service and administrators may read
+//!   (Windows ACLs in `private_dir::acl`)
 //! - [`secret`]    random secrets from the OS (tokens, the setup code)
 //! - [`tls`]       the HTTPS listener's certificate: generated and kept, or the config's own files
 //! - [`resources`] downloadable runtimes/models: pinned catalog and the needs resolver
+//! - [`download`]  `download-models` / `list-models`: the catalog's model files
+//! - [`setup_openvino`] / [`setup_onnxruntime`] install the pinned runtimes (`setup-*` commands)
+//! - [`update`]    release update check against the project's GitHub releases
 //! - [`benchmark`] per-model device benchmark (CLI, `/v1/benchmark`), results and recommendations
 //! - [`training`]  in-app model training: capability, recipes, dataset assembly, the run queue
 //! - [`storage`]   disk use and the cleanup of rebuildable files (caches, staging, crashed job folders)
+//! - [`retention`] retention of the saved-image folder and the low-free-space warning
+//! - [`system_info`] best-effort host information for logs and the status page
 //! - [`parallel`]  work-stealing maps on scoped threads (import analysis, dataset walks)
 //! - [`fsx`]       atomic writes, file-lock waits and safe on-disk names shared by every writer
 //! - [`json_aside`] setting a damaged JSON store aside (training's records, the benchmark's files)
+//! - [`text`]      byte caps on UTF-8 text on a char boundary (client-chosen names, log messages)
+//! - `test_dirs`   (tests only) scratch folders removed on drop
 //! - [`children`]  registry of child processes the service started; the post-crash orphan sweep
 //! - [`command`]   the bounded runner for short helper programs (output drained and capped, stopped at the deadline)
 //! - [`sync`]      poison-recovering `Mutex` / `RwLock` helpers (`lock_recover`, `read_recover`, `write_recover`)
@@ -93,6 +109,7 @@ pub mod config_store;
 pub mod diagnostics;
 pub mod download;
 pub mod fsx;
+pub mod geom;
 pub mod image;
 pub mod image_stats;
 pub mod json_aside;
@@ -125,6 +142,7 @@ pub mod sync;
 pub mod system_info;
 #[cfg(test)]
 pub(crate) mod test_dirs;
+pub mod text;
 pub mod tls;
 pub mod training;
 pub mod tray;

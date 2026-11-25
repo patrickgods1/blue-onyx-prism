@@ -25,12 +25,7 @@ pub struct PanicReport {
 impl PanicReport {
     /// The report of the panic `info` on the current thread.
     pub fn of(info: &std::panic::PanicHookInfo<'_>) -> Self {
-        let payload = info.payload();
-        let message = payload
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "non-string panic payload".to_string());
+        let message = payload_message(info.payload()).to_string();
         let backtrace = std::backtrace::Backtrace::capture();
         Self {
             thread: std::thread::current()
@@ -56,6 +51,16 @@ impl PanicReport {
             None => format!("thread '{}' panicked: {}", self.thread, self.message),
         }
     }
+}
+
+/// The message of a panic's payload (`panic!` with a literal gives a `&str`, with a format
+/// string a `String`), else `non-string panic payload`. The one copy: the hook, the server's
+/// panic middleware and the inference threads' catch all show the same text.
+pub fn payload_message(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>()
+        .copied()
+        .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 thread_local! {
@@ -226,6 +231,20 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("location=\"src/panic.rs:"), "{line}");
+    }
+
+    #[test]
+    fn payload_message_reads_both_payload_kinds() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(payload_message(literal.as_ref()), "boom");
+        let formatted: Box<dyn std::any::Any + Send> = Box::new(format!("boom {}", 7));
+        assert_eq!(payload_message(formatted.as_ref()), "boom 7");
+        let other: Box<dyn std::any::Any + Send> = Box::new(7_u32);
+        assert_eq!(payload_message(other.as_ref()), "non-string panic payload");
+        // What `catch_unwind` hands over is the same box.
+        let caught =
+            std::panic::catch_unwind(|| std::panic::panic_any(String::from("caught"))).unwrap_err();
+        assert_eq!(payload_message(caught.as_ref()), "caught");
     }
 
     #[test]

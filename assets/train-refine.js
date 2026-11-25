@@ -2,7 +2,7 @@
 // offers the full check (fold models) or a quick check with a model trained here (`check_mode`,
 // the model select filled from GET /v1/refine `capability.models`; folds and epochs hidden and not
 // sent then), previews (GET /v1/refine/preview) and starts (POST /v1/refine/check) a check and follows it
-// through PrismPoll on GET /v1/train/jobs?tasks=busy (every 3 s while one is listed, every 30 s
+// through PrismPoll on GET /v1/train/jobs?tasks=busy (TrainArea.jobs; every 3 s while one is listed, every 30 s
 // while none is, so a check started elsewhere shows up), with Pause / Resume / Cancel posted to the
 // queue's routes. The Findings and Coverage cards are drawn from GET /v1/refine (each mode's last
 // report: `report` of the full check, `quick_report` of the quick one, RefineFloor.reports; the
@@ -292,7 +292,7 @@
     if (quick) o.model = f.model.value || '';
     if (f.gpu && f.gpu.value) o.gpu = f.gpu.value;
     // "Start anyway" beside the preview's memory refusal (shown only with one).
-    if (window.PrismMemory && window.PrismMemory.ticked($('refine-memory-anyway'))) o.ignore_memory_check = true;
+    if (window.PrismMemory.ticked($('refine-memory-anyway'))) o.ignore_memory_check = true;
     return o;
   }
   function query(o) {
@@ -361,7 +361,7 @@
       p.warnings.forEach(function (t) { w.appendChild(el('li', null, t)); });
       box.appendChild(w);
     }
-    if (window.PrismMemory) window.PrismMemory.sync($('refine-memory-anyway'), p.memory);
+    window.PrismMemory.sync($('refine-memory-anyway'), p.memory);
     if (p.refused) box.appendChild(el('p', 'error', 'A start would be refused: ' + p.refused));
     else box.appendChild(el('p', 'muted small', 'Nothing was run or written.'));
   }
@@ -414,7 +414,7 @@
       .then(function (j) {
         say(j.message);
         $('refine-preview').hidden = true;
-        if (window.PrismMemory) window.PrismMemory.sync($('refine-memory-anyway'), null);
+        window.PrismMemory.sync($('refine-memory-anyway'), null);
         window.dispatchEvent(new Event('train-area:refresh'));
         poller.kick();
         load();
@@ -523,16 +523,11 @@
   // The jobs list is the cheap poll (memory only). A check gone from it has ended: the findings
   // and coverage are read again, once.
   function follow() {
-    return fetch('/v1/train/jobs?tasks=busy', { headers: { Accept: 'application/json' }, cache: 'no-store' })
-      // A failed answer rejects, so PrismPoll backs off instead of polling a down server every 3 s
-      // (QA-115).
-      .then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      })
+    // A failed answer rejects (TrainArea.jobs), so PrismPoll backs off instead of polling a down
+    // server every 3 s (QA-115).
+    return TrainArea.jobs('tasks=busy')
       .then(function (j) {
-        if (!j || !j.jobs) throw new Error('the jobs list is missing from the answer');
-        var mine = j.jobs.active.concat(j.jobs.queued).filter(function (x) {
+        var mine = j.all.filter(function (x) {
           return x.link && x.link.indexOf('/train/refine#job-') === 0;
         })[0];
         if (mine) { drawJob(mine); return true; }

@@ -16,19 +16,24 @@
 use crate::js_harness::{asset, have_node, run_node_json, run_node_ok};
 use serde_json::{Value, json};
 
-/// `expr` evaluated in a context that loaded bench-core.js (`BC` = BenchCore), as JSON.
+/// `expr` evaluated in a context that loaded live.js (no `document`: its pure part, `PrismPoll`)
+/// and bench-core.js (`BC` = BenchCore), as every page loads them, as JSON.
 fn eval(expr: &str) -> Value {
     let driver = r#"
 const fs = require('fs'), vm = require('vm');
 const ctx = vm.createContext({});
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+vm.runInContext(fs.readFileSync(process.argv[3], 'utf8'), ctx);
 vm.runInContext('var BC = BenchCore;', ctx);
-const out = vm.runInContext('(' + fs.readFileSync(process.argv[3], 'utf8') + ')', ctx);
+const out = vm.runInContext('(' + fs.readFileSync(process.argv[4], 'utf8') + ')', ctx);
 process.stdout.write(JSON.stringify(out === undefined ? null : out));
 "#;
     run_node_json(
         driver,
-        &[asset("bench-core.js").as_os_str()],
+        &[
+            asset("live.js").as_os_str(),
+            asset("bench-core.js").as_os_str(),
+        ],
         &[("expr.js", expr.as_bytes())],
     )
 }
@@ -563,6 +568,34 @@ fn disagreements_and_csv() {
     assert_eq!(v["cell"], json!([true, true, false, false]));
 }
 
+/// `BenchCore.cellTag` says what its Rust twin `training::dataset::is_cell_tag` says, on tags built
+/// from the Rust constants: renaming `HELDOUT_CAM` or `HELDOUT_CAMSCENE` without the page would
+/// list the per-camera rows in the Benchmark tag tables.
+#[test]
+fn the_cell_tags_follow_the_rust_constants() {
+    use blue_onyx_prism::training::dataset::{HELDOUT_CAM, HELDOUT_CAMSCENE, is_cell_tag};
+    if !have_node() {
+        return;
+    }
+    let tags = [
+        format!("{HELDOUT_CAM}back"),
+        format!("{HELDOUT_CAMSCENE}ir:a"),
+        "camera:back".to_string(),
+        "heldout:all".to_string(),
+    ];
+    let v = eval(&format!(
+        "{}.map(BC.cellTag)",
+        serde_json::to_string(&tags).unwrap()
+    ));
+    let rust: Vec<bool> = tags.iter().map(|t| is_cell_tag(t)).collect();
+    assert_eq!(v, json!(rust), "{tags:?}");
+    assert_eq!(
+        rust,
+        [true, true, false, false],
+        "both kinds of cell tag, and two that are not"
+    );
+}
+
 /// The scatter's numbers sit clear of each other and of every point, however close the points;
 /// a one-value range is no range; a model whose training lists do not read says so.
 #[test]
@@ -1072,14 +1105,21 @@ fn history_delete_asks_about_one_run() {
 
 /// "Latest request wins": a newer begin() aborts the one before, whose answer (and any aborted
 /// one, or a list with one) never wins; the winner ends the ticket; no AbortController still goes
-/// by the order; stop() aborts the one in flight.
+/// by the order; stop() aborts the one in flight. `PrismPoll.latest` (live.js, the Train tabs and
+/// the Browse dialog) and its Benchmark name `BenchCore.latest` alike.
 #[test]
 fn the_latest_request_wins() {
     if !have_node() {
         return;
     }
-    let v = eval(
-        r#"(function () {
+    for name in ["BC.latest", "PrismPoll.latest"] {
+        latest_cases(name);
+    }
+}
+
+/// [`the_latest_request_wins`] for the `latest` function named `name`.
+fn latest_cases(name: &str) {
+    let expr = r#"(function () {
           var made = [];
           var mk = function () { var c = {aborted: false, signal: {n: made.length}, abort: function () { c.aborted = true; }}; made.push(c); return c; };
           var L = BC.latest(mk), a = L.begin(), b = L.begin(), out = {};
@@ -1092,8 +1132,15 @@ fn the_latest_request_wins() {
           var N = BC.latest(function () { return null; }), x = N.begin(), y = N.begin();
           out.plain = [JSON.stringify(x.init), x.wins({success: true}), y.wins({success: true})];
           out.noController = JSON.stringify(BC.latest().begin().init);
+          var s = L.begin(), s2 = L.begin(); out.current = [s.current(), s2.current()];
+          L.stop(); out.current.push(s2.current());
           return out;
-        })()"#,
+        })()"#;
+    let v = eval(&expr.replace("BC.latest", name));
+    assert_eq!(
+        v["current"],
+        json!([false, true, false]),
+        "{name}: current()"
     );
     assert_eq!(v["replaced"], json!([true, false, false, true, true]));
     assert_eq!(
@@ -1158,7 +1205,7 @@ fn the_frame_labels_keep_their_size_on_screen() {
     assert_eq!(v[5], json!([16, 3.692, 4.923, 0.178]), "another size");
 }
 
-/// Train -> Models, "Use as default" (assets/training.js on the stub page): a low-confidence
+/// Train -> Models, "Use as default" (assets/train-models.js on the stub page): a low-confidence
 /// suggestion (`suggestion.confirm`) asks in the page before the form saves its threshold (the
 /// box ticked, or always when the model is the default already), then posts `confirm=1` with
 /// `use_threshold=1`; Cancel posts nothing; with enough data nothing is asked.
@@ -1185,7 +1232,7 @@ fn the_use_form_confirms_a_low_confidence_threshold() {
       route: req => /switch-preview/.test(req.url) ? {json: preview(already, confirm)} : {hold: true}});
     form = new W.El('form'); form.dataset['switch'] = 'run1';
     host = new W.El('td'); row = new W.El('tr'); row.hidden = true; row.appendChild(host); host.closest = () => row;
-    W.load('training.js'); await flush();
+    W.load('train-area.js'); W.load('train-models.js'); await flush();
     form.dispatch('submit'); await flush();
     const drawn = host.all().filter(e => e.tagName === 'FORM')[0];
     assert.ok(drawn, 'the preview drew its form');

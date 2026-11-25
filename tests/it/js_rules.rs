@@ -772,6 +772,46 @@ fn the_constants_are_the_rust_ones() {
     assert_eq!(got["VEHICLES"], json!(repeats::VEHICLES));
 }
 
+/// `isDismissal` (what the page counts as no verdict, and drops from a relabelled box) says what
+/// its Rust twin `bulk::is_dismissal` says, on the Rust reason constants: renaming one without the
+/// page would count dismissals as the reviewer's verdicts.
+#[test]
+fn dismissals_are_the_rust_ones() {
+    use blue_onyx_prism::collect::labels::bulk::{
+        DISMISSED_REASON, OTHER_CLASS_REASON, SIZE_FLOOR_REASON, SPOT_DISMISSED_REASON,
+        is_dismissal,
+    };
+    if !have_node() {
+        return;
+    }
+    const DISMISSALS: &str = r#"
+const fs = require('fs');
+require(process.argv[2]);
+const R = globalThis.ReviewRules;
+const req = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+// null: a box without a reason (the field is left out of the JSON).
+process.stdout.write(JSON.stringify(req.reasons.map((r) => R.isDismissal(r === null ? undefined : r))));
+"#;
+    let reasons = [
+        Some(DISMISSED_REASON),
+        Some(SPOT_DISMISSED_REASON),
+        Some(SIZE_FLOOR_REASON),
+        Some(OTHER_CLASS_REASON),
+        Some("low_score"),
+        Some("duplicate"),
+        Some(""),
+        None,
+    ];
+    let page = node_with(DISMISSALS, &json!({ "reasons": reasons }));
+    let rust: Vec<bool> = reasons.iter().map(|r| is_dismissal(*r)).collect();
+    assert_eq!(page, json!(rust), "{reasons:?}");
+    assert_eq!(
+        rust.iter().filter(|x| **x).count(),
+        3,
+        "the three dismissal reasons"
+    );
+}
+
 /// The twins differ in three places (`stacks.rs`), and the page holds a suggestion to the boxes the
 /// server named (`overlaps.rs`, checked by `held_to_named`). Pinned, so that a change on either side
 /// is a decision.

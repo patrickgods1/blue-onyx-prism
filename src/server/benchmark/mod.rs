@@ -80,6 +80,24 @@ pub(super) fn loaded_devices(state: &AppState) -> HashMap<String, String> {
         .collect()
 }
 
+/// The benchmark context of `state` (its config, runtimes, loaded devices, resources, hardware
+/// profile and metrics), saving into `results_path`: the one builder for page-started runs and the
+/// training queue's hooks, so both benchmark on the same devices and profile.
+pub(in crate::server) fn run_context(
+    state: &AppState,
+    results_path: std::path::PathBuf,
+) -> crate::benchmark::service::RunContext {
+    crate::benchmark::service::RunContext {
+        config: state.config_read().clone(),
+        results_path,
+        runtimes: state.registry.runtimes().cloned(),
+        loaded: loaded_devices(state),
+        resources: state.resources.clone(),
+        profile: state.registry.profile().map(|(p, _)| p.clone()),
+        metrics: Some(state.metrics.clone()),
+    }
+}
+
 /// The config's view for the page: global device, and per model its `device`, the device it
 /// runs on (loaded, else what the config resolves to) and its execution provider.
 fn config_view(state: &AppState, snap: &DevicesSnapshot) -> serde_json::Value {

@@ -23,8 +23,8 @@
 //! [`Frame::resolve`] (404 otherwise); POST bodies are JSON (415 otherwise) with per-route size
 //! caps (413); the admin guard and the cross-site check of the router apply. A folder under review
 //! that is not there (an unplugged drive) is its own state, `folder_missing: true` with a message
-//! ([`folder_problem`]: 200 from `/v1/review/next`, 503 where the folder is needed), not an empty
-//! dataset.
+//! ([`ReviewCtx::folder_problem`]: 200 from `/v1/review/next`, 503 where the folder is needed),
+//! not an empty dataset.
 //!
 //! This file holds what the routes share (filter checks, the context of the current config; the
 //! JSON answers and body reader are [`super::answer`]'s), the page, the queue (`next`) and a
@@ -90,13 +90,6 @@ fn success(fields: serde_json::Value) -> Response {
     Json(v).into_response()
 }
 
-/// Why the folder under review `dir` cannot be used, as the page words it; None when it can
-/// ([`crate::collect::CollectConfig::review_folder_problem`]: an absent folder is not an empty
-/// dataset).
-pub(super) fn folder_problem(state: &AppState, dir: &std::path::Path) -> Option<String> {
-    state.config_read().collect.review_folder_problem(dir)
-}
-
 /// The answer of a route that needs the folder under review while it is unavailable.
 fn folder_unavailable(message: String) -> Response {
     (
@@ -104,11 +97,6 @@ fn folder_unavailable(message: String) -> Response {
         Json(serde_json::json!({ "success": false, "folder_missing": true, "message": message })),
     )
         .into_response()
-}
-
-/// [`not_found`], or [`folder_unavailable`] when that is why `dir` has no such frame.
-fn no_frame(state: &AppState, dir: &std::path::Path) -> Response {
-    folder_problem(state, dir).map_or_else(not_found, folder_unavailable)
 }
 
 fn query_map(
@@ -174,22 +162,62 @@ pub(super) fn push_past_limit(message: &mut String, eligible: usize, limit: usiz
     }
 }
 
-/// Folder under review (`collect.review_dir`, else the dataset folder), classes and data root
-/// of the current config.
-fn context(state: &AppState) -> (PathBuf, Vec<String>, PathBuf) {
-    let cfg = state.config_read();
-    (
-        cfg.collect.resolved_review_dir(&cfg.data_root()),
-        cfg.collect.classes.clone(),
-        cfg.data_root(),
-    )
+/// What a review route reads of the config, from one snapshot ([`review_ctx`]): the class list,
+/// the hidden classes, the size floor and the folder of one request never come from two
+/// revisions (a `/v1/review/classes` save landing between two reads, QA-238).
+struct ReviewCtx {
+    /// The config all of it was read from.
+    config: crate::config_store::ConfigRef,
+    /// The folder under review (`collect.review_dir`, else the dataset folder).
+    dir: PathBuf,
+    /// `collect.classes`.
+    classes: Vec<String>,
+    /// `collect.hidden_classes` in the class list's spelling ([`in_list_spelling`]): with
+    /// `classes`, what the reviewer wants ([`Self::wanted`]).
+    hidden: Vec<String>,
+    /// The data root.
+    root: PathBuf,
 }
 
-/// `collect.hidden_classes` of the current config in the class list's spelling ([`in_list_spelling`]):
-/// with `collect.classes`, what the reviewer wants ([`bulk::Wanted`]).
-fn hidden(state: &AppState) -> Vec<String> {
-    let cfg = state.config_read();
-    in_list_spelling(&cfg.collect.hidden_classes, &cfg.collect.classes)
+impl ReviewCtx {
+    /// The classes the reviewer wants ([`bulk::Wanted`]).
+    fn wanted(&self) -> bulk::Wanted<'_> {
+        bulk::Wanted {
+            classes: &self.classes,
+            hidden: &self.hidden,
+        }
+    }
+
+    /// `collect.size_floor`.
+    fn size_floor(&self) -> Option<labels::SizeFloor> {
+        self.config.collect.size_floor
+    }
+
+    /// Why the folder under review cannot be used, as the page words it; None when it can
+    /// ([`crate::collect::CollectConfig::review_folder_problem`]: an absent folder is not an
+    /// empty dataset).
+    fn folder_problem(&self) -> Option<String> {
+        self.config.collect.review_folder_problem(&self.dir)
+    }
+
+    /// [`not_found`], or [`folder_unavailable`] when that is why the folder has no such frame.
+    fn no_frame(&self) -> Response {
+        self.folder_problem()
+            .map_or_else(not_found, folder_unavailable)
+    }
+}
+
+/// The [`ReviewCtx`] of the current config.
+fn review_ctx(state: &AppState) -> ReviewCtx {
+    let config = state.config_read();
+    let root = config.data_root();
+    ReviewCtx {
+        dir: config.collect.resolved_review_dir(&root),
+        classes: config.collect.classes.clone(),
+        hidden: in_list_spelling(&config.collect.hidden_classes, &config.collect.classes),
+        root,
+        config,
+    }
 }
 
 /// `hidden` with each name in the spelling of the class of `classes` it names (compared as
@@ -236,8 +264,13 @@ struct ReviewTemplate {
 /// `GET /train/review`.
 pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let dataset = CollectSettings::for_config(&state.config_read()).dir;
+        let ReviewCtx {
+            config,
+            dir,
+            classes,
+            ..
+        } = review_ctx(&state);
+        let dataset = CollectSettings::for_config(&config).dir;
         render(&ReviewTemplate {
             nav: "train",
             tab: super::train_area::REVIEW,
@@ -279,24 +312,22 @@ pub(super) async fn next(
     let mut filters = filters(&q)?;
     filters.order = next_order(&q, &filters)?;
     Ok(blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
+        let ctx = review_ctx(&state);
+        let dir = &ctx.dir;
         if filters.order == Order::Recommended {
             // One snapshot for the index and the walk alike.
-            filters.steer = Some(steer::snapshot(&state, &dir, &classes, &hidden));
+            filters.steer = Some(steer::snapshot(&state, dir, &ctx.classes, &ctx.hidden));
         }
-        filters.wanted = Some((classes, hidden));
+        filters.wanted = Some((ctx.classes.clone(), ctx.hidden.clone()));
         let after = q.get("after").map(String::as_str).filter(|a| !a.is_empty());
         let then = q.get("then").map(String::as_str).filter(|t| !t.is_empty());
-        let found = labels::index::answer(&dir, &filters, after, then)
-            .unwrap_or_else(|| labels::index::Answer::walk(&dir, &filters, after, then));
+        let found = labels::index::answer(dir, &filters, after, then)
+            .unwrap_or_else(|| labels::index::Answer::walk(dir, &filters, after, then));
         let mut answer = serde_json::json!(found);
         if let Some(fields) = answer.as_object_mut() {
             fields.insert("success".into(), true.into());
         }
-        if let (Some(message), Some(fields)) =
-            (folder_problem(&state, &dir), answer.as_object_mut())
-        {
+        if let (Some(message), Some(fields)) = (ctx.folder_problem(), answer.as_object_mut()) {
             fields.insert("folder_missing".into(), true.into());
             fields.insert("message".into(), message.into());
         }
@@ -419,12 +450,10 @@ pub(super) async fn labels_get(
 ) -> Answer {
     let rel = frame_param(&query_map(query))?;
     Ok(blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
-        let size_floor = state.config_read().collect.size_floor;
-        match Frame::resolve(&dir, &rel) {
-            Some(f) => labels_answer(&f, &classes, &hidden, size_floor, None),
-            None => no_frame(&state, &dir),
+        let ctx = review_ctx(&state);
+        match Frame::resolve(&ctx.dir, &rel) {
+            Some(f) => labels_answer(&f, &ctx.classes, &ctx.hidden, ctx.size_floor(), None),
+            None => ctx.no_frame(),
         }
     })
     .await)
@@ -600,10 +629,9 @@ pub(super) async fn labels_post(
         .map_or_else(|_| SentLists::default(), |b| SentLists::of(b));
     let file: LabelFile = json_body(&headers, body)?;
     Ok(blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
-        let Some(frame) = Frame::resolve(&dir, &rel) else {
-            return no_frame(&state, &dir);
+        let ctx = review_ctx(&state);
+        let Some(frame) = Frame::resolve(&ctx.dir, &rel) else {
+            return ctx.no_frame();
         };
         let rec = match frame.record() {
             Ok(r) => r,
@@ -616,7 +644,7 @@ pub(super) async fn labels_post(
             file,
             &sent,
             expected.as_deref(),
-            &classes,
+            &ctx.classes,
             (rec.width, rec.height),
             &now(),
             || {},
@@ -650,9 +678,9 @@ pub(super) async fn labels_post(
         tracing::debug!(frame = %rel, status = status.as_str(), boxes = f.boxes.len(), "review labels saved");
         labels_answer(
             &frame,
-            &classes,
-            &hidden,
-            state.config_read().collect.size_floor,
+            &ctx.classes,
+            &ctx.hidden,
+            ctx.size_floor(),
             Some(format!("Saved as {}.", status.as_str())),
         )
     })
@@ -993,7 +1021,10 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         let default = PathBuf::from(v["report"]["out_dir"].as_str().unwrap());
-        assert!(default.starts_with(exports_dir(&d.state)), "{v}");
+        assert!(
+            default.starts_with(exports_dir(&d.state.config_read())),
+            "{v}"
+        );
 
         let new = d.root.join("exports-here/deep");
         let body = serde_json::json!({"format": "coco", "out_dir": new}).to_string();
@@ -2776,7 +2807,7 @@ mod tests {
         );
 
         // The re-check under the lock: a frame that changed is left alone.
-        let (dir, classes, _) = context(&d.state);
+        let ReviewCtx { dir, classes, .. } = review_ctx(&d.state);
         assert!(!accept_one(&dir, &b, &classes, "t").unwrap());
         assert!(accept_one(&dir, "ir/x/2026-10-22/nope.jpg", &classes, "t").is_err());
 
@@ -3732,6 +3763,139 @@ mod tests {
         assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// QA-242: every bulk route that changes frames drops the Refine tab's caches
+    /// ([`bulk_routes::wrote`]) once, a dry run never. Counted per folder
+    /// ([`bulk_routes::wrote_count`]): other tests drop the process's caches too, so a cache gone
+    /// after the call alone would prove nothing; a route that skipped the drop leaves its count at
+    /// 0. The kept open count, held right before the call, is gone after it as well.
+    #[tokio::test]
+    async fn every_bulk_route_that_writes_drops_the_refine_caches() {
+        use crate::collect::labels::bulk::test_support::{auto_box, put_frame as put_boxes};
+        use labels::{BoxState, Origin, RejectReason, Source, Triage};
+        fn model(label: &str) -> labels::LabelBox {
+            labels::LabelBox {
+                source: Source::Model,
+                origin: Some(Origin::Prediction),
+                auto: Default::default(),
+                ..auto_box(label, 0.7, Triage::Review)
+            }
+        }
+        fn with(state: BoxState, b: labels::LabelBox) -> labels::LabelBox {
+            labels::LabelBox { state, ..b }
+        }
+        fn edit(dir: &std::path::Path, rel: &str, change: impl FnOnce(&mut LabelFile)) {
+            let frame = Frame::resolve(dir, rel).unwrap();
+            let mut f = frame.labels().unwrap().unwrap();
+            change(&mut f);
+            labels::write(&frame.labels, &f).unwrap();
+        }
+        let spot =
+            r#""camera": "cam", "label": "car", "bbox": [2, 2, 30, 40], "width": 64, "height": 48"#;
+        /// Route, body fields, what the folder holds first.
+        type Case = (&'static str, String, fn(&std::path::Path));
+        let cases: [Case; 9] = [
+            ("/v1/review/accept-auto", String::new(), |dir| {
+                let a = put_frame(dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
+                put_auto_labels(dir, &a, true);
+            }),
+            (
+                "/v1/review/reject-low",
+                r#""min_score": 0.3"#.into(),
+                |dir| {
+                    put_boxes(dir, "a", None, vec![auto_box("dog", 0.1, Triage::Review)]);
+                },
+            ),
+            ("/v1/review/accept-repeats", String::new(), |dir| {
+                let mut car = with(BoxState::Rejected, auto_box("car", 0.4, Triage::Review));
+                car.reject_reason = Some(RejectReason::StaticObject);
+                let rel = put_boxes(dir, "a", None, vec![car]);
+                edit(dir, &rel, |f| f.repeat_spot = true);
+            }),
+            ("/v1/review/reject-stacked", String::new(), |dir| {
+                let car = |bbox, score| labels::LabelBox {
+                    bbox,
+                    ..with(BoxState::Accepted, auto_box("car", score, Triage::Accept))
+                };
+                put_boxes(
+                    dir,
+                    "a",
+                    None,
+                    vec![
+                        car([0.0, 0.0, 40.0, 40.0], 0.9),
+                        car([0.0, 0.0, 40.0, 38.0], 0.4),
+                    ],
+                );
+            }),
+            ("/v1/review/restore-reopened", String::new(), |dir| {
+                let car = with(BoxState::Rejected, auto_box("car", 0.7, Triage::Review));
+                let rel = put_boxes(dir, "a", None, vec![car]);
+                edit(dir, &rel, |f| {
+                    f.reviewed_at = Some("2026-10-01T00:00:00Z".into());
+                    f.disagreement = Some("re-label by sam3: 1 new box".into());
+                });
+            }),
+            ("/v1/review/reject-other-class", String::new(), |dir| {
+                put_boxes(dir, "a", None, vec![model("clock")]);
+            }),
+            (
+                "/v1/review/reject-unwanted-reviewed",
+                String::new(),
+                |dir| {
+                    let rel = put_boxes(
+                        dir,
+                        "a",
+                        None,
+                        vec![with(BoxState::Accepted, model("clock"))],
+                    );
+                    edit(dir, &rel, |f| f.status = labels::Status::Reviewed);
+                },
+            ),
+            (
+                "/v1/review/reject-spot",
+                format!(r#"{spot}, "reject_reason": "static_object""#),
+                |dir| {
+                    put_boxes(dir, "a", None, vec![auto_box("car", 0.4, Triage::Review)]);
+                },
+            ),
+            ("/v1/review/accept-spot", spot.to_string(), |dir| {
+                put_boxes(dir, "a", None, vec![auto_box("car", 0.4, Triage::Review)]);
+            }),
+        ];
+        for (uri, fields, setup) in cases {
+            let d = ds_with(|c| {
+                c.collect.classes = ["person", "car", "dog"].map(String::from).to_vec();
+            });
+            setup(&d.dir);
+            let ctx = review_ctx(&d.state);
+            let sep = if fields.is_empty() { "" } else { ", " };
+            let dry = format!(r#"{{{fields}{sep}"dry_run": true}}"#);
+            let (s, v) = json(&d.state, post_json(uri, &dry)).await;
+            assert_eq!(s, StatusCode::OK, "{uri} dry run: {v}");
+            assert_eq!(
+                bulk_routes::wrote_count(&d.dir),
+                0,
+                "{uri}: a dry run drops nothing"
+            );
+            // Held right before the call (a drop by another test meanwhile: once more).
+            let open = super::super::refine::keep_open_now;
+            let kept =
+                open(&d.dir, &ctx.classes, &ctx.hidden) || open(&d.dir, &ctx.classes, &ctx.hidden);
+            let (s, v) = json(&d.state, post_json(uri, &format!("{{{fields}}}"))).await;
+            assert_eq!(s, StatusCode::OK, "{uri}: {v}");
+            assert_eq!(
+                bulk_routes::wrote_count(&d.dir),
+                1,
+                "{uri} changed a frame and drops the Refine caches once: {v}"
+            );
+            if kept {
+                assert!(
+                    super::super::refine::kept_open(&d.dir, &ctx.classes, &ctx.hidden).is_none(),
+                    "{uri}: the kept open count is gone"
+                );
+            }
+        }
+    }
+
     /// A queued frame `<stem>` of `d` whose sidecar predicts `labels`, without a label file.
     fn put_frame_with_record(d: &Ds, stem: &str, labels: &[&str]) -> String {
         let rel = crate::collect::labels::bulk::test_support::put_frame(&d.dir, stem, None, vec![]);
@@ -3762,10 +3926,18 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(folder_problem(&d.state, &new), None);
+        let ctx = review_ctx(&d.state);
+        assert_eq!(ctx.dir, new);
+        assert_eq!(ctx.folder_problem(), None);
         // Its parent gone too is a drive that is not there.
         let gone = d.root.join("drive").join("frames");
-        assert!(folder_problem(&d.state, &gone).is_some());
+        assert!(
+            d.state
+                .config_read()
+                .collect
+                .review_folder_problem(&gone)
+                .is_some()
+        );
     }
 
     both_ways!(
@@ -4014,8 +4186,9 @@ mod tests {
         put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.5);
         put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.6);
         let first = order_of(&d, &[]).await;
-        let (_, classes, _) = context(&d.state);
-        let hidden = super::hidden(&d.state);
+        let ReviewCtx {
+            classes, hidden, ..
+        } = review_ctx(&d.state);
         let a = steer::spots(&d.dir, &classes, &hidden);
         let b = steer::spots(&d.dir, &classes, &hidden);
         assert!(Arc::ptr_eq(&a, &b));
@@ -4160,7 +4333,8 @@ mod tests {
             order: Order::Recommended,
             ..Filters::default()
         };
-        f.wanted = Some((context(&d.state).1, hidden(&d.state)));
+        let ctx = review_ctx(&d.state);
+        f.wanted = Some((ctx.classes, ctx.hidden));
         let recommended: Vec<String> = labels::queue::build(&d.dir, &f)
             .items
             .into_iter()
@@ -4397,8 +4571,12 @@ mod tests {
             .collect();
         let mut f = Filters::from_query(&q).unwrap();
         f.order = next_order(&q, &f).unwrap();
-        let (dir, classes, _) = context(&d.state);
-        let hidden = hidden(&d.state);
+        let ReviewCtx {
+            dir,
+            classes,
+            hidden,
+            ..
+        } = review_ctx(&d.state);
         if f.order == Order::Recommended {
             // The route's steer (held-out steering, spots, recall).
             f.steer = Some(steer::snapshot(&d.state, &dir, &classes, &hidden));

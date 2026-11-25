@@ -2331,18 +2331,18 @@ const NO_MODELS: &str = "models: at least one model is required; add one on the 
      (Add a model by path), with `blue-onyx-prism add-model --path <file>`, or fetch the default \
      with `blue-onyx-prism download-models --name IPcam-general --add-to-config`";
 
-/// `https_port` (1-65535, not `port`; the two may only both be 0, as tests bind them) and
-/// `tls_cert_path` / `tls_key_path` (both or neither, neither empty).
+/// `https_port` (1-65535, not `port`) and `tls_cert_path` / `tls_key_path` (both or neither,
+/// neither empty). Runs after `port` was checked to be 1-65535 ([`Config::validate`]).
 fn validate_https(c: &Config) -> Result<()> {
     use anyhow::bail;
-    if c.https_port == 0 && c.port != 0 {
+    if c.https_port == 0 {
         bail!(
             "https_port: must be between 1 and 65535, got 0; set the port of the web UI's HTTPS \
              listener (default {})",
             crate::DEFAULT_HTTPS_PORT
         );
     }
-    if c.https_port == c.port && c.port != 0 {
+    if c.https_port == c.port {
         bail!(
             "https_port: {} is also `port`; the HTTPS listener (web UI) and the HTTP listener \
              (Blue Iris) need two ports. Set https_port to another port, such as {}",

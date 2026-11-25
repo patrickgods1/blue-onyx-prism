@@ -11,6 +11,7 @@ use super::tighten::{FrameCandidates, Looked, SavedDet};
 use crate::collect::labels::export::ExportFrame;
 use crate::collect::labels::refine::{self, Kind, Suggestion};
 use crate::collect::labels::{self, Frame, LabelFile, iou};
+use crate::geom::area;
 use crate::training::autolabel::relabel::Detections;
 use crate::training::autolabel::triage::Det;
 use anyhow::{Result, anyhow};
@@ -239,10 +240,6 @@ pub struct Tightened {
     /// Frames whose write failed, the first [`MAX_FAILURES`] reasons.
     pub failed: usize,
     pub failures: Vec<String>,
-}
-
-fn area(b: &[f32; 4]) -> f32 {
-    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
 }
 
 /// `a` and `b` name the same label: exact box, label alike.

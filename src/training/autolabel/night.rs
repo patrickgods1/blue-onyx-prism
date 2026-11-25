@@ -48,7 +48,7 @@ pub const MDV6_THRESHOLD: f32 = 0.2;
 
 /// Whether a frame of `scene` gets the night extras.
 pub fn is_night(scene: &str) -> bool {
-    matches!(scene, "night" | "ir")
+    crate::image_stats::Scene::parse(scene).is_some_and(crate::image_stats::Scene::is_night)
 }
 
 /// MegaDetector's weights pin.
@@ -70,15 +70,7 @@ pub fn frame_labeler(base: &str, r: &AutolabelRequest, scene: &str) -> String {
     if !is_night(scene) || r.with_model.is_some() {
         return base.to_string();
     }
-    let mut s = base.to_string();
-    if r.mdv6 {
-        s.push_str(" + ");
-        s.push_str(MDV6_MODEL);
-    }
-    if let Some(p) = enhancement(r) {
-        s.push_str(&format!(" + night-{p}"));
-    }
-    s
+    with_extras(base, r.mdv6, enhancement(r))
 }
 
 /// The marker a labelers run of `r` writes on a frame of `scene` whose labelers are `base`, from what
@@ -97,12 +89,18 @@ pub fn done_labeler(
     if !is_night(scene) || r.with_model.is_some() {
         return base.to_string();
     }
+    with_extras(base, mdv6_ran, enhanced.then(|| enhancement(r)).flatten())
+}
+
+/// The one writer of a marker's night extras (read back by [`marker_covers`]): `base`, then
+/// ` + mdv6-yolov9-c` when `mdv6`, then ` + night-<mode>` for `enhance`.
+fn with_extras(base: &str, mdv6: bool, enhance: Option<Preprocess>) -> String {
     let mut s = base.to_string();
-    if mdv6_ran {
+    if mdv6 {
         s.push_str(" + ");
         s.push_str(MDV6_MODEL);
     }
-    if enhanced && let Some(p) = enhancement(r) {
+    if let Some(p) = enhance {
         s.push_str(&format!(" + night-{p}"));
     }
     s

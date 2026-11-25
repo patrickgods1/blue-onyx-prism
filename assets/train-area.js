@@ -7,8 +7,491 @@
 // bar goes to the tab's own URL, so a reload shows it again instead of asking to resubmit. An old
 // /training#import link (the redirect keeps its fragment) goes on to the card's new tab, and a
 // #fragment inside a closed section opens it.
+//
+// TrainArea (first part, nothing done at load, so node loads it; tests/it/js_training.rs): what the
+// tab scripts share. The Import, Auto-label, Train and Models tabs each have their own script
+// (train-import.js, train-autolabel.js, train-train.js, train-models.js), loaded at the end of the
+// page; they call:
+// - asJson(res): an answer's JSON body (an error answer keeps the server's own words); a body
+//   that is not JSON (a proxy's HTML 502) rejects with "HTTP <status>" instead of the parser's
+//   message. checked(form, name): the value of a checked radio. toggle(form, name, attr): shows
+//   the `[attr]` blocks whose list names the checked radio's value (hidden ones disabled).
+// - restoreForm(id): the Import, Auto-label and Train forms keep what was typed across the page
+//   the server answers with (sessionStorage, once); returns the restored picked classes or null.
+//   openInvalid(): an invalid field inside a closed <details> opens it, so its message shows.
+// - alEntries(cat), alSelection(picker, catalog, CP): the auto-label class picker's entries and
+//   what it holds (Import and Auto-label tabs). keepAlOptions(form) / alOptions(): the settings
+//   of the last auto-label run (localStorage, else the form's defaults), for the run an import
+//   chains.
+// - jobs(query): GET /v1/train/jobs (with `query`, e.g. "tasks=busy"): resolves {active, queued,
+//   all (active then queued), task, tasks}; rejects on an answer that is not ok, not JSON or holds
+//   no job list, so a PrismPoll chain built on it backs off. The Jobs tab's list, the Dataset
+//   tab's export lines and the Refine tab's check follow it.
+// - follow(): the Jobs card of the four tabs (the Models list shares parts): Remove with files
+//   asks first, each run's Log box keeps its open state, the run metrics (train-metrics.js) and
+//   settings lines, the early-stop notice's Continue, and live progress of the queued and running
+//   runs and import / auto-label jobs: GET /v1/training?poll=1 every 3 s while one is busy and the
+//   tab shows (a PrismPoll chain), then the page goes to its own address once one finishes, so the
+//   results show.
+(function (root) {
+  "use strict";
+
+  function asJson(res) {
+    return res.json().catch(function () { throw new Error("HTTP " + res.status); });
+  }
+
+  // The value of the checked radio `name` of `form`.
+  function checked(form, name) {
+    var r = form.querySelector('input[name="' + name + '"]:checked');
+    return r ? r.value : "";
+  }
+
+  // Show the `[attr]` blocks of `form` whose space-separated list names `value`. A hidden
+  // block's fields are disabled (not posted, not validated: a stale value there must not block
+  // the form); the server ignores the fields the choice does not use anyway.
+  function toggle(form, name, attr) {
+    if (!form) return;
+    var update = function () {
+      var v = checked(form, name);
+      form.querySelectorAll("[" + attr + "]").forEach(function (el) {
+        var off = el.getAttribute(attr).split(" ").indexOf(v) < 0;
+        el.hidden = off;
+        el.querySelectorAll("input, select, textarea").forEach(function (f) { f.disabled = off; });
+      });
+    };
+    form.querySelectorAll('input[name="' + name + '"]').forEach(function (r) {
+      r.addEventListener("change", update);
+    });
+    update();
+  }
+
+  // The form `id` keeps what was typed across the page the server answers with (it renders the
+  // defaults, also after "Not queued: ..."): a submission that goes ahead stashes the visible
+  // fields in sessionStorage (`formdata`, after the submit handlers added the picked classes),
+  // the next load puts them back once, before the tab script's toggles read them. Only fields
+  // that existed at submit are touched (a folder saved meanwhile keeps its default); hidden
+  // inputs are not restored. Returns the picked classes the submission posted, or null.
+  function restoreForm(id) {
+    var form = document.getElementById(id);
+    if (!form) return null;
+    var KEY = "bop.training.form." + id;
+    var keyOf = function (el, seen) {
+      if (el.type === "checkbox" || el.type === "radio") return el.name + "\u0000" + el.value;
+      var n = seen[el.name] = (seen[el.name] || 0) + 1;
+      return el.name + "\u0000#" + n;
+    };
+    var kept = function (el) {
+      return el.name && el.type !== "hidden" && el.type !== "file" && el.type !== "submit" && el.type !== "button";
+    };
+    form.addEventListener("formdata", function () {
+      var v = {}, seen = {}, classes = [];
+      Array.prototype.forEach.call(form.elements, function (el) {
+        if (el.type === "hidden" && el.name === "classes") classes.push(el.value);
+        if (!kept(el)) return;
+        var k = keyOf(el, seen);
+        if (el.type === "checkbox" || el.type === "radio") v[k] = el.checked;
+        else if (el.multiple) v[k] = Array.prototype.filter.call(el.options, function (o) { return o.selected; }).map(function (o) { return o.value; });
+        else v[k] = el.value;
+      });
+      try { window.sessionStorage.setItem(KEY, JSON.stringify({ fields: v, classes: classes })); } catch (e) { /* storage blocked */ }
+    });
+    var saved = null;
+    try {
+      saved = JSON.parse(window.sessionStorage.getItem(KEY) || "null");
+      window.sessionStorage.removeItem(KEY);
+    } catch (e) { saved = null; }
+    if (!saved || typeof saved.fields !== "object") return null;
+    var seen = {};
+    Array.prototype.forEach.call(form.elements, function (el) {
+      if (!kept(el)) return;
+      var k = keyOf(el, seen);
+      if (!Object.prototype.hasOwnProperty.call(saved.fields, k)) return;
+      var x = saved.fields[k];
+      if (el.type === "checkbox" || el.type === "radio") el.checked = !!x;
+      else if (el.multiple && Array.isArray(x)) Array.prototype.forEach.call(el.options, function (o) { o.selected = x.indexOf(o.value) >= 0; });
+      else if (typeof x === "string") el.value = x;
+    });
+    return Array.isArray(saved.classes) && saved.classes.length ? saved.classes : null;
+  }
+
+  // An invalid field inside a closed <details> (Sampling options, Advanced) cannot show its
+  // message: open it first.
+  function openInvalid() {
+    document.querySelectorAll("form").forEach(function (f) {
+      f.addEventListener("invalid", function (ev) {
+        var d = ev.target.closest && ev.target.closest("details");
+        if (d && !d.open) d.open = true;
+      }, true);
+    });
+  }
+
+  // The class picker's entries of catalog `cat`.
+  function alEntries(cat) {
+    var out = root.ClassPicker.util.mergeEntries(cat.entries || [], (cat.classes || []));
+    out.forEach(function (e) { if ((cat.classes || []).indexOf(e.name) >= 0) e.in_list = true; e.hidden = (cat.hidden || []).indexOf(e.name) >= 0; });
+    return out;
+  }
+  // What the picker `picker` holds, for the Preview and the auto-label an import chains.
+  function alSelection(picker, catalog, CP) {
+    var names = picker.getSelected();
+    return {
+      names: names,
+      missing: CP.util.missingFrom(names, catalog.classes || []).length > 0,
+      listed: function () { return names.filter(function (n) { return (catalog.classes || []).indexOf(n) >= 0; }); },
+      ensure: function () { return CP.ensureInList(names, catalog); }
+    };
+  }
+
+  // The settings of an auto-label run, kept for the run an import chains on the Import tab: the
+  // form's fields without the frames, classes and confirmations, which are that form's own.
+  var AL_OPTIONS = "bop.training.alOptions";
+  var AL_DEFAULTS = [
+    ["mode", "labelers"], ["gdino", "tiny"], ["vlm", "2b"], ["vlm_batch", "on"], ["vlm_min_on", "on"],
+    ["vlm_min_score", "0.15"], ["rfdetr", "on"], ["siglip", "on"], ["prefetch", "on"],
+    ["run_options", "1"], ["keep_on_cancel", "on"]
+  ];
+  var AL_NOT_OPTIONS = ["classes", "confirm_large", "status", "scene", "camera", "label", "auto", "limit", "frames", "again", "missing_only"];
+  function keepAlOptions(form) {
+    form.addEventListener("formdata", function (ev) {
+      var kept = [];
+      ev.formData.forEach(function (value, name) {
+        if (typeof value === "string" && AL_NOT_OPTIONS.indexOf(name) < 0) kept.push([name, value]);
+      });
+      try { window.localStorage.setItem(AL_OPTIONS, JSON.stringify(kept)); } catch (e) { /* defaults next time */ }
+    });
+  }
+  function alOptions() {
+    var kept = null;
+    try { kept = JSON.parse(window.localStorage.getItem(AL_OPTIONS) || "null"); } catch (e) { kept = null; }
+    return Array.isArray(kept) && kept.length ? kept : AL_DEFAULTS;
+  }
+
+  function jobs(query) {
+    return fetch("/v1/train/jobs" + (query ? "?" + query : ""), { headers: { Accept: "application/json" }, cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        if (!j || !j.jobs || !Array.isArray(j.jobs.active) || !Array.isArray(j.jobs.queued)) throw new Error("no job list in the answer");
+        return { active: j.jobs.active, queued: j.jobs.queued, all: j.jobs.active.concat(j.jobs.queued), task: j.task, tasks: j.tasks };
+      });
+  }
+
+  function follow() {
+    // Deleting a run's files asks first, naming the size (the form's data-confirm).
+    document.querySelectorAll("form[data-confirm]").forEach(function (f) {
+      f.addEventListener("submit", function (e) {
+        if (!window.confirm(f.dataset.confirm)) e.preventDefault();
+      });
+    });
+
+    // Live progress.
+    var runs = document.getElementById("training-runs");
+    var tasks = document.getElementById("training-tasks");
+    var busy = {};
+    var isBusy = function (s) { return s === "queued" || s === "running" || s === "paused"; };
+    [[runs, "run"], [tasks, "task"]].forEach(function (p) {
+      if (!p[0]) return;
+      p[0].querySelectorAll("tr[data-" + p[1] + "]").forEach(function (tr) {
+        var st = tr.querySelector('[data-field="state"]');
+        if (st && isBusy(st.textContent)) busy[tr.dataset[p[1]]] = true;
+      });
+    });
+
+    // Metrics (curves, per-epoch table, columns) of the runs that report a history: rendered on
+    // load for every run (finished ones too) and again when the history, batch or columns change.
+    var metricsState = { columns: [], metrics: [], data: null };
+    function logBoxes() {
+      // The Log <details> keeps its open state per run for this tab.
+      document.querySelectorAll("details.tr-logbox").forEach(function (d) {
+        var key = "prism.training.log." + d.dataset.run;
+        try { if (window.sessionStorage.getItem(key) === "1") d.open = true; } catch (e) { /* storage blocked */ }
+        d.addEventListener("toggle", function () {
+          try { window.sessionStorage.setItem(key, d.open ? "1" : "0"); } catch (e) { /* storage blocked */ }
+        });
+      });
+    }
+    logBoxes();
+    function availableKeys(data) {
+      var seen = {}, raw = [];
+      (data.runs || []).forEach(function (r) {
+        var h = r.progress && r.progress.history;
+        if (h) window.TrainMetrics.keysOf(h).forEach(function (k) { if (!seen[k]) { seen[k] = true; raw.push(k); } });
+      });
+      var known = (data.metrics || metricsState.metrics || []).map(function (m) { return m.id; }).filter(function (id) { return seen[id]; });
+      return known.concat(raw.filter(function (k) { return known.indexOf(k) < 0; }).sort());
+    }
+    function saveColumns(list) {
+      return fetch("/v1/training/metric-columns", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ columns: list })
+      }).then(function (res) {
+        return res.json().catch(function () { return null; }).then(function (j) {
+          if (!res.ok || !j || j.success === false) {
+            return { ok: false, message: (j && j.message) || "The server answered HTTP " + res.status + " (the columns were not saved)." };
+          }
+          metricsState.columns = j.columns || list;
+          // renderMetrics takes the columns from the last poll's answer: keep it current.
+          if (metricsState.data) metricsState.data.metric_columns = metricsState.columns;
+          renderMetrics(metricsState.data, true);
+          return { ok: true };
+        });
+      });
+    }
+    function renderMetrics(data, force) {
+      if (!data || !window.TrainMetrics) return;
+      metricsState.data = data;
+      if (data.metric_columns) metricsState.columns = data.metric_columns;
+      if (data.metrics) metricsState.metrics = data.metrics;
+      var avail = availableKeys(data);
+      var byId = {};
+      (data.runs || []).forEach(function (r) { byId[r.id] = r; });
+      document.querySelectorAll(".tr-metrics[data-run]").forEach(function (host) {
+        var r = byId[host.dataset.run];
+        var sig = r ? window.TrainMetrics.signature(r.progress, metricsState.columns) + "|" + r.state + "|" + avail.length : "";
+        var row = host.closest("tr");
+        // Same history and columns: only the tiles move (batch, learning rate, time left).
+        if (!force && host.dataset.sig === sig) {
+          if (r && r.progress && window.TrainMetrics.refresh) {
+            window.TrainMetrics.refresh(host, r.progress, metricsState.metrics, { running: r.state === "running" });
+          }
+          return;
+        }
+        host.dataset.sig = sig;
+        if (r && r.progress) {
+          window.TrainMetrics.render(host, r.progress, metricsState.columns, metricsState.metrics, {
+            runId: r.id, available: avail, running: r.state === "running", onColumns: saveColumns
+          });
+        } else {
+          host.replaceChildren();
+        }
+        if (row && row.classList.contains("tr-metrics-row")) row.hidden = host.childNodes.length === 0;
+      });
+    }
+    // The run's settings under its progress text, joined with " · ": device, batch (and the OOM
+    // retry that lowered it), input size, learning rate and schedule, epoch cap, patience, the
+    // metric selected by (when not mAP), seed, scene, data loader workers. From progress.settings
+    // (what the job resolved) and the trainer's
+    // start event (batch_size, imgsz); a run queued before those existed falls back to its
+    // request's recipe. Missing parts are left out; nothing known = no line.
+    function lrText(v) { return v === 0 ? "0" : (+v.toPrecision(4)).toExponential(); }
+    var isNum = function (v) { return typeof v === "number" && !isNaN(v); };
+    function metricShort(id) {
+      var m = (metricsState.metrics || []).filter(function (x) { return x.id === id; })[0];
+      return (m && m.short) || id;
+    }
+    function settingsParts(r) {
+      var p = r.progress || {}, s = p.settings || null, rec = (r.request && r.request.recipe) || {};
+      var out = [];
+      var dev = r.device || p.device || (s && s.gpu) || "";
+      if (dev) out.push(dev);
+      var want = s && isNum(s.batch) ? s.batch : rec.batch;
+      if (isNum(p.batch_size)) out.push("batch " + p.batch_size + (isNum(want) && p.batch_size < want ? " (OOM retry from " + want + ")" : ""));
+      else if (isNum(want)) out.push("batch " + want);
+      var px = isNum(p.imgsz) ? p.imgsz : rec.imgsz;
+      if (isNum(px)) out.push(px + " px");
+      if (s) {
+        var lr = isNum(s.lr) ? "lr " + lrText(s.lr) : "lr auto";
+        if (s.lr_schedule) lr += " " + s.lr_schedule + (isNum(s.lr_min_factor) ? " → " + (+s.lr_min_factor.toPrecision(3)) + "×" : "");
+        if (isNum(s.lr_encoder)) lr += ", enc " + lrText(s.lr_encoder);
+        out.push(lr);
+      } else if (isNum(rec.lr)) {
+        out.push("lr " + lrText(rec.lr));
+      }
+      var cap = s && isNum(s.epochs) ? s.epochs : isNum(rec.epochs) ? rec.epochs : p.epochs;
+      if (isNum(cap) && cap > 0) out.push("cap " + cap + " ep");
+      var pat = s && isNum(s.patience) ? s.patience : p.patience;
+      if (isNum(pat)) out.push(pat > 0 ? "patience " + pat + (s && s.patience_doubled ? " (×2, small val)" : "") : "early stop off");
+      var select = s ? s.select_metric : rec.select_metric;
+      // "selected by F2 over car, person": the classes with enough validation boxes (the support
+      // event, TrainMetrics.selectedBy); an older record names the metric only.
+      var TM = window.TrainMetrics;
+      var by = !p.select_fallback && TM && TM.selectedBy ? TM.selectedBy(p, function (id) { return { short: metricShort(id) }; }) : "";
+      if (p.select_fallback) out.push("selected by mAP (" + metricShort(p.select_fallback.metric) + " failed at epoch " + p.select_fallback.epoch + ")");
+      else if (by) out.push("selected " + by);
+      else if (select && select !== "map") out.push("selected by " + metricShort(select));
+      var seed = s && isNum(s.seed) ? s.seed : r.request && isNum(r.request.train_seed) ? r.request.train_seed : null;
+      if (seed !== null) out.push("seed " + seed);
+      if (s && typeof s.scene === "string" && s.scene && s.scene !== "all") out.push(s.scene);
+      // training.ignore: said only when it is not the default (records before it are drop-frame).
+      if (s && s.ignore === "drop-frame") out.push("frames with a too-small object left out");
+      if (s && isNum(s.workers)) out.push("workers " + s.workers);
+      return out;
+    }
+    function settingsLine(tr, r) {
+      var desc = tr.querySelector('[data-field="describe"]');
+      if (!desc) return;
+      var line = tr.querySelector(".tr-settings");
+      var text = settingsParts(r).join(" · ");
+      if (!line) {
+        if (!text) return;
+        line = document.createElement("p");
+        line.className = "muted small tr-settings";
+        desc.parentNode.insertBefore(line, desc.nextSibling);
+      }
+      line.textContent = text;
+      line.hidden = !text;
+    }
+    function renderSettings(data) {
+      var t = document.getElementById("training-runs");
+      if (!t || !data) return;
+      (data.runs || []).forEach(function (r) {
+        var tr = t.querySelector('tr[data-run="' + r.id + '"]');
+        if (tr) settingsLine(tr, r);
+      });
+    }
+    // The light answer of GET /v1/training?poll=1 (src/server/training/poll.rs): the epochs this
+    // page holds are named in `have` and not sent again; TrainMetrics.poll puts the whole history
+    // back on each run, so the answer reads as a full one. No capability (the Auto-label tab's GPU
+    // fit check fetches it once), no losses, logs only of busy jobs, no metrics catalog after the
+    // first (renderMetrics keeps it). Without train-metrics.js (no run on the page) nothing is
+    // held and every history comes whole.
+    var pollStore = {};
+    function fetchTraining() {
+      var P = window.TrainMetrics && window.TrainMetrics.poll;
+      var have = P ? P.have(pollStore) : "";
+      // Any `have` (an empty one too) also says the page holds the metrics catalog: not sent again.
+      var holds = have || (metricsState.metrics && metricsState.metrics.length);
+      return fetch("/v1/training?poll=1" + (holds ? "&have=" + have : ""), { headers: { Accept: "application/json" }, cache: "no-store" })
+        .then(function (res) {
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          return res.json();
+        })
+        .then(function (data) {
+          if (P) P.merge(pollStore, data.runs);
+          return data;
+        });
+    }
+    function loadMetrics() {
+      if (!document.querySelector(".tr-metrics[data-run]")) return;
+      fetchTraining()
+        .then(function (data) { renderSettings(data); renderMetrics(data, false); })
+        .catch(function () {});
+    }
+
+    // Continue hides the notice of that early-stop point (the run goes on by itself; a later
+    // point shows again).
+    function extendKey(el) { return "bop-extend:" + el.dataset.run + ":" + el.dataset.ext; }
+    function extendDismissed(el) {
+      try { return sessionStorage.getItem(extendKey(el)) === "1"; } catch (e) { return false; }
+    }
+    document.querySelectorAll('[data-field="extend"]').forEach(function (el) {
+      if (extendDismissed(el)) el.hidden = true;
+      var btn = el.querySelector('[data-action="extend-continue"]');
+      if (btn) btn.addEventListener("click", function () {
+        try { sessionStorage.setItem(extendKey(el), "1"); } catch (e) { /* private mode: hide only */ }
+        el.hidden = true;
+      });
+    });
+
+    if (Object.keys(busy).length === 0) { loadMetrics(); return; }
+    function describe(r, list) {
+      if (r.state === "queued") {
+        if (!r.after) return "queued";
+        var dep = (list || []).filter(function (x) { return x.id === r.after; })[0];
+        return "queued (after " + (dep && dep.kind === "import" ? "import " : "") + r.after + ")";
+      }
+      if (r.state !== "running" && r.state !== "paused") return r.state;
+      var s = r.stage ? String(r.stage).replace(/_/g, " ") : "starting";
+      if (r.state === "paused") return r.stage ? "paused (" + s + " " + r.step + "/" + r.steps + ")" + (r.detail ? ": " + r.detail : "") : "paused";
+      return s + " (" + r.step + "/" + r.steps + ")" + (r.detail ? ": " + r.detail : "");
+    }
+    function update(table, attr, list) {
+      var finished = false;
+      if (!table) return false;
+      (list || []).forEach(function (r) {
+        var tr = table.querySelector("tr[data-" + attr + '="' + r.id + '"]');
+        if (!tr) return;
+        var set = function (f, v) {
+          var el = tr.querySelector('[data-field="' + f + '"]');
+          if (!el) return;
+          if (f === "percent") el.value = v; else el.textContent = v;
+        };
+        set("state", r.state);
+        set("percent", r.percent);
+        set("describe", describe(r, list));
+        // The actual batch / input size arrive with the trainer's start event: kept current.
+        if (attr === "run") settingsLine(tr, r);
+        // The dataset's warnings arrive once the dataset is assembled.
+        var warnList = attr === "run" ? tr.querySelector('[data-field="warnings"]') : null;
+        if (warnList) {
+          var ws = (r.dataset && r.dataset.warnings) || [];
+          if (warnList.childElementCount !== ws.length) {
+            warnList.replaceChildren();
+            ws.forEach(function (w) {
+              var li = document.createElement("li");
+              li.textContent = w;
+              warnList.appendChild(li);
+            });
+          }
+          warnList.hidden = !ws.length;
+        }
+        if (r.log && r.log.length) {
+          var logEl = tr.querySelector('[data-field="log"]');
+          var box = logEl && logEl.closest("details.tr-logbox");
+          if (box) { box.hidden = false; set("log", r.log.slice(-40).join("\n")); }
+          else set("log", r.log.slice(-6).join("\n"));
+        }
+        // Pause while running, Resume while paused (Cancel in both).
+        var pause = tr.querySelector('[data-field="pause"]');
+        var resume = tr.querySelector('[data-field="resume"]');
+        if (pause) pause.hidden = r.state !== "running";
+        if (resume) resume.hidden = r.state !== "paused";
+        // Finish now: a run in its training stage that has not stopped or started exporting.
+        var finish = tr.querySelector('[data-field="finish"]');
+        if (finish) {
+          var p = r.progress || {};
+          finish.hidden = !((r.state === "running" || r.state === "paused") && r.stage === "train" && !p.stopped && !p.phase && !r.retrying);
+        }
+        // An early-stop point passed while validation still improves: Stop now / Continue.
+        var ext = tr.querySelector('[data-field="extend"]');
+        if (ext) {
+          var n = (r.progress || {}).extension;
+          var show = !!n && finish && !finish.hidden;
+          if (show) {
+            ext.dataset.ext = String(n.extension);
+            set("extend-text", n.text);
+            set("extend-stop", "Stop now and keep epoch " + n.keep_epoch);
+          }
+          ext.hidden = !show || extendDismissed(ext);
+        }
+        if (busy[r.id] && !isBusy(r.state)) finished = true;
+      });
+      return finished;
+    }
+    // One tick: false once a job this page showed busy has finished and the page moves on (the
+    // loop stops). A chained loop, never an interval: the next request leaves 3 s after this one
+    // answered, none while the tab is hidden, and one at once when it shows again, so a run that
+    // finished meanwhile still navigates.
+    function tick() {
+      return fetchTraining().then(function (data) {
+        var a = update(runs, "run", data.runs);
+        var b = update(tasks, "task", data.tasks);
+        renderMetrics(data, false);
+        // States and progress changed in place: the user's sort (sort.js) again.
+        if (window.PrismSort) [runs, tasks].forEach(function (t) { if (t) window.PrismSort.apply(t); });
+        if (!(a || b)) return true;
+        // Not reload(): the page may be the answer to a POST, and reloading it would ask to
+        // resubmit (and queue the job again). The poll navigates, not the user: no activity.
+        PrismPoll.navigate(window.location.pathname + window.location.hash);
+        return false;
+      });
+    }
+    PrismPoll.create({ run: tick, period: 3000, more: function (go) { return go !== false; } }).start();
+  }
+
+  root.TrainArea = {
+    asJson: asJson, checked: checked, toggle: toggle, restoreForm: restoreForm, openInvalid: openInvalid,
+    alEntries: alEntries, alSelection: alSelection, keepAlOptions: keepAlOptions, alOptions: alOptions,
+    jobs: jobs, follow: follow
+  };
+})(typeof globalThis !== "undefined" ? globalThis : window);
+
 (function () {
   "use strict";
+  if (typeof document === "undefined") return; // loaded by a node test: only TrainArea
   var strip = document.getElementById("train-strip");
   if (!strip) return;
   var tab = strip.dataset.tab;
@@ -167,15 +650,10 @@
   // Rejects on an answer that is not the list (HTTP error, HTML from a proxy): PrismPoll then backs
   // off (6, 12, ... 30 s) instead of asking every 3 s through an outage, and onError says so.
   function loadJobs() {
-    return fetch("/v1/train/jobs", { headers: { Accept: "application/json" }, cache: "no-store" })
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
-      })
+    return TrainArea.jobs()
       .then(function (j) {
-        if (!j || !j.jobs) throw new Error("no job list in the answer");
         jobsOutage("");
-        var all = j.jobs.active.concat(j.jobs.queued);
+        var all = j.all;
         var key = all.map(function (x) { return x.id; }).join();
         jobsCount.textContent = all.length;
         jobsCount.hidden = !all.length;

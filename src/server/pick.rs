@@ -48,9 +48,11 @@
 //! the paths that person chose, for an hour. The in-page listing (`GET /v1/fs/browse`) keeps
 //! the roots rule (SV-10 unchanged), so a pick never widens what the page can list.
 
+use super::browse::{plain, strip_verbatim};
 use super::guard::{host_part, request_host};
 use super::{AppState, blocking, loopback_peer};
 use crate::command::{Ended, RunOutput};
+use crate::sync::LockExt as _;
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
@@ -580,17 +582,6 @@ fn host_launcher() -> Result<Launcher, String> {
     }
 }
 
-/// Without the Windows `\\?\` verbatim prefix (canonical paths carry it; dialogs do not take it).
-fn strip_verbatim(s: String) -> String {
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        return format!(r"\\{rest}");
-    }
-    match s.strip_prefix(r"\\?\") {
-        Some(rest) => rest.to_string(),
-        None => s,
-    }
-}
-
 /// The folder a dialog starts in for the input's current value `raw` (relative = under the
 /// data root): the value itself when it is a folder, else its nearest existing ancestor.
 fn start_folder(cfg: &crate::config::Config, raw: Option<&str>) -> Option<String> {
@@ -605,7 +596,8 @@ fn start_folder(cfg: &crate::config::Config, raw: Option<&str>) -> Option<String
         }
     }
     let c = p.canonicalize().ok()?;
-    Some(strip_verbatim(c.to_string_lossy().into_owned()))
+    // Without the verbatim prefix: dialogs do not take it.
+    Some(strip_verbatim(&c.to_string_lossy()))
 }
 
 /// How long a picked path stays trusted (see the module doc).
@@ -683,19 +675,7 @@ impl PickedPaths {
 static PICKED: Mutex<PickedPaths> = Mutex::new(PickedPaths::new());
 
 fn picked() -> std::sync::MutexGuard<'static, PickedPaths> {
-    PICKED.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// `p` without the Windows `\\?\` verbatim prefix (unchanged elsewhere).
-fn plain(p: &Path) -> PathBuf {
-    #[cfg(windows)]
-    {
-        PathBuf::from(strip_verbatim(p.to_string_lossy().into_owned()))
-    }
-    #[cfg(not(windows))]
-    {
-        p.to_path_buf()
-    }
+    PICKED.lock_recover()
 }
 
 /// Trust a path the dialog returned (ignored unless it is absolute and exists). Touches the
@@ -1269,7 +1249,7 @@ mod tests {
             download_dir: Some(dir.clone()),
             ..Default::default()
         };
-        let canon = |p: PathBuf| strip_verbatim(p.canonicalize().unwrap().to_string_lossy().into());
+        let canon = |p: PathBuf| strip_verbatim(&p.canonicalize().unwrap().to_string_lossy());
         assert_eq!(
             start_folder(&cfg, Some("sub")),
             Some(canon(dir.join("sub")))

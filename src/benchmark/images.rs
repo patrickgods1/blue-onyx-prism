@@ -339,9 +339,39 @@ impl GroundTruth {
             GroundTruth::Manifest => "ground truth (manifest)".into(),
             GroundTruth::Coco => "ground truth (COCO JSON)".into(),
             GroundTruth::Yolo => "ground truth (YOLO labels)".into(),
-            GroundTruth::Pseudo(r) => format!("relative to {r}, not ground truth"),
+            GroundTruth::Pseudo(r) => relative_desc([r.clone()]),
         }
     }
+}
+
+/// Start of a pseudo-ground-truth description ([`relative_desc`]).
+const RELATIVE_PREFIX: &str = "relative to ";
+/// End of a pseudo-ground-truth description ([`relative_desc`]).
+const RELATIVE_SUFFIX: &str = ", not ground truth";
+
+/// "relative to <ref>[, <ref>...], not ground truth": the description of scores against the
+/// pseudo ground truth of the reference runs `refs` ("rt-detrv2-x on openvino:cpu"), each named
+/// once, sorted. Saved in results (`AccuracyReport::ground_truth`, `SearchResult::ground_truth`)
+/// and read back by [`relative_refs`], so the wording is a file format.
+pub(super) fn relative_desc<I: IntoIterator<Item = String>>(refs: I) -> String {
+    let refs: std::collections::BTreeSet<String> = refs.into_iter().collect();
+    format!(
+        "{RELATIVE_PREFIX}{}{RELATIVE_SUFFIX}",
+        refs.into_iter().collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// The references a [`relative_desc`] names (None = not a pseudo-ground-truth description).
+/// The trailing ", not ground truth" is optional here; [`is_relative_desc`] requires it.
+pub(super) fn relative_refs(desc: &str) -> Option<Vec<&str>> {
+    let rest = desc.strip_prefix(RELATIVE_PREFIX)?;
+    let rest = rest.strip_suffix(RELATIVE_SUFFIX).unwrap_or(rest);
+    Some(rest.split(", ").collect())
+}
+
+/// `desc` is a whole [`relative_desc`] (prefix and suffix).
+pub(super) fn is_relative_desc(desc: &str) -> bool {
+    desc.starts_with(RELATIVE_PREFIX) && desc.ends_with(RELATIVE_SUFFIX)
 }
 
 /// Largest dataset image file the benchmark reads (64 MiB).
@@ -661,9 +691,10 @@ pub(crate) fn manifest_image(i: &ManifestImage, path: PathBuf) -> SetImage {
     }
 }
 
-/// An image by extension; hidden files (macOS AppleDouble `._x.jpg` beside every file copied
-/// to a non-APFS drive, `.DS_Store`) are not.
-fn is_image(p: &Path) -> bool {
+/// An image by extension ([`IMAGE_EXTENSIONS`]); hidden files (macOS AppleDouble `._x.jpg`
+/// beside every file copied to a non-APFS drive, `.DS_Store`) are not. Also the rule of the
+/// training dataset's image folders, so an export the benchmark reads sees the same files.
+pub(crate) fn is_image(p: &Path) -> bool {
     !p.file_name()
         .is_some_and(|n| n.to_string_lossy().starts_with('.'))
         && p.extension()
@@ -1444,6 +1475,47 @@ mod tests {
 
     fn fixture() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/bench")
+    }
+
+    /// QA-166: the pseudo-ground-truth description is built and parsed in one place; the
+    /// strings saved by earlier versions keep parsing.
+    #[test]
+    fn relative_desc_round_trips_and_reads_saved_strings() {
+        let refs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Sorted, each reference once.
+        let desc = relative_desc(refs(&["b on ort:cpu", "a on openvino:cpu", "b on ort:cpu"]));
+        assert_eq!(
+            desc,
+            "relative to a on openvino:cpu, b on ort:cpu, not ground truth"
+        );
+        assert_eq!(
+            relative_refs(&desc).unwrap(),
+            ["a on openvino:cpu", "b on ort:cpu"]
+        );
+        assert!(is_relative_desc(&desc));
+        assert_eq!(
+            GroundTruth::Pseudo("rt-detrv2-x on openvino:cpu".into()).describe(),
+            "relative to rt-detrv2-x on openvino:cpu, not ground truth"
+        );
+        // Literal strings of saved results.
+        for (saved, want) in [
+            (
+                "relative to rt-detrv2-x on openvino:cpu, not ground truth",
+                vec!["rt-detrv2-x on openvino:cpu"],
+            ),
+            (
+                "relative to a on x, b on y, not ground truth",
+                vec!["a on x", "b on y"],
+            ),
+            // The suffix is optional for the reader; the strict check refuses it.
+            ("relative to a on x", vec!["a on x"]),
+        ] {
+            assert_eq!(relative_refs(saved).unwrap(), want, "{saved}");
+        }
+        assert!(!is_relative_desc("relative to a on x"));
+        assert_eq!(relative_refs("ground truth"), None);
+        assert_eq!(relative_refs("ground truth (COCO JSON)"), None);
+        assert!(!is_relative_desc("ground truth"));
     }
 
     #[test]

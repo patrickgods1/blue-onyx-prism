@@ -23,9 +23,10 @@
 //! then looks at the interned names ([`Index::compact_names`], RA-089), and an index that ends
 //! for any reason asks for an allocator trim ([`crate::backend::memory::trim_soon`]).
 //!
-//! [`crate::backend::priority`] has no way to lower one thread, only a process (and that means
-//! `unsafe`, kept to `backend`), so the walks run at normal priority, on at most
-//! [`crate::parallel::WALK_THREADS_MAX`] threads.
+//! The walks run below normal priority: this thread is lowered when the index spawns it
+//! ([`crate::backend::priority::lower_this_thread`] in `index::open`), and its walks run on
+//! [`crate::parallel::map_all_at`] threads spawned [`crate::parallel::Spawned::Background`], which
+//! lower themselves, at most [`crate::parallel::WALK_THREADS_MAX`] of them.
 
 use super::apply::Swap;
 use super::row::Shard;

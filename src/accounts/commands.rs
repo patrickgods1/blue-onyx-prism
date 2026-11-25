@@ -180,21 +180,13 @@ fn list(store: &Store, out: &mut dyn Write) -> Result<()> {
             out,
             "{:<32}  {:<22}  {:<22}  {:>8}  {}",
             u.name,
-            shown(zone, u.created),
-            shown(zone, u.password_changed),
+            zone.display_unix(u.created),
+            zone.display_unix(u.password_changed),
             u.failures,
             if u.disabled { "yes" } else { "no" }
         )?;
     }
     Ok(())
-}
-
-/// `secs` (unix) as a time in `zone` (`2026-11-16 14:02 PST`).
-fn shown(zone: crate::clock::Zone, secs: u64) -> String {
-    i64::try_from(secs)
-        .ok()
-        .and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0))
-        .map_or_else(|| secs.to_string(), |t| zone.display(t))
 }
 
 /// `setup-code`: the code (made when needed) and how to reach the web UI, or why there is none.

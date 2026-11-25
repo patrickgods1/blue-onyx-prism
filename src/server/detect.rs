@@ -607,7 +607,7 @@ async fn read_multipart(
             }
         };
         if let Some(n) = field.file_name() {
-            req.image_name = crate::static_memory::cap_name(n).to_string();
+            req.image_name = crate::text::cap_name(n).to_string();
         }
         req.image_data = body_budget::charged_bytes(buf, charge);
         got_image = true;
@@ -2453,8 +2453,8 @@ mod tests {
         let (req, _) = parse_detection_body(multipart_of(post(Body::from(body))).await)
             .await
             .unwrap();
-        assert!(req.image_name.len() <= crate::static_memory::MAX_NAME_BYTES);
-        assert!(req.image_name.len() >= crate::static_memory::MAX_NAME_BYTES - 1);
+        assert!(req.image_name.len() <= crate::text::MAX_NAME_BYTES);
+        assert!(req.image_name.len() >= crate::text::MAX_NAME_BYTES - 1);
         assert!(name.starts_with(&req.image_name));
     }
 

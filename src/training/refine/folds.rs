@@ -2,22 +2,12 @@
 //! on a frame of the camera day it is asked about (frames of one camera on one day are near copies).
 //! Pure and deterministic.
 
+use crate::training::dataset::seeded_rank;
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
 /// A (camera, day) group, as the export names it ([`crate::collect::labels::export::Group`]).
 pub type Group = (String, String);
-
-/// The rank of `key` under `seed`: the first 8 bytes of SHA-256(`seed:key`), for seeded ties.
-fn rank(seed: u64, key: &str) -> u64 {
-    use sha2::Digest;
-    let d = sha2::Sha256::digest(format!("{seed}:{key}").as_bytes());
-    let mut b = [0u8; 8];
-    for (o, i) in b.iter_mut().zip(d.iter()) {
-        *o = *i;
-    }
-    u64::from_be_bytes(b)
-}
 
 /// How many folds `k` folds over `groups` groups become: at most one per group.
 pub fn effective_folds(k: usize, groups: usize) -> usize {
@@ -50,7 +40,7 @@ pub fn assign(
     let k = effective_folds(k, groups.len());
     let mut order: Vec<(&Group, usize, u64)> = groups
         .iter()
-        .map(|(g, n)| (g, *n, rank(seed, &format!("{}/{}", g.0, g.1))))
+        .map(|(g, n)| (g, *n, seeded_rank(seed, &format!("{}/{}", g.0, g.1))))
         .collect();
     order.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(b.0)));
     let mut sizes = vec![0usize; k];

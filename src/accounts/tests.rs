@@ -330,9 +330,7 @@ fn the_cache_reads_again_only_after_a_change() {
 }
 
 #[test]
-fn times_print_as_rfc3339() {
-    assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
-    assert_eq!(rfc3339(1_762_560_000), "2025-11-08T00:00:00Z");
+fn now_is_unix_seconds() {
     assert!(now() > 1_762_560_000);
 }
 

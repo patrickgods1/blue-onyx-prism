@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 
+use super::output::{matrix_dims, meets, primary_f32_output};
 use super::{
     Detection, Family, ModelFamilyKind, NamedOutput, PostParams, PreprocessCtx, ResizeMode,
     class_index, retain_finite,
@@ -17,61 +18,6 @@ impl Yolo26 {
     pub fn new(num_classes: usize) -> Self {
         Self { num_classes }
     }
-}
-
-/// The single detection output of a YOLO-style model, as f32 data. When several outputs are
-/// present, the first f32 one is used (some exports append auxiliary heads after the main one).
-pub(crate) fn primary_f32_output<'a>(
-    family: &str,
-    outputs: &'a [NamedOutput],
-) -> Result<(&'a NamedOutput, &'a [f32])> {
-    let out = outputs
-        .iter()
-        .find(|o| o.as_f32().is_some())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{family}: expected an f32 output tensor, got {:?}",
-                outputs
-                    .iter()
-                    .map(|o| (&o.name, &o.shape))
-                    .collect::<Vec<_>>()
-            )
-        })?;
-    let data = out.as_f32().unwrap_or_default();
-    Ok((out, data))
-}
-
-/// `value >= threshold`; false for NaN scores.
-#[inline]
-pub(crate) fn meets(value: f32, threshold: f32) -> bool {
-    value >= threshold
-}
-
-/// Interpret `[1, R, C]` or `[R, C]` as `(R, C)` and check the data length.
-pub(crate) fn matrix_dims(
-    family: &str,
-    expected: &str,
-    out: &NamedOutput,
-    len: usize,
-) -> Result<(usize, usize)> {
-    let dims = match out.shape.as_slice() {
-        [1, r, c] | [r, c] => (*r, *c),
-        _ => anyhow::bail!(
-            "{family}: output `{}` has shape {:?}, expected {expected}",
-            out.name,
-            out.shape
-        ),
-    };
-    let implied = dims.0.checked_mul(dims.1);
-    if implied != Some(len) {
-        anyhow::bail!(
-            "{family}: output `{}` shape {:?} implies {} values but the buffer has {len}",
-            out.name,
-            out.shape,
-            implied.map_or_else(|| "too many".to_string(), |n| n.to_string())
-        );
-    }
-    Ok(dims)
 }
 
 impl Family for Yolo26 {

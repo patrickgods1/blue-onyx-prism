@@ -263,7 +263,7 @@ fn siglip_objection<'a>(
 /// Why a `label` box on a `scene` frame is always reviewed: a person or an animal at night
 /// (`night` / `ir`). The labelers' [`triage`] and a model's [`model_triage`] share the rule.
 pub fn night_review(label: &str, scene: &str) -> Option<&'static str> {
-    if !matches!(scene, "night" | "ir") {
+    if !crate::image_stats::Scene::parse(scene).is_some_and(crate::image_stats::Scene::is_night) {
         return None;
     }
     match Category::of(label) {
@@ -413,6 +413,14 @@ pub struct ApplyReport {
     /// Proposals [`merge_proposals`] would have added with no room left in the file
     /// ([`labels::MAX_BOXES`], the most a Review save takes): left out, the last first.
     pub full: usize,
+}
+
+impl ApplyReport {
+    /// The boxes changed for a reviewer (a box added, evidence on a box, a class suggestion): the
+    /// frame is queued for review. A vote is no such change.
+    pub fn for_review(&self) -> bool {
+        self.merge.added > 0 || self.annotated > 0 || self.class_suggestions > 0
+    }
 }
 
 /// Merge `boxes` into `f`. Per proposal, against the existing (pre-merge) boxes at IoU >=
@@ -943,10 +951,7 @@ pub struct LabelersReport {
 impl LabelersReport {
     /// The boxes changed for a reviewer: the frame is queued for review. A vote is no such change.
     pub fn for_review(&self) -> bool {
-        self.apply.merge.added > 0
-            || self.apply.annotated > 0
-            || self.apply.class_suggestions > 0
-            || self.missing.candidates() > 0
+        self.apply.for_review() || self.missing.candidates() > 0
     }
 }
 
@@ -4435,5 +4440,55 @@ mod tests {
             "{why:?}"
         );
         assert!(!why.iter().any(|w| w.contains("SigLIP")), "{why:?}");
+    }
+
+    /// Audit 2026-11 (QA-258): one rule for "a reviewer has something to look at" (a box added,
+    /// evidence on a box, a class suggestion), shared by the labelers' and the model's writes; a
+    /// vote or a full file alone queues nothing, a missing-object candidate does for labelers.
+    #[test]
+    fn a_frame_is_queued_for_review_only_for_a_change_a_reviewer_sees() {
+        let quiet = ApplyReport {
+            full: 2,
+            ..ApplyReport::default()
+        };
+        assert!(!quiet.for_review());
+        for a in [
+            ApplyReport {
+                merge: MergeReport {
+                    added: 1,
+                    ..MergeReport::default()
+                },
+                ..ApplyReport::default()
+            },
+            ApplyReport {
+                annotated: 1,
+                ..ApplyReport::default()
+            },
+            ApplyReport {
+                class_suggestions: 1,
+                ..ApplyReport::default()
+            },
+        ] {
+            assert!(a.for_review(), "{a:?}");
+            let l = LabelersReport {
+                apply: a,
+                ..LabelersReport::default()
+            };
+            assert!(l.for_review(), "{a:?}");
+        }
+        let voted = LabelersReport {
+            apply: quiet,
+            votes: 3,
+            ..LabelersReport::default()
+        };
+        assert!(!voted.for_review());
+        let missing = LabelersReport {
+            missing: MissingReport {
+                added: 1,
+                ..MissingReport::default()
+            },
+            ..LabelersReport::default()
+        };
+        assert!(missing.for_review());
     }
 }

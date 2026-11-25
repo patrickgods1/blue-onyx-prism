@@ -15,7 +15,7 @@
 
 use super::pipeline::{Done, InFlight, Job, Meta, Pipeline, Stage};
 use super::reap::reap;
-use super::save::{self, SaveJob};
+use super::save::{self, After, SaveJob};
 use super::verify::{Lane, LaneCtx, Pending};
 use super::watch::{SlowCompile, StuckWatch, collect_watched, watch_slow_compile};
 use super::{
@@ -148,11 +148,7 @@ impl Drop for Contained {
 
 /// The text of a panic payload (`panic!` gives a `&str` or a `String`).
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "non-string panic payload".to_string())
+    crate::panic::payload_message(payload).to_string()
 }
 
 /// A load given up because the worker was stopped (its token cancelled: the service stops, or
@@ -694,21 +690,7 @@ impl WorkerCtx {
     /// The served, ready worker of `night` with room for one more request, or why not (a lazy
     /// night model is asked to compile).
     fn night_target(&self, night: &str) -> std::result::Result<Arc<WorkerHandle>, RouteFallback> {
-        use crate::registry::normalize_name;
-        let h = self
-            .cfg
-            .peers
-            .get(night)
-            .filter(|h| normalize_name(&h.name) != normalize_name(&self.cfg.name))
-            .ok_or(RouteFallback::Unknown)?;
-        if h.state.get() != ModelState::Ready {
-            h.trigger_load();
-            return Err(RouteFallback::NotReady);
-        }
-        if h.is_full() {
-            return Err(RouteFallback::QueueFull);
-        }
-        Ok(h)
+        Ok(self.cfg.peers.ready(night, &self.cfg.name)?)
     }
 
     /// Run a night / IR frame here after all: count and warn (throttled), and put the decoded
@@ -1022,16 +1004,7 @@ impl WorkerCtx {
     }
 
     fn reply(&self, meta: Meta, resp: VisionDetectionResponse) {
-        trace!(
-            target: ORDER_TARGET,
-            model = %self.cfg.name,
-            image = %meta.image_name,
-            success = resp.success,
-            "replied"
-        );
-        if !meta.reply.send(resp) {
-            debug!(model = %self.cfg.name, "client went away before the response was sent");
-        }
+        send_reply(&self.cfg.name, &meta.image_name, meta.reply, resp);
     }
 
     /// Block until the model's downloads are installed (true: load now). Keeps the state
@@ -1577,16 +1550,15 @@ impl WorkerCtx {
                 }
                 self.metrics.process_ms.record(millis_u64(process_d));
                 line.emit(&resp.predictions, None);
-                if !crop && let (Some(dir), Some(img)) = (&live.save_image_path, img) {
-                    save_job = Some(SaveJob {
-                        model: name.clone(),
-                        dir: dir.clone(),
-                        image_name: meta.image_name.clone(),
+                if !crop {
+                    save_job = SaveJob::for_answer(
+                        name,
+                        &live,
+                        &meta.image_name,
                         img,
-                        predictions: resp.predictions.clone(),
-                        save_ref: live.save_ref_image,
-                        upload: meta.upload.clone(),
-                    });
+                        &resp.predictions,
+                        meta.upload.as_ref(),
+                    );
                 }
                 resp
             }
@@ -1609,14 +1581,12 @@ impl WorkerCtx {
         };
         // The collector and the image saver get the frame after the reply went out (each a
         // `try_send`, never waits).
-        let collect = collect_job.map(|job| (job, resp.predictions.clone()));
+        let after = After {
+            collect: collect_job.map(|job| (job, resp.predictions.clone())),
+            save: save_job,
+        };
         self.reply(meta, resp);
-        if let Some((job, predictions)) = collect {
-            job.submit(&predictions);
-        }
-        if let Some(job) = save_job {
-            save::submit(self.saver().as_deref(), job);
-        }
+        after.run(self.saver().as_deref());
     }
 
     /// `slot`'s finished outputs: under the stuck watchdog (the request's timeout) when no
@@ -1759,12 +1729,7 @@ impl WorkerCtx {
         let mut lane = self.verify_lane.borrow_mut();
         let now = Instant::now();
         if lane.is_none() && VERIFY_SPAWN.with_borrow_mut(|b| b.may_try(now)) {
-            match Lane::spawn(LaneCtx {
-                name: self.cfg.name.clone(),
-                metrics: self.metrics.clone(),
-                peers: self.cfg.peers.clone(),
-                saver: self.saver(),
-            }) {
+            match Lane::spawn(self.lane_ctx()) {
                 Ok(l) => {
                     *lane = Some(l);
                     VERIFY_SPAWN.with_borrow_mut(SpawnBackoff::started);
@@ -1789,15 +1754,20 @@ impl WorkerCtx {
             None => pending,
         };
         super::verify::complete_unverified(
-            &LaneCtx {
-                name: self.cfg.name.clone(),
-                metrics: self.metrics.clone(),
-                peers: self.cfg.peers.clone(),
-                saver: self.saver(),
-            },
+            &self.lane_ctx(),
             pending,
             super::verify::Failure::Stopped,
         );
+    }
+
+    /// What the verify lane needs of this worker.
+    fn lane_ctx(&self) -> LaneCtx {
+        LaneCtx {
+            name: self.cfg.name.clone(),
+            metrics: self.metrics.clone(),
+            peers: self.cfg.peers.clone(),
+            saver: self.saver(),
+        }
     }
 }
 
@@ -2082,6 +2052,38 @@ fn may_route(meta: &Meta) -> bool {
 /// not itself a verifier check); whether it does depends on the scene and the candidates.
 pub(super) fn may_verify(meta: &Meta) -> bool {
     !meta.verify_crop && meta.live.verify.is_some()
+}
+
+/// Answer `reply` with `resp` for the request of `image_name` (model `model`): the
+/// [`ORDER_TARGET`] "replied" trace (`tests/pipeline.rs` checks FIFO order with it), then the
+/// send; a client that went away is only logged at debug level. The worker and its verify lane
+/// both answer through here.
+pub(super) fn send_reply(
+    model: &str,
+    image_name: &str,
+    reply: Reply,
+    resp: VisionDetectionResponse,
+) {
+    trace!(
+        target: ORDER_TARGET,
+        model = %model,
+        image = %image_name,
+        success = resp.success,
+        "replied"
+    );
+    if !reply.send(resp) {
+        debug!(model = %model, "client went away before the response was sent");
+    }
+}
+
+impl From<super::PeerMiss> for RouteFallback {
+    fn from(m: super::PeerMiss) -> Self {
+        match m {
+            super::PeerMiss::Unknown => RouteFallback::Unknown,
+            super::PeerMiss::NotReady => RouteFallback::NotReady,
+            super::PeerMiss::QueueFull => RouteFallback::QueueFull,
+        }
+    }
 }
 
 /// "not served", "not ready", ... for the fallback warning.

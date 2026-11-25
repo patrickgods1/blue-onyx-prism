@@ -24,8 +24,8 @@
 //!   training folder is on another one, so the fold exports hard-link the frames);
 //! - [`predict`]: a fold model over its frames, in this process ([`predict::FoldPredictor`]; a
 //!   fold model compiles without the OpenVINO model cache);
-//! - [`judge`]: one frame's labels against the detections, pure (and [`judge::tighten`], the
-//!   decision on a loose label from two looks);
+//! - [`judge`]: one frame's labels against the detections, pure (and
+//!   [`judge::tighten_verdict`], the decision on a loose label from two looks);
 //! - [`write`]: the suggestions, re-judged under the label write lock;
 //! - [`tighten`]: the zoom stage after the last fold, a closer look at the loose labels by RF-DETR
 //!   L on a crop of each (the overlap check's script), proposing better-fitting boxes;

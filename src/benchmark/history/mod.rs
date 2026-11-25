@@ -379,9 +379,8 @@ fn device_snap(m: &ModelResult, d: &DeviceResult) -> DeviceSnap {
 
 /// The reference model of "relative to <model> on <device>[, ...], not ground truth".
 fn reference_of_desc(desc: &str) -> Option<String> {
-    let rest = desc.strip_prefix("relative to ")?;
-    let rest = rest.strip_suffix(", not ground truth").unwrap_or(rest);
-    let first = rest.split(", ").next()?;
+    let refs = super::images::relative_refs(desc)?;
+    let first = *refs.first()?;
     let name = first.split_once(" on ").map_or(first, |(m, _)| m).trim();
     (!name.is_empty()).then(|| name.to_string())
 }
@@ -401,7 +400,7 @@ fn labels_of(m: &ModelResult, sets: &[super::report::ImageSetInfo]) -> (Labels, 
             GroundTruth::Pseudo(r) => {
                 pseudo = true;
                 if reference.is_none() {
-                    reference = reference_of_desc(&format!("relative to {r}, not ground truth"));
+                    reference = reference_of_desc(&super::images::relative_desc([r.clone()]));
                 }
             }
             _ => {}

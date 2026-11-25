@@ -509,6 +509,18 @@ impl ClassMap {
         }
     }
 
+    /// The scored class a user-typed class names (a goal's or a search's `classes`): a scored
+    /// class by its canonical name, else the class its ground-truth label is scored as
+    /// ("pedestrian" -> person, "car" -> vehicle on a model with a `vehicle` class). None = not
+    /// scored; each caller decides whether that is an error.
+    pub fn scored_class(&self, label: &str) -> Option<&String> {
+        let canon = canonical_label(label);
+        self.classes.iter().find(|k| **k == canon).or_else(|| {
+            self.gt_class(&canon)
+                .and_then(|g| self.classes.iter().find(|k| *k == g))
+        })
+    }
+
     /// Scored class of a model label (None = not scored).
     pub fn pred_class(&self, label: &str) -> Option<&str> {
         self.pred.get(&canonical_label(label)).map(String::as_str)
@@ -1854,6 +1866,14 @@ mod tests {
         assert_eq!(ipcam.gt_class("truck"), Some("vehicle"));
         assert_eq!(ipcam.gt_class("motorcycle"), None);
         assert_eq!(ipcam.pred_class("unknown"), None);
+        // A user-typed class (goal / search `classes`) names a scored class directly, through
+        // an alias, or through the class its ground-truth label is scored as.
+        assert_eq!(ipcam.scored_class("pedestrian").unwrap(), "person");
+        assert_eq!(ipcam.scored_class(" Person ").unwrap(), "person");
+        assert_eq!(ipcam.scored_class("truck").unwrap(), "vehicle");
+        assert_eq!(ipcam.scored_class("cars"), None);
+        assert_eq!(ipcam.scored_class("motorbike"), None);
+        assert_eq!(coco.scored_class("motorbike").unwrap(), "motorcycle");
         let mapped = ipcam.map_gt(&[gt("bus", [0.0; 4]), gt("dog", [0.0; 4])]);
         assert_eq!(mapped.len(), 1);
         assert_eq!(mapped[0].label, "vehicle");

@@ -781,10 +781,10 @@ pub fn quick_seconds(frames: usize, name: &str, last: Option<&RefineReport>) -> 
     }
 }
 
-/// The quick check's report in the folder under review, when one reads (for its measured pace).
+/// The quick check's report in the folder under review, when one reads (for its measured pace):
+/// [`super::report::read`], so one too large, damaged or of a newer format is none.
 fn last_report(dir: &Path) -> Option<RefineReport> {
-    let b = std::fs::read(super::report::quick_report_path(dir)).ok()?;
-    serde_json::from_slice(&b).ok()
+    super::report::read(&super::report::quick_report_path(dir)).0
 }
 
 /// The warning of a check whose frames include `n` of camera days the model trained on.
@@ -1161,7 +1161,7 @@ pub fn plan(
             paths,
             platform,
             accelerator,
-            timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
+            timeout: config.training.timeout(),
         })
     } else {
         None

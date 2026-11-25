@@ -35,7 +35,9 @@
 
   // The in-page browser (server-side listing).
   var list, pathEl, msg, roots, up, use, title;
-  var kind = "video", target = null, cur = null, seq = 0;
+  var kind = "video", target = null, cur = null;
+  // One listing at a time: a newer one aborts the one still out (PrismPoll.latest, live.js).
+  var listings = PrismPoll.latest();
   var TITLES = { video: "Choose a video or a folder", model: "Choose a model file or folder", classes: "Choose a classes YAML", folder: "Choose a folder" };
   var EMPTY = { video: "No video here (choose this folder for its images).", folder: "No subfolders here.", model: "No model files here.", classes: "No classes YAML here." };
   function pick(path) {
@@ -67,19 +69,19 @@
     if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: "nearest" });
   }
   function go(path, retry) {
-    var n = ++seq;
+    var t = listings.begin();
     var url = "/v1/fs/browse?kind=" + encodeURIComponent(kind) + (path ? "&path=" + encodeURIComponent(path) : "");
-    fetch(url, { headers: { Accept: "application/json" } }).then(function (r) {
+    fetch(url, Object.assign({ headers: { Accept: "application/json" } }, t.init)).then(function (r) {
       return r.json().then(function (j) { return { status: r.status, body: j }; });
     }).then(function (res) {
-      if (n !== seq) return;
+      if (!t.current()) return;
       if (res.status === 200) { render(res.body); if (retry) msg.textContent = retry; return; }
       var m = (res.body && res.body.message) || "Cannot list that folder.";
       // A folder that is gone, or outside the roots (e.g. picked natively before): the default
       // folder, with the reason.
       if ((res.status === 404 || res.status === 403) && path) { go("", m); return; }
       msg.textContent = m;
-    }).catch(function () { if (n === seq) msg.textContent = "Cannot reach the server."; });
+    }).catch(function () { if (t.current()) msg.textContent = "Cannot reach the server."; });
   }
   function openInPage(b, t) {
     if (!inPage) return;

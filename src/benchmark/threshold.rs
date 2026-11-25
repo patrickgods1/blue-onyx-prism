@@ -476,26 +476,9 @@ pub fn exact_pick(bp: &Breakpoints, objective: Objective) -> Option<Pick> {
             relative: false,
         });
     }
-    let (_, primary, secondary) = fallback_keys(objective)?;
     // Target not reached: the best grid value on the constrained metric (then the other
-    // metric, then the higher threshold).
-    let mut best: Option<&ThresholdPoint> = None;
-    for p in &points {
-        let Some(v) = primary(p) else { continue };
-        let better = match best {
-            None => true,
-            Some(b) => {
-                let bv = primary(b).unwrap_or(0.0);
-                v > bv + TIE
-                    || ((v - bv).abs() <= TIE
-                        && secondary(p).unwrap_or(0.0) >= secondary(b).unwrap_or(0.0) - TIE)
-            }
-        };
-        if better {
-            best = Some(p);
-        }
-    }
-    let p = *best?;
+    // metric, then the higher threshold; the grid is ascending).
+    let p = *fallback_point(&points, objective)?;
     Some(Pick {
         objective: objective.to_string(),
         threshold: p.threshold,
@@ -540,10 +523,24 @@ pub fn pick(points: &[ThresholdPoint], objective: Objective) -> Option<Pick> {
         let note = (p.counts.tp == 0).then(|| "no threshold finds any object".to_string());
         return Some(make(&p, true, note));
     }
-    let (_, primary, secondary) = fallback_keys(objective)?;
     // Target not reached: the best on the constrained metric (then the other one).
+    let p = fallback_point(sorted.iter().copied(), objective)?;
+    Some(make(p, false, Some(unreached_note(objective, p))))
+}
+
+type Metric = fn(&ThresholdPoint) -> Option<f64>;
+
+/// The point closest to an unmet target of `objective` (None for an objective without one, or
+/// when no point has the constrained metric): the best on the constrained metric, a tie within
+/// [`TIE`] going to the better (or equal) other metric. `points` must be in ascending
+/// threshold order: a full tie goes to the later point, the higher threshold.
+fn fallback_point<'a>(
+    points: impl IntoIterator<Item = &'a ThresholdPoint>,
+    objective: Objective,
+) -> Option<&'a ThresholdPoint> {
+    let (_, primary, secondary) = fallback_keys(objective)?;
     let mut best: Option<&ThresholdPoint> = None;
-    for p in &sorted {
+    for p in points {
         let Some(v) = primary(p) else { continue };
         let better = match best {
             None => true,
@@ -558,11 +555,8 @@ pub fn pick(points: &[ThresholdPoint], objective: Objective) -> Option<Pick> {
             best = Some(p);
         }
     }
-    let p = best?;
-    Some(make(p, false, Some(unreached_note(objective, p))))
+    best
 }
-
-type Metric = fn(&ThresholdPoint) -> Option<f64>;
 
 /// For a target objective: (target, the constrained metric, the maximized one).
 fn fallback_keys(objective: Objective) -> Option<(f64, Metric, Metric)> {
@@ -1740,6 +1734,46 @@ mod tests {
     }
 
     /// One detection of the sweep tests.
+    /// QA-167: the unmet-target fallback is one rule for the exact grid and the stored grid:
+    /// equal precision goes to the higher recall, not the higher threshold, and a full tie to
+    /// the higher threshold.
+    #[test]
+    fn unmet_target_fallback_is_shared_by_both_picks() {
+        use super::super::metrics::{SweepImage, SweepScope};
+        // Four persons; detections fp .9, tp .8, fp .5, tp .4. Precision .5 at 0.51 ..= 0.80
+        // (recall .25) and at or below 0.40 (recall .5); never 0.9.
+        let img = SweepImage {
+            gt: vec![("person".into(), false); 4],
+            preds: vec![
+                sp("person", 0.9, false),
+                sp("person", 0.8, true),
+                sp("person", 0.5, false),
+                sp("person", 0.4, true),
+            ],
+            ..SweepImage::default()
+        };
+        let bp = Breakpoints::new(&[&img], SweepScope::All);
+        let o = Objective::Precision(0.9);
+        let exact = exact_pick(&bp, o).unwrap();
+        assert!(!exact.met);
+        assert_eq!(exact.threshold, 0.4);
+        assert_eq!(exact.plateau, Some([0.4, 0.4]));
+        let points: Vec<ThresholdPoint> = grid().into_iter().map(|t| bp.point_at(t)).collect();
+        let stored = pick(&points, o).unwrap();
+        assert_eq!((stored.threshold, stored.met), (0.4, false));
+        assert_eq!(stored.note, exact.note);
+        // Unsorted input: `pick` sorts before the fallback.
+        let mut shuffled = points.clone();
+        shuffled.reverse();
+        assert_eq!(pick(&shuffled, o).unwrap().threshold, 0.4);
+        // A full tie goes to the higher threshold.
+        let c = vec![pt(0.3, 2, 2, 8), pt(0.5, 2, 2, 8), pt(0.7, 1, 2, 9)];
+        assert_eq!(pick(&c, o).unwrap().threshold, 0.5);
+        assert_eq!(fallback_point(&c, o).map(|p| p.threshold), Some(0.5));
+        // An objective without a target has no fallback.
+        assert!(fallback_point(&c, Objective::F1).is_none());
+    }
+
     fn sp(class: &str, confidence: f32, tp: bool) -> super::super::metrics::SweepPred {
         super::super::metrics::SweepPred {
             confidence,

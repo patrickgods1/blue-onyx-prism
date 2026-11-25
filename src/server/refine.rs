@@ -43,7 +43,7 @@ use crate::sync::LockExt;
 use crate::training::capability::Capability;
 use crate::training::eta::JobTiming;
 use crate::training::refine::predict::LocalPredictor;
-use crate::training::refine::report::{self, REPORT_VERSION, RefineReport};
+use crate::training::refine::report::{self, RefineReport};
 use crate::training::refine::{self as check, RefineFrames, RefineJob, RefineRequest};
 use crate::training::service::{NotQueued, RunRecord, RunState};
 use crate::training::task::{Task, TaskKind, TaskRecord};
@@ -73,8 +73,6 @@ const STRIP_OPEN_TTL: Duration = Duration::from_secs(10 * 60);
 const STRIP_WALK_EVERY: Duration = Duration::from_secs(60);
 /// Most walks' answers kept at once (folders under review x class lists).
 const OPEN_KEEP: usize = 8;
-/// Largest `report.json` read (a report with this many recall rows is not one this build wrote).
-const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------------------------
 // The page
@@ -386,12 +384,12 @@ pub(super) fn save_changes_open(before: Option<&LabelFile>, after: &LabelFile) -
 /// The full check's report in `dir` and what is wrong with it: `(None, None)` when there is none
 /// (never an error), `(None, Some(why))` when it does not read or is a later build's.
 pub(super) fn read_report(dir: &Path) -> (Option<RefineReport>, Option<String>) {
-    read_report_at(&report::report_path(dir))
+    report::read(&report::report_path(dir))
 }
 
 /// The quick check's report in `dir` (`refine/report-quick.json`), as [`read_report`] reads.
 pub(super) fn read_quick_report(dir: &Path) -> (Option<RefineReport>, Option<String>) {
-    read_report_at(&report::quick_report_path(dir))
+    report::read(&report::quick_report_path(dir))
 }
 
 /// The report the recall tables are drawn from (the Coverage and Too small cards, the coverage
@@ -407,7 +405,7 @@ pub(super) fn recall_report(dir: &Path) -> Option<RefineReport> {
 /// saw, and a cancelled or failed full check only its finished folds' frames. Read again only when
 /// either file changed ([`COVERED`]): the strip asks on every poll.
 pub(super) fn check_covered(dir: &Path) -> Option<u64> {
-    check_covered_in(&COVERED, dir, &|p| read_report_at(p).0)
+    check_covered_in(&COVERED, dir, &|p| report::read(p).0)
 }
 
 /// A report file as [`COVERED`] keys it: not there, or its length and modification time.
@@ -476,66 +474,6 @@ pub(super) fn quick_model_ready(config: &Config, revision: u64) -> bool {
     !quick_models(&MODELS, config, revision, MODELS_TTL)
         .0
         .is_empty()
-}
-
-/// The report at `path`, as [`read_report`] reads it.
-fn read_report_at(path: &Path) -> (Option<RefineReport>, Option<String>) {
-    let bytes = match std::fs::metadata(path) {
-        Ok(m) if m.len() > MAX_REPORT_BYTES => {
-            return (
-                None,
-                Some(format!(
-                    "{} is too large to be a report of the dataset check ({} bytes)",
-                    path.display(),
-                    m.len()
-                )),
-            );
-        }
-        Ok(_) => match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) => {
-                return (
-                    None,
-                    Some(format!("{} could not be read: {e}", path.display())),
-                );
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
-        Err(e) => {
-            return (
-                None,
-                Some(format!("{} could not be read: {e}", path.display())),
-            );
-        }
-    };
-    // The format first, alone: a later build's report may not parse as this build's at all, and
-    // is then newer, not damaged.
-    #[derive(Deserialize)]
-    struct Format {
-        version: u64,
-    }
-    if let Ok(Format { version }) = serde_json::from_slice::<Format>(&bytes)
-        && version > u64::from(REPORT_VERSION)
-    {
-        return (
-            None,
-            Some(format!(
-                "{} was written by a newer version of this program (report format {version}, \
-                 this one reads up to {REPORT_VERSION}); update to see it",
-                path.display(),
-            )),
-        );
-    }
-    match serde_json::from_slice::<RefineReport>(&bytes) {
-        Ok(r) => (Some(r), None),
-        Err(e) => (
-            None,
-            Some(format!(
-                "{} is damaged and was not read ({e}); the next check writes a new one",
-                path.display()
-            )),
-        ),
-    }
 }
 
 /// The check in the queue (running, paused or queued) as the Jobs list words it, plus its state;
@@ -1165,7 +1103,7 @@ mod tests {
     use crate::collect::labels::bulk::test_support::put_frame_at;
     use crate::collect::labels::refine::{Answer, Suggestion};
     use crate::collect::labels::{self, BoxState, Frame, LabelBox, Source, Status};
-    use crate::training::refine::report::Mode;
+    use crate::training::refine::report::{Mode, REPORT_VERSION};
     use axum::body::Body;
     use axum::http::Request;
     use axum::http::header;
@@ -2027,7 +1965,7 @@ mod tests {
         let reads = std::cell::Cell::new(0usize);
         let read = |p: &Path| {
             reads.set(reads.get() + 1);
-            read_report_at(p).0
+            report::read(p).0
         };
         let covered = || check_covered_in(&cache, &review, &read);
         assert_eq!(covered(), None);

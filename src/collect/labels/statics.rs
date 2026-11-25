@@ -76,9 +76,9 @@
 
 use super::bulk::Wanted;
 use super::export::ExportFrame;
-use super::iou;
 use super::refine::{Kind, Suggestion};
 use super::repeats::VEHICLES;
+use super::{cmp_box, iou, proper_box};
 use crate::model::coco::coco_class;
 use crate::training::autolabel::Category;
 use serde::Serialize;
@@ -191,7 +191,7 @@ impl Spot {
     /// IoU with the representative box, None when it does not lie there, is of another object, or
     /// is of a class that is never static ([`may_be_static`]).
     pub fn iou_with(&self, label: &str, bbox: &[f32; 4], min_iou: f32) -> Option<f32> {
-        if !may_be_static(label) || object_of(label) != self.object || !proper(bbox) {
+        if !may_be_static(label) || object_of(label) != self.object || !proper_box(bbox) {
             return None;
         }
         let v = iou(&self.bbox, bbox);
@@ -239,27 +239,9 @@ impl Spot {
     }
 }
 
-/// Finite coordinates of a box with a positive size.
-fn proper(b: &[f32; 4]) -> bool {
-    b.iter().all(|v| v.is_finite()) && b[2] > b[0] && b[3] > b[1]
-}
-
 /// FNV-1a, 64 bits: a fixed hash for the frame sample (std's hasher may change between releases).
 pub fn fnv1a(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h
-}
-
-fn cmp_box(a: &[f32; 4], b: &[f32; 4]) -> Ordering {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| x.total_cmp(y))
-        .find(|o| o.is_ne())
-        .unwrap_or(Ordering::Equal)
+    crate::collect::hash::fnv1a64(s.bytes())
 }
 
 /// The canonical order of observations: the box, then frame, day, scene, label.
@@ -464,7 +446,7 @@ fn cluster(
             *per_day.entry(obs[i].day.as_str()).or_default() += 1;
         }
         let stayed = stay_days(per_day, totals, share).len();
-        if members.len() < MIN_FRAMES || stayed < MIN_DAYS || !proper(&rep) {
+        if members.len() < MIN_FRAMES || stayed < MIN_DAYS || !proper_box(&rep) {
             no_seed[seed] = true;
             for &i in &members {
                 no_seed[i] = true;
@@ -624,7 +606,7 @@ fn sample_frames(list: &[Obs]) -> BTreeSet<&str> {
     let mut per_frame: BTreeMap<&str, usize> = BTreeMap::new();
     for o in list {
         let k = per_frame.entry(o.frame.as_str()).or_default();
-        if proper(&o.bbox) && may_be_static(&o.label) {
+        if proper_box(&o.bbox) && may_be_static(&o.label) {
             *k += 1;
         }
     }
@@ -661,7 +643,7 @@ fn build(
         // count only in the frames per day.
         let statics: Vec<&Obs> = list
             .iter()
-            .filter(|o| proper(&o.bbox) && may_be_static(&o.label))
+            .filter(|o| proper_box(&o.bbox) && may_be_static(&o.label))
             .collect();
         if statics.is_empty() {
             continue;
@@ -1047,6 +1029,18 @@ mod tests {
             .collect()
     }
 
+    // QA-192: the frame sample's hash is pinned (FNV-1a 64): of nothing, the offset basis; of "a",
+    // the published value; a key as the sample hashes it.
+    #[test]
+    fn the_sample_hash_is_pinned() {
+        assert_eq!(fnv1a(""), 14_695_981_039_346_656_037);
+        assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(
+            fnv1a("day/drive/2026-10-21/20261021T010203004Z_a"),
+            6_932_700_042_157_016_026
+        );
+    }
+
     #[test]
     fn a_place_on_enough_frames_and_days_is_a_spot() {
         let t = Table::build(parked("patio", 12, 3, A, 0));
@@ -1379,7 +1373,7 @@ mod tests {
                 }
             }
             let days: BTreeSet<&str> = members.iter().map(|&i| obs[i].day.as_str()).collect();
-            if members.len() < MIN_FRAMES || days.len() < MIN_DAYS || !proper(&rep) {
+            if members.len() < MIN_FRAMES || days.len() < MIN_DAYS || !proper_box(&rep) {
                 no_seed[seed] = true;
                 members.iter().for_each(|&i| no_seed[i] = true);
                 continue;

@@ -40,7 +40,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 /// The scenes of the breakdown and the `scene=` filter.
-pub const SCENES: [&str; 3] = ["day", "night", "ir"];
+pub const SCENES: [&str; 3] = crate::collect::layout::SCENES;
 
 /// What [`build`] reads besides the combos' inputs ([`crate::benchmark::combos::Inputs`]).
 #[derive(Debug, Clone, Copy)]

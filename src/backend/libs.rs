@@ -633,7 +633,7 @@ pub(crate) fn diagnostics() -> String {
 pub const ORT_DIR_NAME: &str = "onnxruntime";
 /// File in the ONNX Runtime folder naming the installed flavor (`cpu`, `cuda`, `directml`,
 /// `coreml`).
-pub(crate) const ORT_FLAVOR_FILE: &str = "flavor.txt";
+pub(crate) use crate::resources::extract::FLAVOR_FILE as ORT_FLAVOR_FILE;
 /// Environment variable `ort` itself honors: the path of the ONNX Runtime library (or, for us, a
 /// directory holding it).
 pub const ENV_ORT_DYLIB_PATH: &str = "ORT_DYLIB_PATH";
@@ -1111,6 +1111,37 @@ pub(crate) unsafe fn symbol<'a, T>(
     unsafe { lib.get(name) }.map_err(|e| dl_error(&e))
 }
 
+/// [`open_system`], never unloaded: the library is leaked, so it stays loaded for the whole
+/// process and code pointers read from it ([`static_symbol`]) stay valid for `'static`. For
+/// driver APIs (NVML, the CUDA driver) whose function pointers the process keeps.
+///
+/// # Safety
+/// Same contract as [`open_system`].
+// Every caller is platform-gated; unused on other targets.
+#[allow(dead_code)]
+pub(crate) unsafe fn leak_system(name: &str) -> Result<&'static libloading::Library, String> {
+    // SAFETY: upheld by the caller (see `# Safety`).
+    let lib = unsafe { open_system(name) }?;
+    Ok(Box::leak(Box::new(lib)))
+}
+
+/// The value of symbol `name` (a function pointer) of a library that is never unloaded
+/// ([`leak_system`]), copied out of its [`libloading::Symbol`]: valid for the whole process.
+///
+/// # Safety
+/// Same contract as [`symbol`]: `T` must be the symbol's real type (its C signature, with the
+/// right calling convention).
+// Every caller is platform-gated; unused on other targets.
+#[allow(dead_code)]
+pub(crate) unsafe fn static_symbol<T: Copy>(
+    lib: &'static libloading::Library,
+    name: &[u8],
+) -> Result<T, String> {
+    // SAFETY: upheld by the caller (see `# Safety`); `lib` is never unloaded, so the copied
+    // pointer outlives the `Symbol` borrow.
+    unsafe { symbol::<T>(lib, name) }.map(|s| *s)
+}
+
 /// Load one CUDA library by absolute path and keep it loaded.
 fn open_cuda_lib(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
@@ -1271,6 +1302,33 @@ mod tests {
             .expect_err("a missing library must not load");
         let text = dl_error(&e);
         assert!(text.len() > e.to_string().len(), "{text}");
+    }
+
+    #[test]
+    fn leaked_system_libraries_give_typed_symbols() {
+        // SAFETY: the file does not exist, so nothing is loaded and no initializer runs.
+        assert!(unsafe { leak_system("bop-no-such-library-xyz.so") }.is_err());
+        // The C runtime every process already has loaded; loading it again runs nothing new.
+        #[cfg(target_os = "macos")]
+        let (name, func): (&str, &[u8]) = ("libSystem.B.dylib", b"strlen\0");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let (name, func): (&str, &[u8]) = ("libc.so.6", b"strlen\0");
+        #[cfg(windows)]
+        let (name, func): (&str, &[u8]) = ("kernel32.dll", b"lstrlenA\0");
+        #[cfg(unix)]
+        type Len = unsafe extern "C" fn(*const std::ffi::c_char) -> usize;
+        #[cfg(windows)]
+        type Len = unsafe extern "system" fn(*const std::ffi::c_char) -> i32;
+        // SAFETY: as above.
+        let lib = unsafe { leak_system(name) }.unwrap();
+        // SAFETY: `Len` is the C signature of that function.
+        let len = unsafe { static_symbol::<Len>(lib, func) }.unwrap();
+        // SAFETY: a NUL-terminated string.
+        let n = unsafe { len(c"prism".as_ptr()) };
+        assert_eq!(n, 5);
+        // SAFETY: the type does not matter for a symbol that is not there.
+        let missing = unsafe { static_symbol::<Len>(lib, b"bop_no_such_symbol\0") };
+        assert!(missing.is_err());
     }
 
     #[test]

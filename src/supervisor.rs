@@ -109,6 +109,14 @@ pub struct Reload {
 
 /// The pure reload schedule: feed it every worker's [`Status`] and it says which models to
 /// reload now.
+/// The delay before try number `attempt` (1-based; 0 counts as 1) of a doubling backoff:
+/// `first` doubled per earlier try, at most `max` (the doublings stop at 16, so no shift or
+/// multiplication overflows).
+fn doubling(first: Duration, max: Duration, attempt: u32) -> Duration {
+    let doublings = attempt.saturating_sub(1).min(16);
+    first.checked_mul(1u32 << doublings).unwrap_or(max).min(max)
+}
+
 #[derive(Debug, Default)]
 pub struct Recovery {
     models: HashMap<String, Attempts>,
@@ -118,11 +126,7 @@ impl Recovery {
     /// The delay before automatic reload number `attempt` (1-based): [`FIRST_DELAY`] doubled
     /// per earlier attempt, at most [`MAX_DELAY`].
     pub fn delay(attempt: u32) -> Duration {
-        let doublings = attempt.saturating_sub(1).min(16);
-        FIRST_DELAY
-            .checked_mul(1u32 << doublings)
-            .unwrap_or(MAX_DELAY)
-            .min(MAX_DELAY)
+        doubling(FIRST_DELAY, MAX_DELAY, attempt)
     }
 
     /// Update the schedule with the workers' states at `now` and return the models to reload
@@ -211,11 +215,7 @@ impl Upgrades {
     /// The delay before try number `attempt` (1-based): [`UPGRADE_FIRST_DELAY`] doubled per
     /// earlier try, at most [`UPGRADE_MAX_DELAY`].
     pub fn delay(attempt: u32) -> Duration {
-        let doublings = attempt.saturating_sub(1).min(16);
-        UPGRADE_FIRST_DELAY
-            .checked_mul(1u32 << doublings)
-            .unwrap_or(UPGRADE_MAX_DELAY)
-            .min(UPGRADE_MAX_DELAY)
+        doubling(UPGRADE_FIRST_DELAY, UPGRADE_MAX_DELAY, attempt)
     }
 
     /// Update the schedule at `now` with the models listed and return those to try now, in the
@@ -443,6 +443,20 @@ fn try_better(state: &AppState, u: &Upgrade) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doubling_doubles_from_the_first_delay_up_to_the_cap() {
+        let s = Duration::from_secs;
+        assert_eq!(doubling(s(3), s(100), 0), s(3));
+        assert_eq!(doubling(s(3), s(100), 1), s(3));
+        assert_eq!(doubling(s(3), s(100), 2), s(6));
+        assert_eq!(doubling(s(3), s(100), 6), s(96));
+        assert_eq!(doubling(s(3), s(100), 7), s(100));
+        assert_eq!(doubling(s(3), s(100), u32::MAX), s(100));
+        // A first delay above the cap is capped; a huge one does not overflow.
+        assert_eq!(doubling(s(200), s(100), 1), s(100));
+        assert_eq!(doubling(Duration::MAX, s(100), 17), s(100));
+    }
 
     #[test]
     fn delays_double_up_to_the_cap() {

@@ -818,8 +818,10 @@ mod tests {
 
     #[test]
     fn the_job_timeout_is_the_hours_as_a_duration() {
-        let mut c = TrainingConfig::default();
-        c.timeout_hours = 3;
+        let c = TrainingConfig {
+            timeout_hours: 3,
+            ..TrainingConfig::default()
+        };
         assert_eq!(c.timeout(), std::time::Duration::from_secs(3 * 3600));
     }
 }

@@ -38,8 +38,8 @@ use std::collections::BTreeMap;
 /// held-out objects of a camera is not trusted on its own ([`CameraRecall::well_supported`]).
 pub const PRIOR_GT: usize = MIN_CLASS_GT;
 
-/// The scenes a [`Measured`] may hold a slice for.
-pub const SCENES: [&str; 3] = ["day", "night", "ir"];
+/// The scenes a [`Measured`] may hold a slice for: the dataset's scene folders.
+pub use crate::collect::layout::SCENES;
 
 /// Held-out objects of one class (or of every class) and how many of them were missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -263,6 +263,10 @@ pub struct Store {
     /// Tests: make the next index appends fail with this error kind (image and sidecar written).
     #[cfg(test)]
     pub(super) fail_index: Option<std::io::ErrorKind>,
+    /// Tests: make the next writes find an image that does not decode (the upload's own decode
+    /// passed, so only a seam reaches it).
+    #[cfg(test)]
+    pub(super) fail_decode: bool,
     /// Tests: the zone of day folders and stems instead of the process-wide one.
     #[cfg(test)]
     pub(super) zone: Option<crate::clock::Zone>,
@@ -279,15 +283,12 @@ impl std::fmt::Debug for Store {
 
 /// Uniform in `[0, 1)` from the request id and bucket (FNV-1a), so sampling is deterministic.
 pub fn sample(request_id: &str, bucket: Bucket) -> f64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in request_id
-        .bytes()
-        .chain(std::iter::once(0xff))
-        .chain(bucket.as_str().bytes())
-    {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let mut h = super::hash::fnv1a64(
+        request_id
+            .bytes()
+            .chain(std::iter::once(0xff))
+            .chain(bucket.as_str().bytes()),
+    );
     // Finalizer (murmur3 fmix64) so similar ids spread over the whole range.
     h ^= h >> 33;
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -319,13 +320,17 @@ struct Reference {
     thumb: Option<Thumb>,
 }
 
+/// The Collect tab's error for a frame Blue Iris sent that does not decode (`e`, the decoder's).
+fn undecodable(e: &anyhow::Error) -> String {
+    format!(
+        "could not read a frame Blue Iris sent, so it was not saved: {e:#}; the image may be \
+         damaged or in a format the service cannot decode"
+    )
+}
+
 /// The scene of a sidecar's `scene` (`day`, `night`, `ir`; anything else counts as day).
 fn scene_of(s: &str) -> Scene {
-    match s {
-        "night" => Scene::Night,
-        "ir" => Scene::Ir,
-        _ => Scene::Day,
-    }
+    Scene::parse(s).unwrap_or_default()
 }
 
 /// What the dedup decided for a frame: a near duplicate, or why not ([`DedupInfo`]).
@@ -469,6 +474,8 @@ impl Store {
             fail_writes: None,
             #[cfg(test)]
             fail_index: None,
+            #[cfg(test)]
+            fail_decode: false,
             #[cfg(test)]
             zone: None,
         }
@@ -625,6 +632,7 @@ impl Store {
         }
         let camera = record.record.camera.clone();
         self.note_camera(&camera, at, &settings);
+        let scene = scene_of(&record.record.scene);
         let passing: Vec<Bucket> = matched
             .iter()
             .copied()
@@ -632,8 +640,7 @@ impl Store {
                 let c = settings.buckets.get(*b);
                 let sampled = f64::from(c.rate) >= 1.0
                     || sample(&record.record.request_id, *b) < f64::from(c.rate);
-                let interval =
-                    Duration::from_secs(u64::from(c.interval_for(*b, &record.record.scene)));
+                let interval = Duration::from_secs(u64::from(c.interval_for(*b, scene)));
                 let due = self.last.get(&(camera.clone(), *b)).is_none_or(|t| {
                     at.duration_since(*t)
                         .map_or(true, |since| since >= interval)
@@ -646,7 +653,6 @@ impl Store {
             return Handled::Dropped(Dropped::Rate);
         }
         let mode = settings.dedup_mode;
-        let scene = scene_of(&record.record.scene);
         let (hash, thumb) = match dhash::luma_of_encoded(&image) {
             Ok((luma, w, h)) => (
                 dhash::of_luma(&luma, w, h),
@@ -655,10 +661,7 @@ impl Store {
                     .flatten(),
             ),
             Err(e) => {
-                self.note_error(&format!(
-                    "could not read a frame Blue Iris sent, so it was not saved: {e:#}; the image \
-                     may be damaged or in a format the service cannot decode"
-                ));
+                self.note_error(&undecodable(&e));
                 METRICS.record_drop(Dropped::Error);
                 return Handled::Dropped(Dropped::Error);
             }
@@ -716,10 +719,17 @@ impl Store {
         record.record.dedup = Some(check.info);
         let rel = match self.write(&settings.dir, &mut record, &image) {
             Ok(rel) => rel,
-            Err(e) if is_disk_full(&e) => {
-                self.disable(format!("the disk is full ({e})"), &settings);
+            Err(layout::FrameWriteError::Io { error, .. }) if is_disk_full(&error) => {
+                self.disable(format!("the disk is full ({error})"), &settings);
                 METRICS.record_drop(Dropped::Disk);
                 return Handled::Dropped(Dropped::Disk);
+            }
+            // The upload decoded for the dHash, so hardly ever: told as what it is, not as a
+            // failed write.
+            Err(layout::FrameWriteError::Decode(e)) => {
+                self.note_error(&undecodable(&e));
+                METRICS.record_drop(Dropped::Error);
+                return Handled::Dropped(Dropped::Error);
             }
             Err(e) => {
                 self.note_error(&format!(
@@ -886,10 +896,19 @@ impl Store {
         dir: &Path,
         frame: &mut super::Draft,
         image: &[u8],
-    ) -> std::io::Result<String> {
+    ) -> Result<String, layout::FrameWriteError> {
         #[cfg(test)]
         if let Some(kind) = self.fail_writes {
-            return Err(std::io::Error::from(kind));
+            return Err(layout::FrameWriteError::Io {
+                step: layout::FrameStep::Image,
+                error: std::io::Error::from(kind),
+            });
+        }
+        #[cfg(test)]
+        if self.fail_decode {
+            return Err(layout::FrameWriteError::Decode(anyhow::anyhow!(
+                "test: not an image"
+            )));
         }
         // Day folder and stem in the configured zone as of this write (a zone change takes effect
         // with the next frame); the sidecar's `timestamp` stays UTC.
@@ -915,14 +934,7 @@ impl Store {
         let written = layout::write_frame(&day, &stem, image, r);
         #[cfg(test)]
         layout::fail_frames_at(None);
-        let (line, total) = written.map_err(|e| match e {
-            // An upload that does not decode (the worker decoded it already, so hardly ever) is
-            // told as a failed write, as before the shared writer.
-            layout::FrameWriteError::Decode(e) | layout::FrameWriteError::Encode(e) => {
-                std::io::Error::other(e)
-            }
-            layout::FrameWriteError::Io { error, .. } => error,
-        })?;
+        let (line, total) = written?;
         self.summary.add(&line, &date);
         self.usage.prunable_bytes = self.usage.prunable_bytes.saturating_add(total);
         Ok(rel.jpg())
@@ -1274,6 +1286,22 @@ mod tests {
         let share = kept as f64 / f64::from(n);
         assert!((share - 0.25).abs() < 0.02, "{share}");
         assert_eq!(sample("abc", Bucket::Empty), sample("abc", Bucket::Empty));
+    }
+
+    // QA-192: the sampling hash is pinned to fixed values: a change would move which frames a
+    // `rate` below 1 keeps (FNV-1a 64 of the id, 0xff, the bucket name; then fmix64).
+    #[test]
+    fn the_sampling_hash_is_pinned() {
+        let bits = |id: &str, b: Bucket| sample(id, b).to_bits();
+        assert_eq!(bits("", Bucket::Empty), 4_602_976_074_687_621_006);
+        assert_eq!(bits("abc", Bucket::Empty), 4_598_601_937_906_302_452);
+        assert_eq!(bits("abc", Bucket::Positive), 4_602_658_211_284_360_880);
+        assert_eq!(
+            bits("req-0001", Bucket::NearThreshold),
+            4_578_650_398_360_034_880
+        );
+        // About 0.27: kept at a rate of 0.3, dropped at 0.25.
+        assert!((sample("abc", Bucket::Empty) - 0.273_687_627_472_070_76).abs() < 1e-15);
     }
 
     /// An empty frame at night or IR is kept after the shorter `night_interval` (120 s); a day one
@@ -2211,6 +2239,29 @@ mod tests {
         let now = shared.lock().unwrap().clone();
         assert!(now.last_error.is_some());
         assert_eq!(now.last_saved_at, Some(crate::collect::utc_rfc3339(t(1))));
+    }
+
+    /// Phase 9 left open: a frame the writer cannot decode is reported as one that does not
+    /// decode, not as a failed write under the folder (named behaviour change, phase 10).
+    #[test]
+    fn a_frame_the_writer_cannot_decode_is_told_as_undecodable() {
+        let tmp = Tmp::new();
+        let s = settings(&tmp.0, |_| {});
+        let shared = Arc::new(Mutex::new(Status::default()));
+        let mut st = Store::with_probe(shared.clone(), Box::new(|_| None));
+        st.fail_decode = true;
+        assert_eq!(
+            st.handle(frame(&s, positive("a", "r1", t(0)), 1)),
+            Handled::Dropped(Dropped::Error)
+        );
+        let e = shared.lock().unwrap().last_error.clone().unwrap();
+        assert_eq!(
+            e.message,
+            "could not read a frame Blue Iris sent, so it was not saved: test: not an image; the \
+             image may be damaged or in a format the service cannot decode"
+        );
+        assert!(shared.lock().unwrap().disabled.is_none(), "no disk stop");
+        assert_eq!(shared.lock().unwrap().last_saved_at, None);
     }
 
     #[test]

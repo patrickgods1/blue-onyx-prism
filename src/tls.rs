@@ -621,7 +621,9 @@ pub fn load(
     }
 }
 
-/// The error of own files that do not load: what failed and what to do.
+/// The error of own files that do not load: what failed and what to do. It names no retry
+/// period: the listener's message adds the real one (`server::listen`, "trying again every N s"),
+/// and `tls-fingerprint` retries nothing.
 fn own_files_error(cert: &Path, key: &Path, p: PairProblem) -> anyhow::Error {
     let why = match p {
         PairProblem::Missing => format!(
@@ -634,8 +636,7 @@ fn own_files_error(cert: &Path, key: &Path, p: PairProblem) -> anyhow::Error {
     anyhow::anyhow!(
         "{why}. The HTTPS listener stays down (plain HTTP keeps working) until the pair loads; \
          fix the files (PEM: the certificate chain, leaf first, and its private key) or remove \
-         tls_cert_path and tls_key_path from the config file to use a generated certificate. \
-         The files are read again every 30 s"
+         tls_cert_path and tls_key_path from the config file to use a generated certificate"
     )
 }
 
@@ -1128,6 +1129,19 @@ pub fn pinned_client(cert: &Path) -> Result<reqwest::ClientBuilder> {
         .no_proxy())
 }
 
+/// The default headers of a client that sends the API token `token`: `Authorization: Bearer
+/// <token>`, marked sensitive (reqwest and hyper then keep it out of `Debug` output and HPACK
+/// tables). For the CLI's `diagnostics`, the load test and the test fixtures, which pick their
+/// own transport ([`pinned_client`] or, for a throwaway test server, none).
+pub fn bearer_header(token: &str) -> Result<reqwest::header::HeaderMap> {
+    let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+        .context("the API token is not a header value")?;
+    auth.set_sensitive(true);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    Ok(headers)
+}
+
 /// The certificate file a client of the service running `config` pins: the config's own
 /// `tls_cert_path`, else the generated `<data root>/auth/tls/cert.pem`.
 pub fn cert_path(config: &Config) -> PathBuf {
@@ -1136,3 +1150,20 @@ pub fn cert_path(config: &Config) -> PathBuf {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// [`bearer_header`] (QA-208).
+#[cfg(test)]
+mod bearer_tests {
+    #[test]
+    fn the_token_is_one_sensitive_bearer_header() {
+        let h = super::bearer_header("tok-123").unwrap();
+        assert_eq!(h.len(), 1);
+        let v = h.get(reqwest::header::AUTHORIZATION).unwrap();
+        assert_eq!(v.to_str().unwrap(), "Bearer tok-123");
+        assert!(v.is_sensitive());
+        assert!(!format!("{v:?}").contains("tok-123"), "{v:?}");
+        let e = super::bearer_header("bad\ntoken").unwrap_err();
+        assert!(format!("{e:#}").contains("not a header value"), "{e:#}");
+        assert!(!format!("{e:#}").contains("bad"), "{e:#}");
+    }
+}

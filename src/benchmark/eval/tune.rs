@@ -20,7 +20,7 @@ use super::stats::Estimate;
 use super::tally::sum_all;
 use crate::benchmark::combos::sets::{CompareSet, compare_sets};
 use crate::benchmark::images::GroundTruth;
-use crate::benchmark::metrics::{ClassMap, EvalImage, canonical_label, image_counts};
+use crate::benchmark::metrics::{ClassMap, EvalImage, image_counts};
 use crate::benchmark::report::BenchmarkResults;
 use crate::benchmark::search::{StoredPreds, StoredRun};
 use crate::benchmark::threshold::{NOT_ON_LABELS, grid};
@@ -173,16 +173,9 @@ fn counted(map: &ClassMap, goal: &Goal) -> Vec<String> {
         return map.classes.clone();
     }
     let mut v: Vec<String> = Vec::new();
-    for c in &goal.classes {
-        let canon = canonical_label(c);
-        let class = map.classes.iter().find(|k| **k == canon).or_else(|| {
-            map.gt_class(&canon)
-                .and_then(|g| map.classes.iter().find(|k| *k == g))
-        });
-        if let Some(c) = class
-            && !v.contains(c)
-        {
-            v.push(c.clone());
+    for class in goal.classes.iter().filter_map(|c| map.scored_class(c)) {
+        if !v.contains(class) {
+            v.push(class.clone());
         }
     }
     v

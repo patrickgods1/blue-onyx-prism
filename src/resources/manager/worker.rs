@@ -5,7 +5,8 @@
 
 use super::*;
 
-pub(super) fn unix_now() -> u64 {
+/// Now, in whole seconds since the Unix epoch (0 before it).
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -297,6 +298,14 @@ fn gate_of<'a>(shared: &'a Shared, res: &Resource) -> Option<Gate<'a>> {
     })
 }
 
+/// What every step of one job reads: the worker's state, its HTTP client and runtime, the job.
+struct JobRun<'a> {
+    shared: &'a Shared,
+    client: &'a reqwest::Client,
+    rt: &'a tokio::runtime::Runtime,
+    job: &'a Job,
+}
+
 /// Install one job (steps 1-6 of the module docs).
 fn run_job(
     shared: &Shared,
@@ -309,17 +318,17 @@ fn run_job(
     // Installed, or downloaded already and waiting for the next start (`in_use::place`).
     // A staged update counts only beside the install it replaces: with that install gone (deleted
     // by hand), nothing would ever swap it in (RA resources-11).
-    let done = || {
+    let already_done = || {
         is_installed(res, &job.target)
             || (read_manifest(&job.target.join(MANIFEST_FILE)).is_some_and(|m| m.id == res.id)
                 && super::in_use::staged_version(res.id, &job.target).as_deref()
                     == Some(job.version()))
     };
-    if !local && done() {
+    if !local && already_done() {
         return Ok(());
     }
     let _lock = DownloadLock::acquire(&shared.opts.root, shared.opts.lock_wait, &shared.abort)?;
-    if !local && done() {
+    if !local && already_done() {
         return Ok(());
     }
     if !local && let Some(damage) = install_damage(&manifest_path(res, &job.target), &job.target) {
@@ -332,7 +341,6 @@ fn run_job(
         );
     }
     let total = res.size();
-    let mut done = 0u64;
     let mut last_report = Instant::now() - Duration::from_secs(1);
     let mut progress = |bytes: u64, force: bool| {
         if force || last_report.elapsed() >= Duration::from_millis(100) {
@@ -340,54 +348,84 @@ fn run_job(
             shared.set(job, State::Downloading { bytes, total });
         }
     };
-
-    // Model files: verified, then renamed into place next to the target.
+    let run = JobRun {
+        shared,
+        client,
+        rt,
+        job,
+    };
     if res.parts.iter().all(|p| p.layout == Layout::File) {
-        std::fs::create_dir_all(&job.target)
-            .with_context(|| format!("creating {}", job.target.display()))?;
-        let mut files = Vec::new();
-        for part in res.parts {
-            let dest = job.target.join(part.file_name);
-            // A file of the right size is about to be hashed: gigabytes, so it shows.
-            if std::fs::metadata(&dest).is_ok_and(|m| m.len() == part.size) {
-                shared.set(job, State::Verifying);
-            }
-            if file_matches(&dest, part.size, part.sha256, &shared.abort)? {
-                done += part.size;
-            } else {
-                let partial = job.target.join(format!("{}.partial", part.file_name));
-                let gate = gate_of(shared, res);
-                rt.block_on(download_part(
-                    client,
-                    part,
-                    &partial,
-                    &shared.abort,
-                    gate.as_ref(),
-                    |b| progress(done + b, false),
-                ))?;
-                shared.set(job, State::Verifying);
-                verify(&partial, part, &shared.abort)?;
-                std::fs::rename(&partial, &dest)
-                    .with_context(|| format!("renaming to {}", dest.display()))?;
-                done += part.size;
-                progress(done, true);
-            }
-            files.push(part.file_name.to_string());
-        }
-        write_manifest(
-            &manifest_path(res, &job.target),
-            &Manifest {
-                id: res.id.to_string(),
-                version: job.version().to_string(),
-                sha256: res.parts.iter().map(|p| p.sha256.to_string()).collect(),
-                files,
-            },
-            &job.target,
-        )?;
-        return Ok(());
+        install_files(&run, &mut progress)
+    } else {
+        install_archives(&run, &mut progress)
     }
+}
 
-    // Archives: download (or take local ones), extract into staging, swap into place.
+/// Download `part` to `partial` (resuming what is there), verify it, rename it to `dest`.
+/// `progress` hears `base` plus the bytes of this part so far.
+fn fetch_part(
+    run: &JobRun<'_>,
+    part: &crate::resources::catalog::Part,
+    partial: &Path,
+    dest: &Path,
+    base: u64,
+    progress: &mut dyn FnMut(u64, bool),
+) -> Result<()> {
+    let gate = gate_of(run.shared, run.job.resource);
+    run.rt.block_on(download_part(
+        run.client,
+        part,
+        partial,
+        &run.shared.abort,
+        gate.as_ref(),
+        |b| progress(base + b, false),
+    ))?;
+    run.shared.set(run.job, State::Verifying);
+    verify(partial, part, &run.shared.abort)?;
+    std::fs::rename(partial, dest).with_context(|| format!("renaming to {}", dest.display()))
+}
+
+/// Model files: verified, then renamed into place next to the target; then the manifest.
+fn install_files(run: &JobRun<'_>, progress: &mut dyn FnMut(u64, bool)) -> Result<()> {
+    let (shared, job) = (run.shared, run.job);
+    let res = job.resource;
+    std::fs::create_dir_all(&job.target)
+        .with_context(|| format!("creating {}", job.target.display()))?;
+    let mut done = 0u64;
+    let mut files = Vec::new();
+    for part in res.parts {
+        let dest = job.target.join(part.file_name);
+        // A file of the right size is about to be hashed: gigabytes, so it shows.
+        if std::fs::metadata(&dest).is_ok_and(|m| m.len() == part.size) {
+            shared.set(job, State::Verifying);
+        }
+        if file_matches(&dest, part.size, part.sha256, &shared.abort)? {
+            done += part.size;
+        } else {
+            let partial = job.target.join(format!("{}.partial", part.file_name));
+            fetch_part(run, part, &partial, &dest, done, progress)?;
+            done += part.size;
+            progress(done, true);
+        }
+        files.push(part.file_name.to_string());
+    }
+    write_manifest(
+        &manifest_path(res, &job.target),
+        &Manifest {
+            id: res.id.to_string(),
+            version: job.version().to_string(),
+            sha256: res.parts.iter().map(|p| p.sha256.to_string()).collect(),
+            files,
+        },
+        &job.target,
+    )
+}
+
+/// Archives: download (or take local ones), extract into staging, swap into place.
+fn install_archives(run: &JobRun<'_>, progress: &mut dyn FnMut(u64, bool)) -> Result<()> {
+    let (shared, job) = (run.shared, run.job);
+    let res = job.resource;
+    let local = job.local_archives.is_some();
     let downloads = shared.opts.root.join(DOWNLOADS_DIR);
     let mut archives: Vec<PathBuf> = Vec::new();
     match &job.local_archives {
@@ -405,23 +443,12 @@ fn run_job(
         None => {
             std::fs::create_dir_all(&downloads)
                 .with_context(|| format!("creating {}", downloads.display()))?;
+            let mut done = 0u64;
             for part in res.parts {
                 let file = downloads.join(part.file_name);
                 if !file_matches(&file, part.size, part.sha256, &shared.abort)? {
                     let partial = downloads.join(format!("{}.partial", part.file_name));
-                    let gate = gate_of(shared, res);
-                    rt.block_on(download_part(
-                        client,
-                        part,
-                        &partial,
-                        &shared.abort,
-                        gate.as_ref(),
-                        |b| progress(done + b, false),
-                    ))?;
-                    shared.set(job, State::Verifying);
-                    verify(&partial, part, &shared.abort)?;
-                    std::fs::rename(&partial, &file)
-                        .with_context(|| format!("renaming to {}", file.display()))?;
+                    fetch_part(run, part, &partial, &file, done, progress)?;
                 }
                 done += part.size;
                 progress(done, true);
@@ -523,6 +550,21 @@ fn sibling(dir: &Path, what: &str) -> Result<PathBuf> {
     let parent = dir.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     Ok(parent.join(format!(".{name}.{what}")))
+}
+
+/// Bytes of the regular files under `p`, recursively (symlinks not followed); 0 when it cannot
+/// be read. For the size `setup-*` reports.
+pub(crate) fn dir_size(p: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return 0;
+    };
+    rd.filter_map(|e| e.ok())
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Remove `p` whether it is a file, a directory tree or a symlink; absent is fine.
@@ -2164,6 +2206,93 @@ mod tests {
         assert!(user.join("mine").join("notes.txt").is_file());
         assert!(is_installed(res, &user));
         assert!(!super::super::exclusively_ours(&user, res.id));
+    }
+
+    /// QA-145 (resources-20): an ONNX Runtime merged into a shared folder that holds another
+    /// flavor's install: the old flavor's libraries and markers go first (flavors never mix),
+    /// everything else in the folder stays, and the manifest lists the new files. A second
+    /// install merges again (the user's files survive; a swap would have dropped them, and
+    /// leaves an `.<name>.old-<pid>` folder on the way).
+    #[test]
+    fn merge_into_a_shared_dir_keeps_foreign_files_and_drops_old_ort_libs() {
+        let root = crate::test_dirs::TempDir::new("mgr-shared-ort");
+        let shared = root.join("shared");
+        std::fs::create_dir_all(shared.join("mine")).unwrap();
+        let foreign = [
+            "keep.txt",
+            "libfoo.so",
+            "onnxruntime.txt",
+            "mine/libonnxruntime.so.1.20",
+        ];
+        for f in foreign {
+            std::fs::write(shared.join(f), b"mine").unwrap();
+        }
+        let old_ort = [
+            "libonnxruntime.so.1.20",
+            "libonnxruntime_providers_cuda.so",
+            "flavor.txt",
+            "VERSION",
+        ];
+        for f in old_ort {
+            std::fs::write(shared.join(f), b"old cuda install").unwrap();
+        }
+        let install = |content: &[u8], version: &'static str| {
+            let archive = runtime_archive(content);
+            let server = serve(archive.clone(), false);
+            let res: &'static Resource = Box::leak(Box::new(Resource {
+                version,
+                ..*runtime_resource(&server.url, &archive)
+            }));
+            install_all(
+                ManagerOptions::new(&*root),
+                vec![Job::into_dir(res, shared.clone())],
+            )
+            .unwrap();
+            res
+        };
+        let res = install(b"v1", "1");
+        for f in old_ort.iter().filter(|f| f.starts_with("lib")) {
+            assert!(!shared.join(f).exists(), "{f} of the old flavor is gone");
+        }
+        for f in foreign {
+            assert_eq!(std::fs::read(shared.join(f)).unwrap(), b"mine", "{f}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(shared.join("flavor.txt"))
+                .unwrap()
+                .trim(),
+            "cpu"
+        );
+        let manifest = shared.join(MANIFEST_FILE);
+        assert!(is_merged(&manifest));
+        let files = read_manifest(&manifest).unwrap().files;
+        for f in ["libonnxruntime.so", "flavor.txt", "VERSION"] {
+            assert!(files.iter().any(|x| x == f), "{f} in {files:?}");
+        }
+        assert!(
+            !files.iter().any(|x| foreign.contains(&x.as_str())),
+            "{files:?}"
+        );
+        assert!(is_installed(res, &shared));
+
+        let res = install(b"v2", "2");
+        assert_eq!(
+            std::fs::read(shared.join("libonnxruntime.so")).unwrap(),
+            b"v2"
+        );
+        for f in foreign {
+            assert_eq!(std::fs::read(shared.join(f)).unwrap(), b"mine", "{f}");
+        }
+        assert!(is_merged(&manifest), "merged again, never swapped");
+        assert!(is_installed(res, &shared));
+        let aside: Vec<String> = std::fs::read_dir(&*root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            // The in-use lock stays (see `in_use`); nothing else.
+            .filter(|n| n.starts_with(".shared.") && n != ".shared.in-use")
+            .collect();
+        assert!(aside.is_empty(), "no swap left a folder aside: {aside:?}");
     }
 
     /// QA-025: the merge flag alone keeps a directory from being replaced as a whole: an install

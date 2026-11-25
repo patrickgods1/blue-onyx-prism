@@ -33,8 +33,12 @@ pub const INDEX_FILE: &str = "index.jsonl";
 pub const REVIEW_QUEUE_FILE: &str = "review-queue.jsonl";
 /// Version of a review-queue line.
 pub const REVIEW_VERSION: u32 = 1;
-/// Scene folders.
-pub const SCENES: [&str; 3] = ["day", "night", "ir"];
+/// Scene folders: [`Scene::ALL`](crate::image_stats::Scene::ALL) spelled (`day`, `night`, `ir`).
+pub const SCENES: [&str; 3] = [
+    crate::image_stats::Scene::Day.as_str(),
+    crate::image_stats::Scene::Night.as_str(),
+    crate::image_stats::Scene::Ir.as_str(),
+];
 /// Newest frames per bucket kept in the [`Summary`] (thumbnails).
 pub const NEWEST_PER_BUCKET: usize = 8;
 /// Key of [`Summary::by_label`] for a frame whose reply had no detection.
@@ -274,7 +278,7 @@ pub struct FrameRef {
 impl FrameRef {
     pub fn of(line: &IndexLine, date: &str) -> Self {
         Self {
-            rel: format!("{}/{}/{date}/{}.jpg", line.scene, line.camera, line.id),
+            rel: line.rel(date),
             timestamp: line.timestamp.clone(),
             scene: line.scene.clone(),
             camera: line.camera.clone(),
@@ -579,18 +583,35 @@ fn ends_a_line(f: &mut std::fs::File) -> std::io::Result<bool> {
 /// interleave. After a torn last line the write starts with a newline: the torn line stays a bad
 /// line of its own and this one is whole.
 pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    append_lines(path, &[line], false)
+}
+
+/// [`append_line`] for several lines: all of them (each with its newline) in a single write, under
+/// the same torn-tail rule; `sync` flushes the file's data to disk before returning. No lines, no
+/// write (the file is still created).
+pub fn append_lines<S: AsRef<str>>(path: &Path, lines: &[S], sync: bool) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
         .open(path)?;
-    let mut buf = Vec::with_capacity(line.len() + 2);
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let len: usize = lines.iter().map(|l| l.as_ref().len() + 1).sum();
+    let mut buf = Vec::with_capacity(len + 1);
     if !ends_a_line(&mut f)? {
         buf.push(b'\n');
     }
-    buf.extend_from_slice(line.as_bytes());
-    buf.push(b'\n');
-    f.write_all(&buf)
+    for line in lines {
+        buf.extend_from_slice(line.as_ref().as_bytes());
+        buf.push(b'\n');
+    }
+    f.write_all(&buf)?;
+    if sync {
+        f.sync_data()?;
+    }
+    Ok(())
 }
 
 /// One line of `review-queue.jsonl`.

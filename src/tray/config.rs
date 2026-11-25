@@ -8,10 +8,9 @@ use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-/// Port of the service when nothing says otherwise (CodeProject.AI's).
-pub const DEFAULT_PORT: u16 = 32168;
-/// HTTPS port of the web UI when nothing says otherwise.
-pub const DEFAULT_HTTPS_PORT: u16 = 32169;
+/// Port of the service when nothing says otherwise (CodeProject.AI's), and the HTTPS port of the
+/// web UI: the service's own defaults.
+pub use crate::{DEFAULT_HTTPS_PORT, DEFAULT_PORT};
 
 /// Ports and listen address read from a service config.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -30,7 +29,7 @@ pub fn service_config_path() -> Option<PathBuf> {
             .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
         Some(
             root.join("BlueOnyxPrism")
-                .join("blue_onyx_prism_config_service.json"),
+                .join(crate::config::SERVICE_CONFIG_FILE),
         )
     }
     #[cfg(target_os = "macos")]

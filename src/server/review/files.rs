@@ -18,8 +18,8 @@
 //! guard) from happening.
 
 use super::{
-    Answer, AppState, blocking, context, folder_problem, folder_unavailable, hidden, json_body,
-    json_fail, now, success,
+    Answer, AppState, ReviewCtx, blocking, folder_unavailable, json_body, json_fail, now,
+    review_ctx, success,
 };
 use crate::collect::CollectSettings;
 use crate::collect::labels::export::{
@@ -41,8 +41,8 @@ use std::sync::Arc;
 
 /// The folder of the page's default exports, `<UTC time>` under it unless `out_dir` is given: where the Train tab looks for them
 /// ([`crate::training::discover_exports`]), so a custom `training.dir` moves it too.
-pub(super) fn exports_dir(state: &AppState) -> std::path::PathBuf {
-    crate::training::training_dir(&state.config_read()).join("exports")
+pub(super) fn exports_dir(config: &crate::config::Config) -> std::path::PathBuf {
+    crate::training::training_dir(config).join("exports")
 }
 
 /// The dataset folder and every folder a finished import wrote to (newest first), once each.
@@ -257,19 +257,18 @@ pub(in crate::server) async fn export(
         ));
     }
     Ok(blocking(move || {
-        let (dir, classes, root) = context(&state);
-        if let Some(message) = folder_problem(&state, &dir) {
+        let ctx = review_ctx(&state);
+        if let Some(message) = ctx.folder_problem() {
             return folder_unavailable(message);
         }
-        let filter = match class_filter(b.labels, b.include_empty, &classes) {
+        let filter = match class_filter(b.labels, b.include_empty, &ctx.classes) {
             Ok(f) => f,
             Err(e) => return json_fail(StatusCode::BAD_REQUEST, e),
         };
         let out_dir = match b.out_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            None => {
-                exports_dir(&state).join(crate::clock::frame_stamp(std::time::SystemTime::now()))
-            }
-            Some(raw) => match export_folder(&state, raw, &root) {
+            None => exports_dir(&ctx.config)
+                .join(crate::clock::frame_stamp(std::time::SystemTime::now())),
+            Some(raw) => match export_folder(&state, raw, &ctx.root) {
                 Ok(p) => p,
                 Err((s, m)) => return json_fail(s, m),
             },
@@ -284,20 +283,21 @@ pub(in crate::server) async fn export(
             },
             benchmark_split: b.benchmark_split,
             include_unreviewed: b.include_unreviewed,
-            hidden_classes: hidden(&state),
-            size_floor: state.config_read().collect.size_floor,
+            hidden_classes: ctx.hidden.clone(),
+            size_floor: ctx.size_floor(),
             // The camera days held out for good: read, and grown by an export of the default
             // split, never with a day a training run has seen.
             heldout: Some(HeldoutPolicy {
-                seen: crate::training::seen_days(&state.config_read()),
+                seen: crate::training::seen_days(&ctx.config),
             }),
         };
         let (side, shutdown) = (state.side_jobs.clone(), state.shutdown.clone());
         // Where the export notes its scratch folder, so a sweep after a crash or a kill finds it
         // in a folder of the user's choice too.
-        let pending = crate::training::training_dir(&state.config_read())
+        let pending = crate::training::training_dir(&ctx.config)
             .join(crate::storage::sweep::EXPORTS_PENDING_DIR);
         drop(state);
+        let ReviewCtx { dir, classes, .. } = ctx;
         let job = side.start(SideKind::DatasetExport, export_title(&req));
         let progress = |s| job.report(side_jobs::export_report(s));
         let stop = || shutdown.is_cancelled();
@@ -348,11 +348,11 @@ pub(in crate::server) async fn import(
 ) -> Answer {
     let b: ImportBody = json_body(&headers, body)?;
     Ok(blocking(move || {
-        let (dir, classes, root) = context(&state);
-        if let Some(message) = folder_problem(&state, &dir) {
+        let ctx = review_ctx(&state);
+        if let Some(message) = ctx.folder_problem() {
             return folder_unavailable(message);
         }
-        let src = match named_folder(&state, "dir", &b.dir, &root) {
+        let src = match named_folder(&state, "dir", &b.dir, &ctx.root) {
             Ok(Some(p)) if p.is_dir() => p,
             Ok(Some(_)) => {
                 return json_fail(
@@ -368,9 +368,14 @@ pub(in crate::server) async fn import(
             }
             Err((s, m)) => return json_fail(s, m),
         };
-        let hidden = hidden(&state);
         let (side, shutdown) = (state.side_jobs.clone(), state.shutdown.clone());
         drop(state);
+        let ReviewCtx {
+            dir,
+            classes,
+            hidden,
+            ..
+        } = ctx;
         let job = side.start(SideKind::XanyImport, format!("From {}", src.display()));
         let result = xany::import_dir_until(
             &dir,
@@ -502,10 +507,11 @@ pub(in crate::server) async fn rescan(
         let _: serde_json::Value = json_body(&headers, body)?;
     }
     Ok(blocking(move || {
-        let (dir, _, _) = context(&state);
-        if let Some(message) = folder_problem(&state, &dir) {
+        let ctx = review_ctx(&state);
+        if let Some(message) = ctx.folder_problem() {
             return folder_unavailable(message);
         }
+        let dir = ctx.dir;
         let Some(_one) = Rescanning::start(&dir) else {
             return json_fail(
                 StatusCode::CONFLICT,
@@ -740,7 +746,7 @@ mod tests {
             serde_json::to_vec(&x).unwrap(),
         )
         .unwrap();
-        let exports = exports_dir(&state);
+        let exports = exports_dir(&state.config_read());
 
         state.shutdown.cancel();
         let (s, m) = post(&state, "/v1/review/export", r#"{"format": "yolo"}"#.into()).await;

@@ -217,7 +217,7 @@ impl Finished {
     /// The summary's parts on the suggestions found: the missing boxes at static spots, and the
     /// better-fitting boxes when the check took a closer look (`look`).
     fn found_parts(&self, look: bool) -> (String, String) {
-        let n = crate::training::import::preview::thousands;
+        let n = crate::training::text::thousands;
         let at_spots = if self.rep.adds_at_spots > 0 {
             format!(" ({} at static spots)", n(self.rep.adds_at_spots))
         } else {
@@ -263,7 +263,7 @@ const FOLD_MODEL: &str = "preparing the fold model";
 /// What the closer look did after a failed fold (`zoom`: how it ended, None when it did not run;
 /// `rep`: its counts), for the task's error: empty without a look.
 fn look_after_failed_fold(zoom: Option<&tighten::ZoomEnd>, rep: &RefineReport) -> String {
-    let n = crate::training::import::preview::thousands;
+    let n = crate::training::text::thousands;
     match zoom {
         None => String::new(),
         Some(z) if z.failed.is_some() => format!(
@@ -1331,7 +1331,7 @@ impl RefineJob {
         let cancelled = matches!(stop, Some(Stop::Cancelled));
         let end = self.finish_report(acc, zoom.as_ref(), (cancelled, failed), steps, report);
         let rep = &end.rep;
-        let n = crate::training::import::preview::thousands;
+        let n = crate::training::text::thousands;
         let w = &rep.written;
         let f = &rep.found;
         let mut summary = match &stop {
@@ -1387,7 +1387,7 @@ impl RefineJob {
 
 /// The summary's part on the closer look (`zoom`: how it ended, None when it did not run).
 fn looked_text(zoom: Option<&tighten::ZoomEnd>, rep: &RefineReport) -> String {
-    let n = crate::training::import::preview::thousands;
+    let n = crate::training::text::thousands;
     match zoom {
         Some(z) if z.failed.is_some() => {
             "; the closer look at them failed (see the warnings), the other suggestions were saved"
@@ -1484,7 +1484,7 @@ impl RefineJob {
         let look = self.tighten();
         let steps = self.steps();
         let name = q.judge.name.clone();
-        let n = crate::training::import::preview::thousands;
+        let n = crate::training::text::thousands;
         // 1. One label snapshot.
         Self::step(
             report,
@@ -1677,7 +1677,7 @@ impl Task for RefineJob {
             return format!(
                 "quick dataset check with {} ({} {} it never saw, {})",
                 q.judge.name,
-                crate::training::import::preview::thousands(q.unseen),
+                crate::training::text::thousands(q.unseen),
                 if q.unseen == 1 { "frame" } else { "frames" },
                 self.request.frames.describe()
             );

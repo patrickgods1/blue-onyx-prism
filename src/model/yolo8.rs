@@ -4,7 +4,7 @@
 use anyhow::Result;
 
 use super::nms::{MAX_DETS, MAX_NMS_CANDIDATES, nms_capped};
-use super::yolo26::{matrix_dims, meets, primary_f32_output};
+use super::output::{matrix_dims, meets, primary_f32_output};
 use super::{
     Detection, Family, ModelFamilyKind, NamedOutput, PostParams, PreprocessCtx, ResizeMode,
 };

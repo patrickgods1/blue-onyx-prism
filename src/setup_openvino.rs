@@ -7,9 +7,9 @@
 //! `.installed.json` manifest. Nothing from the archive is executed.
 
 use crate::resources::catalog;
-use crate::resources::manager::{self, Job, ManagerOptions};
+use crate::resources::manager::{self, Job, ManagerOptions, dir_size};
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Pinned OpenVINO runtime version (the catalog in `resources::catalog` owns the pin).
 pub use crate::resources::catalog::{ArchiveKind, OPENVINO_VERSION};
@@ -48,19 +48,6 @@ pub struct SetupOptions {
     pub keep_archive: bool,
     /// Download root (lock file, `.downloads/`); default the exe dir.
     pub root: Option<PathBuf>,
-}
-
-pub(crate) fn dir_size(p: &Path) -> u64 {
-    let Ok(rd) = std::fs::read_dir(p) else {
-        return 0;
-    };
-    rd.filter_map(|e| e.ok())
-        .map(|e| match e.file_type() {
-            Ok(t) if t.is_dir() => dir_size(&e.path()),
-            Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
-            _ => 0,
-        })
-        .sum()
 }
 
 /// Download (or take `opts.archive`), install the runtime subset into the destination and

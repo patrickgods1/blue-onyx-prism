@@ -1142,10 +1142,6 @@ pub(super) fn save_config(
     if pending.restart_needed() {
         msg.push_str(" Restart the server to apply the other changes.");
     }
-    let tz = state.config_read().timezone;
-    if tz != up.before.timezone {
-        crate::clock::change(tz);
-    }
     if let Some(level) = level {
         match apply_log_level(state, level) {
             Ok(()) => msg.push_str(&format!(

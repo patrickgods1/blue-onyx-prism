@@ -15,9 +15,9 @@
 //!    [`TIGHTEN_FOLD_SCORE`] or more, on a label of a wanted class RF-DETR L can see
 //!    ([`coco_class`]) that is not too small (the floor of rule 4), is a candidate for a closer
 //!    look ([`Judged::candidates`], [`Loose`]): the zoom stage of the check
-//!    ([`super::tighten`]) runs RF-DETR L on a crop of the pair, and [`tighten`] decides from
-//!    both looks whether a better-fitting box is proposed (`tighten`). A fold model's box alone
-//!    never overrules a label: fold models are short-trained at a small input size.
+//!    ([`super::tighten`]) runs RF-DETR L on a crop of the pair, and [`tighten_verdict`] decides
+//!    from both looks whether a better-fitting box is proposed (`tighten`). A fold model's box
+//!    alone never overrules a label: fold models are short-trained at a small input size.
 //! 4. `add`: an unmatched detection at [`ADD_SCORE`] or more, at least [`FLOOR_PX`] on its short side
 //!    at model input, that no box of its object that is not rejected and no ignore box covers
 //!    ([`covers`]), and no judged reject of its object lies on at IoU >= [`REJECT_BLOCK_IOU`].
@@ -78,6 +78,7 @@ use crate::collect::labels::{
     BoxState, LabelBox, LabelFile, SizeFloor, Source, Status, clamp_box, covers, inside_share, iou,
     stacks, under_floor,
 };
+use crate::geom::{area, proper_box};
 use crate::model::coco::coco_class;
 use crate::training::autolabel::triage::Det;
 use crate::training::overlaps::zoom::CropPlace;
@@ -304,11 +305,6 @@ impl Loose {
     }
 }
 
-/// Finite coordinates of a box with a positive size.
-fn proper(b: &[f32; 4]) -> bool {
-    b.iter().all(|v| v.is_finite()) && b[2] > b[0] && b[3] > b[1]
-}
-
 /// The short side of `b` at model input: `min(w / W, h / H) * imgsz`. Infinite for a frame of
 /// unknown size (no floor applies there).
 pub fn short_px(b: &[f32; 4], width: u32, height: u32, imgsz: u32) -> f32 {
@@ -432,7 +428,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
     let dets: Vec<D> = frame
         .dets
         .iter()
-        .filter(|d| d.score.is_finite() && d.score >= MATCH_MIN_SCORE && proper(&d.bbox))
+        .filter(|d| d.score.is_finite() && d.score >= MATCH_MIN_SCORE && proper_box(&d.bbox))
         .filter_map(|d| {
             let class = wanted.class_of(&d.label)?;
             let bbox = if frame.width > 0 && frame.height > 0 {
@@ -440,7 +436,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
             } else {
                 d.bbox
             };
-            proper(&bbox).then(|| D {
+            proper_box(&bbox).then(|| D {
                 class: class.to_string(),
                 key: class.trim().to_ascii_lowercase(),
                 bbox,
@@ -451,7 +447,7 @@ pub fn judge(frame: &FrameInput<'_>, ctx: &Context<'_>) -> Judged {
     let all_train: Vec<T<'_>> = f
         .boxes
         .iter()
-        .filter(|b| b.is_training() && !b.is_ignore() && proper(&b.bbox))
+        .filter(|b| b.is_training() && !b.is_ignore() && proper_box(&b.bbox))
         .map(|b| T {
             b,
             class: wanted.class_of(&b.label).map(str::to_string),
@@ -721,10 +717,6 @@ impl NoTighten {
     }
 }
 
-fn area(b: &[f32; 4]) -> f32 {
-    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
-}
-
 /// Whether `z` ends within [`TIGHTEN_EDGE_PX`] of an edge of the crop at `place` that is not the
 /// image's own edge: the object was cut there. False without a place.
 fn cut_by_crop(z: &[f32; 4], place: Option<CropPlace>) -> bool {
@@ -740,16 +732,6 @@ fn cut_by_crop(z: &[f32; 4], place: Option<CropPlace>) -> bool {
         || (c[1] > 0.0 && z[1] <= c[1] + e)
         || (c[2] < w && z[2] >= c[2] - e)
         || (c[3] < h && z[3] >= c[3] - e)
-}
-
-/// The `tighten` the closer look supports for candidate `c` ([`tighten_verdict`]), or None.
-pub fn tighten(
-    frame: &FrameInput<'_>,
-    c: &Loose,
-    look: &Look,
-    ctx: &Context<'_>,
-) -> Option<Suggestion> {
-    tighten_verdict(frame, c, look, ctx).ok()
 }
 
 /// The `tighten` the closer look supports for candidate `c` (a [`Loose`] pair of `frame`, whose
@@ -787,7 +769,7 @@ pub fn tighten_verdict(
     ctx: &Context<'_>,
 ) -> Result<Suggestion, NoTighten> {
     let f = frame.file;
-    if f.status != Status::Reviewed || !proper(&c.target) || !proper(&c.det) {
+    if f.status != Status::Reviewed || !proper_box(&c.target) || !proper_box(&c.det) {
         return Err(NoTighten::Other);
     }
     let wanted = ctx.wanted;
@@ -826,14 +808,14 @@ pub fn tighten_verdict(
         .filter_map(|(i, d)| {
             #[allow(clippy::cast_possible_truncation, reason = "a score and pixels")]
             let (score, bbox) = (d.score as f32, d.bbox.map(|v| v as f32));
-            if !(score.is_finite() && score >= TIGHTEN_ZOOM_SCORE && proper(&bbox)) {
+            if !(score.is_finite() && score >= TIGHTEN_ZOOM_SCORE && proper_box(&bbox)) {
                 return None;
             }
             if !same_object(&key_of(&d.label, wanted), &key) {
                 return None;
             }
             let b = fit(bbox);
-            proper(&b).then_some((i, b, score.min(1.0)))
+            proper_box(&b).then_some((i, b, score.min(1.0)))
         })
         .collect();
     let (zi, z, z_score) = seen
@@ -1952,7 +1934,7 @@ mod tests {
         }
     }
 
-    /// [`tighten`] on `f` (640 x 480, input 640) for `c` with `zoom` (no crop place), under `floor`.
+    /// [`tighten_verdict`] on `f` (640 x 480, input 640) for `c` with `zoom` (no crop place), under `floor`.
     fn refit(
         f: &LabelFile,
         c: &Loose,

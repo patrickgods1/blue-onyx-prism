@@ -5,7 +5,7 @@
 //! run per video, several at a time, each video's share of the candidate budget as its
 //! `--max-frames`) -> analyse (decode, dHash, scene on all cores but one below normal priority,
 //! then the dedup; in Rust) -> select (SigLIP embeddings from `import_footage.py embed`, k-center
-//! per scene) -> write (the kept video frames again at
+//! per scene; embeddings that fail fall back to the dHash k-center with a warning) -> write (the kept video frames again at
 //! full resolution with `import_footage.py frames`, then the dataset layout, the review queue,
 //! `imports.jsonl`). `ImportJob::stages` runs them in that order, one linear driver; the helper
 //! runs with self-contained inputs and outputs are methods of their own: the self-check
@@ -244,7 +244,7 @@ pub(super) fn capped_warning(
 ) -> Option<String> {
     let lo = quotas.iter().copied().min()?;
     let hi = quotas.iter().copied().max().unwrap_or(lo);
-    let t = super::preview::thousands;
+    let t = crate::training::text::thousands;
     let share = if lo == hi {
         format!("{} frames each", t(lo))
     } else {
@@ -1427,7 +1427,8 @@ impl ImportJob {
             .filter_map(|i| info.get(*i)?.as_ref().map(|x| x.0))
             .collect();
         let embeddings = if r.selection == Selection::Siglip && unique.len() > r.frames {
-            Some(self.embed(&cands, &unique, &script, ctx.runner, report, cancel)?)
+            let embedded = self.embed(&cands, &unique, &script, ctx.runner, report, cancel);
+            embeddings_or_dhash(embedded, guard, &mut warnings)?
         } else {
             None
         };
@@ -1643,6 +1644,33 @@ impl ImportJob {
             summary,
             result: serde_json::to_value(&rep)?,
         })
+    }
+}
+
+/// The SigLIP 2 embeddings, or None for the dHash selection when they could not be computed
+/// (Audit 2026-11, QA-263): one image the embedder cannot decode (a truncated Blue Iris alert JPEG
+/// the Rust decoder reads with zero-filled rows, PIL refuses) must not cost an import its hours
+/// of extraction and analysis. A Cancel or a full disk still ends the import, as everywhere else.
+fn embeddings_or_dhash(
+    embedded: Result<(Vec<f32>, usize)>,
+    guard: &Guard,
+    warnings: &mut Vec<String>,
+) -> Result<Option<(Vec<f32>, usize)>> {
+    match embedded {
+        Ok(e) => Ok(Some(e)),
+        Err(e) if pyenv::is_cancel(&e) => Err(e),
+        Err(e) if disk::is_disk_full(&e) => {
+            guard.trip(Trip::Full);
+            Err(e)
+        }
+        Err(e) => {
+            tracing::warn!("import: SigLIP 2 embeddings failed, using dHash: {e:#}");
+            warnings.push(format!(
+                "the SigLIP 2 embeddings could not be computed ({e:#}; a damaged image?), so \
+                 the frames were picked by dHash instead"
+            ));
+            Ok(None)
+        }
     }
 }
 

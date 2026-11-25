@@ -501,9 +501,7 @@ pub fn run(args: BenchArgs) -> Result<bool> {
     let openvino_dir = config.openvino_dir_effective();
     libs::prepare_environment(openvino_dir.as_deref());
 
-    if args.repeat == Some(0) {
-        bail!("--repeat must be at least 1");
-    }
+    // `--repeat` is 1..=MAX_REPEAT by its parser (`args::parse_repeat_arg`).
     let mut errors = Vec::new();
     let jobs = jobs(&args, &config, &mut errors)?;
     let variant_names: std::collections::HashSet<String> = jobs

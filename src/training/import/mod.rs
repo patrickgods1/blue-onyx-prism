@@ -57,7 +57,6 @@ use crate::resources::export::train::{self as env, TrainPaths};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::Duration;
 
 /// Default number of frames an import keeps.
 pub const DEFAULT_FRAMES: usize = 200;
@@ -388,7 +387,7 @@ pub(crate) fn plan_import_with(
         }
         None => crate::collect::CollectSettings::for_config(config).dir,
     };
-    let work = super::training_dir(config).join("imports").join(&id);
+    let work = imports_dir(config).join(&id);
     disk::check(
         disk::estimate(&plan_sources.plan(&request)),
         &work,
@@ -405,7 +404,7 @@ pub(crate) fn plan_import_with(
         platform,
         accelerator,
         root: config.data_root(),
-        timeout: Duration::from_secs(u64::from(config.training.timeout_hours) * 3600),
+        timeout: config.training.timeout(),
         needs_python,
         finish: None,
         headroom: super::commit::now,

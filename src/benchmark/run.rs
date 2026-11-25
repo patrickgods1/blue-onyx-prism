@@ -748,11 +748,7 @@ impl<'a> Bench<'a> {
         let (in_w, in_h) = info.input_size;
         let family =
             crate::model::make_family(job.family, &info.inputs, &info.outputs, job.classes.len())?;
-        let loaded_on = if dev.spec.is_empty() {
-            dev.actual.clone()
-        } else {
-            dev.spec.clone()
-        };
+        let loaded_on = loaded_spec(&dev).to_string();
         let (threshold, threshold_source) = self.served_threshold(job, &loaded_on);
         let night_threshold = job
             .variant
@@ -763,37 +759,25 @@ impl<'a> Bench<'a> {
             Some(n) => Some(Box::new(self.night_pipeline(n)?)),
             None => None,
         };
-        let mut pipe = Pipeline {
-            pre: Preprocessor::for_family(in_w, in_h, family.as_ref()),
-            family,
+        let mut pipe = self.base_pipeline(
+            job,
             backend,
-            params: PostParams {
-                confidence_threshold: threshold,
-                nms_iou: self.params.nms_iou,
-            },
-            eval_params: PostParams {
-                confidence_threshold: EVAL_CONFIDENCE
+            family,
+            job.variant.as_ref(),
+            verifier,
+            PipelineThresholds {
+                served: threshold,
+                eval: EVAL_CONFIDENCE
                     .min(threshold)
                     .min(night_threshold.unwrap_or(EVAL_CONFIDENCE)),
-                nms_iou: self.params.nms_iou,
             },
-            classes: &job.classes,
-            filter: self.object_filter_for(job),
-            variant: job.variant.as_ref(),
-            verifier: match (
-                verifier,
-                job.variant.as_ref().and_then(|v| v.verify.as_ref()),
-            ) {
-                (Some(b), Some(v)) => Some(Verifier::new(b, v, self.params)?),
-                _ => None,
-            },
-            night_threshold,
-            night,
-            fixed: false,
-            verify_capped: 0,
-            #[cfg(test)]
-            slow_eval: self.slow_eval,
-        };
+        )?;
+        pipe.night_threshold = night_threshold;
+        pipe.night = night;
+        #[cfg(test)]
+        {
+            pipe.slow_eval = self.slow_eval;
+        }
 
         let all: Vec<(&ImageSet, &images::SetImage)> = self
             .sets
@@ -936,40 +920,63 @@ impl<'a> Bench<'a> {
             verifier,
         } = n;
         let info = backend.info();
-        let (in_w, in_h) = info.input_size;
         let family =
             crate::model::make_family(job.family, &info.inputs, &info.outputs, job.classes.len())?;
-        let loaded_on = if info.device.spec.is_empty() {
-            info.device.actual.clone()
-        } else {
-            info.device.spec.clone()
-        };
         let threshold = match variant.served.as_ref().and_then(|s| s.night_threshold) {
             Some(t) => t,
-            None => self.served_threshold(job, &loaded_on).0,
+            None => self.served_threshold(job, loaded_spec(&info.device)).0,
         };
+        let mut pipe = self.base_pipeline(
+            job,
+            backend,
+            family,
+            Some(variant),
+            verifier,
+            PipelineThresholds {
+                served: threshold,
+                eval: EVAL_CONFIDENCE.min(threshold),
+            },
+        )?;
+        pipe.fixed = true;
+        Ok(pipe)
+    }
+
+    /// The stages of `job` on `backend` (its `family` made from the backend's ports): the
+    /// resize, `thresholds`, the job's object filter, `variant` and the verifier `verifier`
+    /// runs for the variant's `verify`. No night routing, not fixed: [`Self::time`] adds the
+    /// As served night pipeline, [`Self::night_pipeline`] fixes its threshold.
+    fn base_pipeline<'s>(
+        &'s self,
+        job: &'s Job,
+        backend: Backend,
+        family: Box<dyn crate::model::Family>,
+        variant: Option<&'s PipelineVariant>,
+        verifier: Option<Backend>,
+        thresholds: PipelineThresholds,
+    ) -> Result<Pipeline<'s>> {
+        let (in_w, in_h) = backend.info().input_size;
         Ok(Pipeline {
             pre: Preprocessor::for_family(in_w, in_h, family.as_ref()),
             family,
             backend,
             params: PostParams {
-                confidence_threshold: threshold,
+                confidence_threshold: thresholds.served,
                 nms_iou: self.params.nms_iou,
             },
             eval_params: PostParams {
-                confidence_threshold: EVAL_CONFIDENCE.min(threshold),
+                confidence_threshold: thresholds.eval,
                 nms_iou: self.params.nms_iou,
             },
             classes: &job.classes,
             filter: self.object_filter_for(job),
-            variant: Some(variant),
-            verifier: match (verifier, variant.verify.as_ref()) {
+            variant,
+            verifier: match (verifier, variant.and_then(|v| v.verify.as_ref())) {
                 (Some(b), Some(v)) => Some(Verifier::new(b, v, self.params)?),
                 _ => None,
             },
             night_threshold: None,
             night: None,
-            fixed: true,
+            fixed: false,
             verify_capped: 0,
             #[cfg(test)]
             slow_eval: None,
@@ -1392,6 +1399,25 @@ pub(super) struct Pipeline<'j> {
     /// Test only: a pause in [`Pipeline::evaluate`] (untimed work).
     #[cfg(test)]
     slow_eval: Option<Duration>,
+}
+
+/// The confidence thresholds of a [`Pipeline`]: `served` the production threshold
+/// (`Pipeline::params`), `eval` the lower one its detections are kept at for the sweep
+/// (`Pipeline::eval_params`).
+#[derive(Debug, Clone, Copy)]
+struct PipelineThresholds {
+    served: f32,
+    eval: f32,
+}
+
+/// The device spec a backend loaded on (`spec`), else its runtime device (`actual`): what the
+/// service looks up device thresholds and read-ahead by.
+fn loaded_spec(dev: &crate::backend::device::DeviceInfo) -> &str {
+    if dev.spec.is_empty() {
+        &dev.actual
+    } else {
+        &dev.spec
+    }
 }
 
 /// The second model of a `verify:<model>` variant (and of an As served model with `verify`):

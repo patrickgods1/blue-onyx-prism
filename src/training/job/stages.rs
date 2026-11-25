@@ -267,8 +267,7 @@ fn setup_env(
                 percent,
                 detail,
             } => {
-                // The export bar's share of these stages ends at its self-check (71%).
-                let pct = u32::from(stage.overall(percent)) * 100 / 71;
+                let pct = pyenv::setup_share(stage, percent);
                 let d = format!("{}: {detail}", stage.label());
                 report(TrainReport::Stage {
                     stage: TrainStage::Setup,
@@ -283,19 +282,7 @@ fn setup_env(
         },
         s.cancel,
     )
-    .map_err(|e| {
-        if e.cancelled {
-            anyhow!(Cancelled)
-        } else {
-            anyhow!(
-                "{}{}",
-                e.stage
-                    .map(|s| format!("while {}: ", s.label()))
-                    .unwrap_or_default(),
-                e.message
-            )
-        }
-    })?;
+    .map_err(pyenv::env_error)?;
     Ok(())
 }
 
@@ -536,11 +523,14 @@ fn fetch_weights(
         super::super::check_public_download(&job.root, job.request.allow_large)?;
         downloads.push((public, public_dir.clone()));
     }
-    let missing: Vec<_> = downloads
-        .iter()
-        .filter(|(r, d)| !manager::is_installed(r, d))
-        .collect();
-    if missing.is_empty() {
+    // Every report enters the stage: a failure while downloading is the weights stage's.
+    let downloaded = pyenv::fetch_all(
+        s.fetcher,
+        &downloads,
+        &mut |pct, detail| enter(current, report, TrainStage::Weights, pct, detail),
+        s.cancel,
+    )?;
+    if !downloaded {
         enter(
             current,
             report,
@@ -548,45 +538,6 @@ fn fetch_weights(
             100,
             "already downloaded",
         );
-        return Ok((wdir, public_dir));
-    }
-    let total: u64 = missing.iter().map(|(r, _)| r.size()).sum();
-    let mut done = 0u64;
-    for (r, dir) in missing {
-        enter(
-            current,
-            report,
-            TrainStage::Weights,
-            manager::percent(done, total),
-            r.title,
-        );
-        s.fetcher.fetch(
-            r,
-            dir,
-            &mut |b, _| {
-                let d = format!(
-                    "{} {} of {} MB",
-                    r.title,
-                    (done + b) / 1_000_000,
-                    total / 1_000_000
-                );
-                report(TrainReport::Stage {
-                    stage: TrainStage::Weights,
-                    percent: manager::percent(done + b, total),
-                    detail: &d,
-                });
-            },
-            s.cancel,
-        )?;
-        if !manager::is_installed(r, dir) {
-            bail!(
-                "{} is not complete in {} after the download",
-                r.title,
-                dir.display()
-            );
-        }
-        done += r.size();
-        check(s.cancel)?;
     }
     Ok((wdir, public_dir))
 }

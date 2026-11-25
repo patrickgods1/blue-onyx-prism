@@ -179,7 +179,9 @@ use super::bulk::Wanted;
 use super::queue::Kept;
 use super::recall::{CameraRecall, InRun, Measured, Miss};
 use super::repeats::same_object;
-use super::{BoxState, LabelBox, LabelFile, Origin, Source, Status, inside_share, iou, statics};
+use super::{
+    BoxState, LabelBox, LabelFile, Origin, Source, Status, area, inside_share, iou, statics,
+};
 use crate::collect::record::{Det, Record};
 use crate::training::autolabel::Category;
 use serde::Serialize;
@@ -1735,41 +1737,7 @@ impl<'a> Scorer<'a> {
                 (hard_best, hard_class) = (h_k, Some(k));
             }
             if best.as_ref().is_none_or(|(t, _)| term > *t) {
-                let mut d = Detail::default();
-                for (b, x) in of_k() {
-                    d.evidence = d.evidence.max(b.e());
-                    if x.kappa.is_some_and(|kp| kp < 1.0) {
-                        d.kept = cam.kept.get(usize::from(k)).copied();
-                    }
-                    if x.a >= CUE_SHARE * e_k {
-                        d.spot |= x.spot;
-                        d.missed |= x.missed;
-                        d.gap |= b.has(GAP);
-                        d.strong |= x.strong;
-                        d.new_region |= x.new_region;
-                    }
-                }
-                let ki = usize::from(k);
-                d.boxes = e_k;
-                d.camera_reviewed = quarters(cam.cells.map(|c| &c.cells), (k, s8));
-                d.reviewed = self
-                    .n_ks
-                    .get(ki)
-                    .and_then(|n| n.get(s))
-                    .copied()
-                    .unwrap_or(0.0);
-                d.class_reviewed = self.boxes.get(ki).copied().unwrap_or(0.0);
-                d.below_floor = cw.floor;
-                d.catch_up = cw.catch_up;
-                d.new_day = cw.new_day;
-                d.heldout_gain = cw.heldout_gain;
-                d.heldout_boxes = self
-                    .need
-                    .steers_heldout()
-                    .then(|| cam.heldout.get(ki).and_then(|h| h.get(s)).copied())
-                    .flatten();
-                d.top = Some(k);
-                best = Some((term, d));
+                best = Some((term, self.detail_of(&cam, cw, of_k(), e_k, s8)));
             }
         }
         let hard = if f.heldout {
@@ -1792,6 +1760,56 @@ impl<'a> Scorer<'a> {
         }
         d.score = score_of(v + hard);
         d.heldout_day = f.heldout;
+        d
+    }
+
+    /// The page's explanation of the top class `cw.k` of a frame of `cam` in scene `s8`: its
+    /// candidates `of_k` (the kept ones, with their values), whose crowd is `e_k`, give the cues
+    /// and the evidence; the rest is the class's counts and why it weighs what it does. Reads
+    /// only: the score's sums are [`Self::score`]'s.
+    fn detail_of<'b>(
+        &self,
+        cam: &Cam<'_>,
+        cw: &ClassWeight,
+        of_k: impl Iterator<Item = (&'b CellBox, &'b BoxVal)>,
+        e_k: f64,
+        s8: u8,
+    ) -> Detail {
+        let (k, s) = (cw.k, usize::from(s8));
+        let mut d = Detail::default();
+        for (b, x) in of_k {
+            d.evidence = d.evidence.max(b.e());
+            if x.kappa.is_some_and(|kp| kp < 1.0) {
+                d.kept = cam.kept.get(usize::from(k)).copied();
+            }
+            if x.a >= CUE_SHARE * e_k {
+                d.spot |= x.spot;
+                d.missed |= x.missed;
+                d.gap |= b.has(GAP);
+                d.strong |= x.strong;
+                d.new_region |= x.new_region;
+            }
+        }
+        let ki = usize::from(k);
+        d.boxes = e_k;
+        d.camera_reviewed = quarters(cam.cells.map(|c| &c.cells), (k, s8));
+        d.reviewed = self
+            .n_ks
+            .get(ki)
+            .and_then(|n| n.get(s))
+            .copied()
+            .unwrap_or(0.0);
+        d.class_reviewed = self.boxes.get(ki).copied().unwrap_or(0.0);
+        d.below_floor = cw.floor;
+        d.catch_up = cw.catch_up;
+        d.new_day = cw.new_day;
+        d.heldout_gain = cw.heldout_gain;
+        d.heldout_boxes = self
+            .need
+            .steers_heldout()
+            .then(|| cam.heldout.get(ki).and_then(|h| h.get(s)).copied())
+            .flatten();
+        d.top = Some(k);
         d
     }
 
@@ -1990,11 +2008,6 @@ fn root(p: &mut [usize], i: usize) -> usize {
         j = up;
     }
     r
-}
-
-/// The area of `b`.
-fn area(b: &[f32; 4]) -> f32 {
-    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
 }
 
 /// Which of `cands` count (see the module docs, "objects"): candidates of other classes that

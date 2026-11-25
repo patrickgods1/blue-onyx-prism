@@ -2,7 +2,9 @@
 //! dialog and opening the web UI, per OS:
 //!
 //! - Windows: a hidden PowerShell runs `Start-Process -Verb RunAs` (the UAC prompt) on a second,
-//!   elevated PowerShell that runs the CLI and saves its output to a temp file. Both scripts go
+//!   elevated PowerShell that runs the CLI and exits with its code. Its output is not captured
+//!   (it would have to go through a file the user controls, written by an administrator's
+//!   process); a failure names the command to run by hand and the Event Viewer. Both scripts go
 //!   through `-EncodedCommand` (base64 UTF-16LE), so no command-line quoting is involved, and
 //!   every path inside them is a PowerShell single-quoted literal. Declining UAC exits 1223
 //!   (`ERROR_CANCELLED`) and counts as cancelled.

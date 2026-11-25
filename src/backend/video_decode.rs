@@ -154,13 +154,12 @@ const MIN_LAST_READING: Duration = Duration::from_millis(200);
 
 #[cfg(windows)]
 mod imp {
+    use crate::backend::pdh::PdhQuery;
     use windows::Win32::System::Performance::{
         PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT, PDH_FMT_COUNTERVALUE_ITEM_W,
-        PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PDH_NO_DATA,
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-        PdhOpenQueryW,
+        PDH_FMT_DOUBLE, PDH_MORE_DATA, PDH_NO_DATA, PdhGetFormattedCounterArrayW,
     };
-    use windows::core::{PCWSTR, w};
+    use windows::core::w;
 
     /// `PDH_FMT_NOCAP100`: values above 100 are not capped per instance (the sum is).
     const PDH_FMT_NOCAP100: u32 = 0x0000_8000;
@@ -168,52 +167,34 @@ mod imp {
     /// The open query and its wildcard counter (owned by the sampling thread: the handles are
     /// not `Send`).
     pub(super) struct Query {
-        query: PDH_HQUERY,
-        counter: PDH_HCOUNTER,
+        pdh: PdhQuery,
     }
 
     impl Query {
         /// Open the query, add the counter and take the first collection (a rate needs two).
         pub(super) fn open() -> Option<Self> {
-            let mut query = PDH_HQUERY::default();
-            // SAFETY: a null data source = live data; `query` is a live out-parameter written
-            // only during the call.
-            if unsafe { PdhOpenQueryW(PCWSTR::null(), 0, &mut query) } != 0 {
-                return None;
-            }
-            let mut counter = PDH_HCOUNTER::default();
-            // SAFETY: `query` was opened above; the path is a NUL-terminated wide string literal;
-            // `counter` is a live out-parameter written only during the call.
-            let added = unsafe {
-                PdhAddEnglishCounterW(
-                    query,
-                    w!(r"\GPU Engine(*engtype_VideoDecode)\Utilization Percentage"),
-                    0,
-                    &mut counter,
-                )
-            };
-            // SAFETY: `query` is open; this fills the counter's first raw values.
-            if added != 0 || unsafe { PdhCollectQueryData(query) } != 0 {
-                // SAFETY: `query` is open and closed once here; nothing uses it afterwards.
-                unsafe { PdhCloseQuery(query) };
-                return None;
-            }
-            Some(Self { query, counter })
+            // SAFETY: a NUL-terminated wide string literal.
+            let pdh = unsafe {
+                PdhQuery::open(w!(
+                    r"\GPU Engine(*engtype_VideoDecode)\Utilization Percentage"
+                ))
+            }?;
+            Some(Self { pdh })
         }
 
         /// One sample ([`super::busiest_engine`]) since the previous collection; None when the
         /// reading fails.
         pub(super) fn sample(&mut self) -> Option<f64> {
-            // SAFETY: `self.query` stays open until drop.
-            if unsafe { PdhCollectQueryData(self.query) } != 0 {
+            if !self.pdh.collect() {
                 return None;
             }
+            let counter = self.pdh.counter();
             let format = PDH_FMT(PDH_FMT_DOUBLE.0 | PDH_FMT_NOCAP100);
             let (mut bytes, mut count) = (0u32, 0u32);
-            // SAFETY: `self.counter` belongs to the open query; a null buffer with size 0 asks
-            // for the size needed, written to the two live out-parameters.
+            // SAFETY: `counter` belongs to the open query; a null buffer with size 0 asks for
+            // the size needed, written to the two live out-parameters.
             let rc = unsafe {
-                PdhGetFormattedCounterArrayW(self.counter, format, &mut bytes, &mut count, None)
+                PdhGetFormattedCounterArrayW(counter, format, &mut bytes, &mut count, None)
             };
             if rc == PDH_NO_DATA || (rc == 0 && count == 0) {
                 // No process has a decode engine instance: nothing decodes.
@@ -228,13 +209,7 @@ mod imp {
             // SAFETY: `buf` holds at least `bytes` bytes, aligned to 8, alive for the call; PDH
             // writes `count` items followed by their name strings into it.
             let rc = unsafe {
-                PdhGetFormattedCounterArrayW(
-                    self.counter,
-                    format,
-                    &mut bytes,
-                    &mut count,
-                    Some(items),
-                )
+                PdhGetFormattedCounterArrayW(counter, format, &mut bytes, &mut count, Some(items))
             };
             if rc != 0 {
                 return None;
@@ -264,14 +239,6 @@ mod imp {
             Some(super::busiest_engine(
                 values.iter().map(|(n, v)| (n.as_str(), *v)),
             ))
-        }
-    }
-
-    impl Drop for Query {
-        fn drop(&mut self) {
-            // SAFETY: the query was opened in `open` and is closed once, here (closing it also
-            // removes its counter).
-            unsafe { PdhCloseQuery(self.query) };
         }
     }
 }

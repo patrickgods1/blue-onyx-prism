@@ -7,8 +7,8 @@
 // mode 'compact' is a drop-down (<details>) with a summary line, for filters.
 // `extra(entry, chip)` may add controls to a chip (the Review Classes card's "don't want").
 // Pure helpers (validName, groupEntries, mergeEntries, defaultSelection, quickSetsFor,
-// classChange, visibleClasses, summaryText, ...) live in ClassPicker.util and are tested by
-// the page tests; no libraries, no inline handlers (CSP).
+// classChange, visibleClasses, summaryText, ...) live in ClassPicker.util; tests/it/js_pickers.rs
+// runs them in node (dom.js loaded first). No libraries, no inline handlers (CSP).
 (function (root) {
   'use strict';
 

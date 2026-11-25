@@ -1,7 +1,8 @@
 //! What the import, auto-label and overlap jobs share: the training environment
 //! (`tools/train-env`, set up by the export's code under its lock, [`setup`]), the verified downloads
 //! of their checkpoints and footage ([`fetch_missing`], where each one goes: [`weights_dir`],
-//! [`dataset_dir`]), running a helper script in it with its `@<tag> {json}` events ([`run_script`]),
+//! [`dataset_dir`]; the download loop [`fetch_all`], the setup's error [`env_error`] and progress
+//! share [`setup_share`] and the cancel [`check`] are a training run's too), running a helper script in it with its `@<tag> {json}` events ([`run_script`]),
 //! `scripts/autolabel.py`'s own check ([`self_check`]) and telling a cancel from a failure
 //! ([`is_cancel`]).
 
@@ -9,7 +10,7 @@ use super::capability::Accelerator;
 use super::task::TaskReport;
 use crate::resources::catalog::{self, Platform, Resource};
 use crate::resources::export::train::{self as env, TrainPaths};
-use crate::resources::export::{Cancelled, CommandRunner, Fetcher, Progress, Stage};
+use crate::resources::export::{Cancelled, CommandRunner, ExportError, Fetcher, Progress, Stage};
 use crate::resources::{hf_token, manager};
 use anyhow::{Context, Result, anyhow, bail};
 use std::ffi::OsString;
@@ -94,7 +95,7 @@ pub fn check_large(list: &[(&'static Resource, PathBuf)], allowed: bool) -> Resu
 }
 
 /// Download (SHA-256 checked, through the download manager) every resource of `list` that is not
-/// installed, reporting stage `step` of `steps`.
+/// installed, reporting stage `step` of `steps` ([`fetch_all`]).
 pub fn fetch_missing(
     fetcher: &dyn Fetcher,
     list: &[(&'static Resource, PathBuf)],
@@ -102,25 +103,41 @@ pub fn fetch_missing(
     (name, step, steps): (&str, usize, usize),
     cancel: &AtomicBool,
 ) -> Result<()> {
+    let downloaded = fetch_all(
+        fetcher,
+        list,
+        &mut |pct, detail| stage(report, name, step, steps, pct, detail),
+        cancel,
+    )?;
+    if !downloaded {
+        stage(report, name, step, steps, 100, "already downloaded");
+    }
+    Ok(())
+}
+
+/// The verified download loop the jobs share (these tasks' [`fetch_missing`], a training run's
+/// weights stage): every resource of `list` that is not installed, one after the other, through
+/// the download manager. `on_progress(percent, detail)` gets the overall share of the bytes:
+/// the resource's title before each, `"<title> <n> of <total> MB"` as bytes arrive. A resource
+/// the manager does not then count as installed is an error; a cancel between two is
+/// [`Cancelled`]. Returns false, without calling `on_progress`, when nothing was missing.
+pub fn fetch_all(
+    fetcher: &dyn Fetcher,
+    list: &[(&'static Resource, PathBuf)],
+    on_progress: &mut dyn FnMut(u8, &str),
+    cancel: &AtomicBool,
+) -> Result<bool> {
     let missing: Vec<&(&'static Resource, PathBuf)> = list
         .iter()
         .filter(|(r, d)| !manager::is_installed(r, d))
         .collect();
     if missing.is_empty() {
-        stage(report, name, step, steps, 100, "already downloaded");
-        return Ok(());
+        return Ok(false);
     }
     let total: u64 = missing.iter().map(|(r, _)| r.size()).sum();
     let mut done = 0u64;
     for (r, dir) in missing {
-        stage(
-            report,
-            name,
-            step,
-            steps,
-            manager::percent(done, total),
-            r.title,
-        );
+        on_progress(manager::percent(done, total), r.title);
         fetcher.fetch(
             r,
             dir,
@@ -131,14 +148,7 @@ pub fn fetch_missing(
                     (done + b) / 1_000_000,
                     total / 1_000_000
                 );
-                stage(
-                    report,
-                    name,
-                    step,
-                    steps,
-                    manager::percent(done + b, total),
-                    &d,
-                );
+                on_progress(manager::percent(done + b, total), &d);
             },
             cancel,
         )?;
@@ -152,7 +162,30 @@ pub fn fetch_missing(
         done += r.size();
         check(cancel)?;
     }
-    Ok(())
+    Ok(true)
+}
+
+/// The share of the training environment's setup an export progress report stands for, in
+/// percent (may pass 100: callers cap it): the export bar's share of these stages ends at its
+/// self-check (71%).
+pub(crate) fn setup_share(stage: Stage, percent: Option<u8>) -> u32 {
+    u32::from(stage.overall(percent)) * 100 / 71
+}
+
+/// A failed environment setup as the jobs report it: [`Cancelled`] for a cancel, else the
+/// message, after `while <stage>: ` when the export named the stage it failed in.
+pub(crate) fn env_error(e: ExportError) -> anyhow::Error {
+    if e.cancelled {
+        anyhow!(Cancelled)
+    } else {
+        anyhow!(
+            "{}{}",
+            e.stage
+                .map(|s| format!("while {}: ", s.label()))
+                .unwrap_or_default(),
+            e.message
+        )
+    }
 }
 
 /// Set up the training environment for `accel`'s lane (uv, Python, the lock's packages; the
@@ -186,9 +219,8 @@ pub fn setup(
                 percent,
                 detail,
             } => {
-                // The export bar's share of these stages ends at its self-check (71%); the
-                // last tenth of this stage is the script's own self-check.
-                let pct = (u32::from(s.overall(percent)) * 100 / 71).min(100) * 9 / 10;
+                // The last tenth of this stage is the script's own self-check.
+                let pct = setup_share(s, percent).min(100) * 9 / 10;
                 let d = format!("{}: {detail}", s.label());
                 stage(
                     report,
@@ -203,19 +235,7 @@ pub fn setup(
         },
         cancel,
     )
-    .map_err(|e| {
-        if e.cancelled {
-            anyhow!(Cancelled)
-        } else {
-            anyhow!(
-                "{}{}",
-                e.stage
-                    .map(|s| format!("while {}: ", s.label()))
-                    .unwrap_or_default(),
-                e.message
-            )
-        }
-    })?;
+    .map_err(env_error)?;
     Ok(())
 }
 

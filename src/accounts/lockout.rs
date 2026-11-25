@@ -99,7 +99,9 @@ pub fn on_failure(state: &State, now: u64) -> State {
     }
 }
 
-/// `state` after a success: nothing counted.
+/// `state` after a success: nothing counted. Tests only: the store resets a success itself
+/// (`Store::record_success`).
+#[cfg(test)]
 pub fn on_success(_state: &State) -> State {
     State::default()
 }
@@ -128,7 +130,10 @@ impl UnknownNames {
         self.names.is_empty()
     }
 
-    /// The decision for `name` (lowercased by the caller) at `now`.
+    /// The decision for `name` (lowercased by the caller) at `now`. Tests only: the sign-in
+    /// path reads [`Self::state`] and decides with its in-flight attempts counted
+    /// (`accounts::process::Attempts`).
+    #[cfg(test)]
     pub fn decide(&self, name: &str, now: u64) -> Decision {
         self.names
             .get(name)
@@ -161,12 +166,6 @@ impl UnknownNames {
         }
         self.names
             .insert(name.to_string(), (on_failure(&State::default(), now), seq));
-    }
-
-    /// A success cannot happen for a name with no account, but a name that gets an account
-    /// starts clean: forget it.
-    pub fn forget(&mut self, name: &str) {
-        self.names.remove(name);
     }
 }
 
@@ -245,6 +244,32 @@ mod tests {
         );
     }
 
+    // QA-232 (lockout half): the stamps a file can hold at the edges. No stamp (a hand-edited
+    // file) is the epoch, long past; the largest stamp is a clock far ahead (allowed, QA-085);
+    // a `now` at the end of time never overflows.
+    #[test]
+    fn edge_stamps_decide_without_overflow() {
+        let now = 1_700_000_000;
+        let unstamped = State {
+            failures: 15,
+            last_failure: None,
+            disabled: false,
+        };
+        assert_eq!(decide(&unstamped, now), Decision::Allow);
+        assert_eq!(decide(&unstamped, 0), Decision::Wait(delay(15)));
+        let at_max = after(15, u64::MAX);
+        assert_eq!(decide(&at_max, now), Decision::Allow);
+        assert_eq!(decide(&at_max, 0), Decision::Allow);
+        // A wait that ends exactly at the end of time still counts down; one that would end
+        // past it saturates there (no panic, no wrap to a tiny `until`).
+        assert_eq!(
+            decide(&after(15, u64::MAX - delay(15)), u64::MAX - delay(15)),
+            Decision::Wait(delay(15))
+        );
+        assert_eq!(decide(&after(15, u64::MAX - 1), u64::MAX), Decision::Allow);
+        assert_eq!(decide(&after(15, now), now), Decision::Wait(delay(15)));
+    }
+
     #[test]
     fn a_hundred_in_a_row_disable_until_unlocked() {
         let t = 5_000;
@@ -307,7 +332,5 @@ mod tests {
         u.record_failure(&early, t);
         u.record_failure("fresh", t);
         assert!(u.names.contains_key(&early));
-        u.forget("fresh");
-        assert!(!u.names.contains_key("fresh"));
     }
 }

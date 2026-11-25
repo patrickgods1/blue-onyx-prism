@@ -85,20 +85,35 @@ pub fn walk(src: &Source) -> Arc<Current> {
     let all = walks();
     let mut map = all.lock_recover();
     map.insert(src.key(), current.clone());
+    evict(&mut map);
+    drop(map);
+    current
+}
+
+/// Drop the oldest walks (by [`Current::at`]) until at most [`KEPT`] are left.
+fn evict(map: &mut HashMap<String, Arc<Current>>) {
     while map.len() > KEPT {
         let Some(oldest) = map.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else {
             break;
         };
         map.remove(&oldest);
     }
-    drop(map);
-    current
 }
 
-/// Whether `c` (of `src`) should be walked again.
+/// Whether `c` (of `src`) should be walked again ([`stale_by`]).
 fn stale(src: &Source, c: &Current) -> bool {
     let age = c.at.elapsed();
-    match (index::rows_version(&src.dir, Some(&wanted(src))), c.rows) {
+    stale_by(
+        index::rows_version(&src.dir, Some(&wanted(src))),
+        c.rows,
+        age,
+    )
+}
+
+/// Whether a walk `age` old should be redone: with the index's row stamp now (`now_rows`) and
+/// before that walk (`then_rows`), when they differ or after [`MAX_AGE`]; else after [`FRESH`].
+fn stale_by(now_rows: Option<u64>, then_rows: Option<u64>, age: Duration) -> bool {
+    match (now_rows, then_rows) {
         (Some(now), Some(then)) => now != then || age >= MAX_AGE,
         _ => age >= FRESH,
     }
@@ -143,5 +158,56 @@ fn start(src: Source) {
     if let Err(e) = spawned {
         WALKING.store(false, Ordering::Release);
         tracing::warn!("could not start the walk of {}: {e}", super::TITLE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN: Duration = Duration::from_secs(60);
+
+    /// QA-190: staleness by the index's row stamp, else by age.
+    #[test]
+    fn staleness_by_rows_then_age() {
+        // Index rows unchanged: fresh until MAX_AGE.
+        assert!(!stale_by(Some(1), Some(1), 9 * MIN));
+        assert!(stale_by(Some(1), Some(1), 10 * MIN));
+        // Rows changed: stale at once.
+        assert!(stale_by(Some(2), Some(1), Duration::ZERO));
+        // No index now: FRESH.
+        assert!(!stale_by(None, Some(1), 4 * MIN));
+        assert!(stale_by(None, Some(1), 5 * MIN));
+        assert!(!stale_by(None, None, 4 * MIN));
+        assert!(stale_by(None, None, 5 * MIN));
+        // An index built since the walk: FRESH too (not "changed").
+        assert!(!stale_by(Some(1), None, 4 * MIN));
+        assert!(stale_by(Some(1), None, 5 * MIN));
+    }
+
+    /// QA-190: past KEPT sources the oldest walks go.
+    #[test]
+    fn eviction_keeps_the_newest() {
+        let base = Instant::now();
+        let mut map: HashMap<String, Arc<Current>> = HashMap::new();
+        for k in 0..=KEPT as u64 {
+            let at = base + Duration::from_secs(k);
+            map.insert(
+                format!("src-{k}"),
+                Arc::new(Current {
+                    found: Found::Empty,
+                    at,
+                    rows: None,
+                }),
+            );
+        }
+        assert_eq!(map.len(), KEPT + 1);
+        evict(&mut map);
+        assert_eq!(map.len(), KEPT);
+        assert!(!map.contains_key("src-0"), "the oldest goes");
+        assert!((1..=KEPT as u64).all(|k| map.contains_key(&format!("src-{k}"))));
+        // At or under KEPT nothing goes.
+        evict(&mut map);
+        assert_eq!(map.len(), KEPT);
     }
 }

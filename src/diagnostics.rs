@@ -405,11 +405,7 @@ pub fn file_name() -> String {
 fn live_client(config: &Config) -> Result<reqwest::Client> {
     let token = crate::admin_token::read(&crate::admin_token::path(config))
         .context("the API token is not available")?;
-    let mut auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.reveal()))
-        .context("the API token is not a header value")?;
-    auth.set_sensitive(true);
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::AUTHORIZATION, auth);
+    let headers = crate::tls::bearer_header(token.reveal())?;
     crate::tls::pinned_client(&crate::tls::cert_path(config))?
         .default_headers(headers)
         .timeout(std::time::Duration::from_secs(5))

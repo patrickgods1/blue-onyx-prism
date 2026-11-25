@@ -173,7 +173,8 @@ impl Attempts {
         })
     }
 
-    /// Attempts in flight on `key`.
+    /// Attempts in flight on `key` (tests; the decision counts them in [`Self::reserve`]).
+    #[cfg(test)]
     pub fn in_flight(&self, key: &str) -> u32 {
         self.map.lock_recover().get(key).copied().unwrap_or(0)
     }

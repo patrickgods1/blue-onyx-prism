@@ -140,19 +140,28 @@ pub(super) async fn browse(
     .await
 }
 
-/// Display form of a path: canonical, without the Windows `\\?\` verbatim prefix.
+/// `s` without the Windows `\\?\` verbatim prefix (`\\?\UNC\server\share` is
+/// `\\server\share`): canonical paths carry it; dialogs, the folder settings and the forms do not.
+/// The one spelling [`display`], [`plain`] and [`super::pick`] compare and show.
+pub(super) fn strip_verbatim(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    s.strip_prefix(r"\\?\").unwrap_or(s).to_string()
+}
+
+/// Display form of a path: canonical, without the Windows `\\?\` verbatim prefix
+/// ([`strip_verbatim`]); lossy for a name that is not valid Unicode (it is only shown).
 fn display(p: &Path) -> String {
-    let s = p.to_string_lossy().into_owned();
+    let s = p.to_string_lossy();
     #[cfg(windows)]
     {
-        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}");
-        }
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            return rest.to_string();
-        }
+        strip_verbatim(&s)
     }
-    s
+    #[cfg(not(windows))]
+    {
+        s.into_owned()
+    }
 }
 
 fn human_size(n: u64) -> String {
@@ -378,18 +387,16 @@ fn resolve(cfg: &Config, raw: &str, trust_picked: bool) -> Result<PathBuf, Brows
     Ok(plain(&canon))
 }
 
-/// `p` without the Windows verbatim prefix ([`display`]); unchanged elsewhere, so a name that
-/// is not valid UTF-8 (Linux allows any bytes) stays the folder it names rather than a lossy
-/// spelling with U+FFFD that does not exist (extra [16]; [`super::pick`] does the same).
+/// `p` without the Windows verbatim prefix ([`strip_verbatim`]); unchanged elsewhere, so a name
+/// that is not valid UTF-8 (Linux allows any bytes) stays the folder it names rather than a lossy
+/// spelling with U+FFFD that does not exist (extra [16]). [`super::pick`] compares its picks in
+/// this form too.
 pub(super) fn plain(p: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         // Only a path that is valid Unicode is rewritten; any other stays as it is.
-        if p.to_str().is_some() {
-            PathBuf::from(display(p))
-        } else {
-            p.to_path_buf()
-        }
+        p.to_str()
+            .map_or_else(|| p.to_path_buf(), |s| PathBuf::from(strip_verbatim(s)))
     }
     #[cfg(not(windows))]
     {
@@ -504,6 +511,17 @@ mod tests {
 
     /// Extra [16]: a folder name that is not valid UTF-8 keeps its bytes (no U+FFFD spelling of
     /// a folder that does not exist).
+    /// QA-241: the one verbatim stripper of browse and pick (UNC, drive, and a path without the
+    /// prefix left as it is).
+    #[test]
+    fn strip_verbatim_drops_only_the_verbatim_prefix() {
+        assert_eq!(strip_verbatim(r"\\?\C:\data\x"), r"C:\data\x");
+        assert_eq!(strip_verbatim(r"\\?\UNC\nas\share\x"), r"\\nas\share\x");
+        assert_eq!(strip_verbatim(r"C:\data"), r"C:\data");
+        assert_eq!(strip_verbatim(r"\\nas\share"), r"\\nas\share");
+        assert_eq!(strip_verbatim("/srv/x"), "/srv/x");
+    }
+
     #[cfg(unix)]
     #[test]
     fn plain_keeps_a_name_that_is_not_utf8() {

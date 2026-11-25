@@ -104,9 +104,14 @@ async function pickWith(pointer) {
       json: () => Promise.resolve(init && init.method === 'POST' ? {path: '/models/a.onnx'} : {available: true})})};
   if (pointer !== null) sb.matchMedia = (q) => ({matches: q === '(pointer: fine)' ? pointer === 'fine' : false, media: q});
   sb.window = sb;
-  const domJs = require('path').join(require('path').dirname(process.argv[2]), 'dom.js');
+  const asset = (name) => require('path').join(require('path').dirname(process.argv[2]), name);
+  // live.js's pure part (PrismPoll; its page part would start the config poll) and dom.js first,
+  // as the page loads them.
+  const live = vm.createContext({});
+  vm.runInContext(fs.readFileSync(asset('live.js'), 'utf8'), live);
+  sb.PrismPoll = live.PrismPoll;
   const sbCtx = vm.createContext(sb);
-  vm.runInContext(fs.readFileSync(domJs, 'utf8'), sbCtx);   // PrismDom first, as the page does
+  vm.runInContext(fs.readFileSync(asset('dom.js'), 'utf8'), sbCtx);   // PrismDom
   vm.runInContext(src, sbCtx);
   await tick(); await tick();
   assert.strictEqual(button.hidden, false, 'the native picker shows the button');

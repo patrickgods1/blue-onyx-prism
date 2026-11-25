@@ -79,6 +79,32 @@ impl OvDevice {
     }
 }
 
+/// An OpenVINO GPU device name: `GPU` or `GPU.N` (any case).
+pub(crate) fn is_ov_gpu(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "GPU" || upper.starts_with("GPU.")
+}
+
+/// The listed OpenVINO device name `openvino:gpu.N` compiles on: `GPU.N` (any case), or a bare
+/// `GPU` for N = 0 when no numbered GPU is listed (one GPU is listed as `GPU`, which is
+/// `GPU.0`). None when it is not listed. The one copy of this rule: the plan
+/// (`plan::ov_gpu_listed`) and the tuning class (`Runtimes::device_class`) both use it.
+pub(crate) fn ov_gpu_name_matches<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    index: u32,
+) -> Option<&'a str> {
+    let gpus: Vec<&str> = names.into_iter().filter(|d| is_ov_gpu(d)).collect();
+    let want = format!("GPU.{index}");
+    gpus.iter()
+        .find(|d| d.eq_ignore_ascii_case(&want))
+        .or_else(|| {
+            (index == 0 && !gpus.iter().any(|d| d.contains('.')))
+                .then(|| gpus.iter().find(|d| d.eq_ignore_ascii_case("GPU")))
+                .flatten()
+        })
+        .copied()
+}
+
 /// The listed OpenVINO GPU that a bare `GPU` request compiles on (`device::load_model` resolves
 /// it the same way, BE-09): with numbered GPUs (`GPU.0`, `GPU.1`, ..) listed, `GPU.0` when it is
 /// an Intel GPU, else the first Intel `GPU.N` (OpenVINO's OpenCL plugin can list an NVIDIA card
@@ -973,6 +999,24 @@ mod tests {
             Some(&single)
         );
         assert_eq!(bare_gpu_device(&[cpu]), None);
+    }
+
+    #[test]
+    fn gpu_index_matches_by_name() {
+        let m = |names: &[&'static str], n| ov_gpu_name_matches(names.iter().copied(), n);
+        assert_eq!(m(&["CPU", "GPU.0", "GPU.1"], 1), Some("GPU.1"));
+        assert_eq!(m(&["CPU", "gpu.0", "GPU.1"], 0), Some("gpu.0"));
+        assert_eq!(m(&["CPU", "GPU.0", "GPU.1"], 2), None);
+        // One unnumbered GPU is GPU.0, and only GPU.0.
+        assert_eq!(m(&["CPU", "GPU"], 0), Some("GPU"));
+        assert_eq!(m(&["CPU", "gpu"], 0), Some("gpu"));
+        assert_eq!(m(&["CPU", "GPU"], 1), None);
+        // A bare GPU beside numbered ones does not stand in for GPU.0.
+        assert_eq!(m(&["GPU", "GPU.1"], 0), None);
+        // Numbered non-GPU devices do not count as numbered GPUs.
+        assert_eq!(m(&["NPU.0", "GPU"], 0), Some("GPU"));
+        assert_eq!(m(&["CPU", "NPU", "GPUX"], 0), None);
+        assert!(is_ov_gpu("gpu.3") && is_ov_gpu("GPU") && !is_ov_gpu("GPUX"));
     }
 
     #[test]

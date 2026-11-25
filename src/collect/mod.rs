@@ -39,6 +39,7 @@
 pub mod blockdiff;
 pub mod config;
 pub mod dhash;
+pub mod hash;
 pub mod health;
 pub mod labels;
 pub mod layout;
@@ -144,7 +145,7 @@ impl Draft {
             model: i.model.to_string(),
             device: i.device.to_string(),
             routed_from: i.routed_from.map(str::to_string),
-            image_name: crate::static_memory::cap_name(i.image_name).to_string(),
+            image_name: crate::text::cap_name(i.image_name).to_string(),
             camera: camera_dir(&camera_key, i.width, i.height),
             camera_key,
             scene: i.stats.scene().as_str().to_string(),
@@ -190,7 +191,11 @@ impl Draft {
     /// Add the verifier's outcomes; its rejected candidates join `suppressed` with reason
     /// `verify`.
     pub fn set_verify(&mut self, v: record::VerifyInfo) {
-        for c in v.candidates.iter().filter(|c| c.outcome == "rejected") {
+        for c in v
+            .candidates
+            .iter()
+            .filter(|c| c.is(crate::verify::Outcome::Rejected))
+        {
             self.record.suppressed.push(record::Suppressed {
                 label: c.label.clone(),
                 score: c.score,
@@ -938,7 +943,7 @@ mod tests {
             threshold: 0.5,
             near_margin: None,
         });
-        let cap = crate::static_memory::MAX_NAME_BYTES;
+        let cap = crate::text::MAX_NAME_BYTES;
         assert!(d.record.image_name.len() <= cap && d.record.image_name.len() > cap - 4);
         assert!(name.starts_with(&d.record.image_name));
         assert!(d.record.camera_key.len() <= cap);

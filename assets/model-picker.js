@@ -5,8 +5,9 @@
 // device select (first option: the model's own device) and, when the chosen model needs them,
 // the licence and large-download confirmations (named confirm_license / confirm_large).
 // getSelection() -> {id, device, model}; id and device post as `with_model` and `device`.
-// Pure helpers (groupModels, optionText, notesFor, ...) live in ModelPicker.util and are tested
-// under node; no libraries, no inline handlers (CSP).
+// Pure helpers (groupModels, optionText, notesFor, missingDefaults, acceptProblem, ...) live in
+// ModelPicker.util; tests/it/js_pickers.rs runs missingDefaults (against the Rust constants) and
+// acceptProblem in node. No libraries, no inline handlers (CSP).
 (function (root) {
   'use strict';
 

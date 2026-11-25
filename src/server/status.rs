@@ -10,6 +10,7 @@
 
 use super::{AppState, state_view};
 use crate::startup::ModelState;
+use crate::tray::probe::label;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -29,10 +30,10 @@ pub(super) enum Overall {
 impl Overall {
     fn label(self) -> &'static str {
         match self {
-            Self::Ready => "ready",
-            Self::Initializing => "initializing",
-            Self::Degraded => "degraded",
-            Self::Failed => "failed",
+            Self::Ready => label::READY,
+            Self::Initializing => label::INITIALIZING,
+            Self::Degraded => label::DEGRADED,
+            Self::Failed => label::FAILED,
         }
     }
 
@@ -52,6 +53,18 @@ pub(super) enum Kind {
     Initializing,
     Lazy,
     Failed,
+}
+
+impl Kind {
+    /// A model's `state` in the answer ([`label`], shared with the tray).
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => label::READY,
+            Self::Initializing => label::INITIALIZING,
+            Self::Lazy => label::LAZY,
+            Self::Failed => label::FAILED,
+        }
+    }
 }
 
 /// Combine model states. A lazy model (loads on its first request) can serve, so it counts as
@@ -81,13 +94,11 @@ pub(super) async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     let mut models = Vec::with_capacity(workers.len());
     let mut loading = Vec::new();
     for w in &workers {
-        let (kind, label, detail) = match w.state.get() {
-            ModelState::Ready => (Kind::Ready, "ready", None),
-            ModelState::Failed(m) => (Kind::Failed, "failed", Some(m)),
-            ModelState::Initializing if w.accepts_while_initializing() => {
-                (Kind::Lazy, "lazy", None)
-            }
-            ModelState::Initializing => (Kind::Initializing, "initializing", state_view(w).2),
+        let (kind, detail) = match w.state.get() {
+            ModelState::Ready => (Kind::Ready, None),
+            ModelState::Failed(m) => (Kind::Failed, Some(m)),
+            ModelState::Initializing if w.accepts_while_initializing() => (Kind::Lazy, None),
+            ModelState::Initializing => (Kind::Initializing, state_view(w).2),
         };
         kinds.push(kind);
         if kind == Kind::Initializing {
@@ -98,7 +109,7 @@ pub(super) async fn readiness(State(state): State<Arc<AppState>>) -> Response {
         let (threshold, source) = w.effective_threshold();
         models.push(json!({
             "name": w.name,
-            "state": label,
+            "state": kind.label(),
             "device": w.metrics.device(),
             "detail": detail,
             "threshold": crate::config::round_threshold_f64(threshold),
@@ -187,6 +198,76 @@ mod tests {
             Overall::Initializing.http(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    /// What the tray makes of an answer: its health and status line, through the tray's own
+    /// parser and display model.
+    fn tray_view(code: StatusCode, body: &[u8]) -> (crate::tray::model::Health, String) {
+        use crate::tray::model::{Inputs, display};
+        use crate::tray::probe::{HttpStatus, parse_body};
+        let report = parse_body(code.as_u16(), body).expect("the tray reads the answer");
+        let http = HttpStatus::Answer(report);
+        let d = display(&Inputs {
+            service: Some(crate::service_ctl::ServiceState::Running),
+            http: Some(&http),
+            ..Inputs::default()
+        });
+        (d.health, d.status_line)
+    }
+
+    /// QA-206: the tray reads the labels this route writes. Real answers for ready, degraded,
+    /// initializing and failed models go through the tray's parser and display model; a lazy
+    /// model (no fake worker accepts while initializing) through an answer built from the same
+    /// labels. A label renamed on one side only fails here.
+    #[tokio::test]
+    async fn the_tray_reads_every_label() {
+        use crate::tray::model::Health;
+        let cases: [(&[(&str, ModelState)], Health); 4] = [
+            (&[("a", ModelState::Ready)], Health::Ready),
+            (
+                &[
+                    ("a", ModelState::Ready),
+                    ("b", ModelState::Failed("x".into())),
+                ],
+                Health::Degraded,
+            ),
+            (&[("a", ModelState::Initializing)], Health::Starting),
+            (&[("a", ModelState::Failed("boom".into()))], Health::Failed),
+        ];
+        for (models, want) in cases {
+            let resp = readiness(State(state_with(models))).await;
+            let code = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let (health, line) = tray_view(code, &bytes);
+            assert_eq!(health, want, "{models:?}: {line}");
+        }
+        let (_, line) = tray_view(
+            StatusCode::OK,
+            &serde_json::to_vec(&json!({
+                "status": overall(&[Kind::Ready, Kind::Lazy]).label(),
+                "models": [
+                    {"name": "a", "state": Kind::Ready.label()},
+                    {"name": "b", "state": Kind::Lazy.label()},
+                ],
+            }))
+            .unwrap(),
+        );
+        assert!(line.ends_with("2 models ready"), "{line}");
+        let (health, line) = tray_view(
+            StatusCode::OK,
+            &serde_json::to_vec(&json!({
+                "status": overall(&[Kind::Ready, Kind::Initializing]).label(),
+                "models": [
+                    {"name": "a", "state": Kind::Ready.label()},
+                    {"name": "b", "state": Kind::Initializing.label()},
+                ],
+            }))
+            .unwrap(),
+        );
+        assert_eq!(health, Health::Degraded);
+        assert!(line.ends_with("1 of 2 models loading"), "{line}");
     }
 
     #[tokio::test]

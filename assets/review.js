@@ -11,16 +11,12 @@
 // put the HUD (the progress, then the frame's facts) over the frame and the view buttons under it;
 // the side panel's width is dragged on its left edge (kept per viewer). The View menu's Brightness
 // and Contrast (`[` `]`, `{` `}`) and the image mode (`b`) change the view only (viewSource).
-// A job queued on the Auto-label tab is followed on GET /v1/train/jobs?task=<id> (its record only;
-// GET /v1/training on a server without it), every 3 s while the tab shows, and the frames reload
-// when it ends. Under Bulk tools, "Accept auto: accept frames" calls POST /v1/review/accept-auto and
-// "Reject auto boxes below" POST /v1/review/reject-low, "Reject boxes of unwanted classes"
-// POST /v1/review/reject-other-class, "Restore reopened frames" POST /v1/review/restore-reopened
-// and "Reject stacked duplicates" POST /v1/review/reject-stacked, plus accept-repeats and
-// suggest-overlaps (each one bulkAction(): dry run, confirm, run, report; the shared DOM and fetch
-// helpers are assets/dom.js). *Suggest overlaps...* queues the overlap check
-// (POST /v1/review/suggest-overlaps, followed like an auto-label job); its stored suggestions show on
-// the frame, and `y` accepts the one on screen. The dataset check's suggestions (`labels.refine`,
+// Parts in files of their own, loaded before this one (each gets what it needs from here): a job
+// followed above the frame and the Bulk tools (review-bulk.js), the session pace (review-pace.js),
+// the key table and the `?` overlay (review-keys.js), the drafts' decisions (review-draft.js); the
+// pure rules (review-rules.js, review-touch.js, review-need.js); the shared DOM and fetch helpers
+// (assets/dom.js). The overlap check's stored suggestions show on the frame, and `y` accepts the
+// one on screen. The dataset check's suggestions (`labels.refine`,
 // `refine_live`; Auto filter "dataset check suggestions", `auto=refine[&refine_kind=]`) come after
 // them, one at a time, strongest first: drawn on the frame (a dashed proposed box, or the box they
 // are about marked and selected), `y` accepts and `w` says no (R.answerRefine), saved with the
@@ -312,10 +308,6 @@
   var quarterFollow = false;           // view.follow before the look (restored after it)
   var frameStart = 0;                  // when the frame was loaded (session pace)
   var servedBoxes = [];                // the frame's boxes as served (session box count)
-  var session = {
-    start: Date.now(), frames: [],     // per saved frame {s, acc, rej, boxes}
-    breakAt: Date.now() + 45 * 60000   // the next break note
-  };
   // View-only image setting (ReviewTouch.viewSettings / viewLut): `mode` auto (bright + equalised
   // on night / IR frames, else off), off, bright (levels stretched, lifted), eq (histogram
   // equalised); `brightness` and `contrast` (-100 .. 100; View's sliders, [ ] and { }) on top.
@@ -4247,12 +4239,12 @@
   // sessionStorage for a reload), so one passed with Next and saved after Back keeps its mark:
   // which picks lost it would otherwise follow the reviewer's choices.
   var RANDOM_PICKS = 'review-random-picks', RANDOM_PICKS_MAX = 2000;
-  var randomPicks = R.servedPicks(window.PrismDraft ? PrismDraft.load(RANDOM_PICKS) : null, null, RANDOM_PICKS_MAX);
+  var randomPicks = R.servedPicks(PrismDraft.load(RANDOM_PICKS), null, RANDOM_PICKS_MAX);
   function noteRandomPick(item) {
     var next = R.servedPicks(randomPicks, item, RANDOM_PICKS_MAX);
     if (next.length === randomPicks.length && next[next.length - 1] === randomPicks[randomPicks.length - 1]) return;
     randomPicks = next;
-    if (window.PrismDraft) PrismDraft.save(RANDOM_PICKS, randomPicks);
+    PrismDraft.save(RANDOM_PICKS, randomPicks);
   }
   function isRandomPick() {
     return !!(cur && cur.labels && cur.labels.review_pick === 'random');
@@ -4309,7 +4301,7 @@
 
   var SCENE_ICONS = { day: '☀', night: '☾', ir: '◐' };
   // The HUD's frame slots: queue place, camera, scene, time, random pick (setHudBoxes does the box
-  // slots, showSession the pace).
+  // slots, review-pace.js the pace).
   function setHud() {
     if (!hud) return;
     var r = (cur && cur.record) || {};
@@ -4460,22 +4452,18 @@
     noneText.hidden = !!indexing;
     pollIndexing();
   }
-  // A request a timer makes, not the reviewer (the poll header of live.js).
-  function background(fn) {
-    return window.PrismPoll && window.PrismPoll.background ? window.PrismPoll.background(fn) : fn();
-  }
   function pollIndexing() {
     stopIndexPoll();
     if (!indexing || document.hidden) return;
     indexTimer = setTimeout(function () {
       indexTimer = null;
       // A poll: it does not keep the session alive (`X-Prism-Poll`, live.js).
-      background(function () { loadNext(null, null, true, cur && cur.frame); });
+      PrismPoll.background(function () { loadNext(null, null, true, cur && cur.frame); });
     }, INDEX_POLL_MS);
   }
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) stopIndexPoll();
-    else if (indexing && !indexTimer) background(function () { loadNext(null, null, true, cur && cur.frame); });
+    else if (indexing && !indexTimer) PrismPoll.background(function () { loadNext(null, null, true, cur && cur.frame); });
   });
   // Leaving the tab (or the page kept in the back-forward cache): no refresh in the background.
   window.addEventListener('pagehide', stopIndexPoll);
@@ -4603,30 +4591,31 @@
   // unseen: they are dropped and the page says so). The labels come back as the undo stack holds
   // them (the `_` page fields such as `_n` and `_checked` too), so they save exactly as if edited
   // live; one undo step returns to the frame as served. A save or another frame drops the draft.
+  // The decisions are review-draft.js's (`Drafts`).
+  var Drafts = window.ReviewDraft;
   var DRAFT = 'review';
   var draftWaiting = false;   // the draft's frame is loading: nothing is written or dropped meanwhile
   function keepDraft() {
-    if (!window.PrismDraft || draftWaiting) return;
-    if (cur && dirty) PrismDraft.save(DRAFT, { id: cur.frame, rev: cur.revision, labels: cur.labels, selected: selected });
-    else PrismDraft.drop(DRAFT);
+    var keep = Drafts.keepChoice(draftWaiting, cur, dirty);
+    if (keep === 'save') PrismDraft.save(DRAFT, { id: cur.frame, rev: cur.revision, labels: cur.labels, selected: selected });
+    else if (keep === 'drop') PrismDraft.drop(DRAFT);
   }
   // In loadFrame, once `cur` is the served frame: [message, isError] when a draft was restored or
   // dropped, else null.
   function restoreDraft(j) {
-    if (!window.PrismDraft) return null;
     // Only the page's first frame takes a draft back; any later load is a frame change (a
     // reload of this frame included: its edits were let go).
     if (!draftWaiting) { PrismDraft.drop(DRAFT); return null; }
-    var d = PrismDraft.load(DRAFT), v = PrismDraft.verdict(d, j.frame, j.revision);
-    if (v === 'none') return null;
+    var d = PrismDraft.load(DRAFT), choice = Drafts.restoreChoice(d, j.frame, j.revision);
+    if (choice === 'none') return null;
     PrismDraft.drop(DRAFT);
-    if (v === 'other') return null;
-    if (v === 'drop' || !d.labels || !Array.isArray(d.labels.boxes)) {
+    if (choice === 'other') return null;
+    if (choice === 'stale') {
       return ['Your unsaved edits on this frame were dropped: someone saved it since.', true];
     }
     snapshot();   // one undo step back to the frame as served; marks the frame unsaved
     cur.labels = d.labels;
-    selected = (typeof d.selected === 'number' && d.selected >= 0 && d.selected < boxes().length) ? d.selected : -1;
+    selected = Drafts.selectedOf(d, boxes().length);
     dups = dupGroups();
     suggestions = liveSuggestions();
     refineCur = currentRefine();
@@ -4828,8 +4817,8 @@
     saveBusy(true);
     postJson(url, body).then(function (j) {
       dirty = false;
-      if (window.PrismDraft) PrismDraft.drop(DRAFT);
-      if (status === 'reviewed') { noteSaved(decisions); noteHistory(frame, body, w, h); }
+      PrismDraft.drop(DRAFT);
+      if (status === 'reviewed') { pace.noteSaved(decisions, frameStart); noteHistory(frame, body, w, h); }
       // After Back: on to the frame Back left (the counts refresh with its place), else the queue's
       // next.
       if (fwdStack.length) {
@@ -4877,79 +4866,10 @@
   }
 
   // ---- session pace -------------------------------------------------------------------------
-
-  function median(a) {
-    var s = a.slice().sort(function (x, y) { return x - y; }), m = s.length >> 1;
-    return s.length ? (s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2) : 0;
-  }
-
-  function acceptRate(fs) {
-    var a = 0, r = 0;
-    fs.forEach(function (f) { a += f.acc; r += f.rej; });
-    return a + r ? a / (a + r) : null;
-  }
-
-  function seconds(fs) { return fs.map(function (f) { return f.s; }); }
-
-  // A saved frame: its time (load to save, at most 10 min) and the reviewer's box decisions on it
-  // (`R.boxDecisions`: boxes pending when served and now decided, plus boxes drawn; a duplicate,
-  // a too-small box, a dismissal or a parked accept is no verdict on an object).
-  function noteSaved(d) {
-    session.frames.push({ s: Math.min(600, (Date.now() - frameStart) / 1000), acc: d.accepted, rej: d.rejected, boxes: d.decided + d.drawn });
-    showSession();
-  }
-
-  // Boxes a minute of review: the frames' own (capped) times, so a break or a frame left open
-  // does not count; '' before a second of it.
-  function boxesPerMinute(fs) {
-    var n = 0, s = 0;
-    fs.forEach(function (f) { n += f.boxes || 0; s += f.s; });
-    if (s < 1) return '';
-    var r = n * 60 / s;
-    return r >= 10 ? String(Math.round(r)) : r.toFixed(1);
-  }
-
-  // "Session 23 frames · 64 boxes, 2.8 a minute · 82% accepted · 37 min" (effort in boxes: a
-  // frame of one box and one of twelve are not the same work), a note when the last 10 frames
-  // went much faster while accepting more (rubber-stamping), and a break note every 45 min.
-  function showSession() {
-    if (!sessionLine) return;
-    var fs = session.frames, min = Math.floor((Date.now() - session.start) / 60000);
-    sessionLine.textContent = '';
-    if (!fs.length) {
-      hudSet(hudEl.pace, '');
-      if (detailsPace) detailsPace.textContent = '';
-      return;
-    }
-    var rate = acceptRate(fs);
-    var nb = 0;
-    fs.forEach(function (f) { nb += f.boxes || 0; });
-    var pace = boxesPerMinute(fs);
-    // The HUD's pace slot (Details holds the whole line where the HUD has no room for it).
-    hudSet(hudEl.pace, nb + ' box' + (nb === 1 ? '' : 'es') + (nb && pace ? ' · ' + pace + '/min' : ''));
-    var parts = [
-      'Session ' + fs.length + ' frame' + (fs.length === 1 ? '' : 's'),
-      nb + ' box' + (nb === 1 ? '' : 'es') + (nb && pace ? ', ' + pace + ' a minute' : '')
-    ];
-    if (rate != null) parts.push(Math.round(rate * 100) + '% accepted');
-    parts.push(min + ' min');
-    // The plain stats (two columns hide them: the HUD's pace slot and Details have them; the
-    // warning chips after them stay).
-    sessionLine.appendChild(el('span', 'rv-session-stats', parts.join(' · ')));
-    if (detailsPace) detailsPace.textContent = parts.join(' · ');
-    if (fs.length >= 15) {
-      var last = fs.slice(-10), lr = acceptRate(last);
-      if (median(seconds(last)) < 0.4 * median(seconds(fs)) && lr != null && rate != null && lr > rate) {
-        sessionLine.appendChild(el('span', 'rv-chip warn', 'Going fast: check the small boxes'));
-      }
-    }
-    if (Date.now() >= session.breakAt) {
-      var note = el('span', 'rv-chip warn', 'Take a break? ');
-      note.appendChild(button('Later', function () { session.breakAt = Date.now() + 45 * 60000; showSession(); }, 'secondary'));
-      sessionLine.appendChild(note);
-    }
-  }
-  setInterval(showSession, 30000);
+  // The session line, the HUD's pace slot and Details' copy (review-pace.js).
+  var pace = window.ReviewPace.init({
+    el: el, button: button, sessionLine: sessionLine, detailsPace: detailsPace, hudSet: hudSet, hudPace: hudEl.pace
+  });
 
   $('rv-save').addEventListener('click', function () { save('reviewed'); });
   $('rv-skip').addEventListener('click', function () { save('skipped'); });
@@ -5087,124 +5007,10 @@
     if (cur && dirty) { ev.preventDefault(); ev.returnValue = ''; }
   });
 
-  // A field that takes the key itself. A checkbox / radio does not (the "Confirmed empty" box
-  // keeps focus after a click); a box's class select takes only its own navigation keys.
-  function typing(t, k) {
-    var tag = t && t.tagName;
-    if (tag === 'INPUT') return !/^(checkbox|radio|button|submit|reset)$/.test(t.type);
-    if (tag === 'SELECT' && t.classList.contains('bx-label')) {
-      return /^(Arrow(Up|Down|Left|Right)|Enter| |Home|End|PageUp|PageDown|Tab)$/.test(k);
-    }
-    return tag === 'TEXTAREA' || tag === 'SELECT' || !!(t && t.isContentEditable);
-  }
-
   // ---- keys: one list for the table under Panel options and the `?` overlay ----------------
-
-  // [group, key, text]; a text of null is the class row (filled by fillKeyHint), a key of '' a note.
-  var KEYS = [
-    ['Decide', 'a', 'accept the selected box (keep a drawn one) and go to the next'],
-    ['Decide', 'r', 'reject the selected box (delete a drawn one) and go to the next'],
-    ['Decide', 't', 'real, parked: accept the selected box and remember its spot, so that auto-label runs accept it there (a VLM no stays flagged); not on drawn boxes'],
-    ['Decide', '1-9, 0', null],
-    ['Decide', 'u', 'reject the selected box as a duplicate of the box it overlaps (stacked, nested or partly overlapping)'],
-    ['Decide', 'Shift+U', 'stacked boxes: keep the best of each stack, reject the others as duplicates'],
-    ['Decide', 'y', 'overlap suggestion: accept the one on screen (drops the box marked drop?, as a duplicate; or keeps both as two objects). Doing anything else ignores it'],
-    ['Decide', 'y (dataset check)', 'once no overlap suggestion is on screen, accept the dataset check\'s suggestion (strongest first): add the dashed box, take the other class or the tighter box, or keep a label no model found. Doing anything else leaves it open'],
-    ['Decide', 'w', 'dataset check suggestion: no (not an object, keep the label or the box as they are, or dismiss "no model found"); remembered, the next check does not ask again'],
-    ['Decide', 'd', 'unsure: a real object you cannot name for sure: kept out of training, its frame goes to held-out only, ignored by the benchmark (?! on the box); again: not unsure'],
-    ['Decide', 'Shift+1-9', 'after a rejection, or on a rejected box: why it was wrong (optional; nothing there, insect / web, rain / snow, IR glare, reflection, part of the scene, other object, too small, duplicate). Too small is also a button in the decision card: a real object too small to label, no negative, treated like unsure'],
-    ['Decide', 'c', 'accept likely: every likely (★) box on the frame; the others stay pending'],
-    ['Decide', 'Shift+A', 'accept proposals: the pending boxes saving would accept (flagged ? boxes and hints stay pending)'],
-    ['Decide', 'Shift+R', 'reject the rest: every box still undecided, the way to clear the unlikely boxes'],
-    ['Decide', 'e', 'confirmed empty (rejects every box)'],
-    ['Decide', 'Delete', 'delete a drawn box, reject a model box'],
-    ['Decide', 'z', 'undo'],
-    ['Decide', 's, Enter', 'save & next; flagged (?) boxes need a decision first, then it asks about boxes not checked yet and "Anything missing?" (Panel options)'],
-    ['Decide', 'drag', 'on an edge or corner of the selected box (it lights up under the pointer): resize; inside it: move; elsewhere: draw a box'],
-    ['Decide', 'arrows', 'move the selected box 1 px (Shift: 10 px)'],
-    ['Decide', '', 'The next box is the next likely (★) one, then the next flagged (?) one, then the next pending one, then each accepted / rejected box not checked yet (check pass, marked to check).'],
-    ['Navigate', 'j / k', 'select the next / previous box'],
-    ['Navigate', 'Esc', 'no box selected (during the quarter look: the whole frame first)'],
-    ['Navigate', 'n', 'next frame without saving (after Back: the frame you came from)'],
-    ['Navigate', 'p', 'back to the previous frame of this session (as saved)'],
-    ['Navigate', 'x', 'zoom to the selected box and follow the selection (the next box, the next frame) until f'],
-    ['Navigate', 'f', 'fit: the whole frame, for the next boxes and frames too'],
-    ['Navigate', 'q', 'while "Anything missing?" asks: zoom to the top-left, top-right, bottom-left and bottom-right quarter in turn, then the whole frame again (small, distant objects are the ones most often missed; drawing works there, s saves)'],
-    ['Navigate', 'wheel', 'zoom about the pointer (up to 16x; sharp pixels from 3x on screen); after zooming or panning by hand the next box is zoomed to, and that stays the choice until f'],
-    ['Navigate', 'right / middle drag, Space + drag', 'pan'],
-    ['Navigate', 'overview', 'drag the outlined part to pan, the wheel zooms there; click a box to select it, elsewhere to move the view there'],
-    ['View', 'b', 'image (view only): auto, off, bright, bright + equalised; auto = bright + equalised on night / IR frames'],
-    ['View', '[ / ]', 'image brightness down / up (view only; the View menu has the slider): lifts or deepens the shadows, never clips the highlights'],
-    ['View', '{ / }', 'image contrast down / up (Shift+[ / ]; view only; the View menu has the slider), about the frame\'s median level (a dark frame does not go black)'],
-    ['View', 'Shift+0', 'image back to auto, brightness and contrast 0'],
-    ['View', 'v', 'spotlight on / off: the frame dimmed outside the selected box, the other boxes faint'],
-    ['View', 'o', 'the overview of the whole frame: at the top of the side panel, or in a corner of the frame (wide screens; kept for your next visits)'],
-    ['View', 'h (hold)', 'hide the boxes'],
-    ['View', 'l', 'labels on the boxes on / off'],
-    ['View', 'i', 'show / put away the hidden boxes of this frame (low-score auto boxes and boxes at spots you rejected, dimmed; accepting one makes it a label)'],
-    ['View', '?', 'this list (Esc closes it)']
-  ];
-
-  function keyRows(tbody, group, withId) {
-    KEYS.forEach(function (k) {
-      if (group && k[0] !== group) return;
-      var tr = el('tr');
-      tr.appendChild(el('td', null, k[1]));
-      var td = el('td');
-      if (k[2] == null) {
-        td.appendChild(document.createTextNode('class 1-10'));
-        var span = el('span', 'rv-key-classes');
-        if (withId) span.id = 'rv-key-classes';
-        td.appendChild(span);
-        td.appendChild(document.createTextNode(': relabel the selected box (accepting it) and go to the next, else the class of new boxes; the bar\'s It\'s a… lists them all'));
-      } else td.textContent = k[2];
-      if (!k[1]) td.className = 'muted';
-      tr.appendChild(td);
-      tbody.appendChild(tr);
-    });
-  }
-
-  function renderKeys() {
-    var tbody = document.querySelector('.review-keys tbody');
-    if (tbody) {
-      tbody.textContent = '';
-      ['Decide', 'Navigate', 'View'].forEach(function (g) {
-        var tr = el('tr', 'rv-keys-group');
-        var th = el('th', null, g);
-        th.colSpan = 2;
-        tr.appendChild(th);
-        tbody.appendChild(tr);
-        keyRows(tbody, g, true);
-      });
-    }
-    keysDialog.textContent = '';
-    // Close first: the dialog focuses it on open, and it should not scroll the list to its end.
-    var head = el('div', 'rv-keys-head');
-    head.appendChild(el('h3', null, 'Keyboard'));
-    head.appendChild(button('Close', function () { keysDialog.close(); }, 'secondary'));
-    keysDialog.appendChild(head);
-    var cols = el('div', 'rv-keys-cols');
-    ['Decide', 'Navigate', 'View'].forEach(function (g) {
-      var col = el('section');
-      col.appendChild(el('h4', null, g));
-      var t = el('table', 'review-keys');
-      var tb = el('tbody');
-      keyRows(tb, g, false);
-      t.appendChild(tb);
-      col.appendChild(t);
-      cols.appendChild(col);
-    });
-    keysDialog.appendChild(cols);
-  }
-
-  function openKeys() {
-    if (keysDialog.open) return;
-    if (keysDialog.showModal) keysDialog.showModal(); else keysDialog.setAttribute('open', '');
-  }
-  keysDialog.addEventListener('click', function (ev) { if (ev.target === keysDialog) keysDialog.close(); });
-  keysDialog.addEventListener('close', function () { canvas.focus({ preventScroll: true }); });
-  if (keysBtn) keysBtn.addEventListener('click', openKeys);
-  renderKeys();
+  // review-keys.js draws both and wires the overlay; `typing`: a field that takes the key itself.
+  var keyTable = window.ReviewKeys.init({ el: el, button: button, dialog: keysDialog, canvas: canvas, keysBtn: keysBtn });
+  var typing = window.ReviewKeys.typing;
 
   document.addEventListener('keydown', function (ev) {
     if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
@@ -5274,7 +5080,7 @@
     else if (k === 'i') toggleDismissed();
     // `q`: the next quarter of "Anything missing?" (once per press; the browser's key otherwise).
     else if (k === 'q') handled = quarterOpen() && (ev.repeat || lookQuarter());
-    else if (k === '?') openKeys();
+    else if (k === '?') keyTable.open();
     else if (k === 'ArrowLeft' || k === 'ArrowRight' || k === 'ArrowUp' || k === 'ArrowDown') {
       var step = ev.shiftKey ? 10 : 1;
       handled = selected >= 0 && nudge(
@@ -5325,400 +5131,12 @@
   });
 
   // ---- follow a job, bulk tools -------------------------------------
-
-  var alStatus = $('rv-al-status');
-  var alProgress = $('rv-al-progress');
-  var polling = null;   // {id, box, bar, after, loop}: the task followed
-
-  function describeTask(t) {
-    if (t.state === 'queued') return 'Queued: ' + (t.title || 'auto-label') + ' (waiting for the queue).';
-    var s = t.stage ? String(t.stage).replace(/_/g, ' ') : 'starting';
-    return (t.title ? t.title + ': ' : '') + s + (t.steps ? ' (' + t.step + '/' + t.steps + ')' : '') +
-      (t.percent != null ? ', ' + t.percent + '%' : '') + (t.detail ? ': ' + t.detail : '');
-  }
-
-  function stopPolling() {
-    if (polling) polling.loop.stop();
-    polling = null;
-  }
-
-  // Task records: task `id` (a list of one, none when the server has no such task), else every
-  // queued, running or paused one. From GET /v1/train/jobs (task=<id> / tasks=busy: the records
-  // without log or result). The server always sends the field (null for an unknown task); an
-  // answer without it is an error, never a reason to ask another route.
-  function taskRecords(id) {
-    // Asked from a poll: a poll throughout.
-    var poll = window.PrismPoll && window.PrismPoll.inPoll && window.PrismPoll.inPoll();
-    var get = poll && window.PrismPoll.fetch ? window.PrismPoll.fetch : fetch;
-    var json = function (url) {
-      return get(url, { headers: { Accept: 'application/json' }, cache: 'no-store' }).then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.json();
-      });
-    };
-    var key = id ? 'task' : 'tasks';
-    return json('/v1/train/jobs?' + (id ? 'task=' + encodeURIComponent(id) : 'tasks=busy')).then(function (j) {
-      if (!j || typeof j !== 'object' || !(key in j)) throw new Error('the jobs answer has no ' + key + ' field');
-      return id ? (j.task ? [j.task] : []) : (j.tasks || []);
-    });
-  }
-
-  // Chained, never an interval (no two requests at once), no request while the tab is hidden, one
-  // at once when it shows again. `run()` resolves false to stop.
-  function loop(run, period) {
-    if (window.PrismPoll) {
-      var p = window.PrismPoll.create({ run: run, period: period, more: function (go) { return go !== false; } });
-      p.start();
-      return p;
-    }
-    // An older live.js: the same loop without the back-off.
-    var timer = null, inFlight = false, done = false;
-    var clear = function () { if (timer !== null) { clearTimeout(timer); timer = null; } };
-    var go = function () {
-      clear();
-      if (done || inFlight || document.hidden) return;
-      inFlight = true;
-      run().then(function (more) { if (more === false) done = true; }, function () {}).then(function () {
-        inFlight = false;
-        if (!done && !document.hidden) timer = setTimeout(go, period);
-      });
-    };
-    document.addEventListener('visibilitychange', function () { if (document.hidden) clear(); else go(); });
-    go();
-    return { stop: function () { done = true; clear(); } };
-  }
-
-  // Follow task `id`; `box` and `bar` show it (default: the line above the frame), `after(t)` runs when
-  // it ends.
-  function pollTask(id, box, bar, after) {
-    stopPolling();
-    var me = { id: id, box: box || alStatus, bar: bar || alProgress, after: after };
-    polling = me;
-    me.loop = loop(function () { return tick(me); }, 3000);
-  }
-
-  function tick(me) {
-    return taskRecords(me.id).then(function (list) {
-      if (polling !== me) return false;
-      var t = list.filter(function (x) { return x.id === me.id; })[0];
-      if (!t) return true;
-      var box = me.box, bar = me.bar, after = me.after;
-      if (t.state === 'queued' || t.state === 'running' || t.state === 'paused') {
-        report(box, [describeTask(t)]);
-        bar.hidden = false;
-        bar.value = t.percent || 0;
-        return true;
-      }
-      stopPolling();
-      bar.hidden = true;
-      if (t.state === 'done') report(box, ['Done: ' + (t.summary || t.title || 'auto-label finished')]);
-      else if (t.state === 'failed') report(box, ['Failed: ' + (t.error || 'see Jobs on the Auto-label tab.')]);
-      else report(box, [t.summary ? 'Cancelled: ' + t.summary : 'Cancelled.']);
-      box.className = 'review-report ' + (t.state === 'done' ? 'ok-text' : 'error-text');
-      // Asked for by the poll's answer, not the reviewer.
-      background(function () {
-        if (after) after(t);
-        reloadQueue();
-      });
-      return false;
-    });
-  }
-
-  // A job queued earlier (here or on the Auto-label tab): follow it.
-  if (alStatus) {
-    taskRecords(null)
-      .then(function (list) {
-        if (polling) return;
-        var busyTasks = list.filter(function (t) {
-          return (t.kind === 'autolabel' || t.kind === 'overlaps') && (t.state === 'queued' || t.state === 'running' || t.state === 'paused');
-        });
-        var t = busyTasks.filter(function (x) { return x.state === 'running'; })[0] || busyTasks[0];
-        if (t && t.kind === 'overlaps') followOverlaps(t.id);
-        else if (t) pollTask(t.id);
-      })
-      .catch(function () {});
-  }
-
-  // The seven bulk buttons share one flow: a dry run of `o.url` ("Counting..."), nothing to do
-  // or a confirm, the real run, its report and a reload. `o`:
-  //   button, box   the button (disabled meanwhile) and the report box
-  //   url           POST /v1/review/<action>; body = `start` (default {}), then the filters named
-  //                 by `keys`, then `extra(body)`, then `dry_run`
-  //   keys          the filter fields sent. Required per action: SuggestOverlapsBody and the
-  //                 stacked walk take no `source` (SuggestOverlapsBody rejects unknown fields, so
-  //                 sending it would answer 400)
-  //   counting      the first line, while the dry run runs
-  //   count(j)      what the dry run found; 0 = nothing to do
-  //   none(j)       the report lines for nothing (afterNone(j), when given, runs next: a promise)
-  //   gate(j, body) optional, after "something found": true = stop (it has reported)
-  //   confirm(j, body, n)  the confirm text; cancelled: the line when the user says no
-  //   done(r)       the first report line of the real run; after(r) runs next (a promise)
-  //   finish(r)     replaces done/after (the overlap check queues a job and has no outcome colour)
-  // `failed` entries are strings (Vec<String> in bulk.rs); any other shape prints as JSON.
-  function bulkAction(o) {
-    var box = o.box, body = o.start || {};
-    o.keys.forEach(function (k) {
-      var e = filtersForm.elements[k];
-      if (e && e.value) body[k] = e.value;
-    });
-    if (o.extra) o.extra(body);
-    body.dry_run = true;
-    box.className = 'review-report';
-    report(box, [o.counting]);
-    o.button.disabled = true;
-    return postJson(o.url, body).then(function (j) {
-      var n = o.count(j);
-      if (!n) {
-        report(box, o.none(j));
-        return o.afterNone ? o.afterNone(j) : null;
-      }
-      if (o.gate && o.gate(j, body)) return null;
-      if (!window.confirm(o.confirm(j, body, n))) {
-        report(box, [o.cancelled]);
-        return null;
-      }
-      body.dry_run = false;
-      return postJson(o.url, body).then(function (r) {
-        if (o.finish) return o.finish(r);
-        var failed = r.failed || [];
-        report(box, [o.done(r)],
-          failed.map(function (f) { return typeof f === 'string' ? f : JSON.stringify(f); }));
-        box.className = 'review-report ' + (failed.length ? 'error-text' : 'ok-text');
-        return o.after(r);
-      });
-    }).catch(function (e) {
-      box.className = 'review-report error-text';
-      report(box, [e.message]);
-    }).then(function () { o.button.disabled = false; });
-  }
-
-  var ALL_KEYS = ['bucket', 'scene', 'camera', 'label', 'source'];
-  var NO_SOURCE_KEYS = ['bucket', 'scene', 'camera', 'label'];
-
-  var bulkBtn = $('rv-accept-auto');
-  if (bulkBtn) {
-    bulkBtn.addEventListener('click', function () {
-      bulkAction({
-        button: bulkBtn, box: $('rv-accept-auto-msg'), url: '/v1/review/accept-auto', keys: ALL_KEYS,
-        counting: 'Counting the frames...',
-        count: function (j) { return j.eligible || 0; },
-        none: function (j) { return [j.message || 'No unreviewed frame with only auto: accept boxes matches the filters.']; },
-        confirm: function (j, body, n) {
-          return 'Accept ' + n + ' frame(s) whose boxes the auto-labeler marked accept? ' +
-            'They are saved as reviewed: those boxes accepted, unconfirmed hint boxes rejected. ' +
-            'Frames with a box flagged for review are left alone.';
-        },
-        cancelled: 'Nothing accepted.',
-        done: function (r) { return r.message || ('Accepted ' + (r.accepted || 0) + ' frame(s).'); },
-        after: function () { return reloadQueue(); }
-      });
-    });
-  }
-
-  // Save the frames spot edits settled (nothing pending left): dry run, ask, save.
-  var repeatsBtn = $('rv-accept-repeats');
-  if (repeatsBtn) {
-    repeatsBtn.addEventListener('click', function () {
-      bulkAction({
-        button: repeatsBtn, box: $('rv-accept-repeats-msg') || msg, url: '/v1/review/accept-repeats', keys: ALL_KEYS,
-        counting: 'Counting the frames...',
-        count: function (j) { return j.eligible || 0; },
-        none: function () { return ['No repeat-only frame matches the filters (a frame with a box still to decide never is).']; },
-        confirm: function (j, body, n) {
-          return 'Save ' + n + ' repeat-only frame(s) as reviewed? Their boxes were all settled by "this spot on all frames"; ' +
-            'nothing on them is pending.';
-        },
-        cancelled: 'Nothing saved.',
-        done: function (r) { return r.message || ('Saved ' + (r.accepted || 0) + ' frame(s).'); },
-        after: function () { return reloadQueue(); }
-      });
-    });
-  }
-
-  var rejectBtn = $('rv-reject-low');
-  if (rejectBtn) {
-    rejectBtn.addEventListener('click', function () {
-      var box = $('rv-reject-low-msg');
-      var score = parseFloat($('rv-reject-low-score').value);
-      box.className = 'review-report';
-      if (!(score >= 0.01 && score <= 1)) {
-        box.className = 'review-report error-text';
-        report(box, ['Enter a score between 0.01 and 1.']);
-        return;
-      }
-      bulkAction({
-        button: rejectBtn, box: box, url: '/v1/review/reject-low', keys: ALL_KEYS,
-        start: { min_score: score },
-        counting: 'Counting the boxes...',
-        count: function (j) { return j.boxes || 0; },
-        none: function (j) { return [j.message || ('No pending auto box below ' + score + ' on the unreviewed frames the filters select.')]; },
-        confirm: function (j, body, n) {
-          return 'Reject ' + n + ' box(es) on ' + (j.eligible || 0) + ' frame(s): the pending auto boxes ' +
-            'scoring below ' + score + '? They are kept as hard negatives (reason low_score); the frames stay ' +
-            'unreviewed and a reviewer can still change them per frame.';
-        },
-        cancelled: 'Nothing rejected.',
-        done: function (r) { return r.message || ('Rejected ' + (r.boxes || 0) + ' box(es).'); },
-        after: function () { return reloadQueue(); }
-      });
-    });
-  }
-
-  // `r` = reviewed_with_unwanted {frames, boxes, classes}: asks whether to reject the accepted
-  // boxes of unwanted classes on reviewed frames too (POST /v1/review/reject-unwanted-reviewed)
-  // and appends the outcome to `box`. Resolves either way.
-  function askReviewedUnwanted(r, box) {
-    if (!r || !(r.frames > 0)) return Promise.resolve();
-    var text = r.frames + ' reviewed frame(s) have ' + r.boxes + ' accepted box(es) of ' +
-      (r.classes || []).join(', ') + '. Reject those too? They are kept as evidence (reason other_class) ' +
-      'and the frames stay reviewed; Cancel keeps them as training labels.';
-    if (!window.confirm(text)) {
-      box.appendChild(el('div', null, 'Reviewed frames left as they are (' + r.frames + ' with boxes of ' +
-        (r.classes || []).join(', ') + ').'));
-      return Promise.resolve();
-    }
-    return postJson('/v1/review/reject-unwanted-reviewed', {}).then(function (j) {
-      box.appendChild(el('div', null, j.message || ('Rejected ' + (j.boxes || 0) + ' box(es).')));
-      if (j.failed && j.failed.length) box.appendChild(el('div', 'error-text', j.failed.join('; ')));
-      return reloadQueue();
-    }).catch(function (e) {
-      box.appendChild(el('div', 'error-text', e.message));
-    });
-  }
-
-  var otherBtn = $('rv-reject-other');
-  if (otherBtn) {
-    otherBtn.addEventListener('click', function () {
-      var box = $('rv-reject-other-msg');
-      bulkAction({
-        button: otherBtn, box: box, url: '/v1/review/reject-other-class', keys: ALL_KEYS,
-        counting: 'Counting the boxes...',
-        count: function (j) { return j.boxes || 0; },
-        none: function (j) {
-          return [j.message || 'No pending box of an unwanted class (hidden, or not in the class list) on the unreviewed frames the filters select.'];
-        },
-        afterNone: function (j) { return askReviewedUnwanted(j.reviewed_with_unwanted, box); },
-        confirm: function (j, body, n) {
-          var renamed = j.relabelled || 0;
-          var text = 'Reject ' + (n - renamed) + ' pending model / auto box(es) of unwanted classes (hidden, or not in ' +
-            'the class list) on ' + (j.eligible || 0) + ' frame(s)? They are kept as evidence (reason other_class); ' +
-            'the frames stay unreviewed and a reviewer can still change them per frame.';
-          if (renamed) {
-            text += ' ' + renamed + ' box(es) whose label is a class of the list under another spelling ' +
-              '(e.g. pottedplant) are renamed to the list\'s spelling instead.';
-          }
-          return text;
-        },
-        cancelled: 'Nothing rejected.',
-        done: function (r) { return r.message || ('Changed ' + (r.boxes || 0) + ' box(es).'); },
-        after: function (r) {
-          return reloadQueue().then(function () { return askReviewedUnwanted(r.reviewed_with_unwanted, box); });
-        }
-      });
-    });
-  }
-
-  // The overlap check: count, confirm, queue, follow. It writes suggestions only; the result line
-  // offers the queue of overlapping boxes.
-  function followOverlaps(id) {
-    var box = $('rv-suggest-msg');
-    pollTask(id, box, $('rv-suggest-progress'), function (t) {
-      if (t.state !== 'done') return;
-      box.appendChild(button('Show the overlapping frames', function () {
-        showOverlaps();
-        filterReload();
-      }));
-    });
-  }
-
-  var suggestBtn = $('rv-suggest-overlaps');
-  if (suggestBtn) {
-    suggestBtn.addEventListener('click', function () {
-      var box = $('rv-suggest-msg');
-      // "Start anyway" shows beside a memory refusal of the dry run (PrismMemory, live.js).
-      var anyway = $('rv-suggest-anyway');
-      var anywayTicked = !!(window.PrismMemory && window.PrismMemory.ticked(anyway));
-      bulkAction({
-        button: suggestBtn, box: box, url: '/v1/review/suggest-overlaps', keys: NO_SOURCE_KEYS,
-        extra: function (body) {
-          var large = $('rv-suggest-large');
-          if (large && large.checked) body.allow_large = true;
-          var askAgain = $('rv-suggest-again');
-          if (askAgain && askAgain.checked) body.again = true;
-        },
-        counting: 'Counting the pairs...',
-        count: function (j) { return j.pairs; },
-        none: function (j) { return [j.message || 'No open overlap without a suggestion on these frames.']; },
-        gate: function (j, body) {
-          if (window.PrismMemory) window.PrismMemory.sync(anyway, j.memory);
-          if (j.memory && !anywayTicked) {
-            box.className = 'review-report error-text';
-            report(box, [j.memory.refusal, 'To queue it anyway, tick Start anyway above, then press Suggest overlaps again.']);
-            return true;
-          }
-          if (j.memory) body.ignore_memory_check = true;
-          return false;
-        },
-        confirm: function (j, body) {
-          return (j.memory ? 'Warning: ' + j.memory.refusal + '\n\n' : '') + 'Check ' + j.pairs + ' overlapping pair(s) on ' + j.frames + ' frame(s), reviewed frames included' +
-            (body.again ? ', answered pairs asked again' : '') + ', ' +
-            'with RF-DETR L (' + j.crops + ' crops, on the training queue, about ' + Math.max(1, Math.ceil(j.crops * 0.08 / 60)) + ' min)? ' +
-            'It writes suggestions only: no box changes until you confirm one here.';
-        },
-        cancelled: 'Nothing queued.',
-        finish: function (r) {
-          report(box, [r.message || 'Queued.']);
-          if (r.id) followOverlaps(r.id);
-        }
-      });
-    });
-  }
-
-  // Stacked boxes span reviewed frames too; the Frames filter does not narrow it (a reviewed frame
-  // need not be in the review queue). Overlaps that are no stack stay a reviewer's: the server's
-  // message says how many and how to list them.
-  var stackedBtn = $('rv-reject-stacked');
-  if (stackedBtn) {
-    stackedBtn.addEventListener('click', function () {
-      bulkAction({
-        button: stackedBtn, box: $('rv-reject-stacked-msg'), url: '/v1/review/reject-stacked', keys: NO_SOURCE_KEYS,
-        counting: 'Counting the boxes...',
-        count: function (j) { return j.boxes || 0; },
-        none: function (j) { return [j.message || 'No stacked duplicates on the frames these filters select.']; },
-        confirm: function (j, body, n) {
-          return 'Reject ' + n + ' stacked duplicate box(es) on ' + (j.eligible || 0) + ' frame(s), reviewed frames ' +
-            'included? The best box of each stack stays. Frames stay reviewed and the boxes are kept as rejected evidence ' +
-            '(reason duplicate, left out of the hard negatives); drawn boxes are never rejected.';
-        },
-        cancelled: 'Nothing rejected.',
-        done: function (r) { return r.message || ('Rejected ' + (r.boxes || 0) + ' box(es).'); },
-        after: function () {
-          histories = {};   // the boxes rejected were decisions of these cameras
-          return reloadQueue();
-        }
-      });
-    });
-  }
-
-  // The undo of a re-label that reopened reviewed frames: back to reviewed when nothing is pending.
-  var restoreBtn = $('rv-restore-reopened');
-  if (restoreBtn) {
-    restoreBtn.addEventListener('click', function () {
-      bulkAction({
-        button: restoreBtn, box: $('rv-restore-reopened-msg'), url: '/v1/review/restore-reopened', keys: ALL_KEYS,
-        counting: 'Counting the frames...',
-        count: function (j) { return j.eligible || 0; },
-        none: function () { return ['No reopened frame with nothing left pending among the frames the filters select.']; },
-        confirm: function (j, body, n) {
-          return 'Put ' + n + ' reopened frame(s) back to reviewed? Their boxes stay as they are, and they ' +
-            'return to exports. Frames with a pending box are not touched.';
-        },
-        cancelled: 'Nothing restored.',
-        done: function (r) { return r.message || ('Restored ' + (r.restored || 0) + ' frame(s).'); },
-        after: function () { return reloadQueue(); }
-      });
-    });
-  }
+  // review-bulk.js: the job followed above the frame, the Bulk tools and the overlap check.
+  window.ReviewBulk.init({
+    $: $, el: el, report: report, postJson: postJson, button: button, msg: msg, filtersForm: filtersForm,
+    reloadQueue: reloadQueue, showOverlaps: showOverlaps, filterReload: filterReload,
+    forgetHistories: function () { histories = {}; }
+  });
 
   // ---- folder under review -------------------------------------------------------------------
 
@@ -5846,26 +5264,25 @@
   }
   // A link may name one frame (`?frame=<scene>/<camera>/<date>/<stem>.jpg`, the Refine tab's
   // "Check these"): read before filtersShown rewrites the address without it.
-  var linkFrame = new URLSearchParams(location.search).get('frame');
-  if (!linkFrame || linkFrame.length > 400 || !/\.jpg$/.test(linkFrame)) linkFrame = null;
+  var linkFrame = Drafts.linkFrame(new URLSearchParams(location.search).get('frame'));
   filtersFromUrl();
   filtersShown();
   // A draft (above) opens its frame; the queue's counts load beside it. Gone: the queue as usual.
-  var draft0 = window.PrismDraft ? PrismDraft.load(DRAFT) : null;
-  if (draft0 && typeof draft0.id === 'string' && draft0.id) {
+  var first = Drafts.start(PrismDraft.load(DRAFT), linkFrame);
+  if (first.from === 'draft') {
     draftWaiting = true;
-    loadNext(null, null, true, draft0.id);
-    loadFrame(draft0.id).then(function () { draftWaiting = false; }, function () {
+    loadNext(null, null, true, first.frame);
+    loadFrame(first.frame).then(function () { draftWaiting = false; }, function () {
       draftWaiting = false;
       PrismDraft.drop(DRAFT);
       say('Your unsaved edits from before the page was closed were dropped: their frame is gone.', true);
       loadNext();
     });
-  } else if (linkFrame) {
+  } else if (first.from === 'link') {
     // The frame the link names, the counts beside it; Next goes on in the link's filters. Gone: the
     // queue as usual.
-    loadNext(null, null, true, linkFrame);
-    loadFrame(linkFrame).catch(function () {
+    loadNext(null, null, true, first.frame);
+    loadFrame(first.frame).catch(function () {
       say('The frame in the link is not in the dataset (any more): showing the queue.', true);
       loadNext();
     });

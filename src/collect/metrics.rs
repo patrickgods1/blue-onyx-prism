@@ -163,7 +163,11 @@ pub static METRICS: DatasetMetrics = DatasetMetrics::new();
 
 /// Append the dataset series to a Prometheus text exposition (`prefix` = the metric prefix).
 pub fn render_prometheus(out: &mut String, prefix: &str) {
-    let m = &METRICS;
+    render_into(&METRICS, out, prefix);
+}
+
+/// [`render_prometheus`] of the counters `m`.
+fn render_into(m: &DatasetMetrics, out: &mut String, prefix: &str) {
     let counters = [
         (
             "requests",
@@ -229,4 +233,112 @@ pub fn render_prometheus(out: &mut String, prefix: &str) {
         "{prefix}dataset_collect_disabled {}",
         u8::from(m.disabled())
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The place each variant must have in `ALL`. Exhaustive: a new variant fails to compile here;
+    /// add it to `Bucket::ALL` / `Dropped::ALL` too, at this place (its discriminant), or its
+    /// counter is never kept nor rendered.
+    fn bucket_place(b: Bucket) -> usize {
+        match b {
+            Bucket::Positive => 0,
+            Bucket::Empty => 1,
+            Bucket::Suppressed => 2,
+            Bucket::VerifyRejected => 3,
+            Bucket::VerifyKept => 4,
+            Bucket::NearThreshold => 5,
+            Bucket::Disagreement => 6,
+        }
+    }
+
+    /// See [`bucket_place`].
+    fn dropped_place(r: Dropped) -> usize {
+        match r {
+            Dropped::QueueFull => 0,
+            Dropped::Rate => 1,
+            Dropped::Dup => 2,
+            Dropped::Disk => 3,
+            Dropped::Error => 4,
+        }
+    }
+
+    // QA-197: the counters are indexed by discriminant (`b as usize`) and rendered by `ALL`, so a
+    // variant's discriminant must be its place in `ALL`; one past its end would be dropped.
+    #[test]
+    fn the_counter_index_is_the_place_in_all() {
+        for (i, b) in Bucket::ALL.iter().enumerate() {
+            assert_eq!(*b as usize, i, "{b:?}");
+            assert_eq!(bucket_place(*b), i, "{b:?}");
+        }
+        for (i, r) in Dropped::ALL.iter().enumerate() {
+            assert_eq!(*r as usize, i, "{r:?}");
+            assert_eq!(dropped_place(*r), i, "{r:?}");
+        }
+        assert_eq!(Bucket::ALL.len(), bucket_place(Bucket::Disagreement) + 1);
+        assert_eq!(Dropped::ALL.len(), dropped_place(Dropped::Error) + 1);
+    }
+
+    #[test]
+    fn each_count_renders_under_its_own_label() {
+        let m = DatasetMetrics::new();
+        m.record_request();
+        m.record_offered();
+        m.record_offered();
+        m.record_no_bucket();
+        m.record_frame(&[Bucket::NearThreshold, Bucket::Disagreement]);
+        m.record_drop(Dropped::Dup);
+        m.record_drop(Dropped::Dup);
+        m.record_drop(Dropped::Error);
+        m.set_bytes(1234);
+        m.set_disabled(true);
+        let mut out = String::new();
+        render_into(&m, &mut out, "bop_");
+        let lines: Vec<&str> = out.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(
+            lines,
+            [
+                "bop_dataset_requests_total 1",
+                "bop_dataset_offered_total 2",
+                "bop_dataset_saved_total 1",
+                "bop_dataset_no_bucket_total 1",
+                "bop_dataset_frames_total{bucket=\"positive\"} 0",
+                "bop_dataset_frames_total{bucket=\"empty\"} 0",
+                "bop_dataset_frames_total{bucket=\"suppressed\"} 0",
+                "bop_dataset_frames_total{bucket=\"verify_rejected\"} 0",
+                "bop_dataset_frames_total{bucket=\"verify_kept\"} 0",
+                "bop_dataset_frames_total{bucket=\"near_threshold\"} 1",
+                "bop_dataset_frames_total{bucket=\"disagreement\"} 1",
+                "bop_dataset_dropped_total{reason=\"queue_full\"} 0",
+                "bop_dataset_dropped_total{reason=\"rate\"} 0",
+                "bop_dataset_dropped_total{reason=\"dup\"} 2",
+                "bop_dataset_dropped_total{reason=\"disk\"} 0",
+                "bop_dataset_dropped_total{reason=\"error\"} 1",
+                "bop_dataset_bytes 1234",
+                "bop_dataset_collect_disabled 1",
+            ]
+        );
+        // Every series has its HELP and TYPE lines.
+        for name in [
+            "requests_total",
+            "offered_total",
+            "saved_total",
+            "no_bucket_total",
+            "frames_total",
+            "dropped_total",
+            "bytes",
+            "collect_disabled",
+        ] {
+            assert!(
+                out.contains(&format!("# HELP bop_dataset_{name} ")),
+                "{name}"
+            );
+            assert!(
+                out.contains(&format!("# TYPE bop_dataset_{name} ")),
+                "{name}"
+            );
+        }
+    }
 }

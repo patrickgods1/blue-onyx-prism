@@ -62,8 +62,9 @@
 // classes asks, then POST /v1/review/reject-unwanted-reviewed. After an export the Exports and
 // coverage cards are read again from the page's own URL. The export card warns when the dataset check left
 // open suggestions (`DatasetOpen`, GET /v1/refine). While an export or an import waits for its
-// answer, its progress comes from its line on the Jobs list (GET /v1/train/jobs, a PrismPoll chain
-// every 2 s; the server lists it as a side job). No inline handlers (CSP); server values
+// answer, its progress comes from its line on the Jobs list (GET /v1/train/jobs through
+// TrainArea.jobs, a PrismPoll chain every 2 s that backs off while the answer is not the list; the
+// server lists it as a side job). No inline handlers (CSP); server values
 // come from data-*.
 (function () {
   'use strict';
@@ -83,24 +84,22 @@
   var el = PrismDom.el, report = PrismDom.report, postJson = PrismFetch.postJson;
 
   // While a POST of `kind` ("Dataset export", "X-AnyLabeling import") waits: its newest line of
-  // the Jobs list in `box`, after `lead`. Returns the stop, called before the answer is shown.
+  // the Jobs list in `box`, after `lead`. Returns the stop, called before the answer is shown. An
+  // answer that is not the list (TrainArea.jobs rejects) leaves the line as it was and backs the
+  // poll off.
   function follow(kind, box, lead) {
-    if (!window.PrismPoll) return function () {};
     var over = false;
-    var poller = window.PrismPoll.create({
+    var poller = PrismPoll.create({
       period: 2000,
       run: function () {
-        return fetch('/v1/train/jobs', { headers: { Accept: 'application/json' }, cache: 'no-store' })
-          .then(function (r) { return r.ok ? r.json() : null; })
-          .then(function (j) {
-            if (over || !j || !j.jobs) return;
-            var mine = j.jobs.active.filter(function (l) { return l.kind === kind; }).pop();
-            if (!mine) return;
-            var where = mine.step && mine.phase ? mine.step + ': ' + mine.phase : mine.step || mine.phase;
-            var text = [where, mine.detail].filter(Boolean).join(' · ');
-            report(box, [lead + (text ? ' ' + text : '') + ' (' + mine.percent + '%, ' + mine.time + ')']);
-          })
-          .catch(function () { /* the line stays as it was */ });
+        return TrainArea.jobs().then(function (j) {
+          if (over) return;
+          var mine = j.active.filter(function (l) { return l.kind === kind; }).pop();
+          if (!mine) return;
+          var where = mine.step && mine.phase ? mine.step + ': ' + mine.phase : mine.step || mine.phase;
+          var text = [where, mine.detail].filter(Boolean).join(' · ');
+          report(box, [lead + (text ? ' ' + text : '') + ' (' + mine.percent + '%, ' + mine.time + ')']);
+        });
       },
       more: function () { return !over; }
     });

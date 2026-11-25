@@ -5,6 +5,7 @@
 //! the resolved form the workers carry in their live settings.
 
 use super::Bucket;
+use crate::image_stats::Scene;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -144,12 +145,13 @@ impl BucketConfig {
         }
     }
 
-    /// The per-camera interval for a frame of `bucket` whose scene is `scene`
-    /// (`day | night | ir`).
-    pub fn interval_for(&self, bucket: Bucket, scene: &str) -> u32 {
-        match scene {
-            "night" | "ir" => self.night_interval(bucket),
-            _ => self.per_camera_min_interval_s,
+    /// The per-camera interval for a frame of `bucket` whose scene is `scene`: the night one for
+    /// night and IR ([`Scene::is_night`]).
+    pub fn interval_for(&self, bucket: Bucket, scene: Scene) -> u32 {
+        if scene.is_night() {
+            self.night_interval(bucket)
+        } else {
+            self.per_camera_min_interval_s
         }
     }
 
@@ -755,22 +757,28 @@ mod tests {
         assert_eq!(c.buckets.empty.per_camera_min_interval_s, 600);
         assert_eq!(c.buckets.empty.night_interval_s, None);
         let e = Bucket::Empty;
-        assert_eq!(c.buckets.empty.interval_for(e, "day"), 600);
-        assert_eq!(c.buckets.empty.interval_for(e, "night"), 120);
-        assert_eq!(c.buckets.empty.interval_for(e, "ir"), 120);
+        assert_eq!(c.buckets.empty.interval_for(e, Scene::Day), 600);
+        assert_eq!(c.buckets.empty.interval_for(e, Scene::Night), 120);
+        assert_eq!(c.buckets.empty.interval_for(e, Scene::Ir), 120);
         assert_eq!(c.buckets.positive.night_interval_s, None);
         assert_eq!(
-            c.buckets.positive.interval_for(Bucket::Positive, "night"),
+            c.buckets
+                .positive
+                .interval_for(Bucket::Positive, Scene::Night),
             30
         );
         // Never stricter than the day interval.
         let mut b = c.buckets.empty.clone();
         b.per_camera_min_interval_s = 30;
-        assert_eq!(b.interval_for(e, "night"), 30);
+        assert_eq!(b.interval_for(e, Scene::Night), 30);
         b.per_camera_min_interval_s = 0;
-        assert_eq!(b.interval_for(e, "ir"), 0);
+        assert_eq!(b.interval_for(e, Scene::Ir), 0);
         b.night_interval_s = Some(500);
-        assert_eq!(b.interval_for(e, "ir"), 500, "an explicit value is kept");
+        assert_eq!(
+            b.interval_for(e, Scene::Ir),
+            500,
+            "an explicit value is kept"
+        );
         assert!(
             !serde_json::to_string(&c)
                 .unwrap()
@@ -827,7 +835,7 @@ mod tests {
             serde_json::from_str(r#"{"buckets": {"empty": {"night_interval": 0}}}"#).unwrap();
         assert_eq!(c.buckets.empty.night_interval_s, Some(0));
         assert_eq!(c.buckets.empty.per_camera_min_interval_s, 600);
-        assert_eq!(c.buckets.empty.interval_for(Bucket::Empty, "ir"), 0);
+        assert_eq!(c.buckets.empty.interval_for(Bucket::Empty, Scene::Ir), 0);
         c.validate(Path::new("/data")).unwrap();
         let back: CollectConfig =
             serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();

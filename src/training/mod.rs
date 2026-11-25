@@ -61,6 +61,7 @@ pub mod self_check;
 pub mod service;
 pub mod switch;
 pub mod task;
+pub(crate) mod text;
 pub mod workers;
 
 pub use capability::{Accelerator, Capability};
@@ -74,7 +75,6 @@ use crate::resources::catalog::{self, Platform};
 use crate::resources::export::train::TrainPaths;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// What this machine can train (detected hardware, cached).
 pub fn capability_now() -> Capability {
@@ -768,7 +768,7 @@ pub fn plan_job(
         accelerator: accel,
         options,
         root: config.data_root(),
-        timeout: Duration::from_secs(u64::from(t.timeout_hours) * 3600),
+        timeout: t.timeout(),
         workers: t.workers.map_or(job::Workers::Auto, job::Workers::Fixed),
         past_runs: Vec::new(),
         keep_work: false,

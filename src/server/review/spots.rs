@@ -4,8 +4,8 @@
 //! `.../retire`, `.../moved`).
 
 use super::{
-    ACCEPT_AUTO_DEFAULT_LIMIT, Answer, AppState, Problem, blocking, bulk_limit, context, filters,
-    hidden, json_body, json_fail, not_found, now, push_failed, push_past_limit, query_map, success,
+    ACCEPT_AUTO_DEFAULT_LIMIT, Answer, AppState, Problem, blocking, bulk_limit, filters, json_body,
+    json_fail, not_found, now, push_failed, push_past_limit, query_map, review_ctx, success,
 };
 use crate::collect::labels::{self, Frame, bulk};
 use crate::collect::layout;
@@ -27,7 +27,7 @@ pub(in crate::server) async fn history(
 ) -> Answer {
     let camera = spot_camera(query_map(query).get("camera"))?;
     Ok(blocking(move || {
-        let (dir, _, _) = context(&state);
+        let dir = review_ctx(&state).dir;
         let h = labels::repeats::history(&dir, &camera);
         success(serde_json::json!({
             "camera": h.camera,
@@ -170,13 +170,12 @@ async fn spot_route(
     };
     let (dry_run, skip) = (b.dry_run, b.skip_frame.unwrap_or_default());
     Ok(blocking(move || {
-        let (dir, classes, _) = context(&state);
-        let hidden = hidden(&state);
+        let ctx = review_ctx(&state);
         let o = bulk::bulk_spot(
-            &dir,
+            &ctx.dir,
             &filters,
-            &classes,
-            &hidden,
+            &ctx.classes,
+            &ctx.hidden,
             &spot,
             &verdict,
             limit,
@@ -184,7 +183,7 @@ async fn spot_route(
             &|r| r != skip,
         );
         if !dry_run {
-            super::bulk_routes::wrote(o.done_count);
+            super::bulk_routes::wrote(&ctx.dir, o.done_count);
         }
         let verb = if accept { "Accepted" } else { "Rejected" };
         let mut message = format!(
@@ -267,7 +266,7 @@ pub(in crate::server) async fn spots(
 ) -> Answer {
     let camera = spot_camera(query_map(query).get("camera"))?;
     Ok(blocking(move || {
-        let (dir, _, _) = context(&state);
+        let dir = review_ctx(&state).dir;
         let store = match labels::spots::read(&dir, &camera) {
             Ok(s) => s,
             Err(e) => return json_fail(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
@@ -307,7 +306,7 @@ pub(in crate::server) async fn spots_parked(
 ) -> Answer {
     let b: SpotParkedBody = json_body(&headers, body)?;
     Ok(blocking(move || {
-        let (dir, _, _) = context(&state);
+        let dir = review_ctx(&state).dir;
         let Some(frame) = Frame::resolve(&dir, &b.frame) else {
             return not_found();
         };
@@ -363,7 +362,7 @@ pub(in crate::server) async fn spots_retire(
     let camera = spot_camera(Some(&b.camera))?;
     let bbox = spot_box(&b.label, b.bbox, b.width, b.height)?;
     Ok(blocking(move || {
-        let (dir, _, _) = context(&state);
+        let dir = review_ctx(&state).dir;
         let at = labels::spots::Place {
             camera: &camera,
             width: b.width,
@@ -398,7 +397,7 @@ pub(in crate::server) async fn spots_moved(
     let b: SpotMovedBody = json_body(&headers, body)?;
     let camera = spot_camera(Some(&b.camera))?;
     Ok(blocking(move || {
-        let (dir, _, _) = context(&state);
+        let dir = review_ctx(&state).dir;
         let at = now();
         match labels::spots::camera_moved(&dir, &camera, &at, crate::clock::zone()) {
             Ok(retired) => {

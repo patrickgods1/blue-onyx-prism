@@ -49,7 +49,7 @@ fn cli_main() -> ExitCode {
         Err(_) => cli,
     };
     let code = match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             error!("{e:#}");
             eprintln!("error: {e:#}");
@@ -65,16 +65,10 @@ fn cli_main() -> ExitCode {
     code
 }
 
-/// `std::process::exit(code)` after the file log's last lines are written (RA-024).
-fn exit_flushed(code: i32) -> ! {
-    cli::flush_logs();
-    std::process::exit(code);
-}
-
 /// `service start|stop|restart|status`: prints the resulting state. The exit code (`Ok`) is
 /// 0, or for `status` 3 when the service is not running (like `systemctl status`); start and
 /// restart that did not reach "running" in time also give 3, stop that did not stop gives 1.
-fn service_command(cmd: cli::ServiceCommand) -> Result<i32> {
+fn service_command(cmd: cli::ServiceCommand) -> Result<u8> {
     use blue_onyx_prism::service_ctl::{self, Action, ServiceState};
     let action = match cmd {
         cli::ServiceCommand::Status => {
@@ -103,8 +97,6 @@ fn service_command(cmd: cli::ServiceCommand) -> Result<i32> {
     Ok(0)
 }
 
-/// `admin-token`: the token on stdout, nothing else there. No config file means this is not the
-/// service's data root, and a token made here would be one nobody checks, so that is an error.
 /// The service's config for a command that works on its data root: the subcommand's
 /// `--config`, else the global one, else the default path; it must exist (`what` names what
 /// could not be found otherwise).
@@ -124,6 +116,8 @@ fn service_config(cli: &Cli, config: Option<PathBuf>, what: &str) -> Result<Conf
     read_config(&cli)
 }
 
+/// `admin-token`: the token on stdout, nothing else there. No config file means this is not the
+/// service's data root, and a token made here would be one nobody checks, so that is an error.
 fn admin_token_command(cli: &Cli, rotate: bool, config: Option<PathBuf>) -> Result<()> {
     let config = service_config(cli, config, "token")?;
     let token = blue_onyx_prism::admin_token::for_command(&config, rotate)?;
@@ -363,7 +357,8 @@ fn list_devices(cli: &Cli, models: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn run(cli: Cli) -> Result<()> {
+/// Run the command line's subcommand (or the service); the process's exit code.
+fn run(cli: Cli) -> Result<ExitCode> {
     // Every command (training, benchmark, accounts, diagnostics, the server) shows times and
     // names files in the config's `timezone`, from its first log line on. A file that does not
     // parse leaves `local`; the command itself reports it when it reads the config.
@@ -386,7 +381,6 @@ fn run(cli: Cli) -> Result<()> {
             };
             let dir = setup_openvino::run(&opts)?;
             println!("OpenVINO runtime installed in {}", dir.display());
-            return Ok(());
         }
         Some(Command::SetupOnnxruntime { flavor, dir }) => {
             let _log = cli::init_logging(LogLevel::Info, None)?;
@@ -402,69 +396,21 @@ fn run(cli: Cli) -> Result<()> {
                 flavor.as_str(),
                 dir.display()
             );
-            return Ok(());
         }
         Some(Command::DownloadModels {
             all,
             name,
             dir,
             add_to_config,
-        }) => {
-            let _log = cli::init_logging(LogLevel::Info, None)?;
-            if !all && name.is_empty() {
-                anyhow::bail!("specify --name <model> (repeatable) or --all; see `list-models`");
-            }
-            let dir = models_dir(&cli, dir)?;
-            let root = resources::download_root(&read_config(&cli)?);
-            let files = download::download_with_root(&name, all, &dir, &root)?;
-            for f in &files {
-                println!("{}", f.display());
-            }
-            if add_to_config {
-                let path = cli
-                    .config
-                    .clone()
-                    .unwrap_or_else(Config::default_config_path);
-                // Under the config lock: a page save of a running service is never undone.
-                // Paths relative to that config's data root, which resolves them (QA-036).
-                let edited = config_file::edit_file(&path, config_file::Missing::Default, |cfg| {
-                    let models = download::model_configs(&files, cfg);
-                    Ok(download::add_to_config(cfg, models))
-                })?;
-                for o in &edited.value {
-                    println!("{}", o.describe(&path));
-                }
-            }
-            return Ok(());
-        }
+        }) => cmd_download_models(&cli, all, &name, dir, add_to_config)?,
         Some(Command::AddModel {
-            path: model_path,
+            path,
             name,
             family,
             classes,
-        }) => {
-            let path = cli
-                .config
-                .clone()
-                .unwrap_or_else(Config::default_config_path);
-            let req = resources::actions::CustomModel {
-                path: model_path.to_string_lossy().to_string(),
-                name,
-                family,
-                classes: classes.map(|c| c.to_string_lossy().to_string()),
-            };
-            // Under the config lock: a page save of a running service is never undone.
-            let edited = config_file::edit_file(&path, config_file::Missing::Default, |cfg| {
-                resources::actions::add_custom_model(cfg, &req)
-                    .map_err(|e| anyhow::anyhow!("{}", e.message()))
-            })?;
-            println!("{}", edited.value);
-            println!("config: {}", path.display());
-            return Ok(());
-        }
+        }) => cmd_add_model(&cli, &path, name, family, classes)?,
         Some(Command::ListModels { dir }) => {
             download::print_list(&models_dir(&cli, dir)?);
-            return Ok(());
         }
         Some(Command::Fetch {
             for_config,
@@ -481,11 +427,11 @@ fn run(cli: Cli) -> Result<()> {
                 all_for_platform,
                 allow_large,
             };
-            return resources::commands::fetch(&read_config(&cli)?, &req);
+            resources::commands::fetch(&read_config(&cli)?, &req)?;
         }
         Some(Command::ListResources { check_urls: true }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
-            return resources::commands::check_urls();
+            resources::commands::check_urls()?;
         }
         Some(Command::ListResources { check_urls: false }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
@@ -500,45 +446,37 @@ fn run(cli: Cli) -> Result<()> {
                     &installed
                 )
             );
-            return Ok(());
         }
         Some(Command::Benchmark(args)) => {
             // Sets up its own stderr logging (warn, or info with --verbose).
             let code = blue_onyx_prism::benchmark::cli::main(*args, cli.config.clone());
-            if code != ExitCode::SUCCESS {
-                exit_flushed(1);
-            }
-            return Ok(());
+            return Ok(success_or_one(code));
         }
         Some(Command::Train(args)) => {
             if train_sweeps_orphans(&args.command) {
                 sweep_orphans(&cli);
             }
             let code = blue_onyx_prism::training::cli::main(*args, cli.config.clone());
-            if code != ExitCode::SUCCESS {
-                exit_flushed(1);
-            }
-            return Ok(());
+            return Ok(success_or_one(code));
         }
         Some(Command::ListDevices { model }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
             list_devices(&cli, &model)?;
-            return Ok(());
         }
-        Some(Command::HfLogin) => return resources::hf_token::login(&read_config(&cli)?),
-        Some(Command::HfLogout) => return resources::hf_token::logout(&read_config(&cli)?),
+        Some(Command::HfLogin) => resources::hf_token::login(&read_config(&cli)?)?,
+        Some(Command::HfLogout) => resources::hf_token::logout(&read_config(&cli)?)?,
         Some(Command::AdminToken { rotate, config }) => {
-            return admin_token_command(&cli, rotate, config);
+            admin_token_command(&cli, rotate, config)?;
         }
         Some(Command::User { action, config }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
             let config = service_config(&cli, config, "accounts")?;
-            return blue_onyx_prism::accounts::commands::user(
+            blue_onyx_prism::accounts::commands::user(
                 &config,
                 &action,
                 &mut blue_onyx_prism::accounts::commands::Terminal,
                 &mut std::io::stdout(),
-            );
+            )?;
         }
         Some(Command::SetupCode { config }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
@@ -547,19 +485,16 @@ fn run(cli: Cli) -> Result<()> {
                 "{}",
                 blue_onyx_prism::accounts::commands::setup_code(&config)?
             );
-            return Ok(());
         }
         Some(Command::TlsFingerprint { config }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
             let config = service_config(&cli, config, "HTTPS certificate")?;
             print!("{}", blue_onyx_prism::tls::fingerprint_report(&config)?);
-            return Ok(());
         }
         Some(Command::TlsRegenerate { config }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
             let config = service_config(&cli, config, "HTTPS certificate")?;
             print!("{}", blue_onyx_prism::tls::regenerate_report(&config)?);
-            return Ok(());
         }
         Some(Command::Diagnostics { out }) => {
             let _log = cli::init_logging(LogLevel::Warn, None)?;
@@ -570,19 +505,84 @@ fn run(cli: Cli) -> Result<()> {
                  camera names and file paths are in it: look through it before sharing it \
                  publicly."
             );
-            return Ok(());
         }
-        Some(Command::Service { action }) => {
-            let code = service_command(action)?;
-            if code != 0 {
-                exit_flushed(code);
-            }
-            return Ok(());
-        }
-        None => {}
+        Some(Command::Service { action }) => return Ok(ExitCode::from(service_command(action)?)),
+        None => return serve(&cli).map(|()| ExitCode::SUCCESS),
     }
+    Ok(ExitCode::SUCCESS)
+}
 
-    let (mut config, config_path) = cli::resolve_config(&cli)?;
+/// A subcommand's exit code as the process's: 0 stays 0, any failure is 1.
+fn success_or_one(code: ExitCode) -> ExitCode {
+    if code == ExitCode::SUCCESS {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `download-models`: the catalog models into `--dir` (else the configured `models_dir`), each
+/// path on stdout; `--add-to-config` adds them to the config file.
+fn cmd_download_models(
+    cli: &Cli,
+    all: bool,
+    name: &[String],
+    dir: Option<PathBuf>,
+    add_to_config: bool,
+) -> Result<()> {
+    let _log = cli::init_logging(LogLevel::Info, None)?;
+    if !all && name.is_empty() {
+        anyhow::bail!("specify --name <model> (repeatable) or --all; see `list-models`");
+    }
+    let dir = models_dir(cli, dir)?;
+    let root = resources::download_root(&read_config(cli)?);
+    let files = download::download_with_root(name, all, &dir, &root)?;
+    for f in &files {
+        println!("{}", f.display());
+    }
+    if add_to_config {
+        let path = config_path(cli);
+        // Under the config lock: a page save of a running service is never undone.
+        // Paths relative to that config's data root, which resolves them (QA-036).
+        let edited = config_file::edit_file(&path, config_file::Missing::Default, |cfg| {
+            let models = download::model_configs(&files, cfg);
+            Ok(download::add_to_config(cfg, models))
+        })?;
+        for o in &edited.value {
+            println!("{}", o.describe(&path));
+        }
+    }
+    Ok(())
+}
+
+/// `add-model`: a custom model file or folder added to the config file.
+fn cmd_add_model(
+    cli: &Cli,
+    model_path: &std::path::Path,
+    name: Option<String>,
+    family: blue_onyx_prism::model::ModelFamilyKind,
+    classes: Option<PathBuf>,
+) -> Result<()> {
+    let path = config_path(cli);
+    let req = resources::actions::CustomModel {
+        path: model_path.to_string_lossy().to_string(),
+        name,
+        family,
+        classes: classes.map(|c| c.to_string_lossy().to_string()),
+    };
+    // Under the config lock: a page save of a running service is never undone.
+    let edited = config_file::edit_file(&path, config_file::Missing::Default, |cfg| {
+        resources::actions::add_custom_model(cfg, &req)
+            .map_err(|e| anyhow::anyhow!("{}", e.message()))
+    })?;
+    println!("{}", edited.value);
+    println!("config: {}", path.display());
+    Ok(())
+}
+
+/// No subcommand: run the HTTP service until a shutdown signal.
+fn serve(cli: &Cli) -> Result<()> {
+    let (mut config, config_path) = cli::resolve_config(cli)?;
     blue_onyx_prism::clock::set(config.timezone);
     // CO-05: no models -> the default catalog model, so the UI comes up (and it downloads).
     cli::seed_default_model(&mut config, &config_path);

@@ -4,13 +4,13 @@
 //! label (`scripts/autolabel.py`, `@autolabel` events, proposals as JSONL) -> triage and merge
 //! into the label files (here, [`super::triage`]; every labelled frame gets an `auto_run`
 //! marker, so a later run of the same labelers skips it unless `again=1`) and queue the changed
-//! frames for review. With
+//! frames for review (stages 2 to 5: `AutolabelJob::run_labelers`). With
 //! `with_model` the stages are [`MODEL_STAGES`]: select the frames -> install the model (a
 //! catalog model not on disk yet: downloaded, or exported with the export toolchain) -> add it
 //! to the config disabled (a local or catalog model, through the [`ConfigWriter`]) -> label with
 //! the service's own pipeline ([`super::relabel`]) -> map, triage and merge
 //! ([`triage::model_boxes`], [`triage::apply_relabel`], which also records the model as a labeler
-//! on the boxes it found again); every frame it looked at gets the
+//! on the boxes it found again; `AutolabelJob::run_model`); every frame it looked at gets the
 //! `model:<name>@<device>` marker. A `missing_only` run differs in two places: stage 1 keeps the
 //! frames of [`triage::missing_scope`] the model did not train on ([`super::trained_frames`]) and
 //! stage 5 writes [`triage::apply_missing`] to the frames that gain a box, and nothing else: no
@@ -629,6 +629,16 @@ impl AutolabelJob {
         .join(" + ")
     }
 
+    /// The size floor now (`collect.size_floor`) and a `width` x `height` frame's size, for the
+    /// triage of a frame's boxes ([`triage::FloorAt`]).
+    fn floor_at(&self, width: u32, height: u32) -> Option<triage::FloorAt> {
+        Some(triage::FloorAt {
+            floor: self.config.collect.size_floor,
+            width,
+            height,
+        })
+    }
+
     /// One short name of the run's boxes (`sam3`), for the note of a frame it reopens: the keys
     /// its boxes carry in `labelers`, not [`Self::labeler`]'s list of checkpoints.
     fn short_labeler(&self) -> &'static str {
@@ -1042,11 +1052,7 @@ impl AutolabelJob {
                     width: sel.width,
                     height: sel.height,
                 });
-                let floor = Some(triage::FloorAt {
-                    floor: self.config.collect.size_floor,
-                    width: sel.width,
-                    height: sel.height,
-                });
+                let floor = self.floor_at(sel.width, sel.height);
                 let a = triage::apply_labelers_at(
                     file,
                     boxes,
@@ -1170,296 +1176,16 @@ impl AutolabelJob {
                 &mut changed,
             )?
         } else {
-            rep.labeler = labeler.clone();
-            rep.sam3_threshold = r.sam3.then_some(r.sam3_threshold);
-            rep.night_enhance = night::enhancement(r).map(|p| p.to_string());
-            rep.mdv6 = r
-                .mdv6
-                .then(|| format!("{} at {}", night::MDV6_MODEL, r.mdv6_threshold));
-            // Read once: every label this run writes would drop a per-frame look's cache. Not for
-            // SAM 3: its boxes are always reviewed.
-            let spot_memory = if r.sam3 {
-                spots::Snapshot::default()
-            } else {
-                spots::Snapshot::take(&self.dataset_dir, frames.iter().map(|f| f.rel.as_str()))
-            };
-            for w in &spot_memory.warnings {
-                tracing::warn!("{w}");
-            }
-            rep.warnings.extend(spot_memory.warnings.iter().cloned());
-            // 2. Environment.
-            let accel = self
-                .accelerator
-                .as_ref()
-                .ok_or_else(|| anyhow!("the auto-labelers need an NVIDIA GPU or Apple silicon"))?;
-            rep.device = Some(accel.device_arg());
-            pyenv::setup(
-                &self.paths,
-                self.platform,
-                accel,
-                ctx.runner,
-                ctx.fetcher,
-                report,
-                (STAGES[1], 2, STAGES.len()),
-                cancel,
-            )?;
-            let (_, script) = crate::resources::export::train::write_task_scripts(&self.paths)?;
-            // The script's own tests of its fusion code, and the imports.
-            self.step(report, 2, 95, "checking the auto-labeler");
-            pyenv::self_check(
-                ctx.runner,
-                &self.paths,
-                self.platform,
-                &script,
-                report,
-                cancel,
-            )?;
-            check(cancel)?;
-            // 3. Weights.
-            let res: Vec<&'static Resource> = r.resources();
-            let list: Vec<(&'static Resource, PathBuf)> = res
-                .iter()
-                .map(|x| (*x, pyenv::weights_dir(&self.paths, x)))
-                .collect();
-            pyenv::check_large(&list, r.allow_large)?;
-            pyenv::fetch_missing(
-                ctx.fetcher,
-                &list,
-                report,
-                (STAGES[2], 3, STAGES.len()),
-                cancel,
-            )?;
-            check(cancel)?;
-            // 4. Label.
-            std::fs::create_dir_all(&self.work)
-                .with_context(|| format!("creating {}", self.work.display()))?;
-            // What a sweep needs to write these proposals if this process dies
-            // ([`recover_crashed`]).
-            let job_file = self.work.join(JOB_FILE);
-            std::fs::write(
-                &job_file,
-                serde_json::to_vec(&WorkRecord {
-                    version: WORK_RECORD_VERSION,
-                    id: self.id.clone(),
-                    request: self.request.clone(),
-                    dataset_dir: self.dataset_dir.clone(),
-                    classes: self.classes.clone(),
-                    labeler: labeler.clone(),
-                })?,
-            )
-            .with_context(|| format!("writing {}", job_file.display()))?;
-            let list_path = self.work.join(FRAMES_FILE);
-            let mut text = String::new();
-            for f in &frames {
-                text.push_str(&serde_json::to_string(&serde_json::json!({
-                    "frame": f.rel, "path": f.jpg, "width": f.width, "height": f.height,
-                    "scene": f.scene,
-                }))?);
-                text.push('\n');
-            }
-            std::fs::write(&list_path, text)?;
-            let syn = self.work.join("synonyms.json");
-            std::fs::write(&syn, serde_json::to_vec(&self.synonyms)?)?;
-            let cats: BTreeMap<&str, Category> = self
-                .classes
-                .iter()
-                .map(|c| (c.as_str(), Category::of(c)))
-                .collect();
-            let cat_path = self.work.join("categories.json");
-            std::fs::write(&cat_path, serde_json::to_vec(&cats)?)?;
-            let out = self.proposals_file();
-            let dir_of = |key: &str| -> Result<OsString> {
-                let r = list
-                    .iter()
-                    .find(|(x, _)| x.id.ends_with(key))
-                    .ok_or_else(|| anyhow!("internal: {key} not planned"))?;
-                Ok(r.1.clone().into_os_string())
-            };
-            let mut args: Vec<OsString> = vec![
-                script.into_os_string(),
-                "--frames".into(),
-                list_path.into_os_string(),
-                "--out".into(),
-                out.clone().into_os_string(),
-                "--classes".into(),
-                serde_json::to_string(&self.classes)?.into(),
-                "--synonyms".into(),
-                syn.into_os_string(),
-                "--categories".into(),
-                cat_path.into_os_string(),
-                "--device".into(),
-                accel.device_arg().into(),
-                "--gdino-threshold".into(),
-                r.gdino_threshold.to_string().into(),
-                "--rfdetr-threshold".into(),
-                r.rfdetr_threshold.to_string().into(),
-            ];
-            if let Some(g) = r.gdino {
-                args.push("--gdino".into());
-                args.push(dir_of(g.key())?);
-            }
-            if r.sam3 {
-                args.push("--sam3".into());
-                args.push(dir_of(catalog::SAM3_KEY)?);
-                args.push("--sam3-threshold".into());
-                args.push(r.sam3_threshold.to_string().into());
-            }
-            if r.rfdetr {
-                let rf = list
-                    .iter()
-                    .find(|(x, _)| x.id == "train-base:rfdetr-large")
-                    .ok_or_else(|| anyhow!("internal: RF-DETR L not planned"))?;
-                let file =
-                    rf.0.parts
-                        .first()
-                        .ok_or_else(|| anyhow!("RF-DETR L has no file"))?
-                        .file_name;
-                args.push("--rfdetr".into());
-                args.push(rf.1.join(file).into_os_string());
-            }
-            if let Some(v) = r.vlm {
-                args.push("--vlm".into());
-                args.push(dir_of(v.key())?);
-                args.push("--vlm-name".into());
-                args.push(v.key().into());
-                let batch = if r.vlm_batch { super::VLM_BATCH } else { 1 };
-                args.push("--vlm-batch".into());
-                args.push(batch.to_string().into());
-                if let Some(m) = r.vlm_min_score {
-                    args.push("--vlm-min-score".into());
-                    args.push(m.to_string().into());
-                    args.push("--vlm-sample".into());
-                    args.push(super::VLM_SAMPLE.to_string().into());
-                }
-            }
-            if r.prefetch {
-                args.push("--prefetch".into());
-            }
-            if r.siglip {
-                args.push("--siglip".into());
-                args.push(dir_of("siglip2-base")?);
-            }
-            if let Some(p) = night::enhancement(r) {
-                args.push("--night-enhance".into());
-                args.push(p.to_string().into());
-            }
-            if r.mdv6 {
-                let (res, dir) = list
-                    .iter()
-                    .find(|(x, _)| x.model_name() == Some(night::MDV6_MODEL))
-                    .ok_or_else(|| anyhow!("internal: MegaDetector not planned"))?;
-                let file = res
-                    .parts
-                    .first()
-                    .ok_or_else(|| anyhow!("MegaDetector has no file"))?
-                    .file_name;
-                args.push("--mdv6".into());
-                args.push(dir.join(file).into_os_string());
-                args.push("--mdv6-threshold".into());
-                args.push(r.mdv6_threshold.to_string().into());
-            }
-            let total = frames.len();
-            let mut done_ev = None;
-            let labelled = pyenv::run_script(
-                ctx.runner,
-                &self.paths,
-                self.platform,
-                &self.work,
-                self.timeout,
-                args,
-                "autolabel",
-                &mut |ev, report| match ev.get("event").and_then(serde_json::Value::as_str) {
-                    Some("frame") => {
-                        let i = ev
-                            .get("index")
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0);
-                        let pct = u8::try_from(i * 100 / u64::try_from(total.max(1)).unwrap_or(1))
-                            .unwrap_or(100);
-                        stage(
-                            report,
-                            STAGES[3],
-                            4,
-                            STAGES.len(),
-                            pct.min(99),
-                            &format!("{i} of {total} frames"),
-                        );
-                    }
-                    Some("model") => stage(
-                        report,
-                        STAGES[3],
-                        4,
-                        STAGES.len(),
-                        0,
-                        &format!(
-                            "loaded {}",
-                            ev.get("name")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("?")
-                        ),
-                    ),
-                    Some("done") => done_ev = Some(ev.clone()),
-                    _ => {}
-                },
-                report,
-                cancel,
-            );
-            // A cancel kills the script; with `keep_on_cancel` the frames it finished (it
-            // flushes `proposals.jsonl` after each) are written below like a finished run's. So
-            // are they when it failed, whatever `keep_on_cancel` says: that option is the user's
-            // choice about their own Cancel, and nobody chose to lose hours of labelling to a
-            // crash. The run is still a failure ([`failed_run`]).
-            let (stopped, failure) = match labelled {
-                Err(e) if r.keep_on_cancel && is_cancel(&e) => (true, None),
-                Err(e) if is_cancel(&e) || (!r.keep_on_cancel && cancelled(cancel)) => {
-                    return Err(e.context("the auto-labeler failed"));
-                }
-                Err(e) => (false, Some(e)),
-                Ok(()) if r.keep_on_cancel && cancelled(cancel) => (true, None),
-                Ok(()) if done_ev.is_none() && !cancelled(cancel) => (
-                    false,
-                    Some(anyhow!(
-                        "it finished without its summary; the script is damaged"
-                    )),
-                ),
-                Ok(()) => (false, None),
-            };
-            if !stopped && failure.is_none() {
-                check(cancel)?;
-            }
-            // 5. Triage and write (no cancel checks: a stopped run writes what it has).
-            let partial = stopped || failure.is_some();
-            let text = match std::fs::read_to_string(&out) {
-                Ok(t) => t,
-                Err(e) => {
-                    let missing = e.kind() == std::io::ErrorKind::NotFound;
-                    // Something is there and it could not be read: not this code's to delete.
-                    *keep_work = !missing;
-                    match failure {
-                        Some(f) => return Err(f.context("the auto-labeler failed")),
-                        None if stopped && missing => String::new(),
-                        None => {
-                            return Err(e).with_context(|| format!("reading {}", out.display()));
-                        }
-                    }
-                }
-            };
-            rep.labeler_ms = labeler_ms(&text);
-            let done_count = self.write_proposals(
+            self.run_labelers(
                 &frames,
-                &text,
-                partial,
                 &labeler,
-                &spot_memory,
+                ctx,
+                report,
+                cancel,
                 &mut rep,
                 &mut changed,
-                report,
-            );
-            if let Some(e) = failure {
-                *keep_work = rep.frames_failed > 0;
-                return Err(self.failed_run(e, frames.len(), &rep, &changed));
-            }
-            (stopped, done_count)
+                keep_work,
+            )?
         };
         if stopped && frames_done == 0 {
             // Nothing finished: a plain cancel.
@@ -1529,7 +1255,7 @@ impl AutolabelJob {
             }
             s
         } else if stopped {
-            let n = crate::training::import::preview::thousands;
+            let n = crate::training::text::thousands;
             format!(
                 "stopped by Cancel after {} of {} frames; those {} were saved for review ({} \
                  boxes: {} accept, {} review; {} added to label files; {} frames queued for \
@@ -1616,6 +1342,320 @@ impl AutolabelJob {
 }
 
 impl AutolabelJob {
+    /// Stages 2 to 5 of a labelers run (no model): the environment, the weights, the script
+    /// (`scripts/autolabel.py`) over `frames`, then the triage and the writes of its proposals;
+    /// returns whether a cancel stopped the labelling (`keep_on_cancel`) and the frames labelled.
+    /// `keep_work` is set when the work folder must stay (proposals that could not be read or
+    /// written).
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the stage machine's state, passed down once; one linear run of the script"
+    )]
+    fn run_labelers(
+        &self,
+        frames: &[Selected],
+        labeler: &str,
+        ctx: TaskContext<'_>,
+        report: &mut dyn FnMut(TaskReport<'_>),
+        cancel: &AtomicBool,
+        rep: &mut AutolabelReport,
+        changed: &mut Vec<String>,
+        keep_work: &mut bool,
+    ) -> Result<(bool, usize)> {
+        let r = &self.request;
+        rep.labeler = labeler.to_string();
+        rep.sam3_threshold = r.sam3.then_some(r.sam3_threshold);
+        rep.night_enhance = night::enhancement(r).map(|p| p.to_string());
+        rep.mdv6 = r
+            .mdv6
+            .then(|| format!("{} at {}", night::MDV6_MODEL, r.mdv6_threshold));
+        // Read once: every label this run writes would drop a per-frame look's cache. Not for
+        // SAM 3: its boxes are always reviewed.
+        let spot_memory = if r.sam3 {
+            spots::Snapshot::default()
+        } else {
+            spots::Snapshot::take(&self.dataset_dir, frames.iter().map(|f| f.rel.as_str()))
+        };
+        for w in &spot_memory.warnings {
+            tracing::warn!("{w}");
+        }
+        rep.warnings.extend(spot_memory.warnings.iter().cloned());
+        // 2. Environment.
+        let accel = self
+            .accelerator
+            .as_ref()
+            .ok_or_else(|| anyhow!("the auto-labelers need an NVIDIA GPU or Apple silicon"))?;
+        rep.device = Some(accel.device_arg());
+        pyenv::setup(
+            &self.paths,
+            self.platform,
+            accel,
+            ctx.runner,
+            ctx.fetcher,
+            report,
+            (STAGES[1], 2, STAGES.len()),
+            cancel,
+        )?;
+        let (_, script) = crate::resources::export::train::write_task_scripts(&self.paths)?;
+        // The script's own tests of its fusion code, and the imports.
+        self.step(report, 2, 95, "checking the auto-labeler");
+        pyenv::self_check(
+            ctx.runner,
+            &self.paths,
+            self.platform,
+            &script,
+            report,
+            cancel,
+        )?;
+        check(cancel)?;
+        // 3. Weights.
+        let res: Vec<&'static Resource> = r.resources();
+        let list: Vec<(&'static Resource, PathBuf)> = res
+            .iter()
+            .map(|x| (*x, pyenv::weights_dir(&self.paths, x)))
+            .collect();
+        pyenv::check_large(&list, r.allow_large)?;
+        pyenv::fetch_missing(
+            ctx.fetcher,
+            &list,
+            report,
+            (STAGES[2], 3, STAGES.len()),
+            cancel,
+        )?;
+        check(cancel)?;
+        // 4. Label.
+        std::fs::create_dir_all(&self.work)
+            .with_context(|| format!("creating {}", self.work.display()))?;
+        // What a sweep needs to write these proposals if this process dies
+        // ([`recover_crashed`]).
+        let job_file = self.work.join(JOB_FILE);
+        std::fs::write(
+            &job_file,
+            serde_json::to_vec(&WorkRecord {
+                version: WORK_RECORD_VERSION,
+                id: self.id.clone(),
+                request: self.request.clone(),
+                dataset_dir: self.dataset_dir.clone(),
+                classes: self.classes.clone(),
+                labeler: labeler.to_string(),
+            })?,
+        )
+        .with_context(|| format!("writing {}", job_file.display()))?;
+        let list_path = self.work.join(FRAMES_FILE);
+        let mut text = String::new();
+        for f in frames {
+            text.push_str(&serde_json::to_string(&serde_json::json!({
+                "frame": f.rel, "path": f.jpg, "width": f.width, "height": f.height,
+                "scene": f.scene,
+            }))?);
+            text.push('\n');
+        }
+        std::fs::write(&list_path, text)?;
+        let syn = self.work.join("synonyms.json");
+        std::fs::write(&syn, serde_json::to_vec(&self.synonyms)?)?;
+        let cats: BTreeMap<&str, Category> = self
+            .classes
+            .iter()
+            .map(|c| (c.as_str(), Category::of(c)))
+            .collect();
+        let cat_path = self.work.join("categories.json");
+        std::fs::write(&cat_path, serde_json::to_vec(&cats)?)?;
+        let out = self.proposals_file();
+        let dir_of = |key: &str| -> Result<OsString> {
+            let r = list
+                .iter()
+                .find(|(x, _)| x.id.ends_with(key))
+                .ok_or_else(|| anyhow!("internal: {key} not planned"))?;
+            Ok(r.1.clone().into_os_string())
+        };
+        let mut args: Vec<OsString> = vec![
+            script.into_os_string(),
+            "--frames".into(),
+            list_path.into_os_string(),
+            "--out".into(),
+            out.clone().into_os_string(),
+            "--classes".into(),
+            serde_json::to_string(&self.classes)?.into(),
+            "--synonyms".into(),
+            syn.into_os_string(),
+            "--categories".into(),
+            cat_path.into_os_string(),
+            "--device".into(),
+            accel.device_arg().into(),
+            "--gdino-threshold".into(),
+            r.gdino_threshold.to_string().into(),
+            "--rfdetr-threshold".into(),
+            r.rfdetr_threshold.to_string().into(),
+        ];
+        if let Some(g) = r.gdino {
+            args.push("--gdino".into());
+            args.push(dir_of(g.key())?);
+        }
+        if r.sam3 {
+            args.push("--sam3".into());
+            args.push(dir_of(catalog::SAM3_KEY)?);
+            args.push("--sam3-threshold".into());
+            args.push(r.sam3_threshold.to_string().into());
+        }
+        if r.rfdetr {
+            let rf = list
+                .iter()
+                .find(|(x, _)| x.id == "train-base:rfdetr-large")
+                .ok_or_else(|| anyhow!("internal: RF-DETR L not planned"))?;
+            let file =
+                rf.0.parts
+                    .first()
+                    .ok_or_else(|| anyhow!("RF-DETR L has no file"))?
+                    .file_name;
+            args.push("--rfdetr".into());
+            args.push(rf.1.join(file).into_os_string());
+        }
+        if let Some(v) = r.vlm {
+            args.push("--vlm".into());
+            args.push(dir_of(v.key())?);
+            args.push("--vlm-name".into());
+            args.push(v.key().into());
+            let batch = if r.vlm_batch { super::VLM_BATCH } else { 1 };
+            args.push("--vlm-batch".into());
+            args.push(batch.to_string().into());
+            if let Some(m) = r.vlm_min_score {
+                args.push("--vlm-min-score".into());
+                args.push(m.to_string().into());
+                args.push("--vlm-sample".into());
+                args.push(super::VLM_SAMPLE.to_string().into());
+            }
+        }
+        if r.prefetch {
+            args.push("--prefetch".into());
+        }
+        if r.siglip {
+            args.push("--siglip".into());
+            args.push(dir_of("siglip2-base")?);
+        }
+        if let Some(p) = night::enhancement(r) {
+            args.push("--night-enhance".into());
+            args.push(p.to_string().into());
+        }
+        if r.mdv6 {
+            let (res, dir) = list
+                .iter()
+                .find(|(x, _)| x.model_name() == Some(night::MDV6_MODEL))
+                .ok_or_else(|| anyhow!("internal: MegaDetector not planned"))?;
+            let file = res
+                .parts
+                .first()
+                .ok_or_else(|| anyhow!("MegaDetector has no file"))?
+                .file_name;
+            args.push("--mdv6".into());
+            args.push(dir.join(file).into_os_string());
+            args.push("--mdv6-threshold".into());
+            args.push(r.mdv6_threshold.to_string().into());
+        }
+        let total = frames.len();
+        let mut done_ev = None;
+        let labelled = pyenv::run_script(
+            ctx.runner,
+            &self.paths,
+            self.platform,
+            &self.work,
+            self.timeout,
+            args,
+            "autolabel",
+            &mut |ev, report| match ev.get("event").and_then(serde_json::Value::as_str) {
+                Some("frame") => {
+                    let i = ev
+                        .get("index")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let pct = u8::try_from(i * 100 / u64::try_from(total.max(1)).unwrap_or(1))
+                        .unwrap_or(100);
+                    stage(
+                        report,
+                        STAGES[3],
+                        4,
+                        STAGES.len(),
+                        pct.min(99),
+                        &format!("{i} of {total} frames"),
+                    );
+                }
+                Some("model") => stage(
+                    report,
+                    STAGES[3],
+                    4,
+                    STAGES.len(),
+                    0,
+                    &format!(
+                        "loaded {}",
+                        ev.get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("?")
+                    ),
+                ),
+                Some("done") => done_ev = Some(ev.clone()),
+                _ => {}
+            },
+            report,
+            cancel,
+        );
+        // A cancel kills the script; with `keep_on_cancel` the frames it finished (it
+        // flushes `proposals.jsonl` after each) are written below like a finished run's. So
+        // are they when it failed, whatever `keep_on_cancel` says: that option is the user's
+        // choice about their own Cancel, and nobody chose to lose hours of labelling to a
+        // crash. The run is still a failure ([`failed_run`]).
+        let (stopped, failure) = match labelled {
+            Err(e) if r.keep_on_cancel && is_cancel(&e) => (true, None),
+            Err(e) if is_cancel(&e) || (!r.keep_on_cancel && cancelled(cancel)) => {
+                return Err(e.context("the auto-labeler failed"));
+            }
+            Err(e) => (false, Some(e)),
+            Ok(()) if r.keep_on_cancel && cancelled(cancel) => (true, None),
+            Ok(()) if done_ev.is_none() && !cancelled(cancel) => (
+                false,
+                Some(anyhow!(
+                    "it finished without its summary; the script is damaged"
+                )),
+            ),
+            Ok(()) => (false, None),
+        };
+        if !stopped && failure.is_none() {
+            check(cancel)?;
+        }
+        // 5. Triage and write (no cancel checks: a stopped run writes what it has).
+        let partial = stopped || failure.is_some();
+        let text = match std::fs::read_to_string(&out) {
+            Ok(t) => t,
+            Err(e) => {
+                let missing = e.kind() == std::io::ErrorKind::NotFound;
+                // Something is there and it could not be read: not this code's to delete.
+                *keep_work = !missing;
+                match failure {
+                    Some(f) => return Err(f.context("the auto-labeler failed")),
+                    None if stopped && missing => String::new(),
+                    None => {
+                        return Err(e).with_context(|| format!("reading {}", out.display()));
+                    }
+                }
+            }
+        };
+        rep.labeler_ms = labeler_ms(&text);
+        let done_count = self.write_proposals(
+            frames,
+            &text,
+            partial,
+            labeler,
+            &spot_memory,
+            rep,
+            changed,
+            report,
+        );
+        if let Some(e) = failure {
+            *keep_work = rep.frames_failed > 0;
+            return Err(self.failed_run(e, frames.len(), rep, changed));
+        }
+        Ok((stopped, done_count))
+    }
+
     /// Stages 2 to 5 of a run with a model; returns whether a cancel stopped the labelling
     /// (`keep_on_cancel`) and the frames labelled.
     #[allow(
@@ -1764,11 +1804,7 @@ impl AutolabelJob {
                 // model as a labeler (its boxes and votes, no marker); anything else nothing.
                 let mut applied = None;
                 let mut as_labeler = None;
-                let floor = Some(triage::FloorAt {
-                    floor: self.config.collect.size_floor,
-                    width: f.width,
-                    height: f.height,
-                });
+                let floor = self.floor_at(f.width, f.height);
                 let res = self.write_frame(f, rep, changed, |file| {
                     if triage::missing_scope(file) {
                         let m = triage::apply_missing(file, out.boxes, &plan.name);
@@ -1795,7 +1831,7 @@ impl AutolabelJob {
                         floor,
                     );
                     let a = &t.apply;
-                    let queue = a.merge.added > 0 || a.annotated > 0 || a.class_suggestions > 0;
+                    let queue = a.for_review();
                     let write = FrameWrite {
                         write: queue || t.votes > 0,
                         queue,
@@ -1827,21 +1863,14 @@ impl AutolabelJob {
             let mut applied = None;
             let res = self.write_frame(f, rep, changed, |file| {
                 file.auto_run = Some(marker);
-                let floor = Some(triage::FloorAt {
-                    floor: self.config.collect.size_floor,
-                    width: f.width,
-                    height: f.height,
-                });
+                let floor = self.floor_at(f.width, f.height);
                 let t =
                     triage::apply_relabel_at(file, &d, out.boxes, &plan.name, &self.classes, floor);
                 let a = &t.apply;
                 let write = FrameWrite {
                     write: true,
                     // A vote is no change for a reviewer: it does not queue the frame.
-                    queue: a.merge.added > 0
-                        || a.annotated > 0
-                        || a.class_suggestions > 0
-                        || t.disagreement.is_some(),
+                    queue: a.for_review() || t.disagreement.is_some(),
                 };
                 applied = Some(t);
                 write
