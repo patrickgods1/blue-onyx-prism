@@ -524,6 +524,17 @@ impl ModelConfig {
                 .unwrap_or_else(|| "model".to_string())
         })
     }
+
+    /// The name requests and config entries compare by:
+    /// [`crate::model::name::normalize_name`] of [`Self::effective_name`] (QA-205).
+    pub fn key(&self) -> String {
+        crate::model::name::normalize_name(&self.effective_name())
+    }
+
+    /// Whether this entry is the model `name` (any case, with or without `.onnx` / `.xml`).
+    pub fn is_named(&self, name: &str) -> bool {
+        self.key() == crate::model::name::normalize_name(name)
+    }
 }
 
 /// `remote = "Self"`: the derives become the inherent `Config::serialize` / `Config::deserialize`,
@@ -1437,6 +1448,38 @@ impl Config {
             .as_deref()
             .map(crate::resolve_path)
             .unwrap_or_else(crate::exe_dir)
+    }
+
+    /// `p` relative to [`Self::data_root`] when it lies under it (also under the root's
+    /// canonical spelling, e.g. `/private/var` for `/var` on macOS), else `p` unchanged: how
+    /// downloads and added models are stored in the config (`models/x.onnx`; QA-130).
+    pub fn relative_to_data_root(&self, p: &Path) -> PathBuf {
+        let root = self.data_root();
+        if let Ok(rel) = p.strip_prefix(&root) {
+            return rel.to_path_buf();
+        }
+        if let Ok(canon) = std::fs::canonicalize(&root)
+            && let Ok(rel) = p.strip_prefix(&canon)
+        {
+            return rel.to_path_buf();
+        }
+        p.to_path_buf()
+    }
+
+    /// Position of the model entry named `name` ([`ModelConfig::is_named`]), enabled or not.
+    pub fn model_index(&self, name: &str) -> Option<usize> {
+        let key = crate::model::name::normalize_name(name);
+        self.models.iter().position(|m| m.key() == key)
+    }
+
+    /// The model entry named `name` ([`Self::model_index`]).
+    pub fn model(&self, name: &str) -> Option<&ModelConfig> {
+        self.model_index(name).and_then(|i| self.models.get(i))
+    }
+
+    /// The model entry named `name`, mutable ([`Self::model_index`]).
+    pub fn model_mut(&mut self, name: &str) -> Option<&mut ModelConfig> {
+        self.model_index(name).and_then(|i| self.models.get_mut(i))
     }
 
     /// A model/classes/models_dir path: absolute as is, else under [`Self::data_root`].
@@ -2442,6 +2485,84 @@ pub(crate) mod test_fields {
 
 #[cfg(test)]
 mod tests {
+
+    /// QA-205: a model entry is found by its name or file stem, in any case, with or without
+    /// `.onnx` / `.xml`; disabled entries count, and the first match wins.
+    #[test]
+    fn model_lookup_by_name_stem_case_and_suffix() {
+        use super::{Config, ModelConfig};
+        let mut c = Config {
+            models: vec![
+                ModelConfig {
+                    path: "models/IPcam-general.onnx".into(),
+                    enabled: false,
+                    ..Default::default()
+                },
+                ModelConfig {
+                    name: Some("Night".into()),
+                    path: "models/other.xml".into(),
+                    ..Default::default()
+                },
+                ModelConfig {
+                    name: Some("night".into()),
+                    path: "models/second.onnx".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(c.models[0].key(), "ipcam-general");
+        assert_eq!(c.model_index("IPcam-general"), Some(0));
+        assert_eq!(c.model_index("ipcam-general.onnx"), Some(0));
+        assert_eq!(c.model_index(" IPCAM-GENERAL.XML "), Some(0));
+        assert_eq!(c.model_index("NIGHT"), Some(1));
+        assert_eq!(
+            c.model_index("other"),
+            None,
+            "a named entry is not found by its stem"
+        );
+        assert_eq!(c.model_index("nope"), None);
+        assert!(c.models[1].is_named("night.onnx"));
+        assert_eq!(
+            c.model("night").map(|m| m.path.clone()),
+            Some("models/other.xml".into())
+        );
+        if let Some(m) = c.model_mut("Night") {
+            m.enabled = false;
+        }
+        assert!(!c.models[1].enabled);
+        assert!(c.models[2].enabled);
+    }
+
+    /// QA-130: a path under the data root is stored relative to it (also under its canonical
+    /// spelling); one outside it stays as it is.
+    #[test]
+    fn relative_to_data_root_plain_canonical_and_outside() {
+        use std::path::Path;
+        let root = crate::test_dirs::TempDir::new("relroot");
+        let other = crate::test_dirs::TempDir::new("relother");
+        let c = super::Config {
+            download_dir: Some(root.to_path_buf()),
+            ..Default::default()
+        };
+        let plain = root.join("models").join("x.onnx");
+        assert_eq!(
+            c.relative_to_data_root(&plain),
+            Path::new("models").join("x.onnx")
+        );
+        let canon = std::fs::canonicalize(&*root)
+            .unwrap()
+            .join("models")
+            .join("y.onnx");
+        assert_eq!(
+            c.relative_to_data_root(&canon),
+            Path::new("models").join("y.onnx")
+        );
+        let outside = other.join("z.onnx");
+        assert_eq!(c.relative_to_data_root(&outside), outside);
+        let rel = Path::new("models").join("r.onnx");
+        assert_eq!(c.relative_to_data_root(&rel), rel);
+    }
 
     /// `timezone` defaults to local, round-trips, and a bad value names the key.
     #[test]

@@ -55,6 +55,7 @@ macro_rules! asset {
 pub(super) static STATIC_FILES: &[(&str, &str, &str)] = &[
     asset!("style.css", CSS),
     asset!("live.js", JS),
+    asset!("dom.js", JS),
     asset!("time.js", JS),
     asset!("sort.js", JS),
     asset!("bench-core.js", JS),

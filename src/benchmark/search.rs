@@ -410,9 +410,9 @@ impl StoredPreds {
 }
 
 /// (modified, length) of a file; None when it does not exist.
-type FileStamp = Option<(Option<std::time::SystemTime>, u64)>;
+pub(crate) type FileStamp = Option<(Option<std::time::SystemTime>, u64)>;
 
-fn file_stamp(p: &Path) -> FileStamp {
+pub(crate) fn file_stamp(p: &Path) -> FileStamp {
     std::fs::metadata(p)
         .ok()
         .map(|m| (m.modified().ok(), m.len()))
