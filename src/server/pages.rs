@@ -1885,6 +1885,18 @@ console.log('ok');
             assert!(picker < own, "{uri}");
         }
         let (_, review) = get_text(&state, "/train/review").await;
+        // The date range: two day inputs, a preset select the filters never send (no name), and the
+        // two date orders.
+        for needle in [
+            "<input type=\"date\" name=\"date_from\"",
+            "<input type=\"date\" name=\"date_to\"",
+            "<select id=\"rv-date-preset\"",
+            "<option value=\"newest\">Newest first</option>",
+            "<option value=\"oldest\">Oldest first</option>",
+        ] {
+            assert!(review.contains(needle), "{needle}");
+        }
+        assert!(!review.contains("name=\"rv-date-preset\""));
         // The overview's places, the layout switch, the side panel's width handle (it replaced
         // "Wider panel"), View's Brightness and Contrast (they replaced Brighter / Darker), and no
         // close-up.

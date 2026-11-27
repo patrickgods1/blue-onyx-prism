@@ -466,7 +466,8 @@
   function orderOf(q) {
     var b = q.get('balance');
     if (b) return 'balance:' + b;
-    return q.get('order') === 'uncertain' ? 'uncertain' : '';
+    var o = q.get('order');
+    return o === 'uncertain' || o === 'newest' || o === 'oldest' ? o : '';
   }
 
   // The dimensions the queue's order balances by: a `balance:` choice's, every one under
@@ -4677,6 +4678,7 @@
         showCounts(j);
         fillCameras(j.cameras);
         fillLabels(j.labels);
+        limitDates(j.dates);
         noteMissing(j.folder_missing ? j.message : '');
         followIndexing(j.indexing);
       });
@@ -4923,6 +4925,10 @@
     if (f.camera.value) parts.push('camera ' + f.camera.value);
     if (f.label.value) parts.push(f.label.value.split(',').join(', '));
     if (f.bucket.value) parts.push('bucket ' + f.bucket.value);
+    if (f.date_from && (f.date_from.value || f.date_to.value)) {
+      var a = f.date_from.value, b = f.date_to.value;
+      parts.push(a && b ? (a === b ? a : a + ' – ' + b) : a ? 'from ' + a : 'to ' + b);
+    }
     if (f.auto.value) parts.push(name('auto'));
     if (f.refine_kind && R.sendsFilter('refine_kind', f.refine_kind.value, f.auto.value)) parts.push(name('refine_kind'));
     // The order, unless an Auto filter's own order replaces Recommended.
@@ -4942,7 +4948,7 @@
       f.order.value = orderOf(q);
       if (f.order.value !== orderOf(q)) f.order.value = '';
     }
-    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source'].forEach(function (k) {
+    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source', 'date_from', 'date_to'].forEach(function (k) {
       var v = q.get(k), e = f[k];
       if (!v || !e) return;
       if (k === 'camera' && !Array.prototype.some.call(e.options, function (o) { return o.value === v; })) {
@@ -4957,6 +4963,23 @@
     if (q.get('auto') === 'overlaps' && !q.has('status') && !q.has('source')) showOverlaps();
     if (q.get('auto') === 'refine' && !q.has('status') && !q.has('source')) showRefine();
     showRefineKind();
+    syncDatePreset();
+  }
+  // The Date select follows the two day inputs: the preset they match, else Custom.
+  function today() { return PrismTime.date(new Date()); }
+  function syncDatePreset() {
+    var f = filtersForm.elements, sel = $('rv-date-preset');
+    if (!sel || !f.date_from || !f.date_to) return;
+    sel.value = R.datePreset(f.date_from.value, f.date_to.value, today());
+  }
+  // The days the folder holds, as the pickers' hint (`dates` of an answer; null = no frames). Not
+  // min/max: a preset reaches past them (Last 7 days with 2 days of frames) and the browser would
+  // mark the inputs invalid and block Enter.
+  function limitDates(d) {
+    var f = filtersForm.elements;
+    if (!f.date_from || !f.date_to) return;
+    var hint = d && d.first && d.last ? 'Frames from ' + d.first + ' to ' + d.last : 'No frames yet';
+    f.date_from.title = f.date_to.title = hint;
   }
   // A filter change with unsaved edits asks first; kept, the frame stays and the counts follow.
   function filterReload() {
@@ -4966,9 +4989,9 @@
     say('Kept this frame with its unsaved changes; the new filters apply from the next frame.');
   }
   var filterTimer = null;
-  function filterChanged() {
+  function filterChanged(ms) {
     if (filterTimer) clearTimeout(filterTimer);
-    filterTimer = setTimeout(function () { filterTimer = null; filterReload(); }, 200);
+    filterTimer = setTimeout(function () { filterTimer = null; filterReload(); }, ms || 200);
   }
   // Overlaps sit on reviewed frames too, and a reviewed frame need not be in the review queue: the
   // Auto filter's "overlapping boxes" opens every status and every collected frame (both stay
@@ -4999,6 +5022,23 @@
       say('Dataset check suggestions: Status set to any and Frames to all collected, so reviewed frames show too.');
     }
     showRefineKind();
+    if (ev.target && ev.target.id === 'rv-date-preset') {
+      var r = R.dateRange(ev.target.value, today()), g = filtersForm.elements;
+      g.date_from.value = r.from;
+      g.date_to.value = r.to;
+    } else if (ev.target && (ev.target.name === 'date_from' || ev.target.name === 'date_to')) {
+      // A typed date fires change per segment (year digits included): wait for the typing, and
+      // send no From past To (a half-typed year) to be refused.
+      syncDatePreset();
+      var g2 = filtersForm.elements;
+      if (g2.date_from.value && g2.date_to.value && g2.date_from.value > g2.date_to.value) {
+        if (filterTimer) { clearTimeout(filterTimer); filterTimer = null; }
+        say('From is after To: pick a From day on or before the To day.');
+        return;
+      }
+      filterChanged(700);
+      return;
+    }
     filterReload();
   });
   filtersForm.addEventListener('submit', function (ev) { ev.preventDefault(); filterReload(); });

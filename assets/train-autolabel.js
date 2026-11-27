@@ -38,7 +38,7 @@
       } else parts.push(k + "=" + v);
       if (k !== "limit") said.push(k + " " + v);
     });
-    ["bucket", "source", "import"].forEach(function (k) {
+    ["bucket", "source", "import", "date_from", "date_to"].forEach(function (k) {
       var v = q.get(k);
       if (!v) return;
       parts.push(k + "=" + v);

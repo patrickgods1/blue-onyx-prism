@@ -4,7 +4,11 @@
 //! few gives in one pass; a sort would build the order of every other frame to throw it away.
 //! The order is the one of [`super::super::queue::sort_items`]: [`Uncertainty::key`], then the
 //! newest, then the path. It has no ties, paths being unique, so what the pass finds is what the
-//! sort would put there.
+//! sort would put there. The time orders ([`Order::Newest`], [`Order::Oldest`]) take the same
+//! pass with the time and the path alone ([`Hit::order`]).
+//!
+//! The date filter is a shard's (a day folder's): [`Compiled::in_days`] decides wherever a row is
+//! counted, after its camera and day are marked for the filter lists, as the walk does.
 //!
 //! The Recommended order ([`Order::Recommended`]) is no key of a row alone: a row's event rank
 //! depends on the other rows of its event, and its need on the reviewed rows ([`need::CellTally`],
@@ -22,8 +26,8 @@
 use super::super::Status;
 use super::super::need::{self, CellBox, CellTally, DayOut, Need, RecallNeed, Scorer};
 use super::super::queue::{
-    AutoFilter, Balance, BalanceNeed, BalanceTally, ClassNeed, Counts, Filters, Item, Order,
-    QueueSource, SortKey, StatusFilter, Uncertainty,
+    AutoFilter, Balance, BalanceNeed, BalanceTally, ClassNeed, Counts, DayRange, DaySpan, Filters,
+    Item, Order, QueueSource, SortKey, StatusFilter, Uncertainty,
 };
 use super::super::recommend;
 use super::super::statics;
@@ -66,6 +70,11 @@ struct Compiled {
     queue_only: bool,
     scene: Want,
     camera: Want,
+    /// The day folders kept, checked per shard ([`Self::in_days`]).
+    days: DayRange,
+    /// [`Order::Newest`] (true) or [`Order::Oldest`] (false): rows sort by time alone
+    /// ([`Hit::order`]). None = by [`SortKey`].
+    time: Option<bool>,
     /// By bucket list.
     bucket: Vec<bool>,
     /// By class set.
@@ -98,9 +107,9 @@ impl Weigh {
         // strings. And the (class set, camera) pairs of the listed rows, whose class part is asked.
         let mut groups: HashMap<(u32, u32, Name, Name), u64> = HashMap::new();
         let mut listed: BTreeSet<(u32, Name)> = BTreeSet::new();
-        for shard in state.shards.values() {
+        for shard in state.shards.values().filter(|s| q.in_days(s)) {
             for row in &shard.rows {
-                if !q.counts(row) {
+                if !q.counts(shard, row) {
                     continue;
                 }
                 if row.part.status == Status::Reviewed {
@@ -203,6 +212,12 @@ impl Compiled {
             queue_only: f.source == QueueSource::Queue,
             scene: Want::of(f.scene.as_deref(), names),
             camera: Want::of(f.camera.as_deref(), names),
+            days: f.days.clone(),
+            time: match f.order {
+                Order::Newest => Some(true),
+                Order::Oldest => Some(false),
+                Order::Uncertain | Order::Recommended => None,
+            },
             bucket: names
                 .bucket_lists()
                 .map(|list| f.bucket.is_none_or(|b| list.contains(&b)))
@@ -238,6 +253,11 @@ impl Compiled {
         !self.queue_only || r.queued
     }
 
+    /// The rows of `shard` pass the date filter: its day folder is in the range.
+    fn in_days(&self, shard: &Shard) -> bool {
+        self.days.is_any() || self.days.keeps(need::date_of(&shard.day))
+    }
+
     /// Passes the scene, camera and bucket filters.
     fn by_line(&self, r: &Row) -> bool {
         self.scene.keeps(r.cand.scene)
@@ -271,19 +291,38 @@ impl Compiled {
         }
     }
 
-    /// Whether [`Counts`] counts `r`: every filter but status and auto keeps it.
-    fn counts(&self, r: &Row) -> bool {
-        self.in_source(r) && self.by_line(r) && !r.gone && r.readable() && self.by_class(r)
+    /// Whether [`Counts`] counts `r` of `shard`: every filter but status and auto keeps it.
+    fn counts(&self, shard: &Shard, r: &Row) -> bool {
+        self.in_source(r)
+            && self.by_line(r)
+            && !r.gone
+            && r.readable()
+            && self.by_class(r)
+            && self.in_days(shard)
     }
 
-    /// Whether the queue lists `r`.
-    fn lists(&self, r: &Row) -> bool {
-        self.counts(r) && self.by_state(r)
+    /// Whether the queue lists `r` of `shard`.
+    fn lists(&self, shard: &Shard, r: &Row) -> bool {
+        self.counts(shard, r) && self.by_state(r)
     }
 
-    /// What sorts `r`. No note text: the sort only asks whether there is one.
+    /// What sorts `r`. No note text: the sort only asks whether there is one. Unused by the time
+    /// orders ([`Hit::order`]), which skip making it.
     fn key(&self, r: &Row) -> SortKey {
+        if self.time.is_some() {
+            return SortKey::default();
+        }
         self.uncertainty(r).key()
+    }
+
+    /// `r` of `shard` as a listed frame of the query's order.
+    fn hit<'a>(&self, shard: &'a Shard, row: &'a Row) -> Hit<'a> {
+        Hit {
+            key: self.key(row),
+            time: self.time,
+            shard,
+            row,
+        }
     }
 
     /// What the orders read of `r`: its uncertainty with the balance score alone and no note text.
@@ -305,26 +344,31 @@ impl Compiled {
 #[derive(Clone, Copy)]
 struct Hit<'a> {
     key: SortKey,
+    /// [`Compiled::time`]: by time alone, newest first (true) or oldest first.
+    time: Option<bool>,
     shard: &'a Shard,
     row: &'a Row,
 }
 
 impl Hit<'_> {
-    /// [`super::super::queue::sort_items`]' order.
+    /// [`super::super::queue::sort_items`]' order; under a time order
+    /// [`super::super::queue::sort_by_time`]'s.
     fn order(&self, other: &Self) -> Ordering {
-        self.key
-            .cmp(&other.key)
-            .then_with(|| {
-                other
-                    .shard
-                    .timestamp(other.row)
-                    .cmp(self.shard.timestamp(self.row))
-            })
-            .then_with(|| {
-                self.shard
-                    .rel_bytes(self.row)
-                    .cmp(other.shard.rel_bytes(other.row))
-            })
+        let older = || {
+            self.shard
+                .timestamp(self.row)
+                .cmp(other.shard.timestamp(other.row))
+        };
+        let by_time = match self.time {
+            Some(true) => older().reverse(),
+            Some(false) => older(),
+            None => self.key.cmp(&other.key).then_with(|| older().reverse()),
+        };
+        by_time.then_with(|| {
+            self.shard
+                .rel_bytes(self.row)
+                .cmp(other.shard.rel_bytes(other.row))
+        })
     }
 }
 
@@ -357,6 +401,8 @@ struct Tally {
     class_sets: Vec<bool>,
     /// By name: a candidate has this camera.
     cameras: Vec<bool>,
+    /// The first and last day folder of a candidate.
+    dates: Option<DaySpan>,
     /// By training set: reviewed frames that have it.
     training: Vec<u64>,
     unreadable: u64,
@@ -403,7 +449,7 @@ impl Tally {
         }
     }
 
-    /// The per-class counts, classes and cameras as names.
+    /// The per-class counts, cameras and classes as names.
     fn finish(mut self, names: &Names) -> (Counts, Vec<String>, Vec<String>) {
         for (id, frames) in self.training.iter().enumerate() {
             if *frames == 0 {
@@ -466,11 +512,7 @@ fn listed<'a>(state: &'a State, q: &Compiled, rel: Option<&str>) -> Option<Hit<'
     let (day, _) = rel.rsplit_once('/')?;
     let shard = state.shards.get(day)?;
     let row = shard.rows.get(shard.find(&stem, json)?)?;
-    q.lists(row).then(|| Hit {
-        key: q.key(row),
-        shard,
-        row,
-    })
+    q.lists(shard, row).then(|| q.hit(shard, row))
 }
 
 fn item(shard: &Shard, r: &Row, q: &Compiled, names: &Names) -> Item {
@@ -502,12 +544,15 @@ enum Step<'a> {
 /// counts and unreadable frames, `each` every counted row and the end of each shard.
 fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn FnMut(Step<'a>)) {
     for shard in state.shards.values() {
+        let in_days = q.in_days(shard);
+        let mut candidate = false;
         for row in &shard.rows {
             if !q.in_source(row) {
                 continue;
             }
             Tally::mark(&mut tally.cameras, row.cand.camera);
-            if row.gone || !q.by_line(row) {
+            candidate = true;
+            if row.gone || !in_days || !q.by_line(row) {
                 continue;
             }
             if !row.readable() {
@@ -520,6 +565,9 @@ fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn Fn
             }
             tally.count(row);
             each(Step::Counted(shard, row, q.by_state(row)));
+        }
+        if candidate {
+            DaySpan::widen(&mut tally.dates, need::date_of(&shard.day));
         }
         each(Step::DayDone);
     }
@@ -682,8 +730,8 @@ impl<'a> Held<'a> {
 /// shard parts of [`NeedCache`].
 fn count_key(f: &Filters) -> String {
     format!(
-        "{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}",
-        f.source, f.scene, f.camera, f.bucket, f.label
+        "{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}",
+        f.source, f.scene, f.camera, f.bucket, f.label, f.days
     )
 }
 
@@ -705,7 +753,7 @@ fn need_tally(
             let mut t = CellTally::default();
             let date = need::date_of(&shard.day);
             for row in &shard.rows {
-                if row.part.status != Status::Reviewed || !q.counts(row) {
+                if row.part.status != Status::Reviewed || !q.counts(shard, row) {
                     continue;
                 }
                 n.add_reviewed(
@@ -787,6 +835,7 @@ pub(super) fn answer(
     let mut shown = upcoming.clone();
     shown.extend(found.iter().map(|i| i.frame.clone()));
     let unreadable = tally.unreadable + state.damaged(f.source == QueueSource::All);
+    let dates = tally.dates.take();
     let (counts, cameras, labels) = tally.finish(names);
     let answer = Answer {
         position: found.as_ref().map(|_| placed.position),
@@ -795,6 +844,7 @@ pub(super) fn answer(
         total: placed.total,
         counts,
         cameras,
+        dates,
         labels,
         unreadable,
         upcoming,
@@ -898,11 +948,7 @@ fn uncertain<'a>(
             return;
         };
         total += 1;
-        let hit = Hit {
-            key: q.key(row),
-            shard,
-            row,
-        };
+        let hit = q.hit(shard, row);
         first.offer(hit);
         if let Some(p) = pivot {
             match hit.order(&p.hit) {

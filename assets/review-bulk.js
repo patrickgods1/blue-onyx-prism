@@ -173,8 +173,8 @@
       }).then(function () { o.button.disabled = false; });
     }
 
-    var ALL_KEYS = ['bucket', 'scene', 'camera', 'label', 'source'];
-    var NO_SOURCE_KEYS = ['bucket', 'scene', 'camera', 'label'];
+    var ALL_KEYS = ['bucket', 'scene', 'camera', 'label', 'source', 'date_from', 'date_to'];
+    var NO_SOURCE_KEYS = ['bucket', 'scene', 'camera', 'label', 'date_from', 'date_to'];
 
     var bulkBtn = $('rv-accept-auto');
     if (bulkBtn) {

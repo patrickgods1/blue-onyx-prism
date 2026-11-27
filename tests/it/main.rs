@@ -25,6 +25,7 @@ mod js_harness;
 mod js_pickers;
 mod js_poll;
 mod js_review_bulk;
+mod js_review_dates;
 mod js_review_draft;
 mod js_review_keys;
 mod js_review_need;

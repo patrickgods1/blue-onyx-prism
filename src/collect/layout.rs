@@ -138,7 +138,8 @@ pub fn camera_ok(s: &str) -> bool {
     name_ok(s, MAX_CAMERA_LEN)
 }
 
-fn date_ok(s: &str) -> bool {
+/// Whether `s` has a day folder's shape, `YYYY-MM-DD` (digits and dashes only; no calendar check).
+pub(crate) fn date_ok(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 10
         && b.iter().enumerate().all(|(i, c)| match i {
