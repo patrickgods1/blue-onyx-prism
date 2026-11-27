@@ -110,10 +110,19 @@ fn filters(q: &BTreeMap<String, String>) -> Result<Filters, Problem> {
     Filters::from_query(q).map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
-/// The filters of a bulk route's body, `[bucket, scene, camera, label, source]` (None = any), with
+/// The filters of a bulk route's body, `[bucket, scene, camera, label, source, date_from,
+/// date_to]` (None = any), with
 /// the `fixed` ones the route sets itself (`status`, `auto`), or 400.
-fn bulk_filters(given: [Option<String>; 5], fixed: &[(&str, &str)]) -> Result<Filters, Problem> {
-    let keys = ["bucket", "scene", "camera", "label", "source"];
+fn bulk_filters(given: [Option<String>; 7], fixed: &[(&str, &str)]) -> Result<Filters, Problem> {
+    let keys = [
+        "bucket",
+        "scene",
+        "camera",
+        "label",
+        "source",
+        "date_from",
+        "date_to",
+    ];
     let mut q: BTreeMap<String, String> = keys
         .into_iter()
         .zip(given)
@@ -289,18 +298,23 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-/// `GET /v1/review/next?bucket=&scene=&camera=&label=&status=&source=&auto=&refine_kind=&balance=&order=&after=&then=`
+/// `GET /v1/review/next?bucket=&scene=&camera=&date_from=&date_to=&label=&status=&source=&auto=&refine_kind=&balance=&order=&after=&then=`
 /// (`refine_kind` only with `auto=refine`; `balance` = `class,scene,camera` or some of them puts the
-/// least reviewed first; [`Filters::from_query`]): the first frame matching the filters in the
+/// least reviewed first; `date_from` / `date_to` = `YYYY-MM-DD`, the day folders kept, both
+/// included, either alone unbounded on the other side; [`Filters::from_query`]): the first frame matching the filters in the
 /// queue's order (after `after`, the frame shown now, when given; past the last one the first
 /// again with `wrapped`). When `after` is not listed (a save just took it out of the filters),
 /// `then`, the frame that was next after it, is the answer itself when it is listed, so the
 /// position stays where the reviewer was; `then` alone gives the place of the frame on screen
 /// ([`labels::queue::next_after`]). With the frame: its position, the counts and the cameras and
-/// classes for the filter lists. The order ([`next_order`]): Recommended by default (the recall
+/// classes for the filter lists, and `dates: {first, last}` (null without a frame), the first and
+/// last day folder of the source's frames before every filter, for the date inputs' bounds. The
+/// order ([`next_order`]): Recommended by default (the recall
 /// need divided by the event rank, in bands, then the most uncertain, [`labels::recommend`],
 /// [`labels::need`], steered by [`steer::snapshot`]); `order=uncertain` = the most uncertain
-/// first; an `auto=` or `balance=` filter keeps its own order, whatever `order` says.
+/// first; an `auto=` or `balance=` filter keeps its own order for those two;
+/// `order=newest|oldest` sorts by the sidecar time alone (then the path) whatever `auto=` says,
+/// and is a 400 with `balance=`.
 /// Only this route reads `order`: bulk actions and auto-label runs keep the uncertainty order. A big
 /// folder answers from [`labels::index`], with `indexing: {done, total}` while its rows are still
 /// coming in; a small one is walked.
@@ -338,18 +352,25 @@ pub(super) async fn next(
 
 /// The order `GET /v1/review/next` sorts by: `order` absent, empty or `recommended` is
 /// [`Order::Recommended`] unless `f` has an `auto=` or `balance=` filter (those keep their own
-/// order, which is the uncertainty order's); `uncertain` is [`Order::Uncertain`]; anything else
-/// is 400.
+/// order, which is the uncertainty order's); `uncertain` is [`Order::Uncertain`]; `newest` /
+/// `oldest` are [`Order::Newest`] / [`Order::Oldest`], with an `auto=` filter too (it still
+/// narrows the list) but never with `balance=` (two orders: 400); anything else is 400.
 fn next_order(q: &BTreeMap<String, String>, f: &Filters) -> Result<Order, Problem> {
     match q.get("order").map(|o| o.trim()).filter(|o| !o.is_empty()) {
         None | Some("recommended") if f.auto.is_none() && f.balance.is_none() => {
             Ok(Order::Recommended)
         }
         None | Some("recommended" | "uncertain") => Ok(Order::Uncertain),
+        Some(o @ ("newest" | "oldest")) if f.balance.is_some() => Err((
+            StatusCode::BAD_REQUEST,
+            format!("order: {o} and balance= are two orders; pick one"),
+        )),
+        Some("newest") => Ok(Order::Newest),
+        Some("oldest") => Ok(Order::Oldest),
         Some(o) => Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "order: '{}' is not recommended or uncertain",
+                "order: '{}' is not recommended, uncertain, newest or oldest",
                 o.escape_debug()
             ),
         )),
@@ -2372,7 +2393,7 @@ mod tests {
             ))
         );
         let f = bulk_filters(
-            [None, Some("ir".into()), None, None, None],
+            [None, Some("ir".into()), None, None, None, None, None],
             &[("status", "unreviewed")],
         )
         .unwrap();
@@ -2385,7 +2406,11 @@ mod tests {
             .unwrap()
         );
         assert_eq!(
-            bulk_filters([None, Some("dusk".into()), None, None, None], &[]).map(|_| ()),
+            bulk_filters(
+                [None, Some("dusk".into()), None, None, None, None, None],
+                &[]
+            )
+            .map(|_| ()),
             Err((
                 StatusCode::BAD_REQUEST,
                 Filters::from_query(&BTreeMap::from([("scene".to_string(), "dusk".to_string())]))
@@ -2752,6 +2777,87 @@ mod tests {
         )
         .await;
         assert_eq!(v["frames"], serde_json::json!([c]), "the filters apply");
+        // The date range too: only the days on screen, as Next lists them.
+        for (body, query, want) in [
+            (
+                r#"{"dry_run": true, "date_from": "2026-10-22"}"#,
+                "date_from=2026-10-22",
+                serde_json::json!([c]),
+            ),
+            (
+                r#"{"dry_run": true, "date_to": "2026-10-21", "date_from": ""}"#,
+                "date_to=2026-10-21",
+                serde_json::json!([a]),
+            ),
+            (
+                r#"{"dry_run": true, "date_from": "2026-10-21", "date_to": "2026-10-22"}"#,
+                "date_from=2026-10-21&date_to=2026-10-22",
+                serde_json::json!([a, c]),
+            ),
+            (
+                r#"{"dry_run": true, "date_from": "2026-10-23"}"#,
+                "date_from=2026-10-23",
+                serde_json::json!([]),
+            ),
+        ] {
+            let (s, v) = json(&d.state, post_json("/v1/review/accept-auto", body)).await;
+            assert_eq!(s, StatusCode::OK, "{body}: {v}");
+            let mut got: Vec<String> = v["frames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f.as_str().unwrap().to_string())
+                .collect();
+            got.sort();
+            assert_eq!(serde_json::json!(got), want, "{body}");
+            assert_eq!(v["eligible"], want.as_array().unwrap().len(), "{body}: {v}");
+            let (_, n) = json(
+                &d.state,
+                get(&format!("/v1/review/next?auto=accept&{query}")),
+            )
+            .await;
+            assert_eq!(n["total"], v["eligible"], "{query}: the view's count");
+        }
+        // The other bodies of the queue's filters take the range too.
+        for (uri, body) in [
+            (
+                "/v1/review/reject-low",
+                r#"{"dry_run": true, "min_score": 0.5, "date_from": "2026-10-22"}"#,
+            ),
+            (
+                "/v1/review/accept-repeats",
+                r#"{"dry_run": true, "date_to": "2026-10-21"}"#,
+            ),
+            (
+                "/v1/review/suggest-overlaps",
+                r#"{"dry_run": true, "date_from": "2026-10-21", "date_to": "2026-10-21"}"#,
+            ),
+        ] {
+            let (s, v) = json(&d.state, post_json(uri, body)).await;
+            assert_eq!(s, StatusCode::OK, "{uri}: {v}");
+        }
+        for (uri, body, field) in [
+            (
+                "/v1/review/accept-auto",
+                r#"{"dry_run": true, "date_from": "2026-10-32"}"#,
+                "date_from",
+            ),
+            (
+                "/v1/review/reject-low",
+                r#"{"dry_run": true, "min_score": 0.5, "date_to": "yesterday"}"#,
+                "date_to",
+            ),
+            (
+                "/v1/review/suggest-overlaps",
+                r#"{"dry_run": true, "date_from": "2026-10-22", "date_to": "2026-10-21"}"#,
+                "date_from",
+            ),
+        ] {
+            let (s, v) = json(&d.state, post_json(uri, body)).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{uri} {body}: {v}");
+            let m = v["message"].as_str().unwrap();
+            assert!(m.contains(field), "{uri} {body}: {m}");
+        }
 
         // At most `limit`.
         let (s, v) = json(
@@ -4126,10 +4232,10 @@ mod tests {
         let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.5);
         let b = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_b", 0.51);
         let c = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.6);
-        let (s, v) = json(&d.state, get("/v1/review/next?order=newest")).await;
+        let (s, v) = json(&d.state, get("/v1/review/next?order=nearest")).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
         let m = v["message"].as_str().unwrap();
-        assert!(m.contains("order") && m.contains("newest"), "{m}");
+        assert!(m.contains("order") && m.contains("nearest"), "{m}");
 
         // Their needs: a weak person and the weak dog the static rule suppressed on each (too weak
         // for the missed doubling). c's is the highest; a and b share a band, so the more uncertain
@@ -4170,6 +4276,96 @@ mod tests {
             order_of(&d, &[("auto", "none"), ("order", "recommended")]).await,
             plain
         );
+    }
+
+    both_ways!(
+        next_keeps_a_date_range_and_sorts_by_time,
+        next_keeps_a_date_range_and_sorts_by_time_indexed,
+        next_keeps_a_date_range_and_sorts_by_time_in
+    );
+
+    /// `date_from` / `date_to` keep the day folders between them, both included; `dates` gives the
+    /// first and last day of every frame whatever the range; `order=newest|oldest` sorts by time,
+    /// an `auto=` filter still narrowing, never with `balance=`; a bad date is a 400 naming its
+    /// field.
+    async fn next_keeps_a_date_range_and_sorts_by_time_in(way: Way) {
+        let d = way.ds();
+        // An empty folder: no span.
+        let (s, v) = json(&d.state, get("/v1/review/next")).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(v["dates"].is_null(), "{v}");
+        let a = put_frame(&d.dir, "drive", "2026-10-20", "20261020T010203004Z_a", 0.9);
+        let b = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_b", 0.52);
+        let c = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.7);
+        let span = serde_json::json!({"first": "2026-10-20", "last": "2026-10-22"});
+        let frames = |rows: Vec<(String, Option<u64>)>| -> Vec<String> {
+            rows.into_iter().map(|(f, _)| f).collect()
+        };
+        let v = next_of(&d, &[]).await;
+        assert_eq!(v["total"], 3, "{v}");
+        assert_eq!(v["dates"], span, "{v}");
+        // From alone, to alone, one day, a range no frame is in.
+        for (params, want) in [
+            (&[("date_from", "2026-10-21")][..], vec![&b, &c]),
+            (&[("date_to", "2026-10-21")], vec![&a, &b]),
+            (
+                &[("date_from", "2026-10-21"), ("date_to", "2026-10-21")],
+                vec![&b],
+            ),
+            (&[("date_from", "2027-01-01")], vec![]),
+        ] {
+            let v = next_of(&d, params).await;
+            assert_eq!(v["total"], want.len(), "{params:?}: {v}");
+            assert_eq!(v["counts"]["total"], want.len(), "{params:?}: {v}");
+            assert_eq!(v["dates"], span, "the span is before every filter: {v}");
+            let uncertain: Vec<(&str, &str)> = params
+                .iter()
+                .copied()
+                .chain([("order", "uncertain")])
+                .collect();
+            let mut got = frames(order_of(&d, &uncertain).await);
+            got.sort();
+            let want: Vec<String> = want.into_iter().cloned().collect();
+            assert_eq!(got, want, "{params:?}");
+        }
+        // The time orders, with a range too.
+        assert_eq!(
+            frames(order_of(&d, &[("order", "newest")]).await),
+            [c.clone(), b.clone(), a.clone()]
+        );
+        assert_eq!(
+            frames(order_of(&d, &[("order", "oldest")]).await),
+            [a.clone(), b.clone(), c.clone()]
+        );
+        assert_eq!(
+            frames(order_of(&d, &[("order", "oldest"), ("date_from", "2026-10-21")]).await),
+            [b.clone(), c.clone()]
+        );
+        let v = next_of(&d, &[("order", "newest")]).await;
+        assert_eq!(v["item"]["frame"], c.as_str(), "{v}");
+        assert_eq!(v["upcoming"], serde_json::json!([b, a]), "{v}");
+        assert!(
+            v["item"]["event_rank"].is_null() && v["need"].is_null(),
+            "{v}"
+        );
+        // An auto filter narrows a time order and leaves it the time order.
+        assert_eq!(
+            frames(order_of(&d, &[("order", "oldest"), ("auto", "none")]).await),
+            [a.clone(), b.clone(), c.clone()]
+        );
+        // Two orders, a bad date, a From after the To: 400s that say which.
+        for (query, says) in [
+            ("order=newest&balance=class", "two orders"),
+            ("order=oldest&balance=scene", "two orders"),
+            ("date_from=2026-13-01", "date_from"),
+            ("date_to=21-10-2026", "date_to"),
+            ("date_from=2026-10-22&date_to=2026-10-21", "date_from"),
+        ] {
+            let (s, v) = json(&d.state, get(&format!("/v1/review/next?{query}"))).await;
+            assert_eq!(s, StatusCode::BAD_REQUEST, "{query}: {v}");
+            let m = v["message"].as_str().unwrap();
+            assert!(m.contains(says), "{query}: {m}");
+        }
     }
 
     both_ways!(

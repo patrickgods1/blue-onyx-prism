@@ -926,6 +926,34 @@
     return !!value && (name !== 'refine_kind' || auto === 'refine');
   }
 
+  // The day `n` days before `day` ('YYYY-MM-DD'), by UTC arithmetic on the string (no DST, no zone).
+  function daysBefore(day, n) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day || '');
+    if (!m) return '';
+    var d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3] - n));
+    return d.getUTCFullYear().toString().padStart(4, '0') + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' +
+      String(d.getUTCDate()).padStart(2, '0');
+  }
+
+  // The Date filter's presets as an inclusive range of days ('' = unbounded) ending `today`:
+  // last7 (today and the 6 days before), last30, older30 (before the last 30 days); anything else: any.
+  function dateRange(preset, today) {
+    if (preset === 'last7') return { from: daysBefore(today, 6), to: today };
+    if (preset === 'last30') return { from: daysBefore(today, 29), to: today };
+    if (preset === 'older30') return { from: '', to: daysBefore(today, 30) };
+    return { from: '', to: '' };
+  }
+
+  // The preset a range is, or 'custom'.
+  function datePreset(from, to, today) {
+    var names = ['any', 'last7', 'last30', 'older30'];
+    for (var i = 0; i < names.length; i++) {
+      var r = dateRange(names[i], today);
+      if (r.from === (from || '') && r.to === (to || '')) return names[i];
+    }
+    return 'custom';
+  }
+
   // A save's copy of the file: page-only fields (`_...`) off the dataset check's suggestions.
   function refineForSave(labels) {
     ((labels && labels.refine) || []).forEach(function (s) {
@@ -1017,6 +1045,8 @@
     adjustingBox: adjustingBox,
     endAdjust: endAdjust,
     sendsFilter: sendsFilter,
+    dateRange: dateRange,
+    datePreset: datePreset,
     refineForSave: refineForSave,
     nextPlan: nextPlan,
     nextLanding: nextLanding

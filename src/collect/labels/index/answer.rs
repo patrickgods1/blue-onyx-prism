@@ -4,7 +4,7 @@
 
 use super::super::super::layout;
 use super::super::need::NeedCounts;
-use super::super::queue::{self, BalanceTally, Counts, Filters, Item, Queue, QueueSource};
+use super::super::queue::{self, BalanceTally, Counts, DaySpan, Filters, Item, Queue, QueueSource};
 use serde::Serialize;
 use std::path::Path;
 
@@ -28,6 +28,9 @@ pub struct Answer {
     pub total: usize,
     pub counts: Counts,
     pub cameras: Vec<String>,
+    /// The first and last day folder among the source's candidates, before every filter, as
+    /// `cameras`: `{"first": "YYYY-MM-DD", "last": "YYYY-MM-DD"}`, null without a candidate.
+    pub dates: Option<DaySpan>,
     pub labels: Vec<String>,
     /// Sidecars and label files that do not parse, and damaged lines.
     pub unreadable: u64,
@@ -72,6 +75,7 @@ impl Answer {
                 .collect(),
             counts: built.counts,
             cameras: built.cameras,
+            dates: built.dates,
             labels: built.labels,
             unreadable: built.unreadable + damaged,
             indexing: None,

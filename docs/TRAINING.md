@@ -1767,7 +1767,7 @@ deleted automatically; confirmed empty frames (hard negatives) come only from th
 **Frames**: `--frames` takes the Review queue's filters as `key=value` pairs: `bucket`, `scene`, `camera`, `label`,
 `status` (default `unreviewed`), `source` (default `all`), `auto` (`review`, `accept`, `nothing`, `none`;
 `label=person|car` = frames with any of these classes; the queue's `label=` takes a comma list;
-docs/DATASET.md "Queue"), `import=<id>|any`, `again=1`, `limit` (default 200). They are taken in the
+docs/DATASET.md "Queue"), `date_from` / `date_to` (`YYYY-MM-DD`, day folders, inclusive; the Review tab's Date filter), `import=<id>|any`, `again=1`, `limit` (default 200). They are taken in the
 queue's uncertainty order (most uncertain first), not the Review tab's default *Recommended* order, which only
 `GET /v1/review/next` uses. The Review tab's button sends its own filters.
 
@@ -2418,6 +2418,12 @@ frame; on 528 crops of 186 frames that gave the same bytes and no difference bey
 whose box moved or went is passed over, a frame you skipped or checked meanwhile is left alone, and only a
 frame that gained a suggestion is written. A frame open on the page when the job writes it answers its
 save with the usual "changed since you opened it" conflict.
+
+**Review tab filters and orders.** Besides Bucket, Scene, Camera, Class, Auto, Status and Frames, *Date* (presets
+or *From* / *To* days, by the frame's day folder in the configured time zone) narrows the queue; bulk actions and
+*Auto-label these frames* follow it. *Order* offers Recommended, Most uncertain first, *Newest first* / *Oldest first*
+(by the frame's time, over an Auto filter's own order, not combinable with the balance orders) and the balance orders; random picks are off under a date range
+(docs/DATASET.md "Review queue").
 
 **On the Review tab**, *Auto: overlapping boxes* (which sets Status to any and Frames to all collected)
 lists the frames strongest suggestion first. A frame opens on the box it would drop, marked `drop?` on the

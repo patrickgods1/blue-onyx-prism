@@ -1747,6 +1747,72 @@ mod cases {
             auto: Some(AutoFilter::Overlaps),
             ..all.clone()
         });
+        // Date ranges: from alone, to alone, both (one day, and a span), and one no frame is in;
+        // with the default source and status too.
+        let ranges = [
+            (Some("2026-10-21"), None),
+            (None, Some("2026-10-21")),
+            (Some("2026-10-21"), Some("2026-10-21")),
+            (Some("2026-10-20"), Some("2026-10-22")),
+            (Some("2030-01-01"), Some("2030-12-31")),
+        ];
+        for (from, to) in ranges {
+            let days = queue::DayRange::parse(from, to).unwrap();
+            out.push(Filters {
+                days: days.clone(),
+                ..all.clone()
+            });
+            out.push(Filters {
+                days,
+                source: QueueSource::Queue,
+                status: StatusFilter::Is(Status::Unreviewed),
+                ..all.clone()
+            });
+        }
+        let to_21 = queue::DayRange::parse(None, Some("2026-10-21")).unwrap();
+        out.push(Filters {
+            days: to_21.clone(),
+            camera: Some("gate".into()),
+            label: ["person".to_string()].into(),
+            ..all.clone()
+        });
+        out.push(Filters {
+            days: to_21.clone(),
+            balance: queue::Balance::parse("class,scene,camera").unwrap(),
+            ..all.clone()
+        });
+        // The time orders: every source x status, with an auto filter (which narrows only),
+        // with a range, with other filters.
+        for order in [Order::Newest, Order::Oldest] {
+            for source in [QueueSource::Queue, QueueSource::All] {
+                for status in statuses {
+                    out.push(Filters {
+                        order,
+                        source,
+                        status,
+                        ..all.clone()
+                    });
+                }
+            }
+            for auto in [AutoFilter::Review, AutoFilter::Overlaps, AutoFilter::Refine] {
+                out.push(Filters {
+                    order,
+                    auto: Some(auto),
+                    ..all.clone()
+                });
+            }
+            out.push(Filters {
+                order,
+                days: queue::DayRange::parse(Some("2026-10-21"), None).unwrap(),
+                ..all.clone()
+            });
+            out.push(Filters {
+                order,
+                camera: Some("elsewhere".into()),
+                scene: Some("day".into()),
+                ..all.clone()
+            });
+        }
         // The Recommended order: every source x status, and with each other filter, steered; and
         // the default view without a steer.
         let recommended = Filters {
@@ -1793,8 +1859,29 @@ mod cases {
         }
         out.push(Filters {
             scene: Some("night".into()),
-            ..recommended
+            ..recommended.clone()
         });
+        // The Recommended order in a window of days (no random slots there), steered and not:
+        // the need tallies of another window must not be served ([`super::super::query`]'s
+        // cache key).
+        for (from, to) in [
+            (Some("2026-10-21"), None),
+            (None, Some("2026-10-21")),
+            (Some("2026-10-22"), Some("2026-10-22")),
+        ] {
+            let days = queue::DayRange::parse(from, to).unwrap();
+            out.push(Filters {
+                days: days.clone(),
+                ..recommended.clone()
+            });
+            out.push(Filters {
+                days,
+                steer: None,
+                source: QueueSource::Queue,
+                status: StatusFilter::Is(Status::Unreviewed),
+                ..recommended.clone()
+            });
+        }
         out
     }
 
@@ -1954,6 +2041,43 @@ mod cases {
             w[0].uncertainty.key() == w[1].uncertainty.key() && w[0].timestamp == w[1].timestamp
         });
         assert!(ties, "no tie for the path to break");
+        // The date ranges of the grid narrow (each end alone keeps some days and drops others),
+        // and the time orders are orders of their own, with time ties for the path to break.
+        let days = built.dates.clone().expect("a span of days");
+        assert!(days.first < days.last, "{days:?}");
+        for (from, to) in [(Some("2026-10-21"), None), (None, Some("2026-10-21"))] {
+            let f = Filters {
+                days: queue::DayRange::parse(from, to).unwrap(),
+                ..all.clone()
+            };
+            let n = queue::build(dir, &f).items.len();
+            assert!(n > 0 && n < built.items.len(), "{from:?} {to:?}: {n}");
+        }
+        let newest = queue::build(
+            dir,
+            &Filters {
+                order: Order::Newest,
+                ..all.clone()
+            },
+        );
+        assert!(
+            newest
+                .items
+                .windows(2)
+                .all(|w| w[0].timestamp >= w[1].timestamp)
+        );
+        assert!(
+            newest
+                .items
+                .windows(2)
+                .any(|w| w[0].timestamp == w[1].timestamp)
+        );
+        let frames = |q: &queue::Queue| q.items.iter().map(|i| i.frame.clone()).collect::<Vec<_>>();
+        assert_ne!(
+            frames(&newest),
+            frames(&built),
+            "newest is the uncertainty order"
+        );
         for auto in [
             AutoFilter::Review,
             AutoFilter::Accept,

@@ -1,10 +1,11 @@
 //! The review queue: the frames of `review-queue.jsonl` (and, with [`QueueSource::All`], every
-//! indexed frame), filtered by bucket, scene, camera, object class ([`frame_labels`]), review
-//! status and auto-label state ([`AutoFilter`]), and sorted by
+//! indexed frame), filtered by bucket, scene, camera, day folder ([`DayRange`]), object class
+//! ([`frame_labels`]), review status and auto-label state ([`AutoFilter`]), and sorted by
 //! uncertainty ([`Uncertainty`]): frames with likely boxes first, then fewer flagged boxes, then the
 //! near-threshold margin, verifier disagreement, the number of suppressed boxes, then newest; or,
 //! with [`Order::Recommended`] (the Review tab's default, set by its route alone), by recall need
-//! divided by the event rank ([`super::need`], [`super::recommend`]). Also the counts the Review
+//! divided by the event rank ([`super::need`], [`super::recommend`]), or by time
+//! ([`Order::Newest`], [`Order::Oldest`]). Also the counts the Review
 //! tab shows, and
 //! [`labelled`], every label file those filters select whichever queue it is in.
 //!
@@ -491,6 +492,110 @@ pub enum Order {
     /// ([`super::recommend`]). Only `GET /v1/review/next` asks for it, without `auto=` and
     /// `balance=`; [`Filters::from_query`] never does.
     Recommended,
+    /// Newest first: [`Item::timestamp`] descending, then the path ([`sort_by_time`]). Only `GET
+    /// /v1/review/next` asks for it (`order=newest`, never with `balance=`); an `auto=` filter
+    /// still narrows the list but its own order gives way.
+    Newest,
+    /// Oldest first: [`Item::timestamp`] ascending, then the path ([`sort_by_time`]); as
+    /// [`Self::Newest`] otherwise.
+    Oldest,
+}
+
+/// `date_from` / `date_to`: the day folders (`<scene>/<camera>/<YYYY-MM-DD>/`, the frame's day in
+/// the configured zone when it was collected) a queue keeps, both ends included; either end absent
+/// = unbounded. The sidecar's timestamp plays no part: the folder is the day the page shows.
+/// Built by [`Self::parse`] only, so both ends are real dates and `from <= to`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DayRange {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+impl DayRange {
+    /// The range of `from` and `to` (trimmed; empty = unbounded). Errors name the field: not a
+    /// `YYYY-MM-DD` date, or `date_from` after `date_to`.
+    pub fn parse(from: Option<&str>, to: Option<&str>) -> Result<Self, String> {
+        let day = |field: &str, v: Option<&str>| -> Result<Option<String>, String> {
+            match v.map(str::trim).filter(|v| !v.is_empty()) {
+                None => Ok(None),
+                Some(d)
+                    if layout::date_ok(d)
+                        && chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok() =>
+                {
+                    Ok(Some(d.to_string()))
+                }
+                Some(d) => Err(format!(
+                    "{field}: '{}' is not a date (YYYY-MM-DD)",
+                    d.escape_debug()
+                )),
+            }
+        };
+        let (from, to) = (day("date_from", from)?, day("date_to", to)?);
+        if let (Some(f), Some(t)) = (&from, &to)
+            && f > t
+        {
+            return Err(format!(
+                "date_from: {f} is after date_to {t}; pick a From day on or before the To day"
+            ));
+        }
+        Ok(Self { from, to })
+    }
+
+    /// Whether the day folder named `date` (`YYYY-MM-DD`) is in the range. Dates of that shape
+    /// compare as text in calendar order.
+    pub fn keeps(&self, date: &str) -> bool {
+        self.from.as_deref().is_none_or(|f| date >= f)
+            && self.to.as_deref().is_none_or(|t| date <= t)
+    }
+
+    /// No end set: every day.
+    pub fn is_any(&self) -> bool {
+        self.from.is_none() && self.to.is_none()
+    }
+
+    pub fn from(&self) -> Option<&str> {
+        self.from.as_deref()
+    }
+
+    pub fn to(&self) -> Option<&str> {
+        self.to.as_deref()
+    }
+}
+
+/// The earliest and latest day folder among a queue's candidates (before every filter), for the
+/// page's date inputs: `{"first": "YYYY-MM-DD", "last": "YYYY-MM-DD"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DaySpan {
+    pub first: String,
+    pub last: String,
+}
+
+impl DaySpan {
+    /// `span` widened to `date`.
+    pub(super) fn widen(span: &mut Option<Self>, date: &str) {
+        match span {
+            None => {
+                *span = Some(Self {
+                    first: date.to_string(),
+                    last: date.to_string(),
+                });
+            }
+            Some(s) => {
+                if date < s.first.as_str() {
+                    date.clone_into(&mut s.first);
+                }
+                if date > s.last.as_str() {
+                    date.clone_into(&mut s.last);
+                }
+            }
+        }
+    }
+}
+
+/// The day folder's date of frame `rel` (`<scene>/<camera>/<date>/<stem>.jpg`, already checked by
+/// [`layout::parse_rel`]): what [`DayRange`] compares.
+pub(super) fn date_of_rel(rel: &str) -> &str {
+    need::date_of(day_of(rel))
 }
 
 /// Queue filters (`GET /v1/review/next?...`).
@@ -499,6 +604,8 @@ pub struct Filters {
     pub bucket: Option<Bucket>,
     pub scene: Option<String>,
     pub camera: Option<String>,
+    /// Only frames whose day folder is in this range (`date_from`, `date_to`); default = any day.
+    pub days: DayRange,
     /// Only frames with any of these classes ([`frame_labels`]); empty = any frame.
     pub label: BTreeSet<String>,
     pub status: StatusFilter,
@@ -530,8 +637,9 @@ impl Filters {
     /// them, empty items ignored, `status` = `unreviewed|reviewed|
     /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none|repeats|
     /// overlaps|both|dismissed|refine`, `refine_kind` = `add|tighten|relabel|verify`, only with
-    /// `auto=refine`, `balance` = a comma list of `class|scene|camera`, [`Balance::parse`]);
-    /// empty values mean "any". Errors name the field. Never reads `order`: the order is
+    /// `auto=refine`, `balance` = a comma list of `class|scene|camera`, [`Balance::parse`],
+    /// `date_from` / `date_to` = `YYYY-MM-DD`, the day folders kept, both included,
+    /// [`DayRange::parse`]); empty values mean "any". Errors name the field. Never reads `order`: the order is
     /// [`Order::Uncertain`] for every caller but `GET /v1/review/next`, which sets it itself.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
@@ -607,10 +715,12 @@ impl Filters {
             }
         };
         let balance = Balance::parse(get("balance").unwrap_or(""))?;
+        let days = DayRange::parse(get("date_from"), get("date_to"))?;
         Ok(Self {
             bucket,
             scene,
             camera: get("camera").map(str::to_string),
+            days,
             label,
             status,
             source,
@@ -624,10 +734,10 @@ impl Filters {
     }
 
     /// What `balance=` balances by: [`Self::balance`] in the uncertainty order; the Recommended
-    /// order weighs by recall need instead ([`Self::need`]).
+    /// order weighs by recall need instead ([`Self::need`]) and the time orders by nothing.
     pub fn balance_by(&self) -> Option<Balance> {
         match self.order {
-            Order::Recommended => None,
+            Order::Recommended | Order::Newest | Order::Oldest => None,
             Order::Uncertain => self.balance,
         }
     }
@@ -1049,6 +1159,16 @@ pub fn sort_items(items: &mut [Item]) {
     });
 }
 
+/// Sort by [`Item::timestamp`], `newest` first ([`Order::Newest`]) or oldest first
+/// ([`Order::Oldest`]), then by path either way. Nothing else counts: a time order is the
+/// reviewer's choice over the uncertainty and the auto filters' orders.
+pub fn sort_by_time(items: &mut [Item], newest: bool) {
+    items.sort_by(|a, b| {
+        let time = a.timestamp.cmp(&b.timestamp);
+        if newest { time.reverse() } else { time }.then_with(|| a.frame.cmp(&b.frame))
+    });
+}
+
 /// Review counts over the frames matching the filters (the status and auto filters aside).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Counts {
@@ -1142,7 +1262,10 @@ pub struct Queue {
     pub counts: Counts,
     /// Cameras among the candidates (for the filter list).
     pub cameras: Vec<String>,
-    /// Classes ([`frame_labels`]) of the frames the bucket, scene and camera filters keep, before
+    /// The first and last day folder among the candidates, before every filter (for the date
+    /// inputs' bounds); None without a candidate.
+    pub dates: Option<DaySpan>,
+    /// Classes ([`frame_labels`]) of the frames the bucket, scene, camera and date filters keep, before
     /// the class filter (for the filter list).
     pub labels: Vec<String>,
     /// Frames left out: unreadable sidecar or label file.
@@ -1494,8 +1617,11 @@ fn build_as(dir: &Path, f: &Filters, threads: Option<usize>, how: Arrangement) -
     let mut kept = Vec::new();
     for c in candidates(dir, f.source) {
         cameras.insert(c.camera.clone());
+        let date = date_of_rel(&c.rel);
+        DaySpan::widen(&mut q.dates, date);
         if f.scene.as_ref().is_some_and(|s| *s != c.scene)
             || f.camera.as_ref().is_some_and(|s| *s != c.camera)
+            || !f.days.keeps(date)
             || f.bucket.is_some_and(|b| !c.buckets.contains(&b))
         {
             continue;
@@ -1540,6 +1666,8 @@ fn build_as(dir: &Path, f: &Filters, threads: Option<usize>, how: Arrangement) -
     }
     match f.order {
         Order::Uncertain => sort_items(&mut q.items),
+        Order::Newest => sort_by_time(&mut q.items, true),
+        Order::Oldest => sort_by_time(&mut q.items, false),
         Order::Recommended => {
             // The random slots move by one with each frame decided (reviewed or skipped).
             let decided = recommend::random_slots(f)
@@ -1878,6 +2006,7 @@ fn name_passes(rel: &str, f: &Filters, keep: &dyn Fn(&str) -> bool) -> bool {
         keep(rel)
             && !f.scene.as_ref().is_some_and(|s| *s != r.scene)
             && !f.camera.as_ref().is_some_and(|c| *c != r.camera)
+            && f.days.keeps(&r.date)
     })
 }
 
@@ -1901,8 +2030,8 @@ fn read_passing(walker: &mut Walker<'_>, f: &Filters, rel: &str, path: &Path) ->
     Some(l)
 }
 
-/// The label files of `dir` ([`super::label_files`], in its order) that the bucket, scene, camera
-/// and class filters of `f` and `keep` select, read one at a time, so a caller may write between
+/// The label files of `dir` ([`super::label_files`], in its order) that the bucket, scene, camera,
+/// date and class filters of `f` and `keep` select, read one at a time, so a caller may write between
 /// them. For edits of already labelled frames, reviewed ones too: [`build`] only reaches what
 /// `f.source` draws from (by default `review-queue.jsonl`, which a frame reviewed under "all
 /// collected" is not in), so `source` is not used here, nor are `status` and `auto`. A frame whose
@@ -2213,6 +2342,259 @@ mod tests {
             "{e}"
         );
         assert!(q(&[("label", &"x".repeat(65))]).is_err());
+    }
+
+    #[test]
+    fn the_date_range_from_the_query() {
+        let q = |pairs: &[(&str, &str)]| {
+            Filters::from_query(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )
+        };
+        // Absent or empty: any day.
+        assert!(q(&[]).unwrap().days.is_any());
+        assert!(
+            q(&[("date_from", " "), ("date_to", "")])
+                .unwrap()
+                .days
+                .is_any()
+        );
+        // From alone: this day and newer.
+        let from = q(&[("date_from", "2026-10-21")]).unwrap().days;
+        assert!(!from.is_any());
+        assert_eq!((from.from(), from.to()), (Some("2026-10-21"), None));
+        assert!(!from.keeps("2026-10-20"));
+        assert!(from.keeps("2026-10-21") && from.keeps("2027-01-01"));
+        // To alone: this day and older.
+        let to = q(&[("date_to", " 2026-10-21 ")]).unwrap().days;
+        assert_eq!((to.from(), to.to()), (None, Some("2026-10-21")));
+        assert!(to.keeps("2025-12-31") && to.keeps("2026-10-21"));
+        assert!(!to.keeps("2026-10-22"));
+        // Both, the same day: that day alone; both ends included; month and year edges.
+        let one = q(&[("date_from", "2026-10-21"), ("date_to", "2026-10-21")])
+            .unwrap()
+            .days;
+        assert!(one.keeps("2026-10-21"));
+        assert!(!one.keeps("2026-10-20") && !one.keeps("2026-10-22"));
+        let span = q(&[("date_from", "2025-12-31"), ("date_to", "2026-02-01")])
+            .unwrap()
+            .days;
+        for d in ["2025-12-31", "2026-01-01", "2026-01-31", "2026-02-01"] {
+            assert!(span.keeps(d), "{d}");
+        }
+        for d in ["2025-12-30", "2026-02-02", "2026-10-21"] {
+            assert!(!span.keeps(d), "{d}");
+        }
+        // Bad formats and days that do not exist name their field.
+        for bad in [
+            "2026-1-05",
+            "20261021",
+            "2026/10/21",
+            "21-10-2026",
+            "2026-13-01",
+            "2026-02-30",
+            "2026-10-21T00:00",
+            "yesterday",
+        ] {
+            let e = q(&[("date_from", bad)]).unwrap_err();
+            assert!(
+                e.starts_with("date_from:") && e.contains("YYYY-MM-DD"),
+                "{e}"
+            );
+            let e = q(&[("date_to", bad)]).unwrap_err();
+            assert!(e.starts_with("date_to:"), "{e}");
+        }
+        // A leap day exists in a leap year only.
+        assert!(q(&[("date_from", "2028-02-29")]).is_ok());
+        assert!(q(&[("date_from", "2026-02-29")]).is_err());
+        // From after To.
+        let e = q(&[("date_from", "2026-10-22"), ("date_to", "2026-10-21")]).unwrap_err();
+        assert!(
+            e.starts_with("date_from:") && e.contains("after date_to"),
+            "{e}"
+        );
+        // Filters compare equal only with the same range.
+        assert_ne!(
+            q(&[("date_from", "2026-10-21")]).unwrap(),
+            Filters::default()
+        );
+    }
+
+    /// Frames of `cam` on three days, each with its sidecar time, indexed: `(day, stem, time)`.
+    fn dated_folder(dir: &Path, frames: &[(&str, &str, &str)]) {
+        for (date, stem, time) in frames {
+            let day = dir.join("day/cam").join(date);
+            std::fs::create_dir_all(&day).unwrap();
+            let mut r = empty_record();
+            r.id = (*stem).into();
+            r.scene = "day".into();
+            r.camera = "cam".into();
+            r.timestamp = (*time).into();
+            r.buckets = vec![Bucket::Positive];
+            r.predictions = vec![det("person")];
+            r.raw = r.predictions.clone();
+            std::fs::write(day.join(format!("{stem}.jpg")), b"jpg").unwrap();
+            std::fs::write(
+                day.join(format!("{stem}.json")),
+                serde_json::to_vec(&r).unwrap(),
+            )
+            .unwrap();
+            let line = super::super::super::record::IndexLine::of(&r, 1);
+            layout::append_line(
+                &day.join(layout::INDEX_FILE),
+                &serde_json::to_string(&line).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_date_range_keeps_its_day_folders_and_the_time_orders_sort_by_time() {
+        let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
+        // The day folder decides, not the sidecar time: `late` was collected on the 21st (its
+        // folder) though its UTC time is the 22nd's.
+        dated_folder(
+            &dir,
+            &[
+                ("2026-10-20", "a", "2026-10-20T08:00:00.000Z"),
+                ("2026-10-21", "b", "2026-10-21T09:00:00.000Z"),
+                ("2026-10-21", "late", "2026-10-22T01:00:00.000Z"),
+                ("2026-10-21", "tie1", "2026-10-21T10:00:00.000Z"),
+                ("2026-10-22", "tie2", "2026-10-21T10:00:00.000Z"),
+                ("2026-10-22", "c", "2026-10-22T12:00:00.000Z"),
+            ],
+        );
+        let all = Filters {
+            source: QueueSource::All,
+            status: StatusFilter::Any,
+            ..Filters::default()
+        };
+        let with = |from: Option<&str>, to: Option<&str>, order: Order| Filters {
+            days: DayRange::parse(from, to).unwrap(),
+            order,
+            ..all.clone()
+        };
+        let stems = |q: &Queue| -> Vec<String> {
+            q.items
+                .iter()
+                .map(|i| {
+                    let file = i.frame.rsplit('/').next().unwrap();
+                    file.trim_end_matches(".jpg").to_string()
+                })
+                .collect()
+        };
+        let span = Some(DaySpan {
+            first: "2026-10-20".into(),
+            last: "2026-10-22".into(),
+        });
+        let every = build(&dir, &all);
+        assert_eq!(every.items.len(), 6);
+        assert_eq!(every.dates, span);
+        // One day.
+        let one = build(
+            &dir,
+            &with(Some("2026-10-21"), Some("2026-10-21"), Order::Uncertain),
+        );
+        let mut got = stems(&one);
+        got.sort();
+        assert_eq!(got, ["b", "late", "tie1"]);
+        assert_eq!(one.counts.total, 3, "the counts follow the range");
+        // The span is of every candidate, before the range, as the cameras are.
+        assert_eq!(one.dates, span);
+        assert_eq!(one.cameras, ["cam"]);
+        // From alone, to alone.
+        assert_eq!(
+            build(&dir, &with(Some("2026-10-22"), None, Order::Uncertain))
+                .items
+                .len(),
+            2
+        );
+        assert_eq!(
+            build(&dir, &with(None, Some("2026-10-20"), Order::Uncertain))
+                .items
+                .len(),
+            1
+        );
+        // A range with no frame: nothing listed, nothing counted, the span still there.
+        let none = build(&dir, &with(Some("2027-01-01"), None, Order::Uncertain));
+        assert!(none.items.is_empty() && none.counts.total == 0);
+        assert_eq!(none.dates, span);
+        // Newest first: the sidecar time descending, a tie by path (`day/cam/2026-10-21/tie1`
+        // before `day/cam/2026-10-22/tie2`).
+        assert_eq!(
+            stems(&build(&dir, &with(None, None, Order::Newest))),
+            ["c", "late", "tie1", "tie2", "b", "a"]
+        );
+        // Oldest first: ascending, the tie by path still.
+        assert_eq!(
+            stems(&build(&dir, &with(None, None, Order::Oldest))),
+            ["a", "b", "tie1", "tie2", "late", "c"]
+        );
+        // With a range too.
+        assert_eq!(
+            stems(&build(&dir, &with(Some("2026-10-21"), None, Order::Newest))),
+            ["c", "late", "tie1", "tie2", "b"]
+        );
+        // The bulk walks follow the range: `labelled` reads only the days in it.
+        for stem in ["a", "b", "c"] {
+            let date = match stem {
+                "a" => "2026-10-20",
+                "b" => "2026-10-21",
+                _ => "2026-10-22",
+            };
+            super::super::write(
+                &dir.join(format!(
+                    "day/cam/{date}/{stem}{}",
+                    super::super::LABELS_SUFFIX
+                )),
+                &LabelFile::default(),
+            )
+            .unwrap();
+        }
+        let ranged = with(Some("2026-10-21"), Some("2026-10-22"), Order::Uncertain);
+        let read: Vec<String> = labelled(&dir, &ranged, &|_| true)
+            .map(|(rel, _)| rel)
+            .collect();
+        assert_eq!(
+            read,
+            ["day/cam/2026-10-21/b.jpg", "day/cam/2026-10-22/c.jpg"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_time_orders_sort_by_time_then_path_alone() {
+        // Uncertainty plays no part: a relabel disagreement and a repeat-only frame sort by time.
+        let relabel = Uncertainty {
+            relabel: Some("x".into()),
+            ..u(Some(0.0), true, 3)
+        };
+        let repeats = Uncertainty {
+            repeats_only: true,
+            ..u(None, false, 0)
+        };
+        let mut items = vec![
+            item("b", "2026-10-21T00:00:00Z", u(Some(0.4), false, 0)),
+            item("r", "2026-10-20T00:00:00Z", relabel),
+            item("a", "2026-10-21T00:00:00Z", repeats),
+            item("z", "2026-10-22T00:00:00Z", u(None, false, 0)),
+        ];
+        sort_by_time(&mut items, true);
+        let order = |items: &[Item]| items.iter().map(|i| i.frame.clone()).collect::<Vec<_>>();
+        assert_eq!(order(&items), ["z", "a", "b", "r"]);
+        sort_by_time(&mut items, false);
+        assert_eq!(order(&items), ["r", "a", "b", "z"]);
+        // No balance under a time order.
+        let f = Filters {
+            balance: Balance::parse("class").unwrap(),
+            order: Order::Newest,
+            ..Filters::default()
+        };
+        assert_eq!(f.balance_by(), None);
+        assert!(f.need().is_none());
     }
 
     fn det(l: &str) -> Det {
@@ -3656,8 +4038,11 @@ mod tests {
         let mut seen_labels = BTreeSet::new();
         for c in candidates(dir, f.source) {
             cameras.insert(c.camera.clone());
+            let date = layout::parse_rel(&c.rel).unwrap().date;
+            DaySpan::widen(&mut q.dates, &date);
             if f.scene.as_ref().is_some_and(|s| *s != c.scene)
                 || f.camera.as_ref().is_some_and(|s| *s != c.camera)
+                || !f.days.keeps(&date)
                 || f.bucket.is_some_and(|b| !c.buckets.contains(&b))
             {
                 continue;
@@ -3707,7 +4092,11 @@ mod tests {
                 random_pick: false,
             });
         }
-        sort_items(&mut q.items);
+        match f.order {
+            Order::Newest => sort_by_time(&mut q.items, true),
+            Order::Oldest => sort_by_time(&mut q.items, false),
+            _ => sort_items(&mut q.items),
+        }
         q.cameras = cameras.into_iter().collect();
         q.labels = seen_labels.into_iter().collect();
         q
@@ -3880,6 +4269,15 @@ mod tests {
         assert!(reference.cameras.iter().any(|c| c == "lost-camera"));
         assert!(reference.cameras.iter().any(|c| c == "elsewhere"));
         assert!(reference.counts.per_class.len() > 1);
+        // `mixed_folder`'s days run to 2026-10-23; the span starts at the gone frame's day
+        // (2026-01-01): a gone frame's day counts, as its camera does.
+        assert_eq!(
+            reference.dates,
+            Some(DaySpan {
+                first: "2026-01-01".into(),
+                last: "2026-10-23".into()
+            })
+        );
         let classes: Vec<String> = ["person", "car"].map(String::from).to_vec();
         let filters = [
             Filters::default(),
@@ -3911,6 +4309,19 @@ mod tests {
             Filters {
                 auto: Some(AutoFilter::Overlaps),
                 wanted: Some((classes, Vec::new())),
+                ..all.clone()
+            },
+            Filters {
+                days: DayRange::parse(Some("2026-10-21"), Some("2026-10-22")).unwrap(),
+                ..all.clone()
+            },
+            Filters {
+                order: Order::Newest,
+                days: DayRange::parse(None, Some("2026-10-21")).unwrap(),
+                ..all.clone()
+            },
+            Filters {
+                order: Order::Oldest,
                 ..all.clone()
             },
         ];

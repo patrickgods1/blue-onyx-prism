@@ -231,7 +231,7 @@ impl VlmSize {
 
 /// Which frames a run labels: the Review queue's filters (`bucket`, `scene`, `camera`,
 /// `label` (any of several classes, separated by `|`: `label=person|car`), `status`, `source`,
-/// `auto`; `auto=overlaps` and `auto=both` need [`Filters::wanted`], which [`AutolabelJob`] sets
+/// `date_from` / `date_to` (`YYYY-MM-DD`, the day folders kept, both included), `auto`; `auto=overlaps` and `auto=both` need [`Filters::wanted`], which [`AutolabelJob`] sets
 /// from the config as the Review tab does), `import=<id>|any` (imported frames), `again=1` (also
 /// frames these labelers already looked at, see [`crate::collect::labels::AutoRun`]) and `limit`
 /// (most frames, in queue order). Written `key=value` pairs separated by commas
@@ -279,12 +279,12 @@ impl FrameFilter {
                     query.insert(k, "1".into());
                 }
                 "bucket" | "scene" | "camera" | "label" | "status" | "source" | "auto"
-                | "import" => {
+                | "import" | "date_from" | "date_to" => {
                     query.insert(k, v);
                 }
                 other => bail!(
                     "unknown frame filter '{other}' (bucket, scene, camera, label, status, \
-                     source, auto, import, again, limit)"
+                     source, auto, import, date_from, date_to, again, limit)"
                 ),
             }
         }
@@ -1191,6 +1191,20 @@ mod tests {
         assert!(!one.accepts_source(Some("import:other")));
         for bad in ["scene", "scene=dusk", "colour=red", "limit=0", "limit=x"] {
             assert!(FrameFilter::parse(bad, "any").is_err(), "{bad}");
+        }
+        // The Review tab's date range passes through to the queue's filters (its "Auto-label
+        // these frames" link carries it), checked as the queue checks it.
+        let days = FrameFilter::parse("date_from=2026-10-21,date_to=2026-10-22", "any").unwrap();
+        let range = days.filters().unwrap().days;
+        assert!(range.keeps("2026-10-21") && range.keeps("2026-10-22"));
+        assert!(!range.keeps("2026-10-20") && !range.keeps("2026-10-23"));
+        for bad in [
+            "date_from=21-10-2026",
+            "date_to=2026-02-30",
+            "date_from=2026-10-22,date_to=2026-10-21",
+        ] {
+            let e = FrameFilter::parse(bad, "any").unwrap_err().to_string();
+            assert!(e.starts_with("date_"), "{bad}: {e}");
         }
         let l = FrameFilter::parse("label=person", "unreviewed").unwrap();
         assert_eq!(l.filters().unwrap().label, ["person".to_string()].into());
