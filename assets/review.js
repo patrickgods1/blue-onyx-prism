@@ -449,7 +449,8 @@
         if (o) p.set(o[0], o[1]);
         return;
       }
-      if (el.name && R.sendsFilter(el.name, el.value, auto)) p.set(el.name, el.value);
+      // A disabled time (its day is empty) keeps what was typed but is never sent.
+      if (el.name && !el.disabled && R.sendsFilter(el.name, el.value, auto)) p.set(el.name, el.value);
     });
     return p;
   }
@@ -4926,7 +4927,8 @@
     if (f.label.value) parts.push(f.label.value.split(',').join(', '));
     if (f.bucket.value) parts.push('bucket ' + f.bucket.value);
     if (f.date_from && (f.date_from.value || f.date_to.value)) {
-      var a = f.date_from.value, b = f.date_to.value;
+      var a = (f.date_from.value + ' ' + liveTime('time_from')).trim();
+      var b = (f.date_to.value + ' ' + liveTime('time_to')).trim();
       parts.push(a && b ? (a === b ? a : a + ' – ' + b) : a ? 'from ' + a : 'to ' + b);
     }
     if (f.auto.value) parts.push(name('auto'));
@@ -4948,7 +4950,7 @@
       f.order.value = orderOf(q);
       if (f.order.value !== orderOf(q)) f.order.value = '';
     }
-    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source', 'date_from', 'date_to'].forEach(function (k) {
+    ['bucket', 'scene', 'camera', 'label', 'auto', 'refine_kind', 'status', 'source', 'date_from', 'date_to', 'time_from', 'time_to'].forEach(function (k) {
       var v = q.get(k), e = f[k];
       if (!v || !e) return;
       if (k === 'camera' && !Array.prototype.some.call(e.options, function (o) { return o.value === v; })) {
@@ -4970,7 +4972,19 @@
   function syncDatePreset() {
     var f = filtersForm.elements, sel = $('rv-date-preset');
     if (!sel || !f.date_from || !f.date_to) return;
-    sel.value = R.datePreset(f.date_from.value, f.date_to.value, today());
+    // A time needs its day: without one the time is disabled, never sent alone. It keeps its
+    // value, so a date read empty mid-edit (a segment backspaced) does not lose the typed time.
+    [['time_from', 'date_from'], ['time_to', 'date_to']].forEach(function (k) {
+      var t = f[k[0]];
+      if (t) t.disabled = !f[k[1]].value;
+    });
+    sel.value = R.datePreset(f.date_from.value, f.date_to.value, today(),
+      liveTime('time_from'), liveTime('time_to'));
+  }
+  // The time of input `name` when it counts (its day is set, so it is enabled), else ''.
+  function liveTime(name) {
+    var t = filtersForm.elements[name];
+    return t && !t.disabled ? t.value : '';
   }
   // The days the folder holds, as the pickers' hint (`dates` of an answer; null = no frames). Not
   // min/max: a preset reaches past them (Last 7 days with 2 days of frames) and the browser would
@@ -4980,6 +4994,7 @@
     if (!f.date_from || !f.date_to) return;
     var hint = d && d.first && d.last ? 'Frames from ' + d.first + ' to ' + d.last : 'No frames yet';
     f.date_from.title = f.date_to.title = hint;
+    if (f.time_from) f.time_from.title = f.time_to.title = 'Frame times are in the configured time zone';
   }
   // A filter change with unsaved edits asks first; kept, the frame stays and the counts follow.
   function filterReload() {
@@ -5026,14 +5041,17 @@
       var r = R.dateRange(ev.target.value, today()), g = filtersForm.elements;
       g.date_from.value = r.from;
       g.date_to.value = r.to;
-    } else if (ev.target && (ev.target.name === 'date_from' || ev.target.name === 'date_to')) {
+      if (g.time_from) g.time_from.value = '';
+      if (g.time_to) g.time_to.value = '';
+      syncDatePreset();
+    } else if (ev.target && ['date_from', 'date_to', 'time_from', 'time_to'].indexOf(ev.target.name) >= 0) {
       // A typed date fires change per segment (year digits included): wait for the typing, and
       // send no From past To (a half-typed year) to be refused.
       syncDatePreset();
       var g2 = filtersForm.elements;
-      if (g2.date_from.value && g2.date_to.value && g2.date_from.value > g2.date_to.value) {
+      if (R.rangeOrder(g2.date_from.value, liveTime('time_from'), g2.date_to.value, liveTime('time_to')) > 0) {
         if (filterTimer) { clearTimeout(filterTimer); filterTimer = null; }
-        say('From is after To: pick a From day on or before the To day.');
+        say('From is after To: pick a From moment on or before the To moment.');
         return;
       }
       filterChanged(700);

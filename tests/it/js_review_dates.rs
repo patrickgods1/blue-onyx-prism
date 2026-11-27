@@ -40,6 +40,18 @@ assert.strictEqual(R.datePreset('', '2026-11-26', '2026-11-26'), 'custom');
 assert.strictEqual(R.datePreset('2026-11-19', '2026-11-25', '2026-11-26'), 'custom');
 // Missing values count as unbounded.
 assert.strictEqual(R.datePreset(undefined, null, '2026-11-26'), 'any');
+// Any time set is a custom range, even with a preset's days.
+assert.strictEqual(R.datePreset('', '', '2026-11-26', '18:00', ''), 'custom');
+assert.strictEqual(R.datePreset('2026-11-20', '2026-11-26', '2026-11-26', '', '12:00'), 'custom');
+assert.strictEqual(R.datePreset('2026-11-20', '2026-11-26', '2026-11-26', '', ''), 'last7');
+// From / To order: empty times are 00:00 and 23:59; no day on a side = nothing to compare.
+assert.strictEqual(R.rangeOrder('2026-11-24', '', '2026-11-24', ''), -1);
+assert.strictEqual(R.rangeOrder('2026-11-25', '', '2026-11-24', ''), 1);
+assert.strictEqual(R.rangeOrder('2026-11-24', '18:00', '2026-11-24', '06:00'), 1);
+assert.strictEqual(R.rangeOrder('2026-11-24', '18:00', '2026-11-25', '06:00'), -1);
+assert.strictEqual(R.rangeOrder('2026-11-24', '06:00', '2026-11-24', '06:00'), 0);
+assert.strictEqual(R.rangeOrder('2026-11-24', '23:59', '2026-11-24', ''), 0);
+assert.strictEqual(R.rangeOrder('', '', '2026-11-24', ''), 0);
 console.log('ok');
 "#;
 

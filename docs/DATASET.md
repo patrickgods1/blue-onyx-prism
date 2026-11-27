@@ -989,11 +989,11 @@ whatever `order` says (`balance=` still weighs reviewed frames per class, scene 
 and spots keep the uncertainty order.
 
 **Date range and the two date orders.** `date_from` / `date_to` (`YYYY-MM-DD`, inclusive, either optional, an empty value
-unbounded; a bad value is 400) keep the frames whose day folder is in the range: the collection day in the configured
-`timezone`, not the file's modified time. Page: Filters > *Date* (presets Any date, Last 7 days, Last 30 days, Older than
-30 days, counted back from today in the page's zone) with *From* / *To* day pickers. `order=newest` / `order=oldest`
+unbounded; a bad value is 400) with optional `time_from` / `time_to` (`HH:MM`, 24 h; a time without its date, or From after To, is 400; From equal to To keeps that one minute) keep the frames taken in the range: the frame's own time (the sidecar timestamp) in the configured
+`timezone`, From at `time_from` (00:00 if none), To through the end of `time_to`'s minute (the whole day if none). The day folder is not used: older collectors named day folders in UTC, so evening frames sat under the next day. Page: Filters > *Date* (presets Any date, Last 7 days, Last 30 days, Older than
+30 days, counted back from today in the page's zone) with *From* / *To* day pickers, each with a time (enabled once its day is set). `order=newest` / `order=oldest`
 (*Newest first* / *Oldest first*) sort by the frame's time (the sidecar timestamp, UTC), then by path, and override an Auto filter's own order; with `balance=` either is 400 (the page never
-sends both). The answer's `dates` is `{first, last}`, the earliest and latest day among the frames before any filter (null
+sends both). The answer's `dates` is `{first, last}`, the earliest and latest frame day (configured zone) among the frames the scene, camera and bucket filters keep (null
 for none); the pickers show it as their hint. Bulk actions (`accept-auto`, rejects, ...) and the auto-label link
 follow the range like every other filter; spots stay per camera over all time. Random picks are off under a range, since
 the pool is hashed over all frames and a range would skew it.

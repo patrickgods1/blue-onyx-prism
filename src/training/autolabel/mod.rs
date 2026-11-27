@@ -231,7 +231,9 @@ impl VlmSize {
 
 /// Which frames a run labels: the Review queue's filters (`bucket`, `scene`, `camera`,
 /// `label` (any of several classes, separated by `|`: `label=person|car`), `status`, `source`,
-/// `date_from` / `date_to` (`YYYY-MM-DD`, the day folders kept, both included), `auto`; `auto=overlaps` and `auto=both` need [`Filters::wanted`], which [`AutolabelJob`] sets
+/// `date_from` / `date_to` (`YYYY-MM-DD`) with the optional `time_from` / `time_to` (`HH:MM`,
+/// 24-hour): the frames' own times kept, read in the zone recorded when the filter was made
+/// ([`Self::zone`]; [`crate::collect::labels::queue::TimeRange`]), `auto`; `auto=overlaps` and `auto=both` need [`Filters::wanted`], which [`AutolabelJob`] sets
 /// from the config as the Review tab does), `import=<id>|any` (imported frames), `again=1` (also
 /// frames these labelers already looked at, see [`crate::collect::labels::AutoRun`]) and `limit`
 /// (most frames, in queue order). Written `key=value` pairs separated by commas
@@ -240,7 +242,17 @@ impl VlmSize {
 pub struct FrameFilter {
     pub query: BTreeMap<String, String>,
     pub limit: usize,
+    /// The zone the dates and times were picked in, recorded when the filter is made with any
+    /// (the configured zone then: [`Self::parse`] takes the process's, a route pins the
+    /// service's with [`Self::pin_zone`]), so a queued run keeps the frames the page showed
+    /// when the zone changes before it starts. None (no date or time, or a record from before
+    /// this field) = the configured zone when the run reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<crate::clock::Zone>,
 }
+
+/// The keys of a time range ([`crate::collect::labels::queue::TimeRange`]).
+const RANGE_KEYS: [&str; 4] = ["date_from", "time_from", "date_to", "time_to"];
 
 impl FrameFilter {
     /// Parse `text` (empty = defaults: every frame, unreviewed). `default_status` is used when
@@ -279,12 +291,12 @@ impl FrameFilter {
                     query.insert(k, "1".into());
                 }
                 "bucket" | "scene" | "camera" | "label" | "status" | "source" | "auto"
-                | "import" | "date_from" | "date_to" => {
+                | "import" | "date_from" | "date_to" | "time_from" | "time_to" => {
                     query.insert(k, v);
                 }
                 other => bail!(
                     "unknown frame filter '{other}' (bucket, scene, camera, label, status, \
-                     source, auto, import, date_from, date_to, again, limit)"
+                     source, auto, import, date_from, time_from, date_to, time_to, again, limit)"
                 ),
             }
         }
@@ -295,13 +307,33 @@ impl FrameFilter {
         if !(1..=MAX_LIMIT).contains(&limit) {
             bail!("limit must be between 1 and {MAX_LIMIT}");
         }
-        let f = Self { query, limit };
+        let mut f = Self {
+            query,
+            limit,
+            zone: None,
+        };
+        f.pin_zone(crate::clock::zone());
         f.filters()?;
         Ok(f)
     }
 
-    /// The Review queue filters.
+    /// Record `zone` as the one the dates and times are read in ([`Self::zone`]), when the
+    /// filter has any (else it stays None).
+    pub fn pin_zone(&mut self, zone: crate::clock::Zone) {
+        let ranged = RANGE_KEYS
+            .iter()
+            .any(|k| self.query.get(*k).is_some_and(|v| !v.trim().is_empty()));
+        self.zone = ranged.then_some(zone);
+    }
+
+    /// The Review queue filters, the times read in [`Self::zone`] (else the configured zone now,
+    /// [`crate::clock::zone`]).
     pub fn filters(&self) -> Result<Filters> {
+        self.filters_in(self.zone.unwrap_or_else(crate::clock::zone))
+    }
+
+    /// [`Self::filters`] with the times read in `zone`.
+    pub fn filters_in(&self, zone: crate::clock::Zone) -> Result<Filters> {
         let mut q = self.query.clone();
         q.remove("import");
         q.remove("again");
@@ -310,7 +342,7 @@ impl FrameFilter {
         if let Some(l) = q.get_mut("label") {
             *l = l.replace('|', ",");
         }
-        Filters::from_query(&q).map_err(anyhow::Error::msg)
+        Filters::from_query_in(&q, zone).map_err(anyhow::Error::msg)
     }
 
     /// `again=1`: label frames these labelers already looked at too.
@@ -349,6 +381,7 @@ impl Default for FrameFilter {
             ]
             .into(),
             limit: DEFAULT_LIMIT,
+            zone: None,
         }
     }
 }
@@ -1039,6 +1072,7 @@ pub fn follow_import(job: &mut AutolabelJob, import: &super::import::job::Import
         ]
         .into(),
         limit: import.request.frames.clamp(1, MAX_LIMIT),
+        zone: None,
     };
 }
 
@@ -1192,20 +1226,75 @@ mod tests {
         for bad in ["scene", "scene=dusk", "colour=red", "limit=0", "limit=x"] {
             assert!(FrameFilter::parse(bad, "any").is_err(), "{bad}");
         }
-        // The Review tab's date range passes through to the queue's filters (its "Auto-label
-        // these frames" link carries it), checked as the queue checks it.
+        // The Review tab's time range passes through to the queue's filters (its "Auto-label
+        // these frames" link carries it), checked as the queue checks it, in the zone read.
+        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
         let days = FrameFilter::parse("date_from=2026-10-21,date_to=2026-10-22", "any").unwrap();
-        let range = days.filters().unwrap().days;
-        assert!(range.keeps("2026-10-21") && range.keeps("2026-10-22"));
-        assert!(!range.keeps("2026-10-20") && !range.keeps("2026-10-23"));
+        let range = days.filters_in(la).unwrap().range;
+        // 10-21 00:00 PDT is 07:00Z; 10-23 00:00 PDT is 10-23 07:00Z.
+        assert!(range.keeps("2026-10-21T07:00:00.000Z") && range.keeps("2026-10-23T06:59:59.999Z"));
+        assert!(!range.keeps("2026-10-21T06:59:59.999Z") && !range.keeps("2026-10-23T07:00:00Z"));
+        let hours = FrameFilter::parse(
+            "date_from=2026-10-21, time_from=16:00, date_to=2026-10-21, time_to=18:00",
+            "any",
+        )
+        .unwrap();
+        assert_eq!(hours.query["time_from"], "16:00");
+        let range = hours.filters_in(la).unwrap().range;
+        // 16:00 PDT = 23:00Z; the 18:00 minute is in, 18:01 is not.
+        assert!(range.keeps("2026-10-21T23:00:00Z") && range.keeps("2026-10-22T01:00:59.999Z"));
+        assert!(!range.keeps("2026-10-21T22:59:59Z") && !range.keeps("2026-10-22T01:01:00Z"));
         for bad in [
             "date_from=21-10-2026",
             "date_to=2026-02-30",
             "date_from=2026-10-22,date_to=2026-10-21",
+            "time_from=16:00",
+            "date_from=2026-10-21,time_to=18:00",
+            "date_from=2026-10-21,time_from=4pm",
+            "date_from=2026-10-21,time_from=24:00",
         ] {
             let e = FrameFilter::parse(bad, "any").unwrap_err().to_string();
-            assert!(e.starts_with("date_"), "{bad}: {e}");
+            assert!(
+                e.starts_with("date_") || e.starts_with("time_"),
+                "{bad}: {e}"
+            );
         }
+        let e = FrameFilter::parse("time_from=16:00", "any")
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("time_from: needs date_from"), "{e}");
+        // The zone is recorded with a range (a route pins the service's), kept through the
+        // stored record and read by `filters`; none without a range, nor in a record from before.
+        assert_eq!(FrameFilter::parse("scene=ir", "any").unwrap().zone, None);
+        assert!(days.zone.is_some(), "the process's zone when parsed");
+        let mut pinned = hours.clone();
+        pinned.pin_zone(la);
+        assert_eq!(pinned.zone, Some(la));
+        let stored: FrameFilter =
+            serde_json::from_str(&serde_json::to_string(&pinned).unwrap()).unwrap();
+        assert_eq!(stored, pinned);
+        assert_eq!(
+            stored.filters().unwrap().range,
+            hours.filters_in(la).unwrap().range
+        );
+        let utc = crate::clock::Zone::Utc;
+        let mut in_utc = hours.clone();
+        in_utc.pin_zone(utc);
+        assert_ne!(
+            in_utc.filters().unwrap().range,
+            stored.filters().unwrap().range,
+            "the recorded zone, not the process's"
+        );
+        let old: FrameFilter = serde_json::from_str(
+            r#"{"query": {"date_from": "2026-10-21", "source": "all", "status": "any"}, "limit": 5}"#,
+        )
+        .unwrap();
+        assert_eq!(old.zone, None);
+        assert!(old.filters().is_ok(), "read in the configured zone now");
+        let mut none = FrameFilter::parse("scene=ir", "any").unwrap();
+        none.pin_zone(la);
+        assert_eq!(none.zone, None, "nothing to read in a zone");
+        assert!(!serde_json::to_string(&none).unwrap().contains("zone"));
         let l = FrameFilter::parse("label=person", "unreviewed").unwrap();
         assert_eq!(l.filters().unwrap().label, ["person".to_string()].into());
         let any = FrameFilter::parse("label=person| car |,status=any", "unreviewed").unwrap();

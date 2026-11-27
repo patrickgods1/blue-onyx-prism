@@ -421,7 +421,9 @@ pub(super) async fn import(State(shared): State<Shared>, body: axum::body::Bytes
             let switches = finish.as_ref().is_some_and(|f| f.review_folder.is_some());
             let autolabel = if chained {
                 let mut plan = || -> anyhow::Result<AutolabelJob> {
-                    let req = autolabel_from_form(&chained_autolabel_fields(&f))?;
+                    let mut req = autolabel_from_form(&chained_autolabel_fields(&f))?;
+                    // The dates and times as the page picked them: the service's zone now.
+                    req.frames.pin_zone(config.timezone);
                     let mut al = crate::training::autolabel::plan_autolabel(
                         &config,
                         &state.config_path,
@@ -573,7 +575,10 @@ pub(super) async fn autolabel(
         let f = super::form::parse(&body);
         let config = state.config_read().clone();
         let result = (|| -> anyhow::Result<(String, String)> {
-            let req = autolabel_from_form(&f)?;
+            let mut req = autolabel_from_form(&f)?;
+            // The dates and times as the page picked them: the service's zone now, kept in the
+            // queued record whatever the zone is when the run starts.
+            req.frames.pin_zone(config.timezone);
             let cap = crate::training::capability_now();
             let mut job =
                 crate::training::autolabel::plan_autolabel(&config, &state.config_path, req, &cap)?;

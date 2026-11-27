@@ -945,13 +945,22 @@
   }
 
   // The preset a range is, or 'custom'.
-  function datePreset(from, to, today) {
+  function datePreset(from, to, today, tFrom, tTo) {
+    if (tFrom || tTo) return 'custom';
     var names = ['any', 'last7', 'last30', 'older30'];
     for (var i = 0; i < names.length; i++) {
       var r = dateRange(names[i], today);
       if (r.from === (from || '') && r.to === (to || '')) return names[i];
     }
     return 'custom';
+  }
+
+  // -1 / 0 / 1: the From moment before / equal to / after the To moment, or 0 when either day is
+  // empty (nothing to compare). An empty From time is 00:00, an empty To time 23:59 (its whole minute).
+  function rangeOrder(dFrom, tFrom, dTo, tTo) {
+    if (!dFrom || !dTo) return 0;
+    var a = dFrom + ' ' + (tFrom || '00:00'), b = dTo + ' ' + (tTo || '23:59');
+    return a < b ? -1 : a > b ? 1 : 0;
   }
 
   // A save's copy of the file: page-only fields (`_...`) off the dataset check's suggestions.
@@ -1047,6 +1056,7 @@
     sendsFilter: sendsFilter,
     dateRange: dateRange,
     datePreset: datePreset,
+    rangeOrder: rangeOrder,
     refineForSave: refineForSave,
     nextPlan: nextPlan,
     nextLanding: nextLanding

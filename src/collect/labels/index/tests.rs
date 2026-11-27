@@ -318,7 +318,9 @@ mod cases {
     use super::super::super::export;
     use super::super::super::need::{self, Steer};
     use super::super::super::overlaps::{Suggestion, Verdict};
-    use super::super::super::queue::{self, AutoFilter, Filters, Order, QueueSource, StatusFilter};
+    use super::super::super::queue::{
+        self, AutoFilter, Filters, Order, QueueSource, StatusFilter, TimeRange,
+    };
     use super::super::super::recall::{Measured, Run, Slice};
     use super::super::super::recommend;
     use super::super::super::{
@@ -330,6 +332,7 @@ mod cases {
     use super::super::refresh::Pass;
     use super::super::{Answer, DIRTY_MAX, HUB, Index};
     use super::*;
+    use crate::clock::Zone;
     use crate::collect::layout::{self, INDEX_FILE, REVIEW_QUEUE_FILE};
     use crate::collect::record::{
         Bucket, Det, IndexLine, Provenance, Record, Suppressed, VerifyCandidate, VerifyInfo,
@@ -1636,6 +1639,22 @@ mod cases {
 
     /// The filters the comparison runs: every source x status x auto filter, and each other
     /// filter on its own, with `wanted`.
+    /// The zone the grid's ranges are read in besides UTC: 7 hours behind in October.
+    fn la() -> Zone {
+        "America/Los_Angeles".parse().unwrap()
+    }
+
+    /// [`TimeRange::parse`], which must parse.
+    fn range(
+        df: Option<&str>,
+        tf: Option<&str>,
+        dt: Option<&str>,
+        tt: Option<&str>,
+        zone: Zone,
+    ) -> TimeRange {
+        TimeRange::parse(df, tf, dt, tt, zone).unwrap()
+    }
+
     fn grid(wanted: &(Vec<String>, Vec<String>), steer: &Arc<Steer>) -> Vec<Filters> {
         let autos = [
             None,
@@ -1747,37 +1766,65 @@ mod cases {
             auto: Some(AutoFilter::Overlaps),
             ..all.clone()
         });
-        // Date ranges: from alone, to alone, both (one day, and a span), and one no frame is in;
-        // with the default source and status too.
+        // Time ranges, in explicit zones (never the process's): from alone, to alone, one day,
+        // one Los Angeles day (most of `TIMES`, the 21st's first hours in UTC, are its evening of
+        // the 20th, in folders of three days), hours to the To minute (`TIMES` has frames on
+        // both sides of each bound), and one no frame is in; with the default source and status
+        // too. And no range in Los Angeles (`dates` in its days).
+        out.push(Filters {
+            range: TimeRange::any_in(la()),
+            ..all.clone()
+        });
         let ranges = [
-            (Some("2026-10-21"), None),
-            (None, Some("2026-10-21")),
-            (Some("2026-10-21"), Some("2026-10-21")),
-            (Some("2026-10-20"), Some("2026-10-22")),
-            (Some("2030-01-01"), Some("2030-12-31")),
+            range(Some("2026-10-21"), None, None, None, la()),
+            range(None, None, Some("2026-10-21"), None, la()),
+            range(
+                Some("2026-10-21"),
+                None,
+                Some("2026-10-21"),
+                None,
+                Zone::Utc,
+            ),
+            range(Some("2026-10-20"), None, Some("2026-10-20"), None, la()),
+            // 2026-10-21 00:00Z to 00:02Z, 00:02:00 itself out.
+            range(
+                Some("2026-10-20"),
+                Some("17:00"),
+                Some("2026-10-20"),
+                Some("17:01"),
+                la(),
+            ),
+            // To 03:00:59.999 in, 23:59:59 out.
+            range(
+                Some("2026-10-21"),
+                Some("00:01"),
+                Some("2026-10-21"),
+                Some("03:00"),
+                Zone::Utc,
+            ),
+            range(Some("2030-01-01"), None, Some("2030-12-31"), None, la()),
         ];
-        for (from, to) in ranges {
-            let days = queue::DayRange::parse(from, to).unwrap();
+        for r in ranges {
             out.push(Filters {
-                days: days.clone(),
+                range: r,
                 ..all.clone()
             });
             out.push(Filters {
-                days,
+                range: r,
                 source: QueueSource::Queue,
                 status: StatusFilter::Is(Status::Unreviewed),
                 ..all.clone()
             });
         }
-        let to_21 = queue::DayRange::parse(None, Some("2026-10-21")).unwrap();
+        let to_21 = range(None, None, Some("2026-10-21"), Some("12:00"), la());
         out.push(Filters {
-            days: to_21.clone(),
+            range: to_21,
             camera: Some("gate".into()),
             label: ["person".to_string()].into(),
             ..all.clone()
         });
         out.push(Filters {
-            days: to_21.clone(),
+            range: to_21,
             balance: queue::Balance::parse("class,scene,camera").unwrap(),
             ..all.clone()
         });
@@ -1803,7 +1850,7 @@ mod cases {
             }
             out.push(Filters {
                 order,
-                days: queue::DayRange::parse(Some("2026-10-21"), None).unwrap(),
+                range: range(Some("2026-10-20"), Some("17:00"), None, None, la()),
                 ..all.clone()
             });
             out.push(Filters {
@@ -1861,21 +1908,33 @@ mod cases {
             scene: Some("night".into()),
             ..recommended.clone()
         });
-        // The Recommended order in a window of days (no random slots there), steered and not:
+        // The Recommended order in a window of time (no random slots there), steered and not:
         // the need tallies of another window must not be served ([`super::super::query`]'s
         // cache key).
-        for (from, to) in [
-            (Some("2026-10-21"), None),
-            (None, Some("2026-10-21")),
-            (Some("2026-10-22"), Some("2026-10-22")),
+        for r in [
+            range(Some("2026-10-21"), None, None, None, la()),
+            range(None, None, Some("2026-10-21"), None, Zone::Utc),
+            range(
+                Some("2026-10-22"),
+                None,
+                Some("2026-10-22"),
+                None,
+                Zone::Utc,
+            ),
+            range(
+                Some("2026-10-21"),
+                Some("18:00"),
+                Some("2026-10-21"),
+                Some("22:00"),
+                la(),
+            ),
         ] {
-            let days = queue::DayRange::parse(from, to).unwrap();
             out.push(Filters {
-                days: days.clone(),
+                range: r,
                 ..recommended.clone()
             });
             out.push(Filters {
-                days,
+                range: r,
                 steer: None,
                 source: QueueSource::Queue,
                 status: StatusFilter::Is(Status::Unreviewed),
@@ -1957,7 +2016,8 @@ mod cases {
         // The walks are the slow part: on threads, as the route's queries come.
         crate::parallel::map_all(filters.len(), 8, &|i| {
             let f = &filters[i];
-            let built = queue::build(dir, f);
+            let built = queue::build_every_folder(dir, f);
+            folder_skip_keeps_sane_frames(dir, f, &built);
             let damaged = layout::damaged_lines(dir, f.source == QueueSource::All);
             let listed: Vec<&str> = built.items.iter().map(|i| i.frame.as_str()).collect();
             let mut afters: Vec<Option<String>> = vec![None, Some("junk".into())];
@@ -2010,6 +2070,38 @@ mod cases {
         });
     }
 
+    /// [`queue::build`]'s folder skip ([`TimeRange::may_hold_folder`]) against `every`, the walk of
+    /// every folder for `f`: it lists only frames `every` lists, and every one of them whose time
+    /// a collector in some zone (UTC-12 to UTC+14) would file in its folder. This fixture also
+    /// has frames days from their folder's day (not what a collector writes), which the skip may
+    /// leave out; with them out, the Recommended order's events and needs may differ, so the
+    /// frames are compared as sets.
+    fn folder_skip_keeps_sane_frames(dir: &Path, f: &Filters, every: &queue::Queue) {
+        let ranged = queue::build(dir, f);
+        let frames = |q: &queue::Queue| -> BTreeSet<String> {
+            q.items.iter().map(|i| i.frame.clone()).collect()
+        };
+        let (all, kept) = (frames(every), frames(&ranged));
+        assert!(kept.is_subset(&all), "{f:?}");
+        if f.range.is_any() {
+            assert_eq!(ranged, *every, "no range, no skip: {f:?}");
+            return;
+        }
+        for i in &every.items {
+            let date = layout::parse_rel(&i.frame).unwrap().date;
+            let start = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .unwrap()
+                .and_time(chrono::NaiveTime::MIN)
+                .and_utc()
+                .timestamp_millis();
+            let sane = recommend::event_ms(&i.timestamp)
+                .is_some_and(|ms| (start - 14 * 3_600_000..start + 36 * 3_600_000).contains(&ms));
+            if sane {
+                assert!(kept.contains(&i.frame), "{f:?}: {} dropped", i.frame);
+            }
+        }
+    }
+
     /// The folder holds what the comparison is meant to cover: every auto filter lists frames,
     /// there are unreadable frames, gone frames whose camera still counts, ties only the path
     /// breaks, queued and unqueued frames, every status, notes and frames of several pages.
@@ -2041,18 +2133,89 @@ mod cases {
             w[0].uncertainty.key() == w[1].uncertainty.key() && w[0].timestamp == w[1].timestamp
         });
         assert!(ties, "no tie for the path to break");
-        // The date ranges of the grid narrow (each end alone keeps some days and drops others),
-        // and the time orders are orders of their own, with time ties for the path to break.
+        // The time ranges of the grid narrow (each end alone, and the hours to a To minute, keep
+        // some frames and drop others), and the time orders are orders of their own, with time
+        // ties for the path to break.
         let days = built.dates.clone().expect("a span of days");
         assert!(days.first < days.last, "{days:?}");
-        for (from, to) in [(Some("2026-10-21"), None), (None, Some("2026-10-21"))] {
+        let in_la = queue::build(
+            dir,
+            &Filters {
+                range: TimeRange::any_in(la()),
+                ..all.clone()
+            },
+        );
+        assert_ne!(in_la.dates, built.dates, "the span is of days in the zone");
+        for r in [
+            range(Some("2026-10-21"), None, None, None, la()),
+            range(None, None, Some("2026-10-21"), None, la()),
+            range(
+                Some("2026-10-20"),
+                Some("17:00"),
+                Some("2026-10-20"),
+                Some("17:01"),
+                la(),
+            ),
+            range(
+                Some("2026-10-21"),
+                Some("00:01"),
+                Some("2026-10-21"),
+                Some("03:00"),
+                Zone::Utc,
+            ),
+        ] {
             let f = Filters {
-                days: queue::DayRange::parse(from, to).unwrap(),
+                range: r,
                 ..all.clone()
             };
             let n = queue::build(dir, &f).items.len();
-            assert!(n > 0 && n < built.items.len(), "{from:?} {to:?}: {n}");
+            assert!(n > 0 && n < built.items.len(), "{r:?}: {n}");
         }
+        // A frame whose folder is not its day in Los Angeles (one a collector in some zone would
+        // file there, so `queue::build`'s folder skip keeps it): its day there keeps it, its
+        // folder's day does not.
+        let la_day = |ts: &str| {
+            let ms = recommend::event_ms(ts)?;
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|t| la().display_date(t))
+        };
+        let moved = built
+            .items
+            .iter()
+            .find(|i| {
+                let folder = layout::parse_rel(&i.frame).unwrap().date;
+                let sane = range(Some(&folder), None, Some(&folder), None, Zone::Utc);
+                // In the folder's UTC day: any zone's day of that folder holds it.
+                la_day(&i.timestamp).is_some_and(|d| d != folder) && sane.keeps(&i.timestamp)
+            })
+            .expect("a frame whose folder is another day");
+        let one_day = |d: &str| {
+            let f = Filters {
+                range: range(Some(d), None, Some(d), None, la()),
+                ..all.clone()
+            };
+            queue::build(dir, &f)
+                .items
+                .iter()
+                .any(|i| i.frame == moved.frame)
+        };
+        assert!(one_day(&la_day(&moved.timestamp).unwrap()));
+        assert!(!one_day(&layout::parse_rel(&moved.frame).unwrap().date));
+        // A frame whose time does not parse is in without a range and out under any.
+        let unparsed = built
+            .items
+            .iter()
+            .find(|i| recommend::event_ms(&i.timestamp).is_none())
+            .expect("a frame whose time does not parse");
+        let far = Filters {
+            range: range(Some("1970-01-02"), None, None, None, Zone::Utc),
+            ..all.clone()
+        };
+        assert!(
+            !queue::build(dir, &far)
+                .items
+                .iter()
+                .any(|i| i.frame == unparsed.frame)
+        );
         let newest = queue::build(
             dir,
             &Filters {
@@ -2309,7 +2472,7 @@ mod cases {
 
     /// Next after next through the whole queue: the index's order is the walk's, ties included.
     fn same_order(dir: &Path, f: &Filters, round: &str) {
-        let built = queue::build(dir, f);
+        let built = queue::build_every_folder(dir, f);
         let mut after: Option<String> = None;
         for (at, want) in built.items.iter().enumerate() {
             let got = from_index(dir, f, after.as_deref());

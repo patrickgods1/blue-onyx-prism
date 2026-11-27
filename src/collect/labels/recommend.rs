@@ -423,19 +423,19 @@ pub fn is_pool_frame(hash: u64, reopened: bool) -> bool {
 }
 
 /// The queue `f` has random slots: the Review tab's default view alone, the Recommended order of
-/// the unreviewed frames with no scene, camera, date, class, bucket, auto or balance filter. Any
-/// of those but the date would make the picks depend on what the frames show. `source` (the
+/// the unreviewed frames with no scene, camera, time, class, bucket, auto or balance filter. Any
+/// of those but the time would make the picks depend on what the frames show. `source` (the
 /// review queue, or every frame) is allowed: it is the population the picks are random among,
-/// not a choice by content. A date range is a choice of population too, but training scores the
+/// not a choice by content. A time range is a choice of population too, but training scores the
 /// random picks apart (`heldout:random`) as a sample of the whole default view, so a window of
-/// days (a reviewer working through last week first) must not pick them.
+/// days or hours (a reviewer working through last week first) must not pick them.
 pub fn random_slots(f: &Filters) -> bool {
     f.order == Order::Recommended
         && f.status == StatusFilter::Is(Status::Unreviewed)
         && f.bucket.is_none()
         && f.scene.is_none()
         && f.camera.is_none()
-        && f.days.is_any()
+        && f.range.is_any()
         && f.label.is_empty()
         && f.auto.is_none()
         && f.refine_kind.is_none()
@@ -1067,15 +1067,29 @@ mod tests {
                 ..default.clone()
             },
         ];
-        // A date range, either end or both: the picks must stay a sample of every day.
+        // A time range, either end or both, with times or not: the picks must stay a sample of
+        // every day.
         let not = not.into_iter().chain(
             [
-                (Some("2026-10-21"), None),
-                (None, Some("2026-10-21")),
-                (Some("2026-10-01"), Some("2026-10-31")),
+                (Some("2026-10-21"), None, None, None),
+                (None, None, Some("2026-10-21"), None),
+                (Some("2026-10-01"), None, Some("2026-10-31"), None),
+                (
+                    Some("2026-10-21"),
+                    Some("16:00"),
+                    Some("2026-10-21"),
+                    Some("18:00"),
+                ),
             ]
-            .map(|(from, to)| Filters {
-                days: super::super::queue::DayRange::parse(from, to).unwrap(),
+            .map(|(df, tf, dt, tt)| Filters {
+                range: super::super::queue::TimeRange::parse(
+                    df,
+                    tf,
+                    dt,
+                    tt,
+                    crate::clock::Zone::Utc,
+                )
+                .unwrap(),
                 ..default.clone()
             }),
         );

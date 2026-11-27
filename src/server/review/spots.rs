@@ -5,7 +5,8 @@
 
 use super::{
     ACCEPT_AUTO_DEFAULT_LIMIT, Answer, AppState, Problem, blocking, bulk_limit, filters, json_body,
-    json_fail, not_found, now, push_failed, push_past_limit, query_map, review_ctx, success,
+    json_fail, not_found, now, push_failed, push_past_limit, query_map, review_ctx, review_zone,
+    success,
 };
 use crate::collect::labels::{self, Frame, bulk};
 use crate::collect::layout;
@@ -154,7 +155,7 @@ async fn spot_route(
     if let Some(s) = b.source {
         q.insert("source".to_string(), s);
     }
-    let filters = filters(&q)?;
+    let filters = filters(&q, review_zone(&state))?;
     let spot = Spot {
         camera,
         label: b.label,

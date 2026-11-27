@@ -1890,6 +1890,8 @@ console.log('ok');
         for needle in [
             "<input type=\"date\" name=\"date_from\"",
             "<input type=\"date\" name=\"date_to\"",
+            "<input type=\"time\" name=\"time_from\"",
+            "<input type=\"time\" name=\"time_to\"",
             "<select id=\"rv-date-preset\"",
             "<option value=\"newest\">Newest first</option>",
             "<option value=\"oldest\">Oldest first</option>",
