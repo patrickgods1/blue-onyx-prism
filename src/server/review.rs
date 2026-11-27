@@ -105,15 +105,27 @@ fn query_map(
     q.map(|Query(m)| m).unwrap_or_default()
 }
 
-/// The queue filters of `q` ([`Filters::from_query`]), or 400.
-fn filters(q: &BTreeMap<String, String>) -> Result<Filters, Problem> {
-    Filters::from_query(q).map_err(|e| (StatusCode::BAD_REQUEST, e))
+/// The zone the review routes read `date_from` / `time_from` / `date_to` / `time_to` and `dates`
+/// in: the configured `timezone`, from the service's config rather than the process-wide copy
+/// ([`crate::clock::zone`], the same zone: set from the config at start and on every change), so
+/// an answer and the walk a test compares it with read one zone whatever another test sets.
+fn review_zone(state: &AppState) -> crate::clock::Zone {
+    state.config_read().timezone
+}
+
+/// The queue filters of `q` ([`Filters::from_query_in`], the times in `zone`), or 400.
+fn filters(q: &BTreeMap<String, String>, zone: crate::clock::Zone) -> Result<Filters, Problem> {
+    Filters::from_query_in(q, zone).map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
 /// The filters of a bulk route's body, `[bucket, scene, camera, label, source, date_from,
-/// date_to]` (None = any), with
-/// the `fixed` ones the route sets itself (`status`, `auto`), or 400.
-fn bulk_filters(given: [Option<String>; 7], fixed: &[(&str, &str)]) -> Result<Filters, Problem> {
+/// time_from, date_to, time_to]` (None = any; the times in `zone`), with the `fixed` ones the
+/// route sets itself (`status`, `auto`), or 400.
+fn bulk_filters(
+    zone: crate::clock::Zone,
+    given: [Option<String>; 9],
+    fixed: &[(&str, &str)],
+) -> Result<Filters, Problem> {
     let keys = [
         "bucket",
         "scene",
@@ -121,7 +133,9 @@ fn bulk_filters(given: [Option<String>; 7], fixed: &[(&str, &str)]) -> Result<Fi
         "label",
         "source",
         "date_from",
+        "time_from",
         "date_to",
+        "time_to",
     ];
     let mut q: BTreeMap<String, String> = keys
         .into_iter()
@@ -131,7 +145,7 @@ fn bulk_filters(given: [Option<String>; 7], fixed: &[(&str, &str)]) -> Result<Fi
     for (k, v) in fixed {
         q.insert((*k).to_string(), (*v).to_string());
     }
-    filters(&q)
+    filters(&q, zone)
 }
 
 /// The most frames a bulk route changes: `given`, else `default`, within
@@ -298,17 +312,21 @@ pub(super) async fn page(State(state): State<Arc<AppState>>) -> Response {
     .await
 }
 
-/// `GET /v1/review/next?bucket=&scene=&camera=&date_from=&date_to=&label=&status=&source=&auto=&refine_kind=&balance=&order=&after=&then=`
+/// `GET /v1/review/next?bucket=&scene=&camera=&date_from=&time_from=&date_to=&time_to=&label=&status=&source=&auto=&refine_kind=&balance=&order=&after=&then=`
 /// (`refine_kind` only with `auto=refine`; `balance` = `class,scene,camera` or some of them puts the
-/// least reviewed first; `date_from` / `date_to` = `YYYY-MM-DD`, the day folders kept, both
-/// included, either alone unbounded on the other side; [`Filters::from_query`]): the first frame matching the filters in the
+/// least reviewed first; `date_from` / `date_to` = `YYYY-MM-DD` with the optional `time_from` /
+/// `time_to` = `HH:MM`, 24-hour, each time only with its date: the frames whose own time, in the
+/// configured zone, is from the From minute to the end of the To minute (a To day alone to its
+/// end), either end alone unbounded on the other side, [`labels::queue::TimeRange`];
+/// [`Filters::from_query`]): the first frame matching the filters in the
 /// queue's order (after `after`, the frame shown now, when given; past the last one the first
 /// again with `wrapped`). When `after` is not listed (a save just took it out of the filters),
 /// `then`, the frame that was next after it, is the answer itself when it is listed, so the
 /// position stays where the reviewer was; `then` alone gives the place of the frame on screen
 /// ([`labels::queue::next_after`]). With the frame: its position, the counts and the cameras and
 /// classes for the filter lists, and `dates: {first, last}` (null without a frame), the first and
-/// last day folder of the source's frames before every filter, for the date inputs' bounds. The
+/// last frame day in the configured zone of the frames the source, bucket, scene and camera
+/// filters keep (before the class, time, status and auto filters), for the date inputs' bounds. The
 /// order ([`next_order`]): Recommended by default (the recall
 /// need divided by the event rank, in bands, then the most uncertain, [`labels::recommend`],
 /// [`labels::need`], steered by [`steer::snapshot`]); `order=uncertain` = the most uncertain
@@ -323,7 +341,7 @@ pub(super) async fn next(
     query: Result<Query<BTreeMap<String, String>>, QueryRejection>,
 ) -> Answer {
     let q = query_map(query);
-    let mut filters = filters(&q)?;
+    let mut filters = filters(&q, review_zone(&state))?;
     filters.order = next_order(&q, &filters)?;
     Ok(blocking(move || {
         let ctx = review_ctx(&state);
@@ -834,6 +852,25 @@ mod tests {
         stem: &str,
         margin_score: f32,
     ) -> String {
+        put_frame_at(
+            dir,
+            camera,
+            date,
+            stem,
+            margin_score,
+            &format!("{date}T01:02:03.004Z"),
+        )
+    }
+
+    /// [`put_frame`] with the sidecar time `timestamp`.
+    fn put_frame_at(
+        dir: &std::path::Path,
+        camera: &str,
+        date: &str,
+        stem: &str,
+        margin_score: f32,
+        timestamp: &str,
+    ) -> String {
         let day = dir.join("ir").join(camera).join(date);
         std::fs::create_dir_all(&day).unwrap();
         let img = image::RgbImage::from_pixel(64, 48, image::Rgb([90, 90, 90]));
@@ -842,7 +879,7 @@ mod tests {
         r.id = stem.into();
         r.scene = "ir".into();
         r.camera = camera.into();
-        r.timestamp = format!("{date}T01:02:03.004Z");
+        r.timestamp = timestamp.into();
         r.width = 64;
         r.height = 48;
         r.threshold = 0.5;
@@ -2392,22 +2429,98 @@ mod tests {
                 "limit: must be between 1 and 20000, got 0".to_string()
             ))
         );
+        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
+        let query = |q: &[(&str, &str)]| {
+            Filters::from_query_in(
+                &q.iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                la,
+            )
+        };
         let f = bulk_filters(
-            [None, Some("ir".into()), None, None, None, None, None],
+            la,
+            [
+                None,
+                Some("ir".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ],
             &[("status", "unreviewed")],
         )
         .unwrap();
         assert_eq!(
             f,
-            Filters::from_query(&BTreeMap::from([
-                ("scene".to_string(), "ir".to_string()),
-                ("status".to_string(), "unreviewed".to_string()),
-            ]))
+            query(&[("scene", "ir"), ("status", "unreviewed")]).unwrap()
+        );
+        // The dates and times go where the query has them, read in the zone given.
+        let timed = bulk_filters(
+            la,
+            [
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("2026-11-24".into()),
+                Some("16:00".into()),
+                Some("2026-11-24".into()),
+                Some("18:00".into()),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            timed,
+            query(&[
+                ("date_from", "2026-11-24"),
+                ("time_from", "16:00"),
+                ("date_to", "2026-11-24"),
+                ("time_to", "18:00"),
+            ])
             .unwrap()
+        );
+        assert_eq!(timed.range.zone(), la);
+        assert_eq!(
+            bulk_filters(
+                la,
+                [
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("16:00".into()),
+                    None,
+                    None
+                ],
+                &[]
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .1,
+            "time_from: needs date_from (a time is of a day; pick a From day)"
         );
         assert_eq!(
             bulk_filters(
-                [None, Some("dusk".into()), None, None, None, None, None],
+                la,
+                [
+                    None,
+                    Some("dusk".into()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None
+                ],
                 &[]
             )
             .map(|_| ()),
@@ -2727,7 +2840,8 @@ mod tests {
     );
 
     async fn bulk_accept_saves_only_the_frames_the_triage_settles_in(way: Way) {
-        let d = way.ds();
+        // The frames' days as their folders say: UTC (the range is read in the configured zone).
+        let d = way.ds_with(|c| c.timezone = crate::clock::Zone::Utc);
         let a = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_a", 0.9);
         let b = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_b", 0.9);
         let c = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.9);
@@ -2777,8 +2891,25 @@ mod tests {
         )
         .await;
         assert_eq!(v["frames"], serde_json::json!([c]), "the filters apply");
-        // The date range too: only the days on screen, as Next lists them.
+        // The time range too: only the frames on screen, as Next lists them (`a` and `c` are
+        // at 01:02:03.004 on their days).
         for (body, query, want) in [
+            (
+                r#"{"dry_run": true, "date_from": "2026-10-21", "time_from": "01:02",
+                    "date_to": "2026-10-21", "time_to": "01:02"}"#,
+                "date_from=2026-10-21&time_from=01:02&date_to=2026-10-21&time_to=01:02",
+                serde_json::json!([a]),
+            ),
+            (
+                r#"{"dry_run": true, "date_from": "2026-10-21", "time_from": "01:03"}"#,
+                "date_from=2026-10-21&time_from=01:03",
+                serde_json::json!([c]),
+            ),
+            (
+                r#"{"dry_run": true, "date_to": "2026-10-22", "time_to": "01:01", "time_from": ""}"#,
+                "date_to=2026-10-22&time_to=01:01",
+                serde_json::json!([a]),
+            ),
             (
                 r#"{"dry_run": true, "date_from": "2026-10-22"}"#,
                 "date_from=2026-10-22",
@@ -2832,6 +2963,20 @@ mod tests {
                 "/v1/review/suggest-overlaps",
                 r#"{"dry_run": true, "date_from": "2026-10-21", "date_to": "2026-10-21"}"#,
             ),
+            (
+                "/v1/review/reject-low",
+                r#"{"dry_run": true, "min_score": 0.5, "date_from": "2026-10-22",
+                    "time_from": "00:00", "time_to": "23:00", "date_to": "2026-10-22"}"#,
+            ),
+            (
+                "/v1/review/accept-repeats",
+                r#"{"dry_run": true, "date_to": "2026-10-21", "time_to": "12:00"}"#,
+            ),
+            (
+                "/v1/review/suggest-overlaps",
+                r#"{"dry_run": true, "date_from": "2026-10-21", "time_from": "01:00",
+                    "date_to": "2026-10-21", "time_to": "02:00"}"#,
+            ),
         ] {
             let (s, v) = json(&d.state, post_json(uri, body)).await;
             assert_eq!(s, StatusCode::OK, "{uri}: {v}");
@@ -2851,6 +2996,27 @@ mod tests {
                 "/v1/review/suggest-overlaps",
                 r#"{"dry_run": true, "date_from": "2026-10-22", "date_to": "2026-10-21"}"#,
                 "date_from",
+            ),
+            (
+                "/v1/review/accept-auto",
+                r#"{"dry_run": true, "time_from": "01:00"}"#,
+                "time_from: needs date_from",
+            ),
+            (
+                "/v1/review/reject-low",
+                r#"{"dry_run": true, "min_score": 0.5, "date_to": "2026-10-21", "time_to": "1:00"}"#,
+                "time_to",
+            ),
+            (
+                "/v1/review/suggest-overlaps",
+                r#"{"dry_run": true, "time_to": "01:00"}"#,
+                "time_to: needs date_to",
+            ),
+            (
+                "/v1/review/accept-repeats",
+                r#"{"dry_run": true, "date_from": "2026-10-21", "time_from": "02:00",
+                    "date_to": "2026-10-21", "time_to": "01:00"}"#,
+                "date_from: 2026-10-21 02:00 is after",
             ),
         ] {
             let (s, v) = json(&d.state, post_json(uri, body)).await;
@@ -4284,40 +4450,90 @@ mod tests {
         next_keeps_a_date_range_and_sorts_by_time_in
     );
 
-    /// `date_from` / `date_to` keep the day folders between them, both included; `dates` gives the
-    /// first and last day of every frame whatever the range; `order=newest|oldest` sorts by time,
-    /// an `auto=` filter still narrowing, never with `balance=`; a bad date is a 400 naming its
-    /// field.
+    /// `date_from` / `date_to` with the optional `time_from` / `time_to` keep the frames whose own
+    /// time, in the configured zone, is from the From minute to the end of the To minute (a To day
+    /// alone to its end), whatever day folder holds them: the folders here are named by UTC day,
+    /// as a collector whose zone was UTC names them, and the zone is Los Angeles. `dates` gives
+    /// the first and last frame day there whatever the range; `order=newest|oldest` sorts by time,
+    /// an `auto=` filter still narrowing, never with `balance=`; a bad date or time, a time without
+    /// its date and a From after the To are 400s naming the field.
     async fn next_keeps_a_date_range_and_sorts_by_time_in(way: Way) {
-        let d = way.ds();
+        let d = way.ds_with(|c| c.timezone = "America/Los_Angeles".parse().unwrap());
         // An empty folder: no span.
         let (s, v) = json(&d.state, get("/v1/review/next")).await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert!(v["dates"].is_null(), "{v}");
-        let a = put_frame(&d.dir, "drive", "2026-10-20", "20261020T010203004Z_a", 0.9);
-        let b = put_frame(&d.dir, "drive", "2026-10-21", "20261021T010203004Z_b", 0.52);
-        let c = put_frame(&d.dir, "yard", "2026-10-22", "20261022T010203004Z_c", 0.7);
-        let span = serde_json::json!({"first": "2026-10-20", "last": "2026-10-22"});
+        // In late November Los Angeles is UTC-8: `u` sits in the 25th's folder but was taken on
+        // the 24th at 17:00 there, `c` in the 27th's on the 26th at 19:00.
+        let (day, at) = ("20261124T180000000Z_a", "2026-11-24T18:00:00.000Z");
+        let a = put_frame_at(&d.dir, "drive", "2026-11-24", day, 0.9, at);
+        let (day, at) = ("20261125T010000000Z_u", "2026-11-25T01:00:00.000Z");
+        let u = put_frame_at(&d.dir, "drive", "2026-11-25", day, 0.52, at);
+        let (day, at) = ("20261125T200000000Z_b", "2026-11-25T20:00:00.000Z");
+        let b = put_frame_at(&d.dir, "yard", "2026-11-25", day, 0.7, at);
+        let (day, at) = ("20261127T030000000Z_c", "2026-11-27T03:00:00.000Z");
+        let c = put_frame_at(&d.dir, "yard", "2026-11-27", day, 0.6, at);
+        let span = serde_json::json!({"first": "2026-11-24", "last": "2026-11-26"});
         let frames = |rows: Vec<(String, Option<u64>)>| -> Vec<String> {
             rows.into_iter().map(|(f, _)| f).collect()
         };
         let v = next_of(&d, &[]).await;
-        assert_eq!(v["total"], 3, "{v}");
-        assert_eq!(v["dates"], span, "{v}");
-        // From alone, to alone, one day, a range no frame is in.
+        assert_eq!(v["total"], 4, "{v}");
+        assert_eq!(
+            v["dates"], span,
+            "the frames' days in the zone, not the folders': {v}"
+        );
+        // From alone, to alone, one day, hours, one minute, a range no frame is in.
         for (params, want) in [
-            (&[("date_from", "2026-10-21")][..], vec![&b, &c]),
-            (&[("date_to", "2026-10-21")], vec![&a, &b]),
+            (&[("date_from", "2026-11-25")][..], vec![&b, &c]),
+            (&[("date_to", "2026-11-24")], vec![&a, &u]),
             (
-                &[("date_from", "2026-10-21"), ("date_to", "2026-10-21")],
+                &[("date_from", "2026-11-24"), ("date_to", "2026-11-24")],
+                vec![&a, &u],
+            ),
+            // The 25th's folder holds `u`, which is the 24th's.
+            (
+                &[("date_from", "2026-11-25"), ("date_to", "2026-11-25")],
                 vec![&b],
             ),
+            (
+                &[
+                    ("date_from", "2026-11-24"),
+                    ("time_from", "16:00"),
+                    ("date_to", "2026-11-24"),
+                    ("time_to", "18:00"),
+                ],
+                vec![&u],
+            ),
+            (
+                &[
+                    ("date_from", "2026-11-24"),
+                    ("time_from", "17:00"),
+                    ("date_to", "2026-11-24"),
+                    ("time_to", "17:00"),
+                ],
+                vec![&u],
+            ),
+            (
+                &[
+                    ("date_from", "2026-11-24"),
+                    ("time_from", "17:01"),
+                    ("date_to", "2026-11-24"),
+                    ("time_to", "18:00"),
+                ],
+                vec![],
+            ),
+            (
+                &[("date_from", "2026-11-26"), ("time_from", "19:00")],
+                vec![&c],
+            ),
+            (&[("date_to", "2026-11-24"), ("time_to", "16:59")], vec![&a]),
             (&[("date_from", "2027-01-01")], vec![]),
         ] {
             let v = next_of(&d, params).await;
             assert_eq!(v["total"], want.len(), "{params:?}: {v}");
             assert_eq!(v["counts"]["total"], want.len(), "{params:?}: {v}");
-            assert_eq!(v["dates"], span, "the span is before every filter: {v}");
+            assert_eq!(v["dates"], span, "the span is before the range: {v}");
             let uncertain: Vec<(&str, &str)> = params
                 .iter()
                 .copied()
@@ -4325,25 +4541,26 @@ mod tests {
                 .collect();
             let mut got = frames(order_of(&d, &uncertain).await);
             got.sort();
-            let want: Vec<String> = want.into_iter().cloned().collect();
+            let mut want: Vec<String> = want.into_iter().cloned().collect();
+            want.sort();
             assert_eq!(got, want, "{params:?}");
         }
         // The time orders, with a range too.
         assert_eq!(
             frames(order_of(&d, &[("order", "newest")]).await),
-            [c.clone(), b.clone(), a.clone()]
+            [c.clone(), b.clone(), u.clone(), a.clone()]
         );
         assert_eq!(
             frames(order_of(&d, &[("order", "oldest")]).await),
-            [a.clone(), b.clone(), c.clone()]
+            [a.clone(), u.clone(), b.clone(), c.clone()]
         );
         assert_eq!(
-            frames(order_of(&d, &[("order", "oldest"), ("date_from", "2026-10-21")]).await),
+            frames(order_of(&d, &[("order", "oldest"), ("date_from", "2026-11-25")]).await),
             [b.clone(), c.clone()]
         );
         let v = next_of(&d, &[("order", "newest")]).await;
         assert_eq!(v["item"]["frame"], c.as_str(), "{v}");
-        assert_eq!(v["upcoming"], serde_json::json!([b, a]), "{v}");
+        assert_eq!(v["upcoming"], serde_json::json!([b, u, a]), "{v}");
         assert!(
             v["item"]["event_rank"].is_null() && v["need"].is_null(),
             "{v}"
@@ -4351,15 +4568,27 @@ mod tests {
         // An auto filter narrows a time order and leaves it the time order.
         assert_eq!(
             frames(order_of(&d, &[("order", "oldest"), ("auto", "none")]).await),
-            [a.clone(), b.clone(), c.clone()]
+            [a.clone(), u.clone(), b.clone(), c.clone()]
         );
-        // Two orders, a bad date, a From after the To: 400s that say which.
+        // Two orders, a bad date or time, a time without its date, a From after the To: 400s
+        // that say which.
         for (query, says) in [
             ("order=newest&balance=class", "two orders"),
             ("order=oldest&balance=scene", "two orders"),
             ("date_from=2026-13-01", "date_from"),
             ("date_to=21-10-2026", "date_to"),
             ("date_from=2026-10-22&date_to=2026-10-21", "date_from"),
+            ("time_from=16:00", "time_from: needs date_from"),
+            (
+                "date_from=2026-11-24&time_to=18:00",
+                "time_to: needs date_to",
+            ),
+            ("date_from=2026-11-24&time_from=4pm", "time_from"),
+            ("date_to=2026-11-24&time_to=24:00", "time_to"),
+            (
+                "date_from=2026-11-24&time_from=18:00&date_to=2026-11-24&time_to=16:00",
+                "date_from: 2026-11-24 18:00 is after date_to 2026-11-24 16:00",
+            ),
         ] {
             let (s, v) = json(&d.state, get(&format!("/v1/review/next?{query}"))).await;
             assert_eq!(s, StatusCode::BAD_REQUEST, "{query}: {v}");
@@ -4765,7 +4994,7 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let mut f = Filters::from_query(&q).unwrap();
+        let mut f = Filters::from_query_in(&q, review_zone(&d.state)).unwrap();
         f.order = next_order(&q, &f).unwrap();
         let ReviewCtx {
             dir,

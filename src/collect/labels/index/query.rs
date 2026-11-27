@@ -7,8 +7,10 @@
 //! sort would put there. The time orders ([`Order::Newest`], [`Order::Oldest`]) take the same
 //! pass with the time and the path alone ([`Hit::order`]).
 //!
-//! The date filter is a shard's (a day folder's): [`Compiled::in_days`] decides wherever a row is
-//! counted, after its camera and day are marked for the filter lists, as the walk does.
+//! The time filter is a row's, on its own sidecar time ([`Shard::timestamp`], never the shard's
+//! day folder, which may be named in another zone): [`Compiled::in_range`] decides wherever a row
+//! is counted, after its classes and time are marked for the filter lists and `dates`, as the walk
+//! does.
 //!
 //! The Recommended order ([`Order::Recommended`]) is no key of a row alone: a row's event rank
 //! depends on the other rows of its event, and its need on the reviewed rows ([`need::CellTally`],
@@ -26,8 +28,8 @@
 use super::super::Status;
 use super::super::need::{self, CellBox, CellTally, DayOut, Need, RecallNeed, Scorer};
 use super::super::queue::{
-    AutoFilter, Balance, BalanceNeed, BalanceTally, ClassNeed, Counts, DayRange, DaySpan, Filters,
-    Item, Order, QueueSource, SortKey, StatusFilter, Uncertainty,
+    AutoFilter, Balance, BalanceNeed, BalanceTally, ClassNeed, Counts, DaySpan, Filters, Item,
+    MsSpan, Order, QueueSource, SortKey, StatusFilter, TimeRange, Uncertainty,
 };
 use super::super::recommend;
 use super::super::statics;
@@ -70,8 +72,8 @@ struct Compiled {
     queue_only: bool,
     scene: Want,
     camera: Want,
-    /// The day folders kept, checked per shard ([`Self::in_days`]).
-    days: DayRange,
+    /// The frame times kept, checked per row ([`Self::in_range`]).
+    range: TimeRange,
     /// [`Order::Newest`] (true) or [`Order::Oldest`] (false): rows sort by time alone
     /// ([`Hit::order`]). None = by [`SortKey`].
     time: Option<bool>,
@@ -107,7 +109,7 @@ impl Weigh {
         // strings. And the (class set, camera) pairs of the listed rows, whose class part is asked.
         let mut groups: HashMap<(u32, u32, Name, Name), u64> = HashMap::new();
         let mut listed: BTreeSet<(u32, Name)> = BTreeSet::new();
-        for shard in state.shards.values().filter(|s| q.in_days(s)) {
+        for shard in state.shards.values() {
             for row in &shard.rows {
                 if !q.counts(shard, row) {
                     continue;
@@ -212,7 +214,7 @@ impl Compiled {
             queue_only: f.source == QueueSource::Queue,
             scene: Want::of(f.scene.as_deref(), names),
             camera: Want::of(f.camera.as_deref(), names),
-            days: f.days.clone(),
+            range: f.range,
             time: match f.order {
                 Order::Newest => Some(true),
                 Order::Oldest => Some(false),
@@ -253,9 +255,9 @@ impl Compiled {
         !self.queue_only || r.queued
     }
 
-    /// The rows of `shard` pass the date filter: its day folder is in the range.
-    fn in_days(&self, shard: &Shard) -> bool {
-        self.days.is_any() || self.days.keeps(need::date_of(&shard.day))
+    /// `r` of `shard` passes the time filter: its own sidecar time is in the range.
+    fn in_range(&self, shard: &Shard, r: &Row) -> bool {
+        self.range.keeps(shard.timestamp(r))
     }
 
     /// Passes the scene, camera and bucket filters.
@@ -298,7 +300,7 @@ impl Compiled {
             && !r.gone
             && r.readable()
             && self.by_class(r)
-            && self.in_days(shard)
+            && self.in_range(shard, r)
     }
 
     /// Whether the queue lists `r` of `shard`.
@@ -401,8 +403,9 @@ struct Tally {
     class_sets: Vec<bool>,
     /// By name: a candidate has this camera.
     cameras: Vec<bool>,
-    /// The first and last day folder of a candidate.
-    dates: Option<DaySpan>,
+    /// The earliest and latest time of a readable row the filters above the class filter keep
+    /// ([`DaySpan`]).
+    span: MsSpan,
     /// By training set: reviewed frames that have it.
     training: Vec<u64>,
     unreadable: u64,
@@ -544,15 +547,12 @@ enum Step<'a> {
 /// counts and unreadable frames, `each` every counted row and the end of each shard.
 fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn FnMut(Step<'a>)) {
     for shard in state.shards.values() {
-        let in_days = q.in_days(shard);
-        let mut candidate = false;
         for row in &shard.rows {
             if !q.in_source(row) {
                 continue;
             }
             Tally::mark(&mut tally.cameras, row.cand.camera);
-            candidate = true;
-            if row.gone || !in_days || !q.by_line(row) {
+            if row.gone || !q.by_line(row) {
                 continue;
             }
             if !row.readable() {
@@ -560,14 +560,13 @@ fn pass<'a>(state: &'a State, q: &Compiled, tally: &mut Tally, each: &mut dyn Fn
                 continue;
             }
             Tally::mark(&mut tally.class_sets, row.classes());
-            if !q.by_class(row) {
+            let ms = recommend::event_ms(shard.timestamp(row));
+            DaySpan::widen(&mut tally.span, ms);
+            if !q.by_class(row) || !q.range.keeps_ms(ms) {
                 continue;
             }
             tally.count(row);
             each(Step::Counted(shard, row, q.by_state(row)));
-        }
-        if candidate {
-            DaySpan::widen(&mut tally.dates, need::date_of(&shard.day));
         }
         each(Step::DayDone);
     }
@@ -730,8 +729,14 @@ impl<'a> Held<'a> {
 /// shard parts of [`NeedCache`].
 fn count_key(f: &Filters) -> String {
     format!(
-        "{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}",
-        f.source, f.scene, f.camera, f.bucket, f.label, f.days
+        "{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}",
+        f.source,
+        f.scene,
+        f.camera,
+        f.bucket,
+        f.label,
+        f.range.from_ms(),
+        f.range.to_ms()
     )
 }
 
@@ -835,7 +840,7 @@ pub(super) fn answer(
     let mut shown = upcoming.clone();
     shown.extend(found.iter().map(|i| i.frame.clone()));
     let unreadable = tally.unreadable + state.damaged(f.source == QueueSource::All);
-    let dates = tally.dates.take();
+    let dates = DaySpan::of(tally.span, f.range.zone());
     let (counts, cameras, labels) = tally.finish(names);
     let answer = Answer {
         position: found.as_ref().map(|_| placed.position),

@@ -28,11 +28,14 @@ pub struct Answer {
     pub total: usize,
     pub counts: Counts,
     pub cameras: Vec<String>,
-    /// The first and last day folder among the source's candidates, before every filter, as
-    /// `cameras`: `{"first": "YYYY-MM-DD", "last": "YYYY-MM-DD"}`, null without a candidate.
+    /// The first and last frame day, in the filter's zone, of the readable frames the source,
+    /// bucket, scene and camera filters keep, before the class, time, status and auto filters
+    /// ([`queue::Queue::dates`], [`DaySpan`]): `{"first": "YYYY-MM-DD", "last": "YYYY-MM-DD"}`,
+    /// null without one.
     pub dates: Option<DaySpan>,
     pub labels: Vec<String>,
-    /// Sidecars and label files that do not parse, and damaged lines.
+    /// Sidecars and label files that do not parse, and damaged lines; not narrowed by a time
+    /// range (a frame's time is in the sidecar that does not read).
     pub unreadable: u64,
     /// The next frames after [`Self::item`], for the page to load ahead.
     pub upcoming: Vec<String>,
@@ -50,12 +53,13 @@ pub struct Answer {
 pub(super) const UPCOMING: usize = 5;
 
 impl Answer {
-    /// The answer from the files: [`queue::build`], [`queue::next_after`] and
-    /// [`layout::damaged_lines`]. What the index has to equal. `after` and `then` as
-    /// [`queue::next_after`] reads them.
+    /// The answer from the files: [`queue::build_every_folder`] (every day folder whatever the
+    /// time range, as the index counts every row: `dates`, `labels` and `unreadable` are of them
+    /// all), [`queue::next_after`] and [`layout::damaged_lines`]. What the index has to equal.
+    /// `after` and `then` as [`queue::next_after`] reads them.
     pub fn walk(dir: &Path, f: &Filters, after: Option<&str>, then: Option<&str>) -> Self {
         let damaged = layout::damaged_lines(dir, f.source == QueueSource::All);
-        Self::of(queue::build(dir, f), damaged, after, then)
+        Self::of(queue::build_every_folder(dir, f), damaged, after, then)
     }
 
     /// The answer of a built queue with `damaged` lines left out of it.

@@ -63,6 +63,7 @@ impl Finish {
         let scope = import_id.map(|id| FrameFilter {
             query: [("import".to_string(), id.to_string())].into(),
             limit: STEP_LIMIT,
+            zone: None,
         });
         let keep = |rel: &str| match &scope {
             None => true,

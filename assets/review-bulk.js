@@ -140,7 +140,7 @@
       var box = o.box, body = o.start || {};
       o.keys.forEach(function (k) {
         var e = filtersForm.elements[k];
-        if (e && e.value) body[k] = e.value;
+        if (e && e.value && !e.disabled) body[k] = e.value;
       });
       if (o.extra) o.extra(body);
       body.dry_run = true;
@@ -173,8 +173,8 @@
       }).then(function () { o.button.disabled = false; });
     }
 
-    var ALL_KEYS = ['bucket', 'scene', 'camera', 'label', 'source', 'date_from', 'date_to'];
-    var NO_SOURCE_KEYS = ['bucket', 'scene', 'camera', 'label', 'date_from', 'date_to'];
+    var ALL_KEYS = ['bucket', 'scene', 'camera', 'label', 'source', 'date_from', 'date_to', 'time_from', 'time_to'];
+    var NO_SOURCE_KEYS = ['bucket', 'scene', 'camera', 'label', 'date_from', 'date_to', 'time_from', 'time_to'];
 
     var bulkBtn = $('rv-accept-auto');
     if (bulkBtn) {

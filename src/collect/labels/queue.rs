@@ -1,5 +1,5 @@
 //! The review queue: the frames of `review-queue.jsonl` (and, with [`QueueSource::All`], every
-//! indexed frame), filtered by bucket, scene, camera, day folder ([`DayRange`]), object class
+//! indexed frame), filtered by bucket, scene, camera, the frame's time ([`TimeRange`]), object class
 //! ([`frame_labels`]), review status and auto-label state ([`AutoFilter`]), and sorted by
 //! uncertainty ([`Uncertainty`]): frames with likely boxes first, then fewer flagged boxes, then the
 //! near-threshold margin, verifier disagreement, the number of suppressed boxes, then newest; or,
@@ -501,101 +501,349 @@ pub enum Order {
     Oldest,
 }
 
-/// `date_from` / `date_to`: the day folders (`<scene>/<camera>/<YYYY-MM-DD>/`, the frame's day in
-/// the configured zone when it was collected) a queue keeps, both ends included; either end absent
-/// = unbounded. The sidecar's timestamp plays no part: the folder is the day the page shows.
-/// Built by [`Self::parse`] only, so both ends are real dates and `from <= to`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DayRange {
-    from: Option<String>,
-    to: Option<String>,
+/// `date_from` / `date_to` (`YYYY-MM-DD`) with the optional `time_from` / `time_to` (`HH:MM`,
+/// 24-hour): the frames a queue keeps by their own time, the sidecar's `timestamp`
+/// ([`recommend::event_ms`]), read in a zone (the configured one, [`crate::clock::zone`], for
+/// [`Filters::from_query`]). Not the day folder: a folder is named by the collector's zone when the
+/// frame was written, which need not be today's (folders written under UTC hold a Pacific
+/// evening in the next day's folder), and folders are never renamed.
+///
+/// The bounds are instants, resolved once by [`Self::parse`] ([`crate::clock::Zone::parse_wall`]:
+/// at a fold the earlier instant, in a gap the wall time moved forward by the gap): from =
+/// `date_from` at `time_from` (else 00:00), included; to = `date_to` at `time_to` plus one minute
+/// (the whole To minute is in), else the next day's 00:00, excluded. Either end absent =
+/// unbounded. A frame whose timestamp does not parse is out whenever an end is set. The zone
+/// also reads [`DaySpan`] (`dates`), with or without an end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeRange {
+    /// Unix milliseconds, included.
+    from_ms: Option<i64>,
+    /// Unix milliseconds, excluded.
+    to_ms: Option<i64>,
+    zone: crate::clock::Zone,
 }
 
-impl DayRange {
-    /// The range of `from` and `to` (trimmed; empty = unbounded). Errors name the field: not a
-    /// `YYYY-MM-DD` date, or `date_from` after `date_to`.
-    pub fn parse(from: Option<&str>, to: Option<&str>) -> Result<Self, String> {
-        let day = |field: &str, v: Option<&str>| -> Result<Option<String>, String> {
-            match v.map(str::trim).filter(|v| !v.is_empty()) {
+impl Default for TimeRange {
+    /// Unbounded, days read in UTC (a [`Filters`] built by hand; [`Filters::from_query`] takes the
+    /// configured zone).
+    fn default() -> Self {
+        Self::any_in(crate::clock::Zone::Utc)
+    }
+}
+
+/// 23:59, where a To day given without a time ends (for comparing walls).
+const LAST_MINUTE: chrono::NaiveTime = match chrono::NaiveTime::from_hms_opt(23, 59, 0) {
+    Some(t) => t,
+    None => chrono::NaiveTime::MIN,
+};
+
+/// The widest offsets from UTC a zone has (UTC+14, UTC-12), in milliseconds: a day folder named
+/// by its day in any zone holds frames from `14 h` before that UTC day to `12 h` after it.
+const EAST_MOST_MS: i64 = 14 * 3_600_000;
+const WEST_MOST_MS: i64 = 12 * 3_600_000;
+const DAY_MS: i64 = 86_400_000;
+
+/// Which pass of a wall time that happens twice (a fold) a bound takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    First,
+    Last,
+}
+
+/// The instant (unix milliseconds) of wall time `naive` in `zone`, and whether it exists: at a
+/// fold its first or last pass (`pass`); in a gap (it never happens) the first instant after the
+/// gap, with `false`. None only out of chrono's range.
+///
+/// The candidates are `naive` read with the offsets in effect a day before, at and a day after
+/// [`crate::clock::Zone::parse_wall`]'s instant (no zone changes its offset twice within a day);
+/// one that reads back as `naive` is a pass. With none, the gap's end is found by bisection
+/// between a day before (its wall is before `naive`) and that instant (after the gap, so after
+/// `naive`): the first millisecond whose wall time is past `naive`.
+fn wall_instant(
+    zone: crate::clock::Zone,
+    naive: chrono::NaiveDateTime,
+    pass: Pass,
+) -> Option<(i64, bool)> {
+    use chrono::{DateTime, TimeDelta, Utc};
+    let near = zone.parse_wall(naive)?;
+    let day = TimeDelta::days(1);
+    let passes = [
+        near.checked_sub_signed(day),
+        Some(near),
+        near.checked_add_signed(day),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|t| {
+        let offset = i64::from(zone.offset_at(t).local_minus_utc());
+        let at = naive
+            .checked_sub_signed(TimeDelta::seconds(offset))?
+            .and_utc();
+        (zone.wall(at) == naive).then_some(at.timestamp_millis())
+    });
+    let found = match pass {
+        Pass::First => passes.min(),
+        Pass::Last => passes.max(),
+    };
+    if let Some(ms) = found {
+        return Some((ms, true));
+    }
+    let wall_of = |ms: i64| DateTime::<Utc>::from_timestamp_millis(ms).map(|t| zone.wall(t));
+    let (mut lo, mut hi) = (near.timestamp_millis() - DAY_MS, near.timestamp_millis());
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if wall_of(mid)? > naive {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some((hi, false))
+}
+
+/// `v` trimmed, None when absent or empty.
+fn given(v: Option<&str>) -> Option<&str> {
+    v.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// `HH:MM`, 24-hour, two digits each.
+fn wall_time(t: &str) -> Option<chrono::NaiveTime> {
+    let b = t.as_bytes();
+    let two = |i: usize| -> Option<u32> {
+        let (h, l) = (*b.get(i)?, *b.get(i + 1)?);
+        (h.is_ascii_digit() && l.is_ascii_digit())
+            .then(|| u32::from(h - b'0') * 10 + u32::from(l - b'0'))
+    };
+    if b.len() != 5 || b.get(2) != Some(&b':') {
+        return None;
+    }
+    chrono::NaiveTime::from_hms_opt(two(0)?, two(3)?, 0)
+}
+
+impl TimeRange {
+    /// No end, days read in `zone`.
+    pub fn any_in(zone: crate::clock::Zone) -> Self {
+        Self {
+            from_ms: None,
+            to_ms: None,
+            zone,
+        }
+    }
+
+    /// The range of `date_from` / `time_from` / `date_to` / `time_to` in `zone` (each trimmed;
+    /// empty = not given). Errors name the field: not a `YYYY-MM-DD` date (or no such day), not an
+    /// `HH:MM` time, a time without its date (`time_from: needs date_from`), or a From after the
+    /// To (From and To the same minute keep that minute).
+    ///
+    /// Daylight saving: at a fold (a wall time that happens twice) From takes the first pass and
+    /// To ends after the last; in a gap (a wall time that never happens) either end is the first
+    /// instant after the gap, so a From of 02:30 on a spring-forward night in Los Angeles starts
+    /// at 03:00 PDT and a To of 02:30 ends there. [`crate::clock::Zone::parse_wall`] stays as it
+    /// is for its other callers.
+    pub fn parse(
+        date_from: Option<&str>,
+        time_from: Option<&str>,
+        date_to: Option<&str>,
+        time_to: Option<&str>,
+        zone: crate::clock::Zone,
+    ) -> Result<Self, String> {
+        let day = |field: &str, v: Option<&str>| -> Result<Option<chrono::NaiveDate>, String> {
+            match given(v) {
                 None => Ok(None),
-                Some(d)
-                    if layout::date_ok(d)
-                        && chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok() =>
-                {
-                    Ok(Some(d.to_string()))
-                }
-                Some(d) => Err(format!(
-                    "{field}: '{}' is not a date (YYYY-MM-DD)",
-                    d.escape_debug()
-                )),
+                Some(d) => layout::date_ok(d)
+                    .then(|| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                    .flatten()
+                    .map(Some)
+                    .ok_or_else(|| {
+                        format!("{field}: '{}' is not a date (YYYY-MM-DD)", d.escape_debug())
+                    }),
             }
         };
-        let (from, to) = (day("date_from", from)?, day("date_to", to)?);
-        if let (Some(f), Some(t)) = (&from, &to)
-            && f > t
-        {
+        let time = |field: &str, v: Option<&str>| -> Result<Option<chrono::NaiveTime>, String> {
+            match given(v) {
+                None => Ok(None),
+                Some(t) => wall_time(t).map(Some).ok_or_else(|| {
+                    format!(
+                        "{field}: '{}' is not a time (HH:MM, 24-hour)",
+                        t.escape_debug()
+                    )
+                }),
+            }
+        };
+        let (df, tf) = (day("date_from", date_from)?, time("time_from", time_from)?);
+        let (dt, tt) = (day("date_to", date_to)?, time("time_to", time_to)?);
+        if df.is_none() && tf.is_some() {
+            return Err("time_from: needs date_from (a time is of a day; pick a From day)".into());
+        }
+        if dt.is_none() && tt.is_some() {
+            return Err("time_to: needs date_to (a time is of a day; pick a To day)".into());
+        }
+        let instant = |field: &str, wall: chrono::NaiveDateTime, pass: Pass| {
+            wall_instant(zone, wall, pass).ok_or_else(|| format!("{field}: {wall} is out of range"))
+        };
+        // From: the first pass of its minute at a fold, the end of a gap it falls in.
+        let from_ms = df
+            .map(|d| {
+                let wall = d.and_time(tf.unwrap_or_default());
+                instant("date_from", wall, Pass::First).map(|(ms, _)| ms)
+            })
+            .transpose()?;
+        let to_ms = match (dt, tt) {
+            // To a minute: past its last pass at a fold; a minute a gap skips has no end of its
+            // own, the range ends where the gap does.
+            (Some(d), Some(t)) => {
+                let (ms, exists) = instant("date_to", d.and_time(t), Pass::Last)?;
+                Some(if exists { ms + 60_000 } else { ms })
+            }
+            // To a day: where the next day starts.
+            (Some(d), None) => {
+                let next = d
+                    .succ_opt()
+                    .ok_or_else(|| format!("date_to: {d} is out of range"))?;
+                let (ms, _) = instant(
+                    "date_to",
+                    next.and_time(chrono::NaiveTime::MIN),
+                    Pass::First,
+                )?;
+                Some(ms)
+            }
+            (None, _) => None,
+        };
+        // Refused by the walls the person picked (a To day alone ends at its 23:59), so a fold
+        // that would let the instants pass cannot hide a From after the To; the instants follow
+        // the walls, so they never cross otherwise.
+        let from_wall = df.map(|d| d.and_time(tf.unwrap_or_default()));
+        let to_wall = dt.map(|d| d.and_time(tt.unwrap_or(LAST_MINUTE)));
+        let walls_cross = from_wall.zip(to_wall).is_some_and(|(f, t)| f > t);
+        let instants_cross = from_ms.zip(to_ms).is_some_and(|(f, t)| f > t);
+        if walls_cross || instants_cross {
+            let at = |d: Option<chrono::NaiveDate>, t: Option<chrono::NaiveTime>| {
+                let d = d
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                match t {
+                    Some(t) => format!("{d} {}", t.format("%H:%M")),
+                    None => d,
+                }
+            };
             return Err(format!(
-                "date_from: {f} is after date_to {t}; pick a From day on or before the To day"
+                "date_from: {} is after date_to {}; pick a From on or before the To",
+                at(df, tf),
+                at(dt, tt)
             ));
         }
-        Ok(Self { from, to })
+        Ok(Self {
+            from_ms,
+            to_ms,
+            zone,
+        })
     }
 
-    /// Whether the day folder named `date` (`YYYY-MM-DD`) is in the range. Dates of that shape
-    /// compare as text in calendar order.
-    pub fn keeps(&self, date: &str) -> bool {
-        self.from.as_deref().is_none_or(|f| date >= f)
-            && self.to.as_deref().is_none_or(|t| date <= t)
+    /// Whether a frame of time `ms` (unix milliseconds, None = its timestamp does not parse) is in
+    /// the range: every frame without an end, else `from <= ms < to`.
+    pub fn keeps_ms(&self, ms: Option<i64>) -> bool {
+        if self.is_any() {
+            return true;
+        }
+        ms.is_some_and(|ms| {
+            self.from_ms.is_none_or(|f| ms >= f) && self.to_ms.is_none_or(|t| ms < t)
+        })
     }
 
-    /// No end set: every day.
+    /// Whether the day folder named `date` (`YYYY-MM-DD`) may hold a frame in the range: true
+    /// without an end, for a name that is not a date, and when the instants a folder of that day
+    /// covers in any zone (UTC-12 to UTC+14: from 14 h before that UTC day to 12 h after it)
+    /// meet the range. A cheap skip ahead of the exact check of each frame's time
+    /// ([`Self::keeps`]), which still decides: it never drops a frame a collector filed by its
+    /// day in its own zone. [`build`] uses it; the Next walk ([`build_every_folder`]) does not.
+    pub fn may_hold_folder(&self, date: &str) -> bool {
+        if self.is_any() {
+            return true;
+        }
+        let Some(day) = layout::date_ok(date)
+            .then(|| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+            .flatten()
+        else {
+            return true;
+        };
+        let start = day
+            .and_time(chrono::NaiveTime::MIN)
+            .and_utc()
+            .timestamp_millis();
+        let (lo, hi) = (start - EAST_MOST_MS, start + DAY_MS + WEST_MOST_MS);
+        self.from_ms.is_none_or(|f| f < hi) && self.to_ms.is_none_or(|t| lo < t)
+    }
+
+    /// [`Self::keeps_ms`] of a sidecar `timestamp` (parsed only when an end is set).
+    pub fn keeps(&self, timestamp: &str) -> bool {
+        self.is_any() || self.keeps_ms(recommend::event_ms(timestamp))
+    }
+
+    /// No end set: every frame.
     pub fn is_any(&self) -> bool {
-        self.from.is_none() && self.to.is_none()
+        self.from_ms.is_none() && self.to_ms.is_none()
     }
 
-    pub fn from(&self) -> Option<&str> {
-        self.from.as_deref()
+    /// The first instant in, unix milliseconds.
+    pub fn from_ms(&self) -> Option<i64> {
+        self.from_ms
     }
 
-    pub fn to(&self) -> Option<&str> {
-        self.to.as_deref()
+    /// The first instant past the range, unix milliseconds.
+    pub fn to_ms(&self) -> Option<i64> {
+        self.to_ms
+    }
+
+    /// The zone the bounds were read in, and [`DaySpan`] reads days in.
+    pub fn zone(&self) -> crate::clock::Zone {
+        self.zone
     }
 }
 
-/// The earliest and latest day folder among a queue's candidates (before every filter), for the
-/// page's date inputs: `{"first": "YYYY-MM-DD", "last": "YYYY-MM-DD"}`.
+/// The earliest and latest frame day of a queue, for the page's date inputs: `{"first":
+/// "YYYY-MM-DD", "last": "YYYY-MM-DD"}`, the days in the filter's zone ([`TimeRange::zone`]) of
+/// the earliest and latest sidecar time ([`recommend::event_ms`]) among the readable frames the
+/// source, bucket, scene and camera filters keep, before the class, time, status and auto filters
+/// (where the class list is gathered). A frame whose time does not parse plays no part.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DaySpan {
     pub first: String,
     pub last: String,
 }
 
+/// The earliest and latest time seen (unix milliseconds), on the way to a [`DaySpan`].
+pub(super) type MsSpan = Option<(i64, i64)>;
+
 impl DaySpan {
-    /// `span` widened to `date`.
-    pub(super) fn widen(span: &mut Option<Self>, date: &str) {
-        match span {
-            None => {
-                *span = Some(Self {
-                    first: date.to_string(),
-                    last: date.to_string(),
-                });
-            }
-            Some(s) => {
-                if date < s.first.as_str() {
-                    date.clone_into(&mut s.first);
-                }
-                if date > s.last.as_str() {
-                    date.clone_into(&mut s.last);
-                }
-            }
+    /// `span` widened to `ms` (None: nothing).
+    pub(super) fn widen(span: &mut MsSpan, ms: Option<i64>) {
+        let Some(ms) = ms else { return };
+        *span = Some(match *span {
+            None => (ms, ms),
+            Some((lo, hi)) => (lo.min(ms), hi.max(ms)),
+        });
+    }
+
+    /// `a` and `b` together.
+    pub(super) fn merge(a: MsSpan, b: MsSpan) -> MsSpan {
+        match (a, b) {
+            (Some((a0, a1)), Some((b0, b1))) => Some((a0.min(b0), a1.max(b1))),
+            (a, None) => a,
+            (None, b) => b,
         }
     }
-}
 
-/// The day folder's date of frame `rel` (`<scene>/<camera>/<date>/<stem>.jpg`, already checked by
-/// [`layout::parse_rel`]): what [`DayRange`] compares.
-pub(super) fn date_of_rel(rel: &str) -> &str {
-    need::date_of(day_of(rel))
+    /// The days of `span` in `zone`.
+    pub(super) fn of(span: MsSpan, zone: crate::clock::Zone) -> Option<Self> {
+        let (lo, hi) = span?;
+        let day = |ms: i64| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(|t| zone.display_date(t))
+        };
+        Some(Self {
+            first: day(lo)?,
+            last: day(hi)?,
+        })
+    }
 }
 
 /// Queue filters (`GET /v1/review/next?...`).
@@ -604,8 +852,9 @@ pub struct Filters {
     pub bucket: Option<Bucket>,
     pub scene: Option<String>,
     pub camera: Option<String>,
-    /// Only frames whose day folder is in this range (`date_from`, `date_to`); default = any day.
-    pub days: DayRange,
+    /// Only frames whose own time is in this range (`date_from`, `time_from`, `date_to`,
+    /// `time_to`), and the zone [`Queue::dates`] reads days in; default = any time, UTC.
+    pub range: TimeRange,
     /// Only frames with any of these classes ([`frame_labels`]); empty = any frame.
     pub label: BTreeSet<String>,
     pub status: StatusFilter,
@@ -638,10 +887,19 @@ impl Filters {
     /// skipped|any`, `source` = `queue|all`, `auto` = `review|accept|nothing|none|repeats|
     /// overlaps|both|dismissed|refine`, `refine_kind` = `add|tighten|relabel|verify`, only with
     /// `auto=refine`, `balance` = a comma list of `class|scene|camera`, [`Balance::parse`],
-    /// `date_from` / `date_to` = `YYYY-MM-DD`, the day folders kept, both included,
-    /// [`DayRange::parse`]); empty values mean "any". Errors name the field. Never reads `order`: the order is
-    /// [`Order::Uncertain`] for every caller but `GET /v1/review/next`, which sets it itself.
+    /// `date_from` / `date_to` = `YYYY-MM-DD` and `time_from` / `time_to` = `HH:MM`, the frames'
+    /// own times kept, read in the configured zone, [`TimeRange::parse`]); empty values mean
+    /// "any". Errors name the field. Never reads `order`: the order is [`Order::Uncertain`] for
+    /// every caller but `GET /v1/review/next`, which sets it itself.
     pub fn from_query(q: &BTreeMap<String, String>) -> Result<Self, String> {
+        Self::from_query_in(q, crate::clock::zone())
+    }
+
+    /// [`Self::from_query`] with the times read in `zone`.
+    pub fn from_query_in(
+        q: &BTreeMap<String, String>,
+        zone: crate::clock::Zone,
+    ) -> Result<Self, String> {
         let get = |k: &str| q.get(k).map(|v| v.trim()).filter(|v| !v.is_empty());
         let bucket = match get("bucket") {
             None => None,
@@ -715,12 +973,18 @@ impl Filters {
             }
         };
         let balance = Balance::parse(get("balance").unwrap_or(""))?;
-        let days = DayRange::parse(get("date_from"), get("date_to"))?;
+        let range = TimeRange::parse(
+            get("date_from"),
+            get("time_from"),
+            get("date_to"),
+            get("time_to"),
+            zone,
+        )?;
         Ok(Self {
             bucket,
             scene,
             camera: get("camera").map(str::to_string),
-            days,
+            range,
             label,
             status,
             source,
@@ -1262,13 +1526,16 @@ pub struct Queue {
     pub counts: Counts,
     /// Cameras among the candidates (for the filter list).
     pub cameras: Vec<String>,
-    /// The first and last day folder among the candidates, before every filter (for the date
-    /// inputs' bounds); None without a candidate.
+    /// The first and last frame day ([`DaySpan`]: of the frames' own times, in the filter's zone)
+    /// of the readable frames the source, bucket, scene and camera filters keep, before the class,
+    /// time, status and auto filters (for the date inputs' bounds); None without one.
     pub dates: Option<DaySpan>,
-    /// Classes ([`frame_labels`]) of the frames the bucket, scene, camera and date filters keep, before
-    /// the class filter (for the filter list).
+    /// Classes ([`frame_labels`]) of the readable frames the source, bucket, scene and camera
+    /// filters keep, before the class and time filters (for the filter list).
     pub labels: Vec<String>,
-    /// Frames left out: unreadable sidecar or label file.
+    /// Frames left out: unreadable sidecar or label file. Not narrowed by a time range (a frame's
+    /// time is in the sidecar that does not read), but [`build`] does not read the day folders a
+    /// range cannot hold ([`TimeRange::may_hold_folder`]).
     pub unreadable: u64,
     /// With [`Filters::balance`]: the reviewed frames the order weighed against.
     pub balance: Option<BalanceTally>,
@@ -1370,6 +1637,8 @@ struct DayQueue {
     items: Vec<Item>,
     counts: Counts,
     labels: BTreeSet<String>,
+    /// The earliest and latest time of its readable frames ([`Queue::dates`]).
+    span: MsSpan,
     unreadable: u64,
     /// With [`Filters::balance_by`]: the reviewed frames counted, and per item its wanted classes.
     balance: BalanceTally,
@@ -1421,8 +1690,12 @@ fn build_day(
             q.unreadable += 1;
             continue;
         };
+        // Its own time: the time filter's, the span's and the events'.
+        let ms = recommend::event_ms(&rec.timestamp);
+        DaySpan::widen(&mut q.span, ms);
         let classes = frame_labels(&rec, labels.as_ref());
-        let keep = f.label.is_empty() || f.label.iter().any(|l| classes.contains(l));
+        let keep = (f.label.is_empty() || f.label.iter().any(|l| classes.contains(l)))
+            && f.range.keeps_ms(ms);
         let wanted = balance.map(|_| {
             let sure = frame_confidence(&rec, labels.as_ref());
             f.wanted_confidence(sure.iter().map(|(c, s)| (c.as_str(), *s)))
@@ -1444,7 +1717,7 @@ fn build_day(
             && f.auto_keeps(labels.as_ref());
         if recommended {
             q.members.push(recommend::Member {
-                ms: recommend::event_ms(&rec.timestamp),
+                ms,
                 alone: recommend::own_event(&rec),
                 decided: status != Status::Unreviewed,
                 listed: listed.then_some(q.items.len()),
@@ -1492,7 +1765,7 @@ fn build_day(
                 });
             }
             counted.push((
-                recommend::event_ms(&rec.timestamp),
+                ms,
                 recommend::own_event(&rec),
                 boxes,
                 listed.then_some(q.items.len()),
@@ -1574,8 +1847,31 @@ fn weigh_need(items: &mut [Item], facts: &[ItemFacts], n: &Need<'_>, tally: &Cel
 
 /// Build the queue of `dir` for `f`. Frames whose image or sidecar is gone (retention) are
 /// left out silently; a sidecar or label file that does not parse counts as `unreadable`.
+///
+/// Under a time range, day folders that cannot hold a frame of it are not read
+/// ([`TimeRange::may_hold_folder`]): the items, counts, balance and need are those of
+/// [`build_every_folder`], but [`Queue::dates`], [`Queue::labels`] and [`Queue::unreadable`]
+/// (gathered before the range) are of the folders read. For every caller but the Next walk:
+/// bulk actions, job selections, the CLI.
 pub fn build(dir: &Path, f: &Filters) -> Queue {
-    build_on(dir, f, None)
+    build_on(dir, f, None, Folders::InRange)
+}
+
+/// [`build`] reading every day folder whatever the range, so [`Queue::dates`],
+/// [`Queue::labels`] and [`Queue::unreadable`] are of every frame the other filters keep: the
+/// Next walk ([`super::index::Answer::walk`]), which the review index (which counts every row)
+/// must equal. Small folders, and folders past the index's ceiling.
+pub fn build_every_folder(dir: &Path, f: &Filters) -> Queue {
+    build_on(dir, f, None, Folders::Every)
+}
+
+/// Which day folders a walk reads under a time range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Folders {
+    /// Those [`TimeRange::may_hold_folder`] keeps.
+    InRange,
+    /// Every one.
+    Every,
 }
 
 /// How [`build_on`] arranges the Recommended order.
@@ -1588,9 +1884,9 @@ enum Arrangement {
     Legacy,
 }
 
-/// [`build`] on `threads` threads (None: as many as a walk of that size takes).
-fn build_on(dir: &Path, f: &Filters, threads: Option<usize>) -> Queue {
-    build_as(dir, f, threads, Arrangement::Need)
+/// [`build`] on `threads` threads (None: as many as a walk of that size takes), reading `folders`.
+fn build_on(dir: &Path, f: &Filters, threads: Option<usize>, folders: Folders) -> Queue {
+    build_as(dir, f, threads, Arrangement::Need, folders)
 }
 
 /// The Recommended order of `dir` for `f` as it was before the need model: event rank as a strict
@@ -1602,10 +1898,16 @@ pub(crate) fn build_legacy(dir: &Path, f: &Filters) -> Queue {
         order: Order::Recommended,
         ..f.clone()
     };
-    build_as(dir, &f, None, Arrangement::Legacy)
+    build_as(dir, &f, None, Arrangement::Legacy, Folders::InRange)
 }
 
-fn build_as(dir: &Path, f: &Filters, threads: Option<usize>, how: Arrangement) -> Queue {
+fn build_as(
+    dir: &Path,
+    f: &Filters,
+    threads: Option<usize>,
+    how: Arrangement,
+    folders: Folders,
+) -> Queue {
     let legacy = how != Arrangement::Need;
     let balance = if legacy {
         Some(Balance::ALL)
@@ -1617,12 +1919,11 @@ fn build_as(dir: &Path, f: &Filters, threads: Option<usize>, how: Arrangement) -
     let mut kept = Vec::new();
     for c in candidates(dir, f.source) {
         cameras.insert(c.camera.clone());
-        let date = date_of_rel(&c.rel);
-        DaySpan::widen(&mut q.dates, date);
         if f.scene.as_ref().is_some_and(|s| *s != c.scene)
             || f.camera.as_ref().is_some_and(|s| *s != c.camera)
-            || !f.days.keeps(date)
             || f.bucket.is_some_and(|b| !c.buckets.contains(&b))
+            || (folders == Folders::InRange
+                && !f.range.may_hold_folder(need::date_of(day_of(&c.rel))))
         {
             continue;
         }
@@ -1640,6 +1941,7 @@ fn build_as(dir: &Path, f: &Filters, threads: Option<usize>, how: Arrangement) -
     let (mut tally, mut wanted) = (BalanceTally::default(), Vec::new());
     let (mut cells, mut facts) = (CellTally::default(), Vec::new());
     let mut events = recommend::Events::default();
+    let mut span: MsSpan = None;
     for mut part in parts {
         // Each part is one day folder: its members' indices move by the items before it.
         let at = q.items.len();
@@ -1650,6 +1952,7 @@ fn build_as(dir: &Path, f: &Filters, threads: Option<usize>, how: Arrangement) -
         q.items.extend(part.items);
         q.counts.merge(part.counts);
         seen_labels.extend(part.labels);
+        span = DaySpan::merge(span, part.span);
         q.unreadable += part.unreadable;
         tally.merge(part.balance);
         wanted.extend(part.wanted);
@@ -1677,6 +1980,7 @@ fn build_as(dir: &Path, f: &Filters, threads: Option<usize>, how: Arrangement) -
     }
     q.cameras = cameras.into_iter().collect();
     q.labels = seen_labels.into_iter().collect();
+    q.dates = DaySpan::of(span, f.range.zone());
     q
 }
 
@@ -2006,19 +2310,20 @@ fn name_passes(rel: &str, f: &Filters, keep: &dyn Fn(&str) -> bool) -> bool {
         keep(rel)
             && !f.scene.as_ref().is_some_and(|s| *s != r.scene)
             && !f.camera.as_ref().is_some_and(|c| *c != r.camera)
-            && f.days.keeps(&r.date)
+            && f.range.may_hold_folder(&r.date)
     })
 }
 
-/// The label file at `path` of frame `rel`, when the frame's files and the bucket and class filters
-/// of `f` let it through.
+/// The label file at `path` of frame `rel`, when the frame's files and the bucket, time and class
+/// filters of `f` let it through.
 fn read_passing(walker: &mut Walker<'_>, f: &Filters, rel: &str, path: &Path) -> Option<LabelFile> {
     let frame = Frame::resolve_in(walker, rel)?;
-    // The buckets a review line or an index line carries: the sidecar's.
-    if let Some(b) = f.bucket
-        && !frame.record().ok()?.buckets.contains(&b)
-    {
-        return None;
+    // The buckets a review line or an index line carries and the frame's time: the sidecar's.
+    if f.bucket.is_some() || !f.range.is_any() {
+        let rec = frame.record().ok()?;
+        if f.bucket.is_some_and(|b| !rec.buckets.contains(&b)) || !f.range.keeps(&rec.timestamp) {
+            return None;
+        }
     }
     let l = super::read(path).ok().flatten()?;
     if !f.label.is_empty() {
@@ -2031,7 +2336,7 @@ fn read_passing(walker: &mut Walker<'_>, f: &Filters, rel: &str, path: &Path) ->
 }
 
 /// The label files of `dir` ([`super::label_files`], in its order) that the bucket, scene, camera,
-/// date and class filters of `f` and `keep` select, read one at a time, so a caller may write between
+/// time and class filters of `f` and `keep` select, read one at a time, so a caller may write between
 /// them. For edits of already labelled frames, reviewed ones too: [`build`] only reaches what
 /// `f.source` draws from (by default `review-queue.jsonl`, which a frame reviewed under "all
 /// collected" is not in), so `source` is not used here, nor are `status` and `auto`. A frame whose
@@ -2275,12 +2580,14 @@ mod tests {
 
     #[test]
     fn filters_from_the_query() {
+        // In UTC, the zone of `Filters::default()` (the process's zone is no test's to read).
         let q = |pairs: &[(&str, &str)]| {
-            Filters::from_query(
+            Filters::from_query_in(
                 &pairs
                     .iter()
                     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                     .collect(),
+                crate::clock::Zone::Utc,
             )
         };
         assert_eq!(q(&[]).unwrap(), Filters::default());
@@ -2344,51 +2651,228 @@ mod tests {
         assert!(q(&[("label", &"x".repeat(65))]).is_err());
     }
 
+    /// Unix milliseconds of an RFC 3339 time.
+    fn ms_of(t: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(t)
+            .unwrap()
+            .timestamp_millis()
+    }
+
     #[test]
-    fn the_date_range_from_the_query() {
-        let q = |pairs: &[(&str, &str)]| {
-            Filters::from_query(
-                &pairs
-                    .iter()
-                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                    .collect(),
+    fn a_time_range_resolves_its_bounds_in_its_zone() {
+        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
+        let r = |df, tf, dt, tt| TimeRange::parse(df, tf, dt, tt, la);
+        let bounds = |r: TimeRange| (r.from_ms(), r.to_ms());
+        // Nothing given, or only blanks: every frame, an unreadable time too.
+        let any = r(Some(" "), Some(""), None, None).unwrap();
+        assert!(any.is_any() && any.keeps("yesterday") && any.keeps_ms(None));
+        assert_eq!(any.zone(), la);
+        // Date-only ends: the From day's first instant, the To day's end (the next midnight),
+        // in the zone: 2026-11-24 is PST, UTC-8.
+        let day = r(Some("2026-11-24"), None, Some(" 2026-11-24 "), None).unwrap();
+        assert_eq!(
+            bounds(day),
+            (
+                Some(ms_of("2026-11-24T08:00:00Z")),
+                Some(ms_of("2026-11-25T08:00:00Z"))
             )
-        };
-        // Absent or empty: any day.
-        assert!(q(&[]).unwrap().days.is_any());
-        assert!(
-            q(&[("date_from", " "), ("date_to", "")])
-                .unwrap()
-                .days
-                .is_any()
         );
-        // From alone: this day and newer.
-        let from = q(&[("date_from", "2026-10-21")]).unwrap().days;
-        assert!(!from.is_any());
-        assert_eq!((from.from(), from.to()), (Some("2026-10-21"), None));
-        assert!(!from.keeps("2026-10-20"));
-        assert!(from.keeps("2026-10-21") && from.keeps("2027-01-01"));
-        // To alone: this day and older.
-        let to = q(&[("date_to", " 2026-10-21 ")]).unwrap().days;
-        assert_eq!((to.from(), to.to()), (None, Some("2026-10-21")));
-        assert!(to.keeps("2025-12-31") && to.keeps("2026-10-21"));
-        assert!(!to.keeps("2026-10-22"));
-        // Both, the same day: that day alone; both ends included; month and year edges.
-        let one = q(&[("date_from", "2026-10-21"), ("date_to", "2026-10-21")])
-            .unwrap()
-            .days;
-        assert!(one.keeps("2026-10-21"));
-        assert!(!one.keeps("2026-10-20") && !one.keeps("2026-10-22"));
-        let span = q(&[("date_from", "2025-12-31"), ("date_to", "2026-02-01")])
-            .unwrap()
-            .days;
-        for d in ["2025-12-31", "2026-01-01", "2026-01-31", "2026-02-01"] {
-            assert!(span.keeps(d), "{d}");
+        assert!(day.keeps("2026-11-24T08:00:00.000Z") && day.keeps("2026-11-25T07:59:59.999Z"));
+        assert!(!day.keeps("2026-11-24T07:59:59.999Z") && !day.keeps("2026-11-25T08:00:00Z"));
+        // Another zone's offset in the sidecar is the same instant.
+        assert!(day.keeps("2026-11-24T23:59:59-08:00") && !day.keeps("2026-11-25T00:00:00-08:00"));
+        // A time that does not parse is out under any end.
+        assert!(!day.keeps("yesterday") && !day.keeps("") && !day.keeps_ms(None));
+        // One end alone: unbounded on the other side.
+        let from = r(Some("2026-11-24"), None, None, None).unwrap();
+        assert_eq!(bounds(from), (Some(ms_of("2026-11-24T08:00:00Z")), None));
+        assert!(from.keeps("2099-01-01T00:00:00Z") && !from.keeps("2026-11-24T07:59:00Z"));
+        let to = r(None, None, Some("2026-11-24"), None).unwrap();
+        assert_eq!(bounds(to), (None, Some(ms_of("2026-11-25T08:00:00Z"))));
+        assert!(to.keeps("1999-01-01T00:00:00Z") && !to.keeps("2026-11-25T08:00:00Z"));
+        // Times: from the From minute to the end of the To minute.
+        let hours = r(
+            Some("2026-11-24"),
+            Some("16:00"),
+            Some("2026-11-24"),
+            Some(" 18:00 "),
+        )
+        .unwrap();
+        assert_eq!(
+            bounds(hours),
+            (
+                Some(ms_of("2026-11-25T00:00:00Z")),
+                Some(ms_of("2026-11-25T02:01:00Z"))
+            )
+        );
+        assert!(hours.keeps("2026-11-25T00:00:00Z") && hours.keeps("2026-11-25T02:00:59.999Z"));
+        assert!(!hours.keeps("2026-11-24T23:59:59.999Z") && !hours.keeps("2026-11-25T02:01:00Z"));
+        // One minute: From and To the same.
+        let minute = r(
+            Some("2026-11-24"),
+            Some("17:00"),
+            Some("2026-11-24"),
+            Some("17:00"),
+        )
+        .unwrap();
+        assert_eq!(minute.to_ms().unwrap() - minute.from_ms().unwrap(), 60_000);
+        // A time at one end only; the other end a whole day.
+        let mixed = r(Some("2026-11-24"), Some("16:00"), Some("2026-11-24"), None).unwrap();
+        assert_eq!(
+            bounds(mixed),
+            (
+                Some(ms_of("2026-11-25T00:00:00Z")),
+                Some(ms_of("2026-11-25T08:00:00Z"))
+            )
+        );
+        let late = r(None, None, Some("2026-11-24"), Some("23:59")).unwrap();
+        assert_eq!(late.to_ms(), Some(ms_of("2026-11-25T08:00:00Z")));
+        // The fold (2026-11-01, clocks back at 02:00 PDT to 01:00 PST): the day has 25 hours;
+        // 01:00 to 01:59 happen twice. From takes the first pass, To ends after the last.
+        let fold = r(Some("2026-11-01"), None, Some("2026-11-01"), None).unwrap();
+        assert_eq!(
+            bounds(fold),
+            (
+                Some(ms_of("2026-11-01T07:00:00Z")),
+                Some(ms_of("2026-11-02T08:00:00Z"))
+            )
+        );
+        let on_fold = |tf, tt| r(Some("2026-11-01"), Some(tf), Some("2026-11-01"), Some(tt));
+        let twice = on_fold("01:30", "01:30").unwrap();
+        assert_eq!(
+            bounds(twice),
+            (
+                Some(ms_of("2026-11-01T08:30:00Z")),
+                Some(ms_of("2026-11-01T09:31:00Z"))
+            )
+        );
+        assert!(twice.keeps("2026-11-01T08:30:00Z"), "the first 01:30 (PDT)");
+        assert!(
+            twice.keeps("2026-11-01T09:30:59Z"),
+            "the second 01:30 (PST)"
+        );
+        assert!(!twice.keeps("2026-11-01T09:31:00Z"));
+        // To 01:59 ends at 02:00 PST, not at the first pass (02:00 PDT, an hour earlier).
+        let late = on_fold("00:00", "01:59").unwrap();
+        assert_eq!(late.to_ms(), Some(ms_of("2026-11-01T10:00:00Z")));
+        assert!(late.keeps("2026-11-01T09:59:59Z") && !late.keeps("2026-11-01T10:00:00Z"));
+        // Off the fold a To minute is the one pass: 02:00 is PST alone.
+        assert_eq!(
+            on_fold("00:00", "02:00").unwrap().to_ms(),
+            Some(ms_of("2026-11-01T10:01:00Z"))
+        );
+        // The walls decide From after To, whatever the passes: 01:30 to 01:10 is refused though
+        // the first 01:30 is before the last 01:10.
+        assert!(
+            on_fold("01:30", "01:10")
+                .unwrap_err()
+                .starts_with("date_from: 2026-11-01 01:30 is after date_to 2026-11-01 01:10")
+        );
+        // The gap (2026-03-08, clocks forward at 02:00 PST to 03:00 PDT): the day has 23 hours;
+        // 02:00 to 02:59 never happen. Either end in it is where the gap ends, 03:00 PDT
+        // (10:00Z): a From of 02:30 keeps 03:00 to 03:29, a To of 02:30 ends there (no minute of
+        // its own to keep).
+        let gap = r(Some("2026-03-08"), None, Some("2026-03-08"), None).unwrap();
+        assert_eq!(
+            bounds(gap),
+            (
+                Some(ms_of("2026-03-08T08:00:00Z")),
+                Some(ms_of("2026-03-09T07:00:00Z"))
+            )
+        );
+        let on_gap = |tf, tt| r(Some("2026-03-08"), Some(tf), Some("2026-03-08"), Some(tt));
+        let skipped = r(Some("2026-03-08"), Some("02:30"), None, None).unwrap();
+        assert_eq!(skipped.from_ms(), Some(ms_of("2026-03-08T10:00:00Z")));
+        assert!(skipped.keeps("2026-03-08T10:00:00Z") && !skipped.keeps("2026-03-08T09:59:59Z"));
+        let to_gap = on_gap("01:00", "02:30").unwrap();
+        assert_eq!(
+            bounds(to_gap),
+            (
+                Some(ms_of("2026-03-08T09:00:00Z")),
+                Some(ms_of("2026-03-08T10:00:00Z"))
+            )
+        );
+        // Both ends in the gap: an empty range, not an error.
+        let inside = on_gap("02:10", "02:50").unwrap();
+        assert_eq!(inside.from_ms(), inside.to_ms());
+        assert!(!inside.keeps("2026-03-08T10:00:00Z") && !inside.is_any());
+        // Around the gap the minutes are as usual: 01:59 PST and 03:00 PDT.
+        assert_eq!(
+            bounds(on_gap("01:59", "03:00").unwrap()),
+            (
+                Some(ms_of("2026-03-08T09:59:00Z")),
+                Some(ms_of("2026-03-08T10:01:00Z"))
+            )
+        );
+        // A zone whose gap is at midnight (Santiago, 2026-09-06: 00:00 to 00:59 never happen, and
+        // the day starts at 01:00 -03).
+        let santiago: crate::clock::Zone = "America/Santiago".parse().unwrap();
+        let midnight =
+            TimeRange::parse(Some("2026-09-06"), None, Some("2026-09-05"), None, santiago);
+        assert!(midnight.is_err(), "From after To by the walls");
+        let day =
+            TimeRange::parse(Some("2026-09-06"), None, Some("2026-09-06"), None, santiago).unwrap();
+        assert_eq!(day.from_ms(), Some(ms_of("2026-09-06T04:00:00Z")));
+        let before = TimeRange::parse(None, None, Some("2026-09-05"), None, santiago).unwrap();
+        assert_eq!(before.to_ms(), Some(ms_of("2026-09-06T04:00:00Z")));
+        // The same wall bounds in UTC are other instants.
+        let utc = TimeRange::parse(
+            Some("2026-11-24"),
+            None,
+            Some("2026-11-24"),
+            None,
+            crate::clock::Zone::Utc,
+        )
+        .unwrap();
+        assert_eq!(
+            bounds(utc),
+            (
+                Some(ms_of("2026-11-24T00:00:00Z")),
+                Some(ms_of("2026-11-25T00:00:00Z"))
+            )
+        );
+        assert_ne!(utc, day);
+        // A time needs its date.
+        assert_eq!(
+            r(None, Some("16:00"), Some("2026-11-24"), None).unwrap_err(),
+            "time_from: needs date_from (a time is of a day; pick a From day)"
+        );
+        assert_eq!(
+            r(Some("2026-11-24"), None, None, Some("18:00")).unwrap_err(),
+            "time_to: needs date_to (a time is of a day; pick a To day)"
+        );
+        // Bad times name their field.
+        for bad in [
+            "4pm",
+            "24:00",
+            "16:60",
+            "1:05",
+            "16:5",
+            "16-00",
+            "16:00:00",
+            "1600",
+            "16:0a",
+            "-1:00",
+            "１６:００",
+        ] {
+            let e = r(Some("2026-11-24"), Some(bad), None, None).unwrap_err();
+            assert!(
+                e.starts_with("time_from:") && e.contains("HH:MM"),
+                "{bad}: {e}"
+            );
+            let e = r(None, None, Some("2026-11-24"), Some(bad)).unwrap_err();
+            assert!(e.starts_with("time_to:"), "{bad}: {e}");
         }
-        for d in ["2025-12-30", "2026-02-02", "2026-10-21"] {
-            assert!(!span.keeps(d), "{d}");
-        }
-        // Bad formats and days that do not exist name their field.
+        assert!(
+            r(
+                Some("2026-11-24"),
+                Some("00:00"),
+                Some("2026-11-24"),
+                Some("23:59")
+            )
+            .is_ok()
+        );
+        // Bad dates and days that do not exist name their field.
         for bad in [
             "2026-1-05",
             "20261021",
@@ -2399,31 +2883,142 @@ mod tests {
             "2026-10-21T00:00",
             "yesterday",
         ] {
-            let e = q(&[("date_from", bad)]).unwrap_err();
+            let e = r(Some(bad), None, None, None).unwrap_err();
             assert!(
                 e.starts_with("date_from:") && e.contains("YYYY-MM-DD"),
                 "{e}"
             );
-            let e = q(&[("date_to", bad)]).unwrap_err();
+            let e = r(None, None, Some(bad), None).unwrap_err();
             assert!(e.starts_with("date_to:"), "{e}");
         }
         // A leap day exists in a leap year only.
-        assert!(q(&[("date_from", "2028-02-29")]).is_ok());
-        assert!(q(&[("date_from", "2026-02-29")]).is_err());
-        // From after To.
-        let e = q(&[("date_from", "2026-10-22"), ("date_to", "2026-10-21")]).unwrap_err();
-        assert!(
-            e.starts_with("date_from:") && e.contains("after date_to"),
-            "{e}"
+        assert!(r(Some("2028-02-29"), None, None, None).is_ok());
+        assert!(r(Some("2026-02-29"), None, None, None).is_err());
+        // From after To: by days, and by times on one day (a To minute before the From one).
+        assert_eq!(
+            r(Some("2026-10-22"), None, Some("2026-10-21"), None).unwrap_err(),
+            "date_from: 2026-10-22 is after date_to 2026-10-21; pick a From on or before the To"
         );
-        // Filters compare equal only with the same range.
-        assert_ne!(
-            q(&[("date_from", "2026-10-21")]).unwrap(),
-            Filters::default()
+        assert_eq!(
+            r(
+                Some("2026-11-24"),
+                Some("18:00"),
+                Some("2026-11-24"),
+                Some("16:00")
+            )
+            .unwrap_err(),
+            "date_from: 2026-11-24 18:00 is after date_to 2026-11-24 16:00; pick a From on or \
+             before the To"
+        );
+        let e = r(
+            Some("2026-11-24"),
+            Some("16:00"),
+            Some("2026-11-24"),
+            Some("15:59"),
+        )
+        .unwrap_err();
+        assert!(e.starts_with("date_from: 2026-11-24 16:00 is after"), "{e}");
+        let e = r(Some("2026-11-25"), Some("00:00"), Some("2026-11-24"), None).unwrap_err();
+        assert!(
+            e.contains("2026-11-25 00:00 is after date_to 2026-11-24;"),
+            "{e}"
         );
     }
 
-    /// Frames of `cam` on three days, each with its sidecar time, indexed: `(day, stem, time)`.
+    #[test]
+    fn a_time_range_may_hold_only_the_folders_of_days_near_it() {
+        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
+        let utc = crate::clock::Zone::Utc;
+        // A folder of day D holds what a collector in UTC-12 to UTC+14 files under D: from
+        // D 00:00Z - 14 h to D+1 00:00Z + 12 h.
+        let any = TimeRange::any_in(la);
+        assert!(any.may_hold_folder("2026-11-24") && any.may_hold_folder("x"));
+        // 2026-11-24 in Los Angeles: 11-24 08:00Z to 11-25 08:00Z.
+        let day = TimeRange::parse(Some("2026-11-24"), None, Some("2026-11-24"), None, la).unwrap();
+        for (folder, may) in [
+            ("2026-11-22", false),
+            ("2026-11-23", true),
+            ("2026-11-24", true),
+            ("2026-11-25", true),
+            ("2026-11-26", false),
+        ] {
+            assert_eq!(day.may_hold_folder(folder), may, "{folder}");
+        }
+        // A name that is not a date is read (the exact check decides).
+        assert!(day.may_hold_folder("someday") && day.may_hold_folder("2026-02-30"));
+        // The edges, both exclusive where the frames are: From 11-23 12:00Z is past the 22nd's
+        // last instant (a UTC-12 collector's 11-22 23:59:59); To 11-21 09:59 ends at 10:00Z,
+        // the 22nd's first (a UTC+14 collector's 00:00).
+        let from = TimeRange::parse(Some("2026-11-23"), Some("12:00"), None, None, utc).unwrap();
+        assert!(!from.may_hold_folder("2026-11-22") && from.may_hold_folder("2099-01-01"));
+        let from = TimeRange::parse(Some("2026-11-23"), Some("11:59"), None, None, utc).unwrap();
+        assert!(from.may_hold_folder("2026-11-22"));
+        let to = TimeRange::parse(None, None, Some("2026-11-21"), Some("09:59"), utc).unwrap();
+        assert!(!to.may_hold_folder("2026-11-22") && to.may_hold_folder("2000-01-01"));
+        let to = TimeRange::parse(None, None, Some("2026-11-21"), Some("10:00"), utc).unwrap();
+        assert!(to.may_hold_folder("2026-11-22"));
+    }
+
+    #[test]
+    fn the_time_range_from_the_query() {
+        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
+        let q = |pairs: &[(&str, &str)]| {
+            Filters::from_query_in(
+                &pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                la,
+            )
+        };
+        // Absent or empty: any time, read in the zone given.
+        let any = q(&[("date_from", " "), ("time_to", "")]).unwrap().range;
+        assert!(any.is_any());
+        assert_eq!(any.zone(), la);
+        let f = q(&[
+            ("date_from", "2026-11-24"),
+            ("time_from", "16:00"),
+            ("date_to", "2026-11-24"),
+            ("time_to", "18:00"),
+        ])
+        .unwrap();
+        assert_eq!(
+            f.range,
+            TimeRange::parse(
+                Some("2026-11-24"),
+                Some("16:00"),
+                Some("2026-11-24"),
+                Some("18:00"),
+                la
+            )
+            .unwrap()
+        );
+        // The errors are the range's.
+        assert!(
+            q(&[("time_from", "16:00")])
+                .unwrap_err()
+                .starts_with("time_from: needs date_from")
+        );
+        assert!(
+            q(&[("date_to", "2026-11-24"), ("time_to", "25:00")])
+                .unwrap_err()
+                .starts_with("time_to:")
+        );
+        assert!(
+            q(&[("date_from", "2026-10-22"), ("date_to", "2026-10-21")])
+                .unwrap_err()
+                .contains("after date_to")
+        );
+        // Filters compare equal only with the same range, and the same zone.
+        assert_ne!(f, Filters::default());
+        assert_ne!(
+            q(&[]).unwrap(),
+            Filters::default(),
+            "Los Angeles is not UTC"
+        );
+    }
+
+    /// Frames of `cam`, each with its sidecar time, indexed: `(day folder, stem, time)`.
     fn dated_folder(dir: &Path, frames: &[(&str, &str, &str)]) {
         for (date, stem, time) in frames {
             let day = dir.join("day/cam").join(date);
@@ -2452,31 +3047,37 @@ mod tests {
     }
 
     #[test]
-    fn a_date_range_keeps_its_day_folders_and_the_time_orders_sort_by_time() {
+    fn a_time_range_keeps_frames_by_their_own_time_and_the_time_orders_sort_by_time() {
         let dir = std::env::temp_dir().join(format!("bop-queue-{}", uuid::Uuid::new_v4()));
-        // The day folder decides, not the sidecar time: `late` was collected on the 21st (its
-        // folder) though its UTC time is the 22nd's.
+        // Folders named by UTC day, as a collector whose zone was UTC names them; the reviewer's
+        // zone is Los Angeles (PST, UTC-8, in late November). `utc` sits in the 25th's folder
+        // but was taken on the 24th at 17:00 there; `early` in the 24th's folder on the 23rd.
         dated_folder(
             &dir,
             &[
-                ("2026-10-20", "a", "2026-10-20T08:00:00.000Z"),
-                ("2026-10-21", "b", "2026-10-21T09:00:00.000Z"),
-                ("2026-10-21", "late", "2026-10-22T01:00:00.000Z"),
-                ("2026-10-21", "tie1", "2026-10-21T10:00:00.000Z"),
-                ("2026-10-22", "tie2", "2026-10-21T10:00:00.000Z"),
-                ("2026-10-22", "c", "2026-10-22T12:00:00.000Z"),
+                ("2026-11-24", "early", "2026-11-24T03:00:00.000Z"),
+                ("2026-11-24", "a", "2026-11-24T18:00:00.000Z"),
+                ("2026-11-25", "utc", "2026-11-25T01:00:00.000Z"),
+                ("2026-11-25", "b", "2026-11-25T09:00:00.000Z"),
+                ("2026-11-25", "tie1", "2026-11-25T10:00:00.000Z"),
+                ("2026-11-26", "tie2", "2026-11-25T10:00:00.000Z"),
+                ("2026-11-26", "c", "2026-11-26T20:00:00.000Z"),
+                ("2026-11-26", "bad", "yesterday"),
             ],
         );
+        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
         let all = Filters {
             source: QueueSource::All,
             status: StatusFilter::Any,
+            range: TimeRange::any_in(la),
             ..Filters::default()
         };
-        let with = |from: Option<&str>, to: Option<&str>, order: Order| Filters {
-            days: DayRange::parse(from, to).unwrap(),
+        let in_zone = |zone, df, tf, dt, tt, order| Filters {
+            range: TimeRange::parse(df, tf, dt, tt, zone).unwrap(),
             order,
             ..all.clone()
         };
+        let with = |df, tf, dt, tt| in_zone(la, df, tf, dt, tt, Order::Uncertain);
         let stems = |q: &Queue| -> Vec<String> {
             q.items
                 .iter()
@@ -2486,65 +3087,140 @@ mod tests {
                 })
                 .collect()
         };
+        let sorted = |q: &Queue| {
+            let mut s = stems(q);
+            s.sort();
+            s
+        };
+        // The span is of the frames' own days in the zone, `early`'s 23rd to `c`'s 26th.
         let span = Some(DaySpan {
-            first: "2026-10-20".into(),
-            last: "2026-10-22".into(),
+            first: "2026-11-23".into(),
+            last: "2026-11-26".into(),
         });
         let every = build(&dir, &all);
-        assert_eq!(every.items.len(), 6);
+        assert_eq!(every.items.len(), 8, "no range: an unreadable time too");
         assert_eq!(every.dates, span);
-        // One day.
+        // In UTC the same frames span the folders' days.
+        assert_eq!(
+            build(
+                &dir,
+                &Filters {
+                    range: TimeRange::any_in(crate::clock::Zone::Utc),
+                    ..all.clone()
+                }
+            )
+            .dates,
+            Some(DaySpan {
+                first: "2026-11-24".into(),
+                last: "2026-11-26".into(),
+            })
+        );
+        // One day in Los Angeles: `utc` from the next day's folder is in, `early` from this
+        // day's folder is not.
         let one = build(
             &dir,
-            &with(Some("2026-10-21"), Some("2026-10-21"), Order::Uncertain),
+            &with(Some("2026-11-24"), None, Some("2026-11-24"), None),
         );
-        let mut got = stems(&one);
-        got.sort();
-        assert_eq!(got, ["b", "late", "tie1"]);
-        assert_eq!(one.counts.total, 3, "the counts follow the range");
-        // The span is of every candidate, before the range, as the cameras are.
-        assert_eq!(one.dates, span);
-        assert_eq!(one.cameras, ["cam"]);
+        assert_eq!(sorted(&one), ["a", "utc"]);
+        assert_eq!(one.counts.total, 2, "the counts follow the range");
+        // The span and the lists are of the frames before the range, in the Next walk (every
+        // folder); `build` reads only the folders the range may hold (a folder holds 14 h before
+        // its UTC day to 12 h after it: the 24th's and the 25th's here), so its span is of those.
+        let next = build_every_folder(
+            &dir,
+            &with(Some("2026-11-24"), None, Some("2026-11-24"), None),
+        );
+        assert_eq!(next.items, one.items);
+        assert_eq!(next.dates, span);
+        assert_eq!(next.cameras, ["cam"]);
+        assert_eq!(next.labels, every.labels);
+        assert_eq!(
+            one.dates,
+            Some(DaySpan {
+                first: "2026-11-23".into(),
+                last: "2026-11-25".into(),
+            }),
+            "the 26th's folder cannot hold the 24th in Los Angeles (08:00Z to 08:00Z)"
+        );
+        // The folder's day is not the frame's: 11-25 holds b, tie1 and tie2 (in two folders).
+        assert_eq!(
+            sorted(&build(
+                &dir,
+                &with(Some("2026-11-25"), None, Some("2026-11-25"), None)
+            )),
+            ["b", "tie1", "tie2"]
+        );
+        // The same days in UTC are the folders' (`bad` never: its time does not parse).
+        assert_eq!(
+            sorted(&build(
+                &dir,
+                &in_zone(
+                    crate::clock::Zone::Utc,
+                    Some("2026-11-24"),
+                    None,
+                    Some("2026-11-24"),
+                    None,
+                    Order::Uncertain
+                )
+            )),
+            ["a", "early"]
+        );
+        // Times: 16:00 to 18:00 on the 24th in Los Angeles is `utc` alone (17:00); the To
+        // minute is in, the minute before the frame is not.
+        let evening = |tf, tt| {
+            sorted(&build(
+                &dir,
+                &with(Some("2026-11-24"), Some(tf), Some("2026-11-24"), Some(tt)),
+            ))
+        };
+        assert_eq!(evening("16:00", "18:00"), ["utc"]);
+        assert_eq!(evening("17:00", "17:00"), ["utc"]);
+        assert!(evening("16:00", "16:59").is_empty());
+        assert!(evening("17:01", "18:00").is_empty());
         // From alone, to alone.
         assert_eq!(
-            build(&dir, &with(Some("2026-10-22"), None, Order::Uncertain))
-                .items
-                .len(),
-            2
+            sorted(&build(&dir, &with(Some("2026-11-25"), None, None, None))),
+            ["b", "c", "tie1", "tie2"]
         );
         assert_eq!(
-            build(&dir, &with(None, Some("2026-10-20"), Order::Uncertain))
-                .items
-                .len(),
-            1
+            sorted(&build(
+                &dir,
+                &with(None, None, Some("2026-11-24"), Some("10:00"))
+            )),
+            ["a", "early"]
         );
         // A range with no frame: nothing listed, nothing counted, the span still there.
-        let none = build(&dir, &with(Some("2027-01-01"), None, Order::Uncertain));
+        let none = build(&dir, &with(Some("2027-01-01"), None, None, None));
+        assert!(none.items.is_empty() && none.counts.total == 0);
+        assert_eq!(none.dates, None, "no folder read");
+        let none = build_every_folder(&dir, &with(Some("2027-01-01"), None, None, None));
         assert!(none.items.is_empty() && none.counts.total == 0);
         assert_eq!(none.dates, span);
-        // Newest first: the sidecar time descending, a tie by path (`day/cam/2026-10-21/tie1`
-        // before `day/cam/2026-10-22/tie2`).
+        // Newest first: the sidecar time descending (as text: `yesterday` after every digit), a
+        // tie by path (`day/cam/2026-11-25/tie1` before `day/cam/2026-11-26/tie2`).
+        let ordered = |df, order| stems(&build(&dir, &in_zone(la, df, None, None, None, order)));
         assert_eq!(
-            stems(&build(&dir, &with(None, None, Order::Newest))),
-            ["c", "late", "tie1", "tie2", "b", "a"]
+            ordered(None, Order::Newest),
+            ["bad", "c", "tie1", "tie2", "b", "utc", "a", "early"]
         );
         // Oldest first: ascending, the tie by path still.
         assert_eq!(
-            stems(&build(&dir, &with(None, None, Order::Oldest))),
-            ["a", "b", "tie1", "tie2", "late", "c"]
+            ordered(None, Order::Oldest),
+            ["early", "a", "utc", "b", "tie1", "tie2", "c", "bad"]
         );
         // With a range too.
         assert_eq!(
-            stems(&build(&dir, &with(Some("2026-10-21"), None, Order::Newest))),
-            ["c", "late", "tie1", "tie2", "b"]
+            ordered(Some("2026-11-25"), Order::Newest),
+            ["c", "tie1", "tie2", "b"]
         );
-        // The bulk walks follow the range: `labelled` reads only the days in it.
-        for stem in ["a", "b", "c"] {
-            let date = match stem {
-                "a" => "2026-10-20",
-                "b" => "2026-10-21",
-                _ => "2026-10-22",
-            };
+        // The bulk walks follow the range by the frame's own time: `labelled` reads only those.
+        for (date, stem) in [
+            ("2026-11-24", "early"),
+            ("2026-11-24", "a"),
+            ("2026-11-25", "utc"),
+            ("2026-11-25", "b"),
+            ("2026-11-26", "bad"),
+        ] {
             super::super::write(
                 &dir.join(format!(
                     "day/cam/{date}/{stem}{}",
@@ -2554,13 +3230,32 @@ mod tests {
             )
             .unwrap();
         }
-        let ranged = with(Some("2026-10-21"), Some("2026-10-22"), Order::Uncertain);
-        let read: Vec<String> = labelled(&dir, &ranged, &|_| true)
-            .map(|(rel, _)| rel)
-            .collect();
+        let read = |f: &Filters| -> Vec<String> {
+            labelled(&dir, f, &|_| true).map(|(rel, _)| rel).collect()
+        };
         assert_eq!(
-            read,
-            ["day/cam/2026-10-21/b.jpg", "day/cam/2026-10-22/c.jpg"]
+            read(&with(Some("2026-11-24"), None, Some("2026-11-24"), None)),
+            ["day/cam/2026-11-24/a.jpg", "day/cam/2026-11-25/utc.jpg"]
+        );
+        assert_eq!(
+            read(&with(
+                Some("2026-11-24"),
+                Some("16:00"),
+                Some("2026-11-24"),
+                Some("18:00")
+            )),
+            ["day/cam/2026-11-25/utc.jpg"]
+        );
+        assert_eq!(read(&all).len(), 5, "no range: every file, `bad` too");
+        let mapped = labelled_map(
+            &dir,
+            &with(Some("2026-11-24"), None, Some("2026-11-24"), None),
+            &|_| true,
+            &|rel, _| Some(rel.to_string()),
+        );
+        assert_eq!(
+            mapped,
+            ["day/cam/2026-11-24/a.jpg", "day/cam/2026-11-25/utc.jpg"]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4036,13 +4731,11 @@ mod tests {
         let mut q = Queue::default();
         let mut cameras = BTreeSet::new();
         let mut seen_labels = BTreeSet::new();
+        let mut span: MsSpan = None;
         for c in candidates(dir, f.source) {
             cameras.insert(c.camera.clone());
-            let date = layout::parse_rel(&c.rel).unwrap().date;
-            DaySpan::widen(&mut q.dates, &date);
             if f.scene.as_ref().is_some_and(|s| *s != c.scene)
                 || f.camera.as_ref().is_some_and(|s| *s != c.camera)
-                || !f.days.keeps(&date)
                 || f.bucket.is_some_and(|b| !c.buckets.contains(&b))
             {
                 continue;
@@ -4057,7 +4750,8 @@ mod tests {
             let classes = frame_labels(&rec, labels.as_ref());
             let keep = f.label.is_empty() || f.label.iter().any(|l| classes.contains(l));
             seen_labels.extend(classes);
-            if !keep {
+            DaySpan::widen(&mut span, recommend::event_ms(&rec.timestamp));
+            if !keep || !f.range.keeps(&rec.timestamp) {
                 continue;
             }
             q.counts.add(labels.as_ref());
@@ -4099,6 +4793,7 @@ mod tests {
         }
         q.cameras = cameras.into_iter().collect();
         q.labels = seen_labels.into_iter().collect();
+        q.dates = DaySpan::of(span, f.range.zone());
         q
     }
 
@@ -4155,8 +4850,19 @@ mod tests {
             r.id = stem.clone();
             r.scene = scene.into();
             r.camera = camera.into();
-            // Ties on purpose: only the frame path orders these.
-            r.timestamp = format!("2026-10-21T00:00:{:02}Z", next(5));
+            // Ties on purpose: only the frame path orders these. Four hours of the folder's day,
+            // and one frame in five on the evening before (UTC), as a collector east of UTC
+            // files it: sane data, which `TimeRange::may_hold_folder` never drops.
+            let folder_day = 20 + (date.as_bytes()[9] - b'0') as usize;
+            r.timestamp = if i % 5 == 0 {
+                format!("2026-10-{:02}T20:00:{:02}Z", folder_day - 1, next(5))
+            } else {
+                format!(
+                    "2026-10-{folder_day:02}T{:02}:00:{:02}Z",
+                    i / 2 % 4 * 6,
+                    next(5)
+                )
+            };
             r.threshold = 0.5;
             r.model = format!("m{}", next(2));
             r.buckets = vec![bucket];
@@ -4269,15 +4975,34 @@ mod tests {
         assert!(reference.cameras.iter().any(|c| c == "lost-camera"));
         assert!(reference.cameras.iter().any(|c| c == "elsewhere"));
         assert!(reference.counts.per_class.len() > 1);
-        // `mixed_folder`'s days run to 2026-10-23; the span starts at the gone frame's day
-        // (2026-01-01): a gone frame's day counts, as its camera does.
+        // The span is of the frames' own times (a gone frame's folder plays no part), in the
+        // filter's zone (UTC for `Filters::default()`; Los Angeles is 7 hours behind): here every
+        // readable frame is listed, so it is their first and last day.
+        let span_of = |q: &Queue, zone: crate::clock::Zone| {
+            let days: BTreeSet<String> = q
+                .items
+                .iter()
+                .filter_map(|i| recommend::event_ms(&i.timestamp))
+                .filter_map(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .map(|t| zone.display_date(t))
+                .collect();
+            Some(DaySpan {
+                first: days.first().unwrap().clone(),
+                last: days.last().unwrap().clone(),
+            })
+        };
         assert_eq!(
             reference.dates,
-            Some(DaySpan {
-                first: "2026-01-01".into(),
-                last: "2026-10-23".into()
-            })
+            span_of(&reference, crate::clock::Zone::Utc)
         );
+        let la: crate::clock::Zone = "America/Los_Angeles".parse().unwrap();
+        let in_la = Filters {
+            range: TimeRange::any_in(la),
+            ..all.clone()
+        };
+        let la_reference = serial_build(&dir, &in_la);
+        assert_eq!(la_reference.dates, span_of(&la_reference, la));
+        let range = |df, tf, dt, tt, zone| TimeRange::parse(df, tf, dt, tt, zone).unwrap();
         let classes: Vec<String> = ["person", "car"].map(String::from).to_vec();
         let filters = [
             Filters::default(),
@@ -4311,30 +5036,56 @@ mod tests {
                 wanted: Some((classes, Vec::new())),
                 ..all.clone()
             },
+            in_la.clone(),
             Filters {
-                days: DayRange::parse(Some("2026-10-21"), Some("2026-10-22")).unwrap(),
+                range: range(Some("2026-10-20"), None, Some("2026-10-20"), None, la),
                 ..all.clone()
             },
             Filters {
                 order: Order::Newest,
-                days: DayRange::parse(None, Some("2026-10-21")).unwrap(),
+                range: range(
+                    Some("2026-10-20"),
+                    Some("12:00"),
+                    Some("2026-10-21"),
+                    Some("06:00"),
+                    crate::clock::Zone::Utc,
+                ),
                 ..all.clone()
+            },
+            Filters {
+                range: range(None, None, Some("2026-10-20"), Some("23:00"), la),
+                ..Filters::default()
             },
             Filters {
                 order: Order::Oldest,
                 ..all.clone()
             },
         ];
+        // What is listed and counted, apart from what is gathered before the range (which the
+        // folder skip of `build` narrows).
+        let listed = |q: &Queue| Queue {
+            dates: None,
+            labels: Vec::new(),
+            unreadable: 0,
+            ..q.clone()
+        };
+        let mut skipped = 0;
         for f in &filters {
             let want = serial_build(&dir, f);
             let bytes = serde_json::to_vec(&want).unwrap();
             for threads in [1, 2, 4, 8] {
-                let got = build_on(&dir, f, Some(threads));
+                let got = build_on(&dir, f, Some(threads), Folders::Every);
                 assert_eq!(got, want, "{threads} threads, {f:?}");
                 assert_eq!(serde_json::to_vec(&got).unwrap(), bytes);
+                let ranged = build_on(&dir, f, Some(threads), Folders::InRange);
+                assert_eq!(listed(&ranged), listed(&want), "{threads} threads, {f:?}");
             }
-            assert_eq!(build(&dir, f), want, "{f:?}");
+            assert_eq!(build_every_folder(&dir, f), want, "{f:?}");
+            let ranged = build(&dir, f);
+            assert_eq!(listed(&ranged), listed(&want), "{f:?}");
+            skipped += usize::from(ranged != want);
         }
+        assert!(skipped > 0, "no range skipped a folder");
         let want = serial_tally(&dir);
         assert!(want.unreadable > 0 && want.frames > 30, "{want:?}");
         assert!(!want.coverage.is_empty());

@@ -6,7 +6,7 @@
 use super::{
     ACCEPT_AUTO_DEFAULT_LIMIT, ACCEPT_AUTO_MAX_LIMIT, Answer, AppState, Problem, blocking,
     bulk_filters, bulk_limit, json_body, json_fail, now, push_failed, push_past_limit, review_ctx,
-    success,
+    review_zone, success,
 };
 use crate::collect::labels::bulk;
 use crate::collect::labels::queue::Filters;
@@ -53,9 +53,9 @@ pub(super) fn wrote_count(dir: &std::path::Path) -> usize {
 }
 
 /// The body of the bulk routes that take the queue's filters, `{bucket?, scene?, camera?, label?,
-/// source?, date_from?, date_to?, dry_run, limit?}` (empty = any; the dates `YYYY-MM-DD`, the day
-/// folders kept, both included, as `GET /v1/review/next` reads them, so a bulk action changes only
-/// the days on screen). `reject-low` adds `min_score` ([`RejectLowBody`]: `flatten` does not mix
+/// source?, date_from?, time_from?, date_to?, time_to?, dry_run, limit?}` (empty = any; the dates
+/// `YYYY-MM-DD` and the times `HH:MM`, the frames' own times kept in the configured zone, as `GET
+/// /v1/review/next` reads them, so a bulk action changes only the frames on screen). `reject-low` adds `min_score` ([`RejectLowBody`]: `flatten` does not mix
 /// with `deny_unknown_fields`).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,7 +73,11 @@ struct BulkBody {
     #[serde(default)]
     date_from: Option<String>,
     #[serde(default)]
+    time_from: Option<String>,
+    #[serde(default)]
     date_to: Option<String>,
+    #[serde(default)]
+    time_to: Option<String>,
     #[serde(default)]
     dry_run: bool,
     #[serde(default)]
@@ -87,10 +91,15 @@ impl BulkBody {
         bulk_limit(self.limit, default)
     }
 
-    /// The filters the body names with the route's `fixed` ones on top ([`bulk_filters`], 400
-    /// for a bad value).
-    fn filters(&self, fixed: &[(&str, &str)]) -> Result<Filters, Problem> {
+    /// The filters the body names with the route's `fixed` ones on top ([`bulk_filters`], the
+    /// times in `zone`; 400 for a bad value).
+    fn filters(
+        &self,
+        zone: crate::clock::Zone,
+        fixed: &[(&str, &str)],
+    ) -> Result<Filters, Problem> {
         bulk_filters(
+            zone,
             [
                 self.bucket.clone(),
                 self.scene.clone(),
@@ -98,7 +107,9 @@ impl BulkBody {
                 self.label.clone(),
                 self.source.clone(),
                 self.date_from.clone(),
+                self.time_from.clone(),
                 self.date_to.clone(),
+                self.time_to.clone(),
             ],
             fixed,
         )
@@ -106,7 +117,7 @@ impl BulkBody {
 }
 
 /// `POST /v1/review/accept-auto` with `{bucket?, scene?, camera?, label?, source?, date_from?,
-/// date_to?, dry_run, limit?}` (empty = any, [`BulkBody`]): the unreviewed frames of those filters whose auto-label triage alone
+/// time_from?, date_to?, time_to?, dry_run, limit?}` (empty = any, [`BulkBody`]): the unreviewed frames of those filters whose auto-label triage alone
 /// settles them (`auto=accept`, [`labels::auto_accept_eligible`]) saved as reviewed, at most
 /// `limit` (default 500; [`bulk::bulk_accept`]). `dry_run` only counts them.
 pub(in crate::server) async fn accept_auto(
@@ -116,7 +127,10 @@ pub(in crate::server) async fn accept_auto(
 ) -> Answer {
     let b: BulkBody = json_body(&headers, body)?;
     let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let mut filters = b.filters(&[("status", "unreviewed"), ("auto", "accept")])?;
+    let mut filters = b.filters(
+        review_zone(&state),
+        &[("status", "unreviewed"), ("auto", "accept")],
+    )?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
         let ctx = review_ctx(&state);
@@ -178,7 +192,11 @@ struct RejectLowBody {
     #[serde(default)]
     date_from: Option<String>,
     #[serde(default)]
+    time_from: Option<String>,
+    #[serde(default)]
     date_to: Option<String>,
+    #[serde(default)]
+    time_to: Option<String>,
     min_score: f32,
     #[serde(default)]
     dry_run: bool,
@@ -187,7 +205,7 @@ struct RejectLowBody {
 }
 
 /// `POST /v1/review/reject-low` with `{bucket?, scene?, camera?, label?, source?, date_from?,
-/// date_to?, min_score, dry_run, limit?}`: on the unreviewed frames of those filters, the pending auto boxes scoring
+/// time_from?, date_to?, time_to?, min_score, dry_run, limit?}`: on the unreviewed frames of those filters, the pending auto boxes scoring
 /// below `min_score` (0.01..=1) rejected with `reason: low_score` (kept as hard-negative
 /// evidence; [`bulk::bulk_reject_below`]), at most `limit` frames (default 500). `dry_run`
 /// only counts the frames and boxes.
@@ -205,6 +223,7 @@ pub(in crate::server) async fn reject_low(
     }
     let limit = bulk_limit(b.limit, ACCEPT_AUTO_DEFAULT_LIMIT)?;
     let filters = bulk_filters(
+        review_zone(&state),
         [
             b.bucket,
             b.scene,
@@ -212,7 +231,9 @@ pub(in crate::server) async fn reject_low(
             b.label,
             b.source,
             b.date_from,
+            b.time_from,
             b.date_to,
+            b.time_to,
         ],
         &[("status", "unreviewed")],
     )?;
@@ -263,7 +284,7 @@ pub(in crate::server) async fn reject_low(
 }
 
 /// `POST /v1/review/accept-repeats` with `{bucket?, scene?, camera?, label?, source?, date_from?,
-/// date_to?, dry_run, limit?}`: the repeat-only frames of those filters (spot edits settled every box, none
+/// time_from?, date_to?, time_to?, dry_run, limit?}`: the repeat-only frames of those filters (spot edits settled every box, none
 /// pending; [`labels::repeats::repeats_only`]) saved as reviewed with `bulk_accepted`
 /// ([`bulk::bulk_accept_repeats`]), at most `limit` (default 500). `dry_run` only counts.
 pub(in crate::server) async fn accept_repeats(
@@ -273,7 +294,7 @@ pub(in crate::server) async fn accept_repeats(
 ) -> Answer {
     let b: BulkBody = json_body(&headers, body)?;
     let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let filters = b.filters(&[])?;
+    let filters = b.filters(review_zone(&state), &[])?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
         let ctx = review_ctx(&state);
@@ -314,7 +335,7 @@ pub(in crate::server) async fn accept_repeats(
 }
 
 /// `POST /v1/review/reject-stacked` with `{bucket?, scene?, camera?, label?, source?, date_from?,
-/// date_to?, dry_run, limit?}`: on the reviewed and unreviewed frames with a label file that the bucket, scene, camera
+/// time_from?, date_to?, time_to?, dry_run, limit?}`: on the reviewed and unreviewed frames with a label file that the bucket, scene, camera
 /// and class filters select, the boxes stacked on a better box of the object (IoU >= 0.7) are
 /// rejected (`reject_reason: duplicate`, kept as evidence; [`bulk::bulk_reject_stacked`]), at most
 /// `limit` frames (default 500). The frames keep their status; drawn boxes and frames a reviewer
@@ -330,7 +351,7 @@ pub(in crate::server) async fn reject_stacked(
 ) -> Answer {
     let b: BulkBody = json_body(&headers, body)?;
     let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let filters = b.filters(&[])?;
+    let filters = b.filters(review_zone(&state), &[])?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
         let ctx = review_ctx(&state);
@@ -401,7 +422,7 @@ pub(in crate::server) async fn reject_stacked(
 }
 
 /// `POST /v1/review/restore-reopened` with `{bucket?, scene?, camera?, label?, source?, date_from?,
-/// date_to?, dry_run, limit?}`: the undo of a re-label that reopened reviewed frames. On the unreviewed frames of those
+/// time_from?, date_to?, time_to?, dry_run, limit?}`: the undo of a re-label that reopened reviewed frames. On the unreviewed frames of those
 /// filters, a frame with a `disagreement` note, a `reviewed_at` and nothing pending goes back to
 /// reviewed and loses the note ([`bulk::bulk_restore_reopened`], re-checked under the write lock),
 /// at most `limit` frames (default 500). Frames with a pending box and frames never reviewed are
@@ -413,7 +434,7 @@ pub(in crate::server) async fn restore_reopened(
 ) -> Answer {
     let b: BulkBody = json_body(&headers, body)?;
     let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let filters = b.filters(&[("status", "unreviewed")])?;
+    let filters = b.filters(review_zone(&state), &[("status", "unreviewed")])?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
         let dir = review_ctx(&state).dir;
@@ -470,7 +491,11 @@ struct SuggestOverlapsBody {
     #[serde(default)]
     date_from: Option<String>,
     #[serde(default)]
+    time_from: Option<String>,
+    #[serde(default)]
     date_to: Option<String>,
+    #[serde(default)]
+    time_to: Option<String>,
     #[serde(default)]
     gpu: Option<String>,
     #[serde(default)]
@@ -486,7 +511,7 @@ struct SuggestOverlapsBody {
 }
 
 /// `POST /v1/review/suggest-overlaps` with `{bucket?, scene?, camera?, label?, date_from?,
-/// date_to?, gpu?, allow_large?, again?, dry_run?, ignore_memory_check?}`: queue the overlap check
+/// time_from?, date_to?, time_to?, gpu?, allow_large?, again?, dry_run?, ignore_memory_check?}`: queue the overlap check
 /// ([`crate::training::overlaps`]) on the label files of the folder under review those filters
 /// select, reviewed frames too (no
 /// `source` or `status` narrows it, a reviewed frame need not be in the review queue). It writes
@@ -514,12 +539,16 @@ pub(in crate::server) async fn suggest_overlaps(
             ("camera", b.camera),
             ("label", b.label),
             ("date_from", b.date_from),
+            ("time_from", b.time_from),
             ("date_to", b.date_to),
+            ("time_to", b.time_to),
         ] {
             if let Some(v) = v.filter(|v| !v.trim().is_empty()) {
                 req.frames.query.insert(k.to_string(), v);
             }
         }
+        // The dates and times in the service's zone now, kept in the queued record.
+        req.frames.pin_zone(review_zone(&state));
         req.gpu = b.gpu;
         req.allow_large = b.allow_large;
         req.ignore_memory_check = b.ignore_memory_check;
@@ -595,7 +624,7 @@ pub(in crate::server) async fn suggest_overlaps(
 }
 
 /// `POST /v1/review/reject-other-class` with `{bucket?, scene?, camera?, label?, source?,
-/// date_from?, date_to?, dry_run, limit?}`: on the unreviewed frames of those filters, the pending model and auto boxes
+/// date_from?, time_from?, date_to?, time_to?, dry_run, limit?}`: on the unreviewed frames of those filters, the pending model and auto boxes
 /// of unwanted classes (not in `collect.classes`, or in `collect.hidden_classes`) rejected with
 /// `reason: other_class` (kept as evidence), or renamed to the list's spelling when the label is
 /// a wanted class under another name (`pottedplant` -> `potted plant`;
@@ -611,7 +640,7 @@ pub(in crate::server) async fn reject_other_class(
 ) -> Answer {
     let b: BulkBody = json_body(&headers, body)?;
     let limit = b.limit(ACCEPT_AUTO_DEFAULT_LIMIT)?;
-    let filters = b.filters(&[("status", "unreviewed")])?;
+    let filters = b.filters(review_zone(&state), &[("status", "unreviewed")])?;
     let dry_run = b.dry_run;
     Ok(blocking(move || {
         let ctx = review_ctx(&state);

@@ -653,7 +653,7 @@ table.bench th, table.bench td { word-break: normal; overflow-wrap: normal; }
 .review-counts .k { color: var(--muted); }
 .review-filters label { margin: 0.3rem 0; }
 /* The day pickers: as wide as a date needs, never wider than the row (WebKit widens date inputs). */
-.review-filters input[type="date"] { width: auto; min-width: 0; max-width: 100%; box-sizing: border-box; }
+.review-filters input[type="date"], .review-filters input[type="time"] { width: auto; min-width: 0; max-width: 100%; box-sizing: border-box; }
 /* The review workspace takes the window's width: the frame is as large as the window allows beside
    the side panel. The prose around it keeps a readable measure. The Review tab's link matches from
    the first paint (the page streams: #review comes later, and main would widen under the reader). */
